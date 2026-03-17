@@ -4,6 +4,7 @@
 #   make build     - Build mxcli for current platform
 #   make release   - Build mxcli for all platforms (macOS, Windows, Linux)
 #   make test      - Run unit tests
+#   make test-integration - Run integration tests (requires mx/mxbuild)
 #   make test-mdl  - Run MDL integration tests (requires Docker)
 #   make lint      - Lint all code (Go + TypeScript)
 #   make lint-go   - Lint Go code (fmt + vet)
@@ -130,6 +131,10 @@ release: clean sync-all
 # Run tests
 test:
 	CGO_ENABLED=0 go test ./...
+
+# Run integration tests (requires mx binary / mxbuild)
+test-integration:
+	CGO_ENABLED=0 go test -tags integration ./...
 
 # Run MDL integration tests (requires Docker and a Mendix project)
 # Usage: make test-mdl MPR=path/to/app.mpr

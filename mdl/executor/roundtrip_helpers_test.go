@@ -80,6 +80,34 @@ func copyTestProject(t *testing.T) string {
 	return destMPR
 }
 
+// findMxBinary searches for the mx command in known locations.
+// Search order: reference/mxbuild/modeler/mx (repo-local), ~/.mxcli/mxbuild/*/modeler/mx
+// (cached downloads), PATH lookup.
+func findMxBinary() string {
+	// 1. Repo-local reference path
+	repoPath, err := filepath.Abs("../../reference/mxbuild/modeler/mx")
+	if err == nil {
+		if _, err := os.Stat(repoPath); err == nil {
+			return repoPath
+		}
+	}
+
+	// 2. Cached downloads (~/.mxcli/mxbuild/*/modeler/mx)
+	if home, err := os.UserHomeDir(); err == nil {
+		pattern := filepath.Join(home, ".mxcli", "mxbuild", "*", "modeler", "mx")
+		if matches, _ := filepath.Glob(pattern); len(matches) > 0 {
+			return matches[len(matches)-1]
+		}
+	}
+
+	// 3. PATH lookup
+	if p, err := exec.LookPath("mx"); err == nil {
+		return p
+	}
+
+	return ""
+}
+
 // createTestProject creates a fresh Mendix project using `mx create-project`.
 // Returns the path to the App.mpr file in a temp directory.
 func createTestProject(t *testing.T) string {
