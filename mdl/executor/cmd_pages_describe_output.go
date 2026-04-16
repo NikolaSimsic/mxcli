@@ -128,6 +128,32 @@ func (e *Executor) outputWidgetMDLV3(w rawWidget, indent int) {
 	prefix := strings.Repeat("  ", indent)
 
 	switch w.Type {
+	case "Forms$TabControl", "Pages$TabControl":
+		header := fmt.Sprintf("TABCONTAINER %s", w.Name)
+		props := appendAppearanceProps(nil, w)
+		if len(w.Children) > 0 {
+			formatWidgetProps(e.output, prefix, header, props, " {\n")
+			for _, child := range w.Children {
+				e.outputWidgetMDLV3(child, indent+1)
+			}
+			fmt.Fprintf(e.output, "%s}\n", prefix)
+		} else {
+			formatWidgetProps(e.output, prefix, header, props, "\n")
+		}
+
+	case "Forms$ScrollContainer", "Pages$ScrollContainer":
+		header := fmt.Sprintf("SCROLLCONTAINER %s", w.Name)
+		props := appendAppearanceProps(nil, w)
+		if len(w.Children) > 0 {
+			formatWidgetProps(e.output, prefix, header, props, " {\n")
+			for _, child := range w.Children {
+				e.outputWidgetMDLV3(child, indent+1)
+			}
+			fmt.Fprintf(e.output, "%s}\n", prefix)
+		} else {
+			formatWidgetProps(e.output, prefix, header, props, "\n")
+		}
+
 	case "Forms$DivContainer", "Pages$DivContainer":
 		header := fmt.Sprintf("CONTAINER %s", w.Name)
 		props := appendAppearanceProps(nil, w)

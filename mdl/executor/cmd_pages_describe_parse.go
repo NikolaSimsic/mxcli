@@ -31,6 +31,54 @@ func (e *Executor) parseRawWidget(w map[string]any, parentEntityContext ...strin
 	typeName, _ := w["$Type"].(string)
 	name, _ := w["Name"].(string)
 
+	// ScrollContainer: children live in CenterRegion.Widgets (not Widgets directly).
+	// We keep the scrollContainer widget ID in the output but also expose all nested
+	// widgets so DESCRIBE PAGE shows what's inside and the extractor can find them.
+	if typeName == "Forms$ScrollContainer" || typeName == "Pages$ScrollContainer" {
+		widget := rawWidget{
+			Type: typeName,
+			Name: name,
+		}
+		// Children are nested inside CenterRegion.Widgets
+		var children []any
+		if centerRegion, ok := w["CenterRegion"].(map[string]any); ok {
+			children = getBsonArrayElements(centerRegion["Widgets"])
+		}
+		// Fallback: some older formats may use Widgets directly
+		if children == nil {
+			children = getBsonArrayElements(w["Widgets"])
+		}
+		for _, c := range children {
+			if cMap, ok := c.(map[string]any); ok {
+				widget.Children = append(widget.Children, e.parseRawWidget(cMap, inheritedCtx)...)
+			}
+		}
+		return []rawWidget{widget}
+	}
+
+	// TabControl: children live in TabPages[].Widgets — recurse so nested widget IDs
+	// (e.g. text widgets inside each tab) are included in the output.
+	if typeName == "Forms$TabControl" || typeName == "Pages$TabControl" {
+		widget := rawWidget{
+			Type: typeName,
+			Name: name,
+		}
+		tabPages := getBsonArrayElements(w["TabPages"])
+		for _, tp := range tabPages {
+			tpMap, ok := tp.(map[string]any)
+			if !ok {
+				continue
+			}
+			tabWidgets := getBsonArrayElements(tpMap["Widgets"])
+			for _, tw := range tabWidgets {
+				if twMap, ok := tw.(map[string]any); ok {
+					widget.Children = append(widget.Children, e.parseRawWidget(twMap, inheritedCtx)...)
+				}
+			}
+		}
+		return []rawWidget{widget}
+	}
+
 	// Parse DivContainer as a proper CONTAINER widget with children
 	if typeName == "Forms$DivContainer" || typeName == "Pages$DivContainer" ||
 		typeName == "Forms$GroupBox" || typeName == "Pages$GroupBox" {
