@@ -197,12 +197,24 @@ func TestJdkSearchPaths_NoHardcodedDriveLetter(t *testing.T) {
 	}
 }
 
-func TestResolveStudioProDir_NotWindows(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("non-windows test")
+func TestResolveStudioProDir_Linux(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux-only test")
 	}
 	if dir := ResolveStudioProDir("11.6.4"); dir != "" {
-		t.Errorf("expected empty on non-windows, got %s", dir)
+		t.Errorf("expected empty on linux, got %s", dir)
+	}
+}
+
+func TestResolveStudioProDir_MacOS_FakeInstall(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("macOS-only test")
+	}
+	// Simulate a Studio Pro .app bundle in a temp Applications directory.
+	// resolveStudioProDirMacOS is hard-coded to /Applications, so we test
+	// it indirectly by confirming that a non-existent version returns "".
+	if dir := resolveStudioProDirMacOS("0.0.0"); dir != "" {
+		t.Errorf("expected empty for non-existent version, got %s", dir)
 	}
 }
 
@@ -266,5 +278,38 @@ func TestResolveMxBuild_PrefersStudioProOverCache(t *testing.T) {
 	}
 	if result != studioBin {
 		t.Errorf("expected Studio Pro binary %s, got %s (should prefer Studio Pro over cache)", studioBin, result)
+	}
+}
+
+func TestResolveMxBuild_PrefersExactCachedVersion(t *testing.T) {
+	dir := t.TempDir()
+	setTestHomeDir(t, dir)
+	setTestApplicationsDir(t, t.TempDir()) // prevent real macOS Studio Pro from matching
+	// Point PATH at an empty temp dir (rather than clearing it) so exec.LookPath
+	// still works for any other testing infrastructure but can't find mxbuild.
+	t.Setenv("PATH", t.TempDir())
+
+	versions := []string{"9.24.40.80973", "11.6.3", "11.9.0"}
+	var expected string
+	for _, version := range versions {
+		modelerDir := filepath.Join(dir, ".mxcli", "mxbuild", version, "modeler")
+		if err := os.MkdirAll(modelerDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		bin := filepath.Join(modelerDir, mxbuildBinaryName())
+		if err := os.WriteFile(bin, []byte("fake"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if version == "11.9.0" {
+			expected = bin
+		}
+	}
+
+	result, err := resolveMxBuild("", "11.9.0")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != expected {
+		t.Errorf("expected exact cached version %s, got %s", expected, result)
 	}
 }

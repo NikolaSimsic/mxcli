@@ -1,3 +1,8 @@
+---
+title: SHOW/DESCRIBE Regular Expressions
+status: proposed
+---
+
 # Proposal: SHOW/DESCRIBE Regular Expressions
 
 ## Overview
@@ -12,7 +17,7 @@ Regular Expressions are reusable named patterns used in entity attribute validat
 
 | Layer | Status | Location |
 |-------|--------|----------|
-| **Go type** | Partial | `model/types.go` line 227 — `RegularExpression{ContainerID, Name, Documentation, Expression}`, missing `Excluded`, `ExportLevel` |
+| **Go type** | Partial | `model/types.go` line 227 — `RegularExpression{ContainerID, Name, documentation, expression}`, missing `Excluded`, `ExportLevel` |
 | **Parser** | No | No `parseRegularExpression()` function |
 | **Reader** | No | No `ListRegularExpressions()` method |
 | **Generated metamodel** | Yes | `generated/metamodel/types.go` line 7769 |
@@ -22,10 +27,10 @@ Regular Expressions are reusable named patterns used in entity attribute validat
 ```
 RegularExpressions$RegularExpression:
   Name: string
-  Documentation: string
-  Expression: string (the regex pattern)
+  documentation: string
+  expression: string (the regex pattern)
   Excluded: bool
-  ExportLevel: string ("API", "Hidden")
+  ExportLevel: string ("api", "Hidden")
 ```
 
 This is one of the simplest document types — just 5 fields.
@@ -35,7 +40,7 @@ This is one of the simplest document types — just 5 fields.
 ### SHOW REGULAR EXPRESSIONS
 
 ```
-SHOW REGULAR EXPRESSIONS [IN Module]
+show REGULAR EXPRESSIONS [in module]
 ```
 
 | Qualified Name | Module | Name | Expression |
@@ -46,7 +51,7 @@ Where "Expression" is truncated to ~40 chars for display.
 ### DESCRIBE REGULAR EXPRESSION
 
 ```
-DESCRIBE REGULAR EXPRESSION Module.Name
+describe REGULAR expression Module.Name
 ```
 
 Output format:
@@ -55,8 +60,8 @@ Output format:
 /**
  * Validates email addresses
  */
-REGULAR EXPRESSION MyModule.EmailRegex
-  EXPRESSION '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$';
+REGULAR expression MyModule.EmailRegex
+  expression '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$';
 /
 ```
 
@@ -74,7 +79,7 @@ func (r *Reader) ListRegularExpressions() ([]*model.RegularExpression, error)
 
 ### 3. Add AST, Grammar, Visitor, Executor
 
-Grammar tokens: `REGULAR`, `EXPRESSION`, `EXPRESSIONS`.
+Grammar tokens: `REGULAR`, `expression`, `EXPRESSIONS`.
 
 This is one of the simplest implementations — no nested structures, no recursive parsing.
 

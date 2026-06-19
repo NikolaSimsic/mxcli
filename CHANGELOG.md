@@ -4,6 +4,284 @@ All notable changes to mxcli will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Graph community detection & centrality (`refresh catalog communities`)** — a pure-Go (no CGO, no deps) graph engine over the refs graph: Leiden community detection, Tarjan cycles, topological layering, PageRank, and betweenness. `refresh catalog communities [resolution n]` computes them (in the full-refresh transaction) into new catalog tables/views — `communities` + `community_summary`, `graph_cycles`, `graph_layers`, `graph_centrality`, `graph_integration_surface` (cross-community edges → OData/REST/event mechanisms), `graph_module_dependencies` — and adds PageRank/betweenness columns to `graph_god_nodes`. Surfaced via `SHOW COMMUNITIES` / `SHOW COMMUNITY [MEMBERS] OF Module.Asset`, and exposed to Starlark lint rules (`community_of`, `layer_of`, `cycles`, `module_dependencies`, `centrality`, `god_nodes`, `integration_surface`, `refs_from`) so teams validate their own architecture guidelines. The native Leiden matches the `leidenalg` reference exactly (105 communities on Evora). Targets two refactoring journeys: spaghetti → layered/modular (cycles + layer sequence numbers) and monolith → multi-app (community cut → integration-contract list).
+- **`mxcli graph-report` — architecture map from the dependency graph** — renders six analyses over new `CATALOG.graph_*` views: god nodes (degree centrality), cross-module coupling ("surprise edges"), module cohesion (intra/inter ratio), dead documents (no inbound edge), the reference-kind distribution, and entity hotspots (used by the most flows). Framework/marketplace modules are excluded by default (`--include-framework` to keep them); `--top N`, `--format markdown|json`, `-o file`. Each section is a thin `SELECT` over a `graph_*` view, so it's reproducible directly (`select * from CATALOG.graph_god_nodes`). Built on the now-substantially-complete `refs` graph; requires `refresh catalog full` (the command runs it). Also made `CATALOG.<name>` query translation generic (regex strip) so new catalog views work without a per-name allowlist.
+- **Marketplace download & install** — the content API now returns a per-version `downloadUrl`, so the previously-parked install path is unblocked. `mxcli marketplace download <id> [--version X] [-o file]` fetches a content version's `.mpk` (two-step: MxToken-authed `303` on `marketplace.mendix.com` → public CDN, no token sent to the CDN). `mxcli marketplace install <id> -p app.mpr` is type-aware: widgets are copied into `widgets/`, new modules are imported via `mx module-import`, other types are downloaded with import instructions. Module **updates** are intentionally reported-not-applied — re-importing an existing module would discard local edits and change persistent-entity IDs (data loss); that path is left to Studio Pro pending an ID-preserving merge
+- **Marketplace search caching** — the first `mxcli marketplace search` fetches the full catalog listing once and caches it under `~/.mxcli/marketplace-catalog-<profile>.json` (24h TTL, mode 0600); subsequent searches (any keyword) are served from the cache instantly. `--refresh` bypasses the cache and re-fetches. An interactive progress line ("Searching marketplace… N items scanned") shows during a fresh scan
+- **`describe` auto-detects the document type** — the type is now optional for a qualified name: `mxcli describe MyModule.Customer` resolves the type itself (entity, microflow, page, snippet, enumeration, constant, java action, nanoflow, workflow, association incl. cross-module, …). Resolution prefers the catalog cache (O(1) lookup, no overhead vs. the explicit form) and falls back to a live project scan when the catalog is absent. An ambiguous name (e.g. an entity and a microflow sharing a name) is reported with its candidates. The explicit `describe <type> <name>` form is unchanged, and is still required for the forms that have no single qualified name (module, settings, navigation, module role)
+- **Bare `describe Module.Name` works as MDL, not just as a CLI flag** — the auto-detect form is now part of the MDL grammar, so it parses and runs everywhere MDL does: the REPL, `exec` scripts, `check`, and the LSP (previously `describe Sales.Order` in the REPL was a parse error and only `mxcli describe Sales.Order` worked). The bare form resolves the type from the project's catalog `objects` index at execution time (built on demand, fresh — no staleness concern); all typed `describe <type> …` forms still take precedence, and an ambiguous or unknown name returns an actionable error
+
+### Changed
+
+- **Catalog `objects` index includes associations** — the unified `objects` view now unions the `associations` table (`ObjectType = ASSOCIATION`), so it is a complete index for the cataloged document types and consumers no longer need a separate associations query. Catalog schema bumped to v3; cached `.mxcli/catalog.db` files rebuild automatically on the next `refresh catalog`.
+- **Catalog indexes image collections, JavaScript actions, and data transformers** — these document types had no catalog table at all; they are now built (via the raw-unit surface, so no `CatalogReader`/backend change) into their own tables and unioned into `objects` (`IMAGE_COLLECTION`, `JAVASCRIPT_ACTION`, `DATA_TRANSFORMER`). `describe` auto-detect resolves image collections and data transformers by bare name. Catalog schema bumped to v4.
+- **Catalog indexes agent-editor documents** — agents, AI models, knowledge bases, and consumed MCP services (one shared `CustomBlobDocuments$CustomBlobDocument` BSON wrapper, distinguished by `CustomDocumentType`) are now cataloged into their own tables and unioned into `objects` (`AGENT`, `AI_MODEL`, `KNOWLEDGE_BASE`, `CONSUMED_MCP_SERVICE`). The document name turned out to be a top-level wrapper field (not buried in the inner JSON blob), so this reads through the raw-unit surface with no `CatalogReader`/backend change, and `describe` auto-detect resolves all four by bare name. Catalog schema bumped to v5; this completes the `objects` index for the document types tracked in #658. (Verified against `test3-app`: 8 agent-editor docs across all four types.)
+
+### Fixed
+
+- **`show context` now resolves its relationship sections** — the sections filtered the refs table on `TargetType`/`SourceType` using lowercase literals (`'entity'`, `'microflow'`, `'page'`) while those values are stored uppercase, so in case-sensitive SQLite "Entities Used", "Microflows Using This Entity", "Pages Displaying This Entity", "Related Entities" and the workflow context sections silently rendered empty. Now matched correctly. (`show callers|callees|references|impact` were unaffected and already pick up the expanded refs automatically.)
+- **`catalog.refs` captures far more references** — the cross-reference index that powers `show callers|callees|references|impact` was missing whole categories (#663). Now added: nanoflow calls, consumed-REST-operation calls, and association-based retrieves from microflow actions; **nanoflows as reference sources** (previously only microflows were walked); **association references** (each association now links to both its FROM and TO entity — was an explicit `// Skipping for now` TODO); **page→layout references** (the emission was dead code gated behind an always-nil `LayoutCall`); **calculated-by** (entity→microflow for calculated attributes); **change/delete entity references** (resolved via lightweight intra-flow variable tracking); and **page- and snippet-widget references** — `datasource` (page/snippet→entity) and `action` (page/snippet→microflow/nanoflow), extracted from the existing raw-BSON widget walk and projected from `widgets_data` (new `MicroflowRef`/`NanoflowRef` columns; snippet widgets now populate the table too, with `ContainerType=SNIPPET`). On `MxGraphStudioDemo` the earlier slice took `associate` 0→104, `layout` 0→22; on `Evora-FactoryManagement` the full effort took `refs` from ~5.5k to 6,459. Re-run `refresh catalog full` to pick them up.
+- **`catalog.activities` labels REST and other actions correctly instead of a generic `MicroflowAction`** — the `ActionType` column came from a hand-maintained type switch that only knew ~17 action types; every other parser-modelled action (REST call, REST operation call, web-service call, nanoflow call, JavaScript-action call, execute-database-query, transform-JSON, XML import/export, show-home-page, delete-object) silently collapsed into `ActionType = 'MicroflowAction'`, so e.g. `select … from CATALOG.activities where ActionType = 'RestCallAction'` returned nothing. The label is now derived from the concrete action type, so it stays correct for every action the parser models (including ones added later), and an action the parser doesn't model yet surfaces its real Mendix storage name rather than a generic bucket. On `MxGraphStudioDemo` the generic bucket dropped from 33 rows to 0, exposing RestCallAction/RestOperationCallAction/JavaScriptActionCallAction/NanoflowCallAction/DeleteObjectAction that were previously hidden. Re-run `refresh catalog full` to pick up the corrected labels.
+- **`SHOW CATALOG TABLES` lists every catalog view** — the table list was hand-maintained and had drifted: the newly-cataloged document-type views (image collections, JavaScript actions, data transformers, agents, AI models, knowledge bases, consumed MCP services) and the pre-existing `navigation_profiles` view were all built and queryable but never shown. They are now listed, and a drift-guard test (`TestTables_CoversAllViews`) asserts every catalog VIEW appears in the list, so a future document type can't be silently omitted again.
+- **`refresh catalog source` no longer O(N²) on large projects** — it resolved each document by re-reading and re-`bson.Unmarshal`ing *every* unit on *every* describe call, so a big app (#651: ~3.3k microflows, ~33k activities) took ~6 hours. The reader now builds a one-time `$Type + qualified-name → unit` index (decoding only the `Name` field, not the whole document), making `GetRawUnitByName` / `GetRawMicroflowByName` O(1); the shared backend means the index is built once across the parallel describe workers. The source phase also reports incremental progress every 2s instead of going silent for the whole build. GraphViewer's source build (993 microflows) dropped to ~3.5 min with live progress; cloud-portal-scale projects go from hours to minutes
+- **Marketplace search now scans the whole catalog** — the Content API has no server-side search and caps `limit` at 100 per page, so `marketplace search` previously only filtered the first 100 items and silently missed matches further in (e.g. External Database Connector `219862`, Mendix Business Events `202649`). It now paginates via `offset`, fetching pages **concurrently** (first page alone so a common early match stays a single request; then bounded-parallel batches), and stops at `--limit` matches or end-of-catalog. Measured ~3m45s → ~44s on a slow link for a deep match; combined with the new cache, repeat searches are instant
+
+## [0.12.0] - 2026-06-04
+
+Headline: **one widget creation path.** The `datagrid`/`gallery`/`combobox`/`image` keywords and the `pluggablewidget '...'` form now build BSON through a single registry-driven engine, fed by widget definitions extracted from each project's installed `.mpk` files (`widget init`; auto-generated/refreshed on `exec`). The Mendix BSON *envelope* still comes from embedded `mendix-11.6` templates — full per-version, project-extracted templates remain tracked under #529.
+
+### Added
+
+- **Cross-version widget-envelope drift gate** — `make check-widget-versions` (script `scripts/check-widget-versions.sh`) runs a widget fixture through `exec` + `mx check` on multiple Mendix versions and fails if the CE0463 set differs between them (v0.12.0 Stream A). It drops each fixture's `create module` targets before exec so leftover/divergent reference-project state doesn't skew the comparison; the 11.10 libSkiaSharp crash is handled automatically via `scripts/mx-check.sh`. Fixture set: `03`, `30`, `31`, `32`. The gate surfaced one real 11.9→11.10 drift (textfilter `attrChoice`, #605, fixed above); after that fix all four fixtures pass with no cross-version drift
+
+### Security
+
+- **Go toolchain pinned to 1.26.4** — resolves two reachable standard-library vulnerabilities flagged by `govulncheck`: GO-2026-5039 (`net/textproto`, unescaped inputs in errors; reached via `mpk.ParseMPK`) and GO-2026-5037 (`crypto/x509`, inefficient candidate hostname parsing). `go.mod` now carries a `toolchain go1.26.4` directive and CI pins `go-version: '1.26.4'`, so every environment builds with the fixed stdlib
+
+### Changed
+
+- **ALTER STYLING design properties** — `ALTER STYLING` now writes design properties on pages and snippets, with correct value-type encoding (Option vs Custom; ToggleButtonGroup uses Option). `DESCRIBE STYLING` round-trips them. (#631)
+- **Dependency bumps** — `chroma/v2` 2.24.1 → 2.26.1, `modernc.org/sqlite` 1.50.1 → 1.51.0, `mattn/go-runewidth` 0.0.23 → 0.0.24
+- **DataGrid construction unified on the pluggable widget engine** — the `datagrid` MDL keyword now routes through the same registry-driven engine as the `pluggablewidget 'com.mendix.widget.web.datagrid.Datagrid'` form, so both produce equivalent BSON. The hand-coded keyword-path builder (`datagrid_builder.go` `BuildDataGrid2Widget` + ~30 helpers, ~990 lines) is deleted. Engine gained the column conventions the keyword path applied implicitly: CONTROLBAR→filtersPlaceholder routing, per-column filter-widget routing (`textfilter`/`numberfilter`/`datefilter`/`dropdownfilter`), object-list item property ordering, `Caption`/`Content` aliases with `CaptionParams`/`ContentParams` resolution, missing-Caption→attribute-name fallback, attribute-less columns default `sortable=false`, content-slot widgets auto-infer `ShowContentAs: customContent`, and the tooltip/exportValue empty-ClientTemplate conventions. (#529 Phase 4)
+- **Catalog schema normalized** — every domain table (entities, microflows, pages, …) is now split into a `<name>_data` storage table plus a `<name>` view that joins `snapshots` to expose `ProjectName`, `SnapshotDate`, `SnapshotSource`, `SourceId`, `SourceBranch`, `SourceRevision`. Existing queries (`SELECT * FROM CATALOG.ENTITIES`, ad-hoc filters by `SnapshotSource`, the `objects` UNION view) keep working unchanged. Existing `.mxcli/catalog.db` files rebuild automatically on first open (schema version bumped to 2); cache metadata is cleared so the rebuild fires through `isCacheValid`. (#576)
+
+### Fixed
+
+- **DESCRIBE round-trips for pages and widgets** — `DESCRIBE` now emits re-executable MDL for several cases that previously broke a roundtrip: bare grant member names (#633), `microflow`/`nanoflow` (not `call_`) for widget actions (#634), an always-present java-action body (#637), quoted reserved-keyword DataGrid column names (#638), and widget-action microflow arguments as `Param: value` (#640)
+- **Reserved-keyword names via quoting** — page/snippet parameter names (#114) and widget names (#619) that collide with MDL reserved words can now be expressed with quoting instead of being rejected
+- **OQL against Mendix 11.11** — `mxcli oql` supports the new `/dev/preview_execute_oql` dev endpoint and surfaces its query errors (which arrive as HTTP 200 with an `{"error": ...}` body) instead of silently succeeding
+- Filter widgets (`textfilter`/`numberfilter`/`datefilter`/`dropdownfilter`) with an explicit `attributes: [...]` list now emit `attrChoice="linked"` instead of `"auto"` (#605). `"auto"` is correct only for a *bare* filter inside a DataGrid column (it binds to the column's attribute); a filter with an explicit attributes list (e.g. inside a Gallery `filter` block) needs `"linked"`. Mendix 11.10+ flags `attrChoice="auto"` alongside a populated attributes list as definition drift (CE0463); Mendix 11.9 tolerated it. This was real 11.9→11.10 envelope drift that the v0.12.0 Stream A gate missed because its fixtures only exercised column-bound filters
+- DataGrid column `ColumnWidth: manual` is honoured again — the Stream B engine consolidation dropped the keyword path's `ColumnWidth` → schema `width` mapping, leaving width at its `autoFill` default. A `Size:` value is only valid when `width=manual`, so under autoFill Studio Pro / `mx check` flagged CE0463. Restored as a `width ← ColumnWidth` column alias (caught by the new cross-version gate as `dgDyn` in fixture 31)
+- Pluggable widget property conditional visibility (#574) — a TextTemplate property hidden by the widget's `editorConfig.js` under the current configuration now emits `TextTemplate: null` instead of the template's populated default, eliminating CE0463 ("the definition of this widget has changed"). Phase 1 hand-authors rules for VideoPlayer (`videoUrl`/`posterUrl` hidden when `type=expression`) and Timeline (`title`/`description`/`timeIndication` hidden when `customVisualization=true`); rules live in each widget's `.def.json` as a `propertyVisibility[]` block and ride the `generatorVersion` auto-refresh
+- `mxcli exec` now generates **missing** widget definitions, not just refreshes stale ones — a project that has `.mpk` widgets installed but was never `widget init`-ed (no `.mxcli/widgets/`) previously failed the first widget build with "unsupported widget type: datagrid". `exec` now extracts the defs from the installed `.mpk` files on demand (matching `refresh catalog`), so it works without a separate `widget init` step
+- Stale project-local widget definitions self-heal — `.def.json` files carry a `generatorVersion` stamp, and `mxcli exec` re-extracts any definition generated by an older engine before building widgets. Projects whose `.mxcli/widgets/` was generated before the v0.12.0 widget changes no longer emit CE0463 ("widget definition changed") on the next run without a manual `widget init --force`
+- DataGrid filter widgets (`textfilter`/`numberfilter`/`datefilter`/`dropdownfilter`) default `attrChoice` to `auto` instead of `linked`/`custom`, so a filter placed inside a column body binds to the column's attribute automatically rather than failing `mx check` with CE0642 ("Property 'Attribute' is required")
+
+## [0.11.0] - 2026-05-21
+
+### Added
+
+- **Pluggable widget property validation** — `mxcli check` flags unknown widget property keys as `MDL-WIDGET01`; respects MDL builtin property names (e.g. `Label`, `Caption`, `DataSource`) so they aren't reported as typos
+- **`mxcli check --post-migration`** — scans for legacy native widgets in pages/snippets and reports `MDL-WIDGET02` with qualified module.document names; version-gated via the legacy-widget catalog
+- **LSP widget integration** — completion suggests widget property keys inside `(...)` blocks; hover shows property descriptions extracted from `.mpk`; widget property typos surface as real-time diagnostics
+- **Widget definition workflow** — `widget init --force` re-extracts existing `.def.json` files; `widget init` and `refresh catalog` auto-refresh stale definitions; `mxcli init` now runs `widget init` so new projects pick up widget defs automatically
+- **Catalog: widget tables** — `widget_definitions` and `widget_definition_properties` queryable via `SELECT ... FROM CATALOG.widget_definitions`
+- **`ALTER` for agent-editor documents** — `ALTER AGENT/MODEL/KNOWLEDGEBASE/MCPSERVICE` (#464)
+- **Skill docs include MDL keyword routing** — generated widget skill files document object-list and child-slot keywords driven from `.def.json`
+
+### Fixed
+
+- DataGrid2 column `tooltip` / `exportValue` / `dynamicText` TextTemplate now matches Studio Pro's per-column-kind convention (CE0463 on attribute-bound columns, #578)
+- DataGrid2 column `CaptionParams` / `ContentParams` / `ShowContentAs` / `Content` roundtrip (#547); `$localVar` references in column captions emit `Forms$PageVariable.LocalVariable`
+- Pluggable widget engine wrote `CustomWidgets$AttributeRef` (not a registered Mendix type); now emits `DomainModels$AttributeRef` with the fully-qualified path so `mx update-widgets` no longer fails with `TypeCacheUnknownTypeException` (#64)
+- Object-list item TextTemplate slots emit `null` when unset (Accordion `groups`, Maps `markers`, AreaChart `series`, PopupMenu items) instead of placeholder ClientTemplate that triggered CE0463 (#548)
+- Pluggable widget CE0463 on Mendix 11.9 — `FormattingInfo TimeFormat` + `Selection` PascalCase normalization
+- DataView `FormOrientation` / `LabelWidth` now controllable from MDL (#554)
+- `ALTER PAGE` fixes: `INSERT`/`REPLACE` serializes DataGrid2 columns correctly; `set Title` actually updates the title (#561); column `SET` is case-insensitive and supports TextTemplate captions (#560); column inserts use the grid's data source as entity context
+- Master-detail page round-trip — Gallery `ItemSelectionMode` + DataView selection-source described correctly
+- `DesktopWidth` / `TabletWidth` / `PhoneWidth`: `AutoFill` now actually sets `Weight: -1` instead of dropping the override
+- Pluggable widget validator respects MDL builtin property names (no false positives on `Label:`, `Caption:`, `DataSource:`, etc.)
+- `mxcli check` detects custom-content column INSERT issues before MxBuild
+- `--references` no longer flags `DROP + CREATE` of the same name as a conflict
+- Reject Mendix reserved words on non-persistent entity attributes (#552)
+- Cached catalog applies the current schema on load (no more "no such table" after schema bump)
+- Nightly CE0117 on Mendix 10.24.19 — drop redundant `toString()` on string parameter
+
+### Changed
+
+- Test infrastructure: `TestMain` runs `widget init` on the shared source project so per-test copies inherit `.def.json` files; integration tests now exercise pluggable widget fixtures end-to-end
+- Robust cleanup for doctype/mx-check tests eliminates ENOTEMPTY flake on CI
+- `modernc.org/sqlite` bumped from 1.50.0 to 1.50.1
+
+### Known limitations
+
+- Two CE0463 cases remain for widgets with property-conditional TextTemplate visibility (VideoPlayer with `type='expression'`, Timeline with `customVisualization='true'`). Root cause and proposal in `docs/11-proposals/PROPOSAL_widget_property_visibility.md`; tracked under #574
+- `pluggablewidget 'com.mendix.widget.web.datagrid.Datagrid'` form is less feature-complete than the `datagrid` keyword form (no CONTROLBAR/customContent/per-column filter routing). Tracked under #529 Phase 4
+
+## [0.10.0] - 2026-05-12
+
+### Added
+
+- **Maven/JAR dependency management** — `CREATE/DROP/SHOW JAR DEPENDENCY` statements; `jar_dependencies` catalog table; skill and docs-site pages (MDL-JARDEP)
+- **Object-list pluggable widget properties** — grammar keywords for object-list blocks, extraction to `.def.json` (Phase 1), and BSON serialization through the executor (Phase 1 Layer 3)
+- **LEGACYDATAGRID grammar** — keyword dispatch table and `LEGACYDATAGRID` grammar rule (Phase 2 pluggable widget overhaul)
+- **`AllowCreateChangeLocally` flag** — exposed on external OData entities (#534)
+- **Catalog: contract_entities → external_entities link** — cross-reference between contract catalog and integration catalog
+- **`not(expr)` grammar enforcement** — grammar now requires parenthesised form; bare `not expr` rejected with CE0117 diagnostic
+
+### Fixed
+
+- `mxcli fmt` exits 1 on unparseable input and pipes describe output correctly (#398)
+- ALTER SNIPPET failing with "page not found" (#402)
+- `SHOW CONTEXT OF` entity showing empty definition (#396)
+- `CREATE ENTITY` rejects unknown attribute type names (#392)
+- `CREATE ENUMERATION` rejects duplicate value names (#390)
+- `DROP ENUMERATION` errors on ambiguous unqualified name (#391)
+- `CREATE ASSOCIATION` rejects duplicates for cross-module associations (#389)
+- `GRANT/REVOKE ON ENTITY` validates module roles (#399)
+- Enum XPath comparisons stored as string literals instead of enum refs (#176)
+- Catalog crash on duplicate OData contract entities/actions
+- `CATALOG.JAR_DEPENDENCIES` missing from `Tables()` list
+- Three nightly CI failures on Mendix 10.24
+- DataGrid2 `WidgetObject` boolean defaults aligned with `PropertyType` schema
+- `TextTemplate` translation defaults populated; `Editable=Always` set on filters
+- Required `CustomWidget` envelope fields added to filter widgets
+- `WidgetObject Properties` reordered to match `WidgetType PropertyTypes` order
+- `AllowUpload` field added to `WidgetValueType` BSON (closes one CE0463 gap)
+- Unique placeholder IDs for `TextTemplate` translations (#30)
+- Two ALTER PAGE bugs caught in test feedback
+- ComboBox CE0463 — guard auto-populate and null `selectAllButtonCaption`
+- Grammar added as explicit dependency of `build`, `test`, and `release` targets
+
+## [0.9.0] - 2026-05-08
+
+### Added
+
+- **Inheritance split and cast** — `CASE $var IS Module.SubType THEN ... END CASE` and `CAST $var AS Module.SubType` statements in microflow/nanoflow bodies; full BSON roundtrip with branch anchors, nested continuation cases, and merge emission (CE0079)
+- **CREATE OR MODIFY** — Standardised `OR MODIFY` variant across all remaining document types so scripts are idempotent by default (#510)
+- **MDL-DUPDEF** — `mxcli check` detects duplicate `CREATE` for the same qualified name and reports `MDL-DUPDEF`
+
+### Fixed
+
+- Catalog crash on duplicate business event channels (#533)
+- `flowRefCollector` skipping EnumSplitStmt case and else bodies — impacted `show callers/callees` accuracy
+- CE0079: inheritance split branches that continue after the split were missing their merge node
+- Nested `traverseFlowUntilMerge` guard could cross an outer merge boundary (#528)
+- Inheritance split: branch anchors, case order, nested continuation tails, and nodes outside cases all preserved
+- List-typed Java action arguments not emitting the `empty` keyword (#521); broadened to cover all resolved `BasicParameterType` params
+- REST mapping cardinality not roundtripping — `as list of` syntax now parsed and emitted (#519)
+- Import mapping: `MinOccurs`/`MaxOccurs` not parsed on mapping elements; repeating Object root treated as list; `SingleObject` inferred when `JsonStructure` absent
+- Microflow layout: spacing, branch heights, and loop containment improved
+- `TEXTFILTER` inside `DATAGRID COLUMN` not wired to the column filter slot (#189)
+- `SET $obj/Assoc` path target rejected and produced wrong BSON (#511)
+- `SHOW WIDGETS WHERE … LIKE` silently degraded to equality match
+- Reserved OData attribute names not renamed when importing entities (#526)
+- Virtual `System.*` Java actions missing from `ListJavaActions` and catalog
+- `ConcurrencyMode=Fixed` incorrectly marked as Creatable during OData import (#525)
+- Reverse-Reference traversal through entity inheritance misclassified
+- `mxcli check --references` reporting false positives on `System.*` references (#523)
+- ANTLR4 version unpinned in CI caused flaky Maven Central lookup failures
+
+### Changed
+
+- Generated ANTLR parser removed from git; `make grammar` step added to CI (#514)
+- `MDLParser.g4` split into domain-specific grammar files for maintainability (#515)
+
+## [0.8.0] - 2026-05-05
+
+### Added
+
+- **CREATE/DROP NANOFLOW** — Full nanoflow authoring pipeline: grammar, AST, visitor, executor, BSON writer, CALL NANOFLOW statement, GRANT/REVOKE nanoflow access, and nanoflow ELK diagram support in VS Code preview
+- **CALL JAVASCRIPT ACTION** — `call javascript action Module.ActionName(params)` fully supported in CREATE NANOFLOW/MICROFLOW bodies: grammar, parser, builder, serializer, and roundtrip
+- **CASE/WHEN enum split** — Enum-value split statements with `CASE $var WHEN Module.Value THEN ... END CASE` syntax; replaces the earlier `split on enum` draft
+- **CALL WEB SERVICE (SOAP)** — Legacy SOAP microflow call statement with unsupported-detail preservation as raw BSON
+- **RENAME WORKFLOW / RENAME MODULE** — RENAME now covers workflows and modules with reference refactoring
+- **Ellipsis placeholder expression** — `...` as a placeholder in microflow expressions
+- **Add-to-list expressions** — `add expression to $list` syntax in microflow/nanoflow bodies
+- **Free microflow annotations** — Unattached `@annotation` nodes in microflow bodies survive describe → exec round-trip
+- **@anchor sequence flow annotation** — `@anchor(from: X, to: Y)` on microflow statements pins SequenceFlow attachment sides; split and loop forms supported; builder-default and layout-equivalent anchors suppressed from DESCRIBE output
+- **OpenAPI import for REST clients** — `CREATE REST CLIENT` accepts `OpenAPI: 'path/or/url'` to auto-generate a consumed REST service from an OpenAPI 3.0 spec (#207)
+- **DESCRIBE CONTRACT OPERATION FROM OPENAPI** — Preview OpenAPI-generated operations without writing to the project
+- **mxcli catalog search** — Search Mendix Catalog for data sources and services (#213)
+- **Local file metadata for OData clients** — `CREATE ODATA CLIENT` supports `file://` URLs and relative paths for `MetadataUrl` (#206)
+- **CATALOG.ASSOCIATIONS table** — Query association metadata via `select ... from CATALOG.ASSOCIATIONS` (#419)
+- **SET format = json** — Session-level `SET key = value` command; `SET format = json` applies to all subsequent output
+- **Java action improvements** — DROP/RENAME updates source file references; `void` qualified name resolved as VoidType; explicit void returns parsed correctly
+- **SHOW LANGUAGES** — Language listing with Languages array parsing and executor handler (#480)
+- **VS Code extension** — LSP coverage extended to all document types (nanoflows, workflows, Java actions, JSON structures, import/export mappings)
+- **LSP snippet completions** — `CREATE NANOFLOW`, `CALL MICROFLOW`, `CALL NANOFLOW`, `CALL JAVASCRIPT ACTION`, `CALL JAVA ACTION` snippets added
+- **make check-mdl** — Fast doctype script syntax validation target; wired into CI
+- **Nanoflow diff support** — `mxcli diff` detects and displays nanoflow changes
+- **Nanoflow validation parity** — `mxcli check` runs full body validation on nanoflows via shared `validateFlowBody` helper
+
+### Fixed
+
+- SIGSEGV in `buildPublishedRestResourceDef` on malformed REST syntax (#429)
+- nil panic in ALTER WORKFLOW when activity ref is missing or uses a keyword (#430)
+- Single quotes not escaped in DESCRIBE ENTITY XPath output (#431)
+- `diff-local` git-error propagation and regression tests (#424)
+- DataGrid2 column name derivation for ALTER PAGE (#116)
+- O(N²) `GetMicroflow`/`GetNanoflow` replaced with direct unit lookup (#397)
+- `CALL MICROFLOW`/`CALL NANOFLOW` validates targets exist before writing model (#395)
+- `mxcli new` exits 0 on download failure (#422)
+- Reject obviously malformed `MetadataUrl` in CREATE ODATA CLIENT (#427)
+- Rename commands reject collisions with existing names (#432)
+- Exit codes and error messages for marketplace, eval list, widget init, TUI (#425)
+- `connect`/`disconnect`/`status` registered in syntax registry (#441)
+- `resolveSnippetRef` checks session cache before querying backend (#509)
+- DESCRIBE WORKFLOW output was missing the `CREATE` keyword (#478)
+- RENAME MODULE failed due to uppercase ObjectType comparison in visitor (#473)
+- JSON structure qualified-name lookup through folder hierarchy (#508)
+- Retry-style error handler tail now loops back to a merge before the source (#507)
+- Cross-module associations preserved on CREATE object actions (#502)
+- Negative annotation coordinates parsed correctly (#494)
+- Multiple retrieve XPath predicates preserved (#500)
+- Custom error handler routing, empty else branch preservation, and structured conditional emit (#366)
+- Validation feedback targets preserved with fully-qualified association paths (#359)
+- Mapping result range cardinality and explicit REST mapping output variables (#372)
+- SNIPPETCALL on parameterised snippets no longer corrupts model
+- SHOW_PAGE button actions no longer produce null `PageParameterMapping.Variable` (#295)
+- `Forms$SnippetParameterMapping` used for snippet call parameter mappings
+- Marketplace search applies client-side filtering (#479)
+- Recursion depth limit added to EXECUTE SCRIPT (#472)
+- `CATALOG.ASSOCIATIONS`/`CONSTANTS`/`OBJECTS` returning no rows (#419)
+
+### Changed
+
+- **MDL string literal escapes** — `\n`, `\r`, `\t`, `\\` inside single-quoted literals are now escape sequences. Scripts embedding raw backslash sequences must double the backslash.
+- **CatalogDB/CatalogTx interfaces** — Catalog, Builder, and LintContext migrated to interface; SQLite implementation extracted to `catalogdb_sqlite.go`
+- **LintReader interface** — `sdk/mpr` removed from linter and executor; all reads go through `LintReader`
+- **Type-safe BSON helpers** — `bsonString`/`bsonBool` consolidated in `mdl/bsonutil` package
+
+## [0.7.0] - 2026-04-21
+
+### Added
+
+- **Agent Editor** — CREATE/DROP Agent, Knowledge Base, Consumed MCP Service, and Model documents; read support for all four types; DESCRIBE MODULE WITH ALL includes agent-editor documents
+- **Consumed REST Client v2** — Redesigned syntax with full mapping support, parameter support for SEND REST REQUEST, BODY JSON FROM clause roundtrip, and TRANSFORM microflow action (JSLT/XSLT, Mendix 11.9+)
+- **Platform Authentication** — `mxcli auth login/logout/status/list` with PAT scheme for mendix.com; credentials stored at `~/.mxcli/auth.json` (mode 0600), MENDIX_PAT env override
+- **Marketplace Browsing** — `mxcli marketplace search/info/versions` with `--min-mendix` compatibility filtering
+- **Entity Event Handlers** — Full MDL support for before/after create/change/delete event handlers with entity parameter validation
+- **System Attributes** — AutoOwner, AutoChangedBy, and other audit pseudo-types; ALTER ENTITY ADD/DROP ATTRIBUTE for system attributes
+- **ALTER PUBLISHED REST SERVICE** — Full in-place modification of published REST services (#161)
+- **GRANT/REVOKE ACCESS on PUBLISHED REST SERVICE** (#162)
+- **GitHub Copilot support** — First-class Copilot integration in `mxcli init`
+- **Unified --json output** — All commands support structured JSON output (#134); `mxcli check --format json/sarif` outputs structured results
+- **OData TripPin bulk-import** — Executable bulk-import example with @Constant syntax for ServiceUrl
+- **Backend Abstraction** — `ExecContext` with typed backend interfaces, dispatch registry replacing type-switch, mutation backends (`page_mutator`, `widget_builder`, `datagrid_builder`, `workflow_mutator`) decoupled from `sdk/mpr`
+- **mdl/types package** — Shared types and utilities extracted from `sdk/mpr` (EDMX, AsyncAPI, ID, navigation, infrastructure, JSON utils)
+- **bsonutil package** — BSON utility functions (IDToBsonBinary, BsonBinaryToID, NewIDBsonBinary)
+- **Mock-based handler tests** — 189 tests across 33 files covering all executor command handlers
+- **OperationRegistry extensibility** — Pluggable operation registry with ContainerSnippet constant
+
+### Fixed
+
+- REST client BASIC auth uses correct `Rest$ConstantValue` BSON key (#200)
+- ConnectionIndex lost on roundtrip (int64 vs int32 type mismatch) (#204)
+- OData: ByAssociation DataSource serialization for DataGrid 2, capability annotations for entity/association CRUD (#201), bulk-create NPEs for primitive collections, derived/abstract/contained entities, and navigation associations (#143)
+- UUID v4 version/variant bits in `GenerateDeterministicID`; panic on invalid UUID in `IDToBsonBinary`
+- Cascade-delete associations on DROP ENTITY and DROP ODATA CLIENT
+- Reserved keywords now allowed as module names in CREATE MODULE
+- Quoted identifiers accepted in CREATE MODULE
+- Find, Filter, ListRange list operations parsed and rendered (#212)
+- DESCRIBE REST CLIENT resolves constant credentials to literal values (#192)
+- DESCRIBE microflow roundtrip issues; eliminate redundant Merge nodes when IF branch returns
+- COLUMN name falls back to attribute + scope association lookup by module (#202)
+- Schema-level external `<Annotations>` blocks parsed in OData $metadata
+- OData ServiceUrl validated as constant reference
+- Agent-editor commands conformed to backend abstraction
+
+### Changed
+
+- Executor fully decoupled from storage layer — all BSON writes go through mutation backends (PRs #225, #237, #238, #239)
+- All executor handlers migrated to free functions using `ExecContext` (removed 233 unused wrapper methods)
+- `show*` executor functions renamed to `list*` for consistency
+- Type aliases added in `sdk/mpr` for backward compatibility after shared-type extraction
+
 ## [0.6.0] - 2026-04-09
 
 ### Added
@@ -136,7 +414,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - Bumped dependencies: pgx v5.9.1, zap v1.27.1, go-runewidth v0.0.21, cobra v1.10.2, mongo-driver v1.17.9, sqlite v1.48.0
-- Refactored Visible/Editable syntax to `Visible: [xpath]` and `Editable: [xpath]`
+- Refactored Visible/Editable syntax to `visible: [xpath]` and `editable: [xpath]`
 - Used dedicated CWTest module in custom widget examples
 - Always-quoted identifiers in MDL to prevent reserved keyword conflicts
 - Added scope & atomicity and documentation sections to PR review checklist
@@ -229,7 +507,7 @@ First public release.
 - **Domain Model** — CREATE/ALTER/DROP ENTITY, CREATE ASSOCIATION, attribute types, indexes, validation rules
 - **Microflows & Nanoflows** — 60+ activity types, loops, error handling, expressions, parameters
 - **Pages** — 50+ widget types, CREATE/ALTER PAGE/SNIPPET, DataGrid, DataView, ListView, pluggable widgets
-- **Page Variables** — `Variables: { $name: Type = 'expression' }` in page/snippet headers for column visibility and conditional logic
+- **Page Variables** — `variables: { $name: type = 'expression' }` in page/snippet headers for column visibility and conditional logic
 - **Security** — Module roles, entity access rules, GRANT/REVOKE, UPDATE SECURITY reconciliation
 - **Navigation** — Navigation profiles, menu items, home pages, login pages
 - **Enumerations** — CREATE/ALTER/DROP ENUMERATION with localized values

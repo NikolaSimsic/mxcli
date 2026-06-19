@@ -7,15 +7,19 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/mendixlabs/mxcli/internal/pathutil"
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
+	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
-	"github.com/mendixlabs/mxcli/sdk/mpr"
 )
 
 // outputJavadoc writes a javadoc-style comment block.
@@ -33,16 +37,17 @@ func outputJavadocIndented(w io.Writer, text string, indent string) {
 	fmt.Fprintf(w, "%s */\n", indent)
 }
 
-// showODataClients handles SHOW ODATA CLIENTS [IN module] command.
-func (e *Executor) showODataClients(moduleName string) error {
-	services, err := e.reader.ListConsumedODataServices()
+// listODataClients handles SHOW ODATA CLIENTS [IN module] command.
+func listODataClients(ctx *ExecContext, moduleName string) error {
+
+	services, err := ctx.Backend.ListConsumedODataServices()
 	if err != nil {
-		return fmt.Errorf("failed to list consumed OData services: %w", err)
+		return mdlerrors.NewBackend("list consumed OData services", err)
 	}
 
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	type row struct {
@@ -76,8 +81,8 @@ func (e *Executor) showODataClients(moduleName string) error {
 		rows = append(rows, row{modName, qn, svc.Version, svc.ODataVersion, url, validated})
 	}
 
-	if len(rows) == 0 {
-		fmt.Fprintln(e.output, "No consumed OData services found.")
+	if len(rows) == 0 && ctx.Format != FormatJSON {
+		fmt.Fprintln(ctx.Output, "No consumed OData services found.")
 		return nil
 	}
 
@@ -93,19 +98,20 @@ func (e *Executor) showODataClients(moduleName string) error {
 	for _, r := range rows {
 		result.Rows = append(result.Rows, []any{r.module, r.qualifiedName, r.version, r.odataVer, r.url, r.validated})
 	}
-	return e.writeResult(result)
+	return writeResult(ctx, result)
 }
 
 // describeODataClient handles DESCRIBE ODATA CLIENT command.
-func (e *Executor) describeODataClient(name ast.QualifiedName) error {
-	services, err := e.reader.ListConsumedODataServices()
+func describeODataClient(ctx *ExecContext, name ast.QualifiedName) error {
+
+	services, err := ctx.Backend.ListConsumedODataServices()
 	if err != nil {
-		return fmt.Errorf("failed to list consumed OData services: %w", err)
+		return mdlerrors.NewBackend("list consumed OData services", err)
 	}
 
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	for _, svc := range services {
@@ -113,21 +119,21 @@ func (e *Executor) describeODataClient(name ast.QualifiedName) error {
 		modName := h.GetModuleName(modID)
 		if strings.EqualFold(modName, name.Module) && strings.EqualFold(svc.Name, name.Name) {
 			folderPath := h.BuildFolderPath(svc.ContainerID)
-			return e.outputConsumedODataServiceMDL(svc, modName, folderPath)
+			return outputConsumedODataServiceMDL(ctx, svc, modName, folderPath)
 		}
 	}
 
-	return fmt.Errorf("consumed OData service not found: %s", name)
+	return mdlerrors.NewNotFoundMsg("consumed OData service", fmt.Sprint(name), fmt.Sprintf("consumed OData service not found: %s", name))
 }
 
 // outputConsumedODataServiceMDL outputs a consumed OData service in MDL format.
-func (e *Executor) outputConsumedODataServiceMDL(svc *model.ConsumedODataService, moduleName string, folderPath string) error {
+func outputConsumedODataServiceMDL(ctx *ExecContext, svc *model.ConsumedODataService, moduleName string, folderPath string) error {
 	// Use Description for javadoc (the user-visible API description)
 	if svc.Description != "" {
-		outputJavadoc(e.output, svc.Description)
+		outputJavadoc(ctx.Output, svc.Description)
 	}
 
-	fmt.Fprintf(e.output, "CREATE ODATA CLIENT %s.%s (\n", moduleName, svc.Name)
+	fmt.Fprintf(ctx.Output, "create odata client %s.%s (\n", moduleName, svc.Name)
 
 	var props []string
 	if folderPath != "" {
@@ -168,12 +174,16 @@ func (e *Executor) outputConsumedODataServiceMDL(svc *model.ConsumedODataService
 		}
 	}
 
-	// Microflow references
+	// Microflow reference. Both the "Configuration microflow" and
+	// "Headers microflow" Studio Pro dropdown options share a single
+	// BSON field — DESCRIBE outputs `ConfigurationMicroflow` for both;
+	// the source MDL keyword (`ConfigurationMicroflow` /
+	// `HeadersMicroflow`) is purely a hint to the reader.
 	if svc.ConfigurationMicroflow != "" {
-		props = append(props, fmt.Sprintf("  ConfigurationMicroflow: MICROFLOW %s", svc.ConfigurationMicroflow))
+		props = append(props, fmt.Sprintf("  ConfigurationMicroflow: microflow %s", svc.ConfigurationMicroflow))
 	}
 	if svc.ErrorHandlingMicroflow != "" {
-		props = append(props, fmt.Sprintf("  ErrorHandlingMicroflow: MICROFLOW %s", svc.ErrorHandlingMicroflow))
+		props = append(props, fmt.Sprintf("  ErrorHandlingMicroflow: microflow %s", svc.ErrorHandlingMicroflow))
 	}
 
 	// Proxy constant references
@@ -190,39 +200,40 @@ func (e *Executor) outputConsumedODataServiceMDL(svc *model.ConsumedODataService
 		props = append(props, fmt.Sprintf("  ProxyPassword: %s", svc.ProxyPassword))
 	}
 
-	fmt.Fprintln(e.output, strings.Join(props, ",\n"))
+	fmt.Fprintln(ctx.Output, strings.Join(props, ",\n"))
 
 	// Custom HTTP headers (between property block close and semicolon)
 	if cfg := svc.HttpConfiguration; cfg != nil && len(cfg.HeaderEntries) > 0 {
-		fmt.Fprintln(e.output, ")")
-		fmt.Fprintln(e.output, "HEADERS (")
+		fmt.Fprintln(ctx.Output, ")")
+		fmt.Fprintln(ctx.Output, "headers (")
 		for i, h := range cfg.HeaderEntries {
 			comma := ","
 			if i == len(cfg.HeaderEntries)-1 {
 				comma = ""
 			}
-			fmt.Fprintf(e.output, "  '%s': %s%s\n", h.Key, formatExprValue(h.Value), comma)
+			fmt.Fprintf(ctx.Output, "  '%s': %s%s\n", h.Key, formatExprValue(h.Value), comma)
 		}
-		fmt.Fprintln(e.output, ");")
+		fmt.Fprintln(ctx.Output, ");")
 	} else {
-		fmt.Fprintln(e.output, ");")
+		fmt.Fprintln(ctx.Output, ");")
 	}
 
-	fmt.Fprintln(e.output, "/")
+	fmt.Fprintln(ctx.Output, "/")
 
 	return nil
 }
 
-// showODataServices handles SHOW ODATA SERVICES [IN module] command.
-func (e *Executor) showODataServices(moduleName string) error {
-	services, err := e.reader.ListPublishedODataServices()
+// listODataServices handles SHOW ODATA SERVICES [IN module] command.
+func listODataServices(ctx *ExecContext, moduleName string) error {
+
+	services, err := ctx.Backend.ListPublishedODataServices()
 	if err != nil {
-		return fmt.Errorf("failed to list published OData services: %w", err)
+		return mdlerrors.NewBackend("list published OData services", err)
 	}
 
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	type row struct {
@@ -253,8 +264,8 @@ func (e *Executor) showODataServices(moduleName string) error {
 		rows = append(rows, row{modName, qn, svc.Path, svc.Version, svc.ODataVersion, esCount, authStr})
 	}
 
-	if len(rows) == 0 {
-		fmt.Fprintln(e.output, "No published OData services found.")
+	if len(rows) == 0 && ctx.Format != FormatJSON {
+		fmt.Fprintln(ctx.Output, "No published OData services found.")
 		return nil
 	}
 
@@ -270,19 +281,20 @@ func (e *Executor) showODataServices(moduleName string) error {
 	for _, r := range rows {
 		result.Rows = append(result.Rows, []any{r.module, r.qualifiedName, r.path, r.version, r.odataVer, r.entitySets, r.authTypes})
 	}
-	return e.writeResult(result)
+	return writeResult(ctx, result)
 }
 
 // describeODataService handles DESCRIBE ODATA SERVICE command.
-func (e *Executor) describeODataService(name ast.QualifiedName) error {
-	services, err := e.reader.ListPublishedODataServices()
+func describeODataService(ctx *ExecContext, name ast.QualifiedName) error {
+
+	services, err := ctx.Backend.ListPublishedODataServices()
 	if err != nil {
-		return fmt.Errorf("failed to list published OData services: %w", err)
+		return mdlerrors.NewBackend("list published OData services", err)
 	}
 
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	for _, svc := range services {
@@ -290,21 +302,21 @@ func (e *Executor) describeODataService(name ast.QualifiedName) error {
 		modName := h.GetModuleName(modID)
 		if strings.EqualFold(modName, name.Module) && strings.EqualFold(svc.Name, name.Name) {
 			folderPath := h.BuildFolderPath(svc.ContainerID)
-			return e.outputPublishedODataServiceMDL(svc, modName, folderPath)
+			return outputPublishedODataServiceMDL(ctx, svc, modName, folderPath)
 		}
 	}
 
-	return fmt.Errorf("published OData service not found: %s", name)
+	return mdlerrors.NewNotFoundMsg("published OData service", fmt.Sprint(name), fmt.Sprintf("published OData service not found: %s", name))
 }
 
 // outputPublishedODataServiceMDL outputs a published OData service in MDL format.
-func (e *Executor) outputPublishedODataServiceMDL(svc *model.PublishedODataService, moduleName string, folderPath string) error {
+func outputPublishedODataServiceMDL(ctx *ExecContext, svc *model.PublishedODataService, moduleName string, folderPath string) error {
 	// Use Description for javadoc (the user-visible API description)
 	if svc.Description != "" {
-		outputJavadoc(e.output, svc.Description)
+		outputJavadoc(ctx.Output, svc.Description)
 	}
 
-	fmt.Fprintf(e.output, "CREATE ODATA SERVICE %s.%s (\n", moduleName, svc.Name)
+	fmt.Fprintf(ctx.Output, "create odata service %s.%s (\n", moduleName, svc.Name)
 
 	var props []string
 	if folderPath != "" {
@@ -331,21 +343,21 @@ func (e *Executor) outputPublishedODataServiceMDL(svc *model.PublishedODataServi
 	if svc.PublishAssociations {
 		props = append(props, "  PublishAssociations: Yes")
 	}
-	fmt.Fprintln(e.output, strings.Join(props, ",\n"))
+	fmt.Fprintln(ctx.Output, strings.Join(props, ",\n"))
 
-	fmt.Fprintln(e.output, ")")
+	fmt.Fprintln(ctx.Output, ")")
 
 	// Authentication types
 	if len(svc.AuthenticationTypes) > 0 {
-		fmt.Fprintf(e.output, "AUTHENTICATION %s\n", strings.Join(svc.AuthenticationTypes, ", "))
+		fmt.Fprintf(ctx.Output, "authentication %s\n", strings.Join(svc.AuthenticationTypes, ", "))
 	}
 	if svc.AuthMicroflow != "" {
-		fmt.Fprintf(e.output, "-- Auth Microflow: %s\n", svc.AuthMicroflow)
+		fmt.Fprintf(ctx.Output, "-- Auth Microflow: %s\n", svc.AuthMicroflow)
 	}
 
 	// Published entities block
 	if len(svc.EntityTypes) > 0 || len(svc.EntitySets) > 0 {
-		fmt.Fprintln(e.output, "{")
+		fmt.Fprintln(ctx.Output, "{")
 
 		// Build entity set lookup by exposed name and entity type name for merging
 		entitySetByExposedName := make(map[string]*model.PublishedEntitySet)
@@ -370,7 +382,7 @@ func (e *Executor) outputPublishedODataServiceMDL(svc *model.PublishedODataServi
 						doc = et.Description
 					}
 				}
-				outputJavadocIndented(e.output, doc, "  ")
+				outputJavadocIndented(ctx.Output, doc, "  ")
 			}
 
 			// Find matching entity set (try exposed name first, then entity reference)
@@ -380,7 +392,7 @@ func (e *Executor) outputPublishedODataServiceMDL(svc *model.PublishedODataServi
 			}
 
 			// PUBLISH ENTITY line with modes
-			fmt.Fprintf(e.output, "  PUBLISH ENTITY %s AS '%s'", et.Entity, et.ExposedName)
+			fmt.Fprintf(ctx.Output, "  publish entity %s as '%s'", et.Entity, et.ExposedName)
 			if es != nil {
 				var modeProps []string
 				if es.ReadMode != "" {
@@ -400,14 +412,14 @@ func (e *Executor) outputPublishedODataServiceMDL(svc *model.PublishedODataServi
 					modeProps = append(modeProps, fmt.Sprintf("PageSize: %d", es.PageSize))
 				}
 				if len(modeProps) > 0 {
-					fmt.Fprintf(e.output, " (\n    %s\n  )", strings.Join(modeProps, ",\n    "))
+					fmt.Fprintf(ctx.Output, " (\n    %s\n  )", strings.Join(modeProps, ",\n    "))
 				}
 			}
-			fmt.Fprintln(e.output)
+			fmt.Fprintln(ctx.Output)
 
 			// EXPOSE members
 			if len(et.Members) > 0 {
-				fmt.Fprintln(e.output, "  EXPOSE (")
+				fmt.Fprintln(ctx.Output, "  expose (")
 				for i, m := range et.Members {
 					var modifiers []string
 					if m.Filterable {
@@ -417,48 +429,49 @@ func (e *Executor) outputPublishedODataServiceMDL(svc *model.PublishedODataServi
 						modifiers = append(modifiers, "Sortable")
 					}
 					if m.IsPartOfKey {
-						modifiers = append(modifiers, "Key")
+						modifiers = append(modifiers, "IsPartOfKey")
 					}
 
-					line := fmt.Sprintf("    %s AS '%s'", m.Name, m.ExposedName)
+					line := fmt.Sprintf("    %s as '%s'", m.Name, m.ExposedName)
 					if len(modifiers) > 0 {
 						line += fmt.Sprintf(" (%s)", strings.Join(modifiers, ", "))
 					}
 					if i < len(et.Members)-1 {
 						line += ","
 					}
-					fmt.Fprintln(e.output, line)
+					fmt.Fprintln(ctx.Output, line)
 				}
-				fmt.Fprintln(e.output, "  );")
+				fmt.Fprintln(ctx.Output, "  );")
 			}
-			fmt.Fprintln(e.output)
+			fmt.Fprintln(ctx.Output)
 		}
 
-		fmt.Fprintln(e.output, "}")
+		fmt.Fprintln(ctx.Output, "}")
 	}
 
 	// Output GRANT statements for allowed module roles
 	if len(svc.AllowedModuleRoles) > 0 {
-		fmt.Fprintln(e.output)
-		fmt.Fprintf(e.output, "GRANT ACCESS ON ODATA SERVICE %s.%s TO %s;\n",
+		fmt.Fprintln(ctx.Output)
+		fmt.Fprintf(ctx.Output, "grant access on odata service %s.%s to %s;\n",
 			moduleName, svc.Name, strings.Join(svc.AllowedModuleRoles, ", "))
 	}
 
-	fmt.Fprintln(e.output, "/")
+	fmt.Fprintln(ctx.Output, "/")
 
 	return nil
 }
 
-// showExternalEntities handles SHOW EXTERNAL ENTITIES [IN module] command.
-func (e *Executor) showExternalEntities(moduleName string) error {
-	domainModels, err := e.reader.ListDomainModels()
+// listExternalEntities handles SHOW EXTERNAL ENTITIES [IN module] command.
+func listExternalEntities(ctx *ExecContext, moduleName string) error {
+
+	domainModels, err := ctx.Backend.ListDomainModels()
 	if err != nil {
-		return fmt.Errorf("failed to list domain models: %w", err)
+		return mdlerrors.NewBackend("list domain models", err)
 	}
 
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	type row struct {
@@ -493,8 +506,8 @@ func (e *Executor) showExternalEntities(moduleName string) error {
 		}
 	}
 
-	if len(rows) == 0 {
-		fmt.Fprintln(e.output, "No external entities found.")
+	if len(rows) == 0 && ctx.Format != FormatJSON {
+		fmt.Fprintln(ctx.Output, "No external entities found.")
 		return nil
 	}
 
@@ -510,25 +523,26 @@ func (e *Executor) showExternalEntities(moduleName string) error {
 	for _, r := range rows {
 		result.Rows = append(result.Rows, []any{r.module, r.qualifiedName, r.service, r.entitySet, r.remoteName, r.countable})
 	}
-	return e.writeResult(result)
+	return writeResult(ctx, result)
 }
 
-// showExternalActions handles SHOW EXTERNAL ACTIONS [IN module] command.
+// listExternalActions handles SHOW EXTERNAL ACTIONS [IN module] command.
 // It scans all microflows and nanoflows for CallExternalAction activities
 // and displays the unique actions grouped by consumed OData service.
-func (e *Executor) showExternalActions(moduleName string) error {
-	mfs, err := e.reader.ListMicroflows()
+func listExternalActions(ctx *ExecContext, moduleName string) error {
+
+	mfs, err := ctx.Backend.ListMicroflows()
 	if err != nil {
-		return fmt.Errorf("failed to list microflows: %w", err)
+		return mdlerrors.NewBackend("list microflows", err)
 	}
-	nfs, err := e.reader.ListNanoflows()
+	nfs, err := ctx.Backend.ListNanoflows()
 	if err != nil {
-		return fmt.Errorf("failed to list nanoflows: %w", err)
+		return mdlerrors.NewBackend("list nanoflows", err)
 	}
 
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	// Collect unique actions: key = service + "." + action name
@@ -608,8 +622,8 @@ func (e *Executor) showExternalActions(moduleName string) error {
 		extractActions(nf.ObjectCollection, modName, nf.Name)
 	}
 
-	if len(actionMap) == 0 {
-		fmt.Fprintln(e.output, "No external actions found.")
+	if len(actionMap) == 0 && ctx.Format != FormatJSON {
+		fmt.Fprintln(ctx.Output, "No external actions found.")
 		return nil
 	}
 
@@ -643,19 +657,20 @@ func (e *Executor) showExternalActions(moduleName string) error {
 	for _, r := range rows {
 		result.Rows = append(result.Rows, []any{r.service, r.actionName, r.params, r.usedBy})
 	}
-	return e.writeResult(result)
+	return writeResult(ctx, result)
 }
 
 // describeExternalEntity handles DESCRIBE EXTERNAL ENTITY command.
-func (e *Executor) describeExternalEntity(name ast.QualifiedName) error {
-	domainModels, err := e.reader.ListDomainModels()
+func describeExternalEntity(ctx *ExecContext, name ast.QualifiedName) error {
+
+	domainModels, err := ctx.Backend.ListDomainModels()
 	if err != nil {
-		return fmt.Errorf("failed to list domain models: %w", err)
+		return mdlerrors.NewBackend("list domain models", err)
 	}
 
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	for _, dm := range domainModels {
@@ -671,25 +686,25 @@ func (e *Executor) describeExternalEntity(name ast.QualifiedName) error {
 			}
 
 			if entity.Source != "Rest$ODataRemoteEntitySource" {
-				return fmt.Errorf("%s.%s is not an external entity (source: %s)", modName, entity.Name, entity.Source)
+				return mdlerrors.NewValidationf("%s.%s is not an external entity (source: %s)", modName, entity.Name, entity.Source)
 			}
 
-			return e.outputExternalEntityMDL(entity, modName)
+			return outputExternalEntityMDL(ctx, entity, modName)
 		}
 	}
 
-	return fmt.Errorf("external entity not found: %s", name)
+	return mdlerrors.NewNotFoundMsg("external entity", fmt.Sprint(name), fmt.Sprintf("external entity not found: %s", name))
 }
 
 // outputExternalEntityMDL outputs an external entity in MDL format.
-func (e *Executor) outputExternalEntityMDL(entity *domainmodel.Entity, moduleName string) error {
+func outputExternalEntityMDL(ctx *ExecContext, entity *domainmodel.Entity, moduleName string) error {
 	if entity.Documentation != "" {
-		outputJavadoc(e.output, entity.Documentation)
+		outputJavadoc(ctx.Output, entity.Documentation)
 	}
 
-	fmt.Fprintf(e.output, "CREATE EXTERNAL ENTITY %s.%s\n", moduleName, entity.Name)
-	fmt.Fprintf(e.output, "FROM ODATA CLIENT %s\n", entity.RemoteServiceName)
-	fmt.Fprintln(e.output, "(")
+	fmt.Fprintf(ctx.Output, "create external entity %s.%s\n", moduleName, entity.Name)
+	fmt.Fprintf(ctx.Output, "from odata client %s\n", entity.RemoteServiceName)
+	fmt.Fprintln(ctx.Output, "(")
 
 	var props []string
 	if entity.RemoteEntitySet != "" {
@@ -708,13 +723,14 @@ func (e *Executor) outputExternalEntityMDL(entity *domainmodel.Entity, moduleNam
 	props = append(props, fmt.Sprintf("  Creatable: %s", boolStr(entity.Creatable)))
 	props = append(props, fmt.Sprintf("  Deletable: %s", boolStr(entity.Deletable)))
 	props = append(props, fmt.Sprintf("  Updatable: %s", boolStr(entity.Updatable)))
-	fmt.Fprintln(e.output, strings.Join(props, ",\n"))
+	props = append(props, fmt.Sprintf("  AllowCreateChangeLocally: %s", boolStr(entity.CreateChangeLocally)))
+	fmt.Fprintln(ctx.Output, strings.Join(props, ",\n"))
 
-	fmt.Fprintln(e.output, ")")
+	fmt.Fprintln(ctx.Output, ")")
 
 	// Output attributes
 	if len(entity.Attributes) > 0 {
-		fmt.Fprintln(e.output, "(")
+		fmt.Fprintln(ctx.Output, "(")
 		for i, attr := range entity.Attributes {
 			typeName := "Unknown"
 			if attr.Type != nil {
@@ -724,12 +740,12 @@ func (e *Executor) outputExternalEntityMDL(entity *domainmodel.Entity, moduleNam
 			if i == len(entity.Attributes)-1 {
 				comma = ""
 			}
-			fmt.Fprintf(e.output, "  %s: %s%s\n", attr.Name, typeName, comma)
+			fmt.Fprintf(ctx.Output, "  %s: %s%s\n", attr.Name, typeName, comma)
 		}
-		fmt.Fprintln(e.output, ");")
+		fmt.Fprintln(ctx.Output, ");")
 	}
 
-	fmt.Fprintln(e.output, "/")
+	fmt.Fprintln(ctx.Output, "/")
 
 	return nil
 }
@@ -739,25 +755,31 @@ func (e *Executor) outputExternalEntityMDL(entity *domainmodel.Entity, moduleNam
 // ============================================================================
 
 // execCreateExternalEntity handles CREATE [OR MODIFY] EXTERNAL ENTITY statements.
-func (e *Executor) execCreateExternalEntity(s *ast.CreateExternalEntityStmt) error {
-	if e.writer == nil {
-		return fmt.Errorf("not connected to a project in write mode")
+func execCreateExternalEntity(ctx *ExecContext, s *ast.CreateExternalEntityStmt) error {
+
+	if !ctx.ConnectedForWrite() {
+		return mdlerrors.NewNotConnectedWrite()
 	}
 
 	if s.Name.Module == "" {
-		return fmt.Errorf("module name required: use CREATE EXTERNAL ENTITY Module.Name FROM ODATA CLIENT ...")
+		return mdlerrors.NewValidation("module name required: use create external entity Module.Name from odata client ...")
 	}
 
 	// Find module
-	module, err := e.findModule(s.Name.Module)
+	module, err := findModule(ctx, s.Name.Module)
 	if err != nil {
 		return err
 	}
 
+	// Validate that the referenced OData client exists.
+	if err := validateODataClientExists(ctx, s.ServiceRef); err != nil {
+		return err
+	}
+
 	// Get domain model
-	dm, err := e.reader.GetDomainModel(module.ID)
+	dm, err := ctx.Backend.GetDomainModel(module.ID)
 	if err != nil {
-		return fmt.Errorf("failed to get domain model: %w", err)
+		return mdlerrors.NewBackend("get domain model", err)
 	}
 
 	// Check if entity already exists
@@ -770,7 +792,7 @@ func (e *Executor) execCreateExternalEntity(s *ast.CreateExternalEntityStmt) err
 	}
 
 	if existingEntity != nil && !s.CreateOrModify {
-		return fmt.Errorf("entity already exists: %s.%s (use CREATE OR MODIFY to update)", s.Name.Module, s.Name.Name)
+		return mdlerrors.NewAlreadyExistsMsg("entity", s.Name.Module+"."+s.Name.Name, fmt.Sprintf("entity already exists: %s.%s (use create or modify to update)", s.Name.Module, s.Name.Name))
 	}
 
 	// Build attributes
@@ -780,7 +802,7 @@ func (e *Executor) execCreateExternalEntity(s *ast.CreateExternalEntityStmt) err
 			Name: a.Name,
 			Type: convertDataType(a.Type),
 		}
-		attr.ID = model.ID(mpr.GenerateID())
+		attr.ID = model.ID(types.GenerateID())
 		attrs = append(attrs, attr)
 	}
 
@@ -788,53 +810,92 @@ func (e *Executor) execCreateExternalEntity(s *ast.CreateExternalEntityStmt) err
 	serviceRef := s.ServiceRef.String()
 
 	if existingEntity != nil {
-		// Update existing entity
+		// Update existing entity. Issue #594: only assign fields that the
+		// MDL statement explicitly set. Omitted (nil) fields preserve the
+		// prior value — previously the executor unconditionally wrote zero
+		// values, wiping fields like RemoteName and triggering Studio Pro
+		// NREs (e.g. ODataRemoteEntitySource.RemoteId on empty RemoteName).
 		existingEntity.Source = "Rest$ODataRemoteEntitySource"
 		existingEntity.RemoteServiceName = serviceRef
-		existingEntity.RemoteEntitySet = s.EntitySet
-		existingEntity.RemoteEntityName = s.RemoteName
-		existingEntity.Countable = s.Countable
-		existingEntity.Creatable = s.Creatable
-		existingEntity.Deletable = s.Deletable
-		existingEntity.Updatable = s.Updatable
+		if s.EntitySet != nil {
+			existingEntity.RemoteEntitySet = *s.EntitySet
+		}
+		if s.RemoteName != nil {
+			existingEntity.RemoteEntityName = *s.RemoteName
+		}
+		if s.Countable != nil {
+			existingEntity.Countable = *s.Countable
+		}
+		if s.Creatable != nil {
+			existingEntity.Creatable = *s.Creatable
+		}
+		if s.Deletable != nil {
+			existingEntity.Deletable = *s.Deletable
+		}
+		if s.Updatable != nil {
+			existingEntity.Updatable = *s.Updatable
+		}
+		if s.AllowCreateChangeLocally != nil {
+			existingEntity.CreateChangeLocally = *s.AllowCreateChangeLocally
+		}
 		if len(attrs) > 0 {
 			existingEntity.Attributes = attrs
 		}
 		if s.Documentation != "" {
 			existingEntity.Documentation = s.Documentation
 		}
-		if err := e.writer.UpdateEntity(dm.ID, existingEntity); err != nil {
-			return fmt.Errorf("failed to update external entity: %w", err)
+		if err := ctx.Backend.UpdateEntity(dm.ID, existingEntity); err != nil {
+			return mdlerrors.NewBackend("update external entity", err)
 		}
-		fmt.Fprintf(e.output, "Modified external entity: %s.%s\n", s.Name.Module, s.Name.Name)
+		fmt.Fprintf(ctx.Output, "Modified external entity: %s.%s\n", s.Name.Module, s.Name.Name)
 		return nil
+	}
+
+	// Initial create: EntitySet is required (no prior value to preserve).
+	if s.EntitySet == nil || *s.EntitySet == "" {
+		return mdlerrors.NewValidation("EntitySet property is required when creating an external entity")
 	}
 
 	// Auto-position based on existing entities
 	location := model.Point{X: 100 + len(dm.Entities)*150, Y: 100}
 
 	newEntity := &domainmodel.Entity{
-		Name:              s.Name.Name,
-		Documentation:     s.Documentation,
-		Persistable:       false, // External entities are not persistable
-		Location:          location,
-		Attributes:        attrs,
-		Source:            "Rest$ODataRemoteEntitySource",
-		RemoteServiceName: serviceRef,
-		RemoteEntitySet:   s.EntitySet,
-		RemoteEntityName:  s.RemoteName,
-		Countable:         s.Countable,
-		Creatable:         s.Creatable,
-		Deletable:         s.Deletable,
-		Updatable:         s.Updatable,
+		Name:                s.Name.Name,
+		Documentation:       s.Documentation,
+		Persistable:         false, // External entities are not persistable
+		Location:            location,
+		Attributes:          attrs,
+		Source:              "Rest$ODataRemoteEntitySource",
+		RemoteServiceName:   serviceRef,
+		RemoteEntitySet:     *s.EntitySet,
+		RemoteEntityName:    derefString(s.RemoteName),
+		Countable:           derefBool(s.Countable),
+		Creatable:           derefBool(s.Creatable),
+		Deletable:           derefBool(s.Deletable),
+		Updatable:           derefBool(s.Updatable),
+		CreateChangeLocally: derefBool(s.AllowCreateChangeLocally),
 	}
-	newEntity.ID = model.ID(mpr.GenerateID())
+	newEntity.ID = model.ID(types.GenerateID())
 
-	if err := e.writer.CreateEntity(dm.ID, newEntity); err != nil {
-		return fmt.Errorf("failed to create external entity: %w", err)
+	if err := ctx.Backend.CreateEntity(dm.ID, newEntity); err != nil {
+		return mdlerrors.NewBackend("create external entity", err)
 	}
-	fmt.Fprintf(e.output, "Created external entity: %s.%s\n", s.Name.Module, s.Name.Name)
+	fmt.Fprintf(ctx.Output, "Created external entity: %s.%s\n", s.Name.Module, s.Name.Name)
 	return nil
+}
+
+func derefString(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+func derefBool(p *bool) bool {
+	if p == nil {
+		return false
+	}
+	return *p
 }
 
 // ============================================================================
@@ -842,24 +903,29 @@ func (e *Executor) execCreateExternalEntity(s *ast.CreateExternalEntityStmt) err
 // ============================================================================
 
 // createODataClient handles CREATE ODATA CLIENT command.
-func (e *Executor) createODataClient(stmt *ast.CreateODataClientStmt) error {
-	if e.writer == nil {
-		return fmt.Errorf("not connected in write mode")
+func createODataClient(ctx *ExecContext, stmt *ast.CreateODataClientStmt) error {
+
+	if !ctx.ConnectedForWrite() {
+		return mdlerrors.NewNotConnectedWrite()
 	}
 
 	if stmt.Name.Module == "" {
-		return fmt.Errorf("module name required: use CREATE ODATA CLIENT Module.Name (...)")
+		return mdlerrors.NewValidation("module name required: use create odata client Module.Name (...)")
 	}
 
-	module, err := e.findModule(stmt.Name.Module)
+	if err := validateMetadataURL(stmt.MetadataUrl); err != nil {
+		return err
+	}
+
+	module, err := findModule(ctx, stmt.Name.Module)
 	if err != nil {
 		return err
 	}
 
 	// Check if client already exists
-	services, err := e.reader.ListConsumedODataServices()
+	services, err := ctx.Backend.ListConsumedODataServices()
 	if err == nil {
-		h, _ := e.getHierarchy()
+		h, _ := getHierarchy(ctx)
 		for _, svc := range services {
 			modID := h.FindModuleID(svc.ContainerID)
 			modName := h.GetModuleName(modID)
@@ -909,6 +975,9 @@ func (e *Executor) createODataClient(stmt *ast.CreateODataClientStmt) error {
 							svc.HttpConfiguration = &model.HttpConfiguration{}
 						}
 						if stmt.ServiceUrl != "" {
+							if err := validateServiceURL(stmt.ServiceUrl); err != nil {
+								return err
+							}
 							svc.HttpConfiguration.OverrideLocation = true
 							svc.HttpConfiguration.CustomLocation = stmt.ServiceUrl
 						}
@@ -932,14 +1001,14 @@ func (e *Executor) createODataClient(stmt *ast.CreateODataClientStmt) error {
 							}
 						}
 					}
-					if err := e.writer.UpdateConsumedODataService(svc); err != nil {
-						return fmt.Errorf("failed to update OData client: %w", err)
+					if err := ctx.Backend.UpdateConsumedODataService(svc); err != nil {
+						return mdlerrors.NewBackend("update OData client", err)
 					}
-					e.invalidateHierarchy()
-					fmt.Fprintf(e.output, "Modified OData client: %s.%s\n", modName, svc.Name)
+					invalidateHierarchy(ctx)
+					fmt.Fprintf(ctx.Output, "Modified OData client: %s.%s\n", modName, svc.Name)
 					return nil
 				}
-				return fmt.Errorf("OData client already exists: %s.%s (use CREATE OR MODIFY to update)", modName, svc.Name)
+				return mdlerrors.NewAlreadyExistsMsg("OData client", modName+"."+svc.Name, fmt.Sprintf("OData client already exists: %s.%s (use create or modify to update)", modName, svc.Name))
 			}
 		}
 	}
@@ -947,9 +1016,9 @@ func (e *Executor) createODataClient(stmt *ast.CreateODataClientStmt) error {
 	// Resolve folder if specified
 	containerID := module.ID
 	if stmt.Folder != "" {
-		folderID, err := e.resolveFolder(module.ID, stmt.Folder)
+		folderID, err := resolveFolder(ctx, module.ID, stmt.Folder)
 		if err != nil {
-			return fmt.Errorf("failed to resolve folder %s: %w", stmt.Folder, err)
+			return mdlerrors.NewBackend(fmt.Sprintf("resolve folder %s", stmt.Folder), err)
 		}
 		containerID = folderID
 	}
@@ -988,6 +1057,16 @@ func (e *Executor) createODataClient(stmt *ast.CreateODataClientStmt) error {
 			ClientCertificate: stmt.ClientCertificate,
 		}
 		if stmt.ServiceUrl != "" {
+			// ServiceUrl must be a constant reference (e.g., @Module.ConstantName)
+			if !strings.HasPrefix(stmt.ServiceUrl, "@") {
+				return fmt.Errorf(`ServiceUrl must now be a constant reference (e.g., '@Module.ApiLocation').
+Previously literal URLs were allowed; this enforces the Mendix best practice of externalizing configuration.
+Create a constant first:
+  CREATE CONSTANT Module.ApiLocation TYPE String DEFAULT 'https://api.example.com/';
+Then reference it:
+  ServiceUrl: '@Module.ApiLocation'
+Got: %s`, stmt.ServiceUrl)
+			}
 			cfg.OverrideLocation = true
 			cfg.CustomLocation = stmt.ServiceUrl
 		}
@@ -1001,10 +1080,23 @@ func (e *Executor) createODataClient(stmt *ast.CreateODataClientStmt) error {
 	}
 
 	// Fetch and cache $metadata from the service URL
+	// Normalize local file paths to absolute file:// URLs for Studio Pro compatibility
 	if newSvc.MetadataUrl != "" {
-		metadata, hash, err := fetchODataMetadata(newSvc.MetadataUrl)
+		mprDir := ""
+		if ctx.MprPath != "" {
+			mprDir = filepath.Dir(ctx.MprPath)
+		}
+
+		// Normalize MetadataUrl: convert relative paths to absolute file:// URLs
+		normalizedUrl, err := pathutil.NormalizeURL(newSvc.MetadataUrl, mprDir)
 		if err != nil {
-			fmt.Fprintf(e.output, "Warning: could not fetch $metadata: %v\n", err)
+			return fmt.Errorf("failed to normalize MetadataUrl: %w", err)
+		}
+		newSvc.MetadataUrl = normalizedUrl
+
+		metadata, hash, err := fetchODataMetadata(normalizedUrl)
+		if err != nil {
+			fmt.Fprintf(ctx.Output, "Warning: could not fetch $metadata: %v\n", err)
 		} else if metadata != "" {
 			newSvc.Metadata = metadata
 			newSvc.MetadataHash = hash
@@ -1012,40 +1104,41 @@ func (e *Executor) createODataClient(stmt *ast.CreateODataClientStmt) error {
 		}
 	}
 
-	if err := e.writer.CreateConsumedODataService(newSvc); err != nil {
-		return fmt.Errorf("failed to create OData client: %w", err)
+	if err := ctx.Backend.CreateConsumedODataService(newSvc); err != nil {
+		return mdlerrors.NewBackend("create OData client", err)
 	}
-	e.invalidateHierarchy()
-	fmt.Fprintf(e.output, "Created OData client: %s.%s\n", stmt.Name.Module, stmt.Name.Name)
+	invalidateHierarchy(ctx)
+	fmt.Fprintf(ctx.Output, "Created OData client: %s.%s\n", stmt.Name.Module, stmt.Name.Name)
 	if newSvc.Metadata != "" {
 		// Parse to show summary
-		if doc, err := mpr.ParseEdmx(newSvc.Metadata); err == nil {
+		if doc, err := types.ParseEdmx(newSvc.Metadata); err == nil {
 			entityCount := 0
 			actionCount := 0
 			for _, s := range doc.Schemas {
 				entityCount += len(s.EntityTypes)
 			}
 			actionCount = len(doc.Actions)
-			fmt.Fprintf(e.output, "  Cached $metadata: %d entity types, %d actions\n", entityCount, actionCount)
+			fmt.Fprintf(ctx.Output, "  Cached $metadata: %d entity types, %d actions\n", entityCount, actionCount)
 		}
 	}
 	return nil
 }
 
 // alterODataClient handles ALTER ODATA CLIENT command.
-func (e *Executor) alterODataClient(stmt *ast.AlterODataClientStmt) error {
-	if e.writer == nil {
-		return fmt.Errorf("not connected in write mode")
+func alterODataClient(ctx *ExecContext, stmt *ast.AlterODataClientStmt) error {
+
+	if !ctx.ConnectedForWrite() {
+		return mdlerrors.NewNotConnectedWrite()
 	}
 
-	services, err := e.reader.ListConsumedODataServices()
+	services, err := ctx.Backend.ListConsumedODataServices()
 	if err != nil {
-		return fmt.Errorf("failed to list consumed OData services: %w", err)
+		return mdlerrors.NewBackend("list consumed OData services", err)
 	}
 
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	for _, svc := range services {
@@ -1068,6 +1161,9 @@ func (e *Executor) alterODataClient(stmt *ast.AlterODataClientStmt) error {
 				case "description":
 					svc.Description = strVal
 				case "serviceurl":
+					if err := validateServiceURL(strVal); err != nil {
+						return err
+					}
 					if svc.HttpConfiguration == nil {
 						svc.HttpConfiguration = &model.HttpConfiguration{}
 					}
@@ -1093,7 +1189,8 @@ func (e *Executor) alterODataClient(stmt *ast.AlterODataClientStmt) error {
 						svc.HttpConfiguration = &model.HttpConfiguration{}
 					}
 					svc.HttpConfiguration.ClientCertificate = strVal
-				case "configurationmicroflow":
+				case "configurationmicroflow", "headersmicroflow":
+					// Both MDL keywords write to the same BSON field.
 					svc.ConfigurationMicroflow = extractMicroflowRef(strVal)
 				case "errorhandlingmicroflow":
 					svc.ErrorHandlingMicroflow = extractMicroflowRef(strVal)
@@ -1106,72 +1203,97 @@ func (e *Executor) alterODataClient(stmt *ast.AlterODataClientStmt) error {
 				case "proxypassword":
 					svc.ProxyPassword = strVal
 				default:
-					return fmt.Errorf("unknown OData client property: %s", key)
+					return mdlerrors.NewUnsupported(fmt.Sprintf("unknown OData client property: %s", key))
 				}
 			}
-			if err := e.writer.UpdateConsumedODataService(svc); err != nil {
-				return fmt.Errorf("failed to alter OData client: %w", err)
+			if err := ctx.Backend.UpdateConsumedODataService(svc); err != nil {
+				return mdlerrors.NewBackend("alter OData client", err)
 			}
-			e.invalidateHierarchy()
-			fmt.Fprintf(e.output, "Altered OData client: %s.%s\n", modName, svc.Name)
+			invalidateHierarchy(ctx)
+			fmt.Fprintf(ctx.Output, "Altered OData client: %s.%s\n", modName, svc.Name)
 			return nil
 		}
 	}
 
-	return fmt.Errorf("OData client not found: %s", stmt.Name)
+	return mdlerrors.NewNotFoundMsg("OData client", fmt.Sprint(stmt.Name), fmt.Sprintf("OData client not found: %s", stmt.Name))
 }
 
 // dropODataClient handles DROP ODATA CLIENT command.
-func (e *Executor) dropODataClient(stmt *ast.DropODataClientStmt) error {
-	if e.writer == nil {
-		return fmt.Errorf("not connected in write mode")
+func dropODataClient(ctx *ExecContext, stmt *ast.DropODataClientStmt) error {
+
+	if !ctx.ConnectedForWrite() {
+		return mdlerrors.NewNotConnectedWrite()
 	}
 
-	services, err := e.reader.ListConsumedODataServices()
+	services, err := ctx.Backend.ListConsumedODataServices()
 	if err != nil {
-		return fmt.Errorf("failed to list consumed OData services: %w", err)
+		return mdlerrors.NewBackend("list consumed OData services", err)
 	}
 
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	for _, svc := range services {
 		modID := h.FindModuleID(svc.ContainerID)
 		modName := h.GetModuleName(modID)
 		if strings.EqualFold(modName, stmt.Name.Module) && strings.EqualFold(svc.Name, stmt.Name.Name) {
-			if err := e.writer.DeleteConsumedODataService(svc.ID); err != nil {
-				return fmt.Errorf("failed to drop OData client: %w", err)
+			// Cascade: delete external entities belonging to this service so that
+			// DeleteEntity can clean up any associations referencing them.
+			serviceRef := modName + "." + svc.Name
+			module, findErr := findModule(ctx, stmt.Name.Module)
+			if findErr != nil {
+				return findErr
 			}
-			e.invalidateHierarchy()
-			fmt.Fprintf(e.output, "Dropped OData client: %s.%s\n", modName, svc.Name)
+			dm, dmErr := ctx.Backend.GetDomainModel(module.ID)
+			if dmErr != nil {
+				return mdlerrors.NewBackend("get domain model for cascade", dmErr)
+			}
+			var externalEntityIDs []model.ID
+			for _, entity := range dm.Entities {
+				if strings.EqualFold(entity.RemoteServiceName, serviceRef) {
+					externalEntityIDs = append(externalEntityIDs, entity.ID)
+				}
+			}
+			for _, entityID := range externalEntityIDs {
+				if err := ctx.Backend.DeleteEntity(dm.ID, entityID); err != nil {
+					return mdlerrors.NewBackend("cascade delete external entity", err)
+				}
+			}
+
+			if err := ctx.Backend.DeleteConsumedODataService(svc.ID); err != nil {
+				return mdlerrors.NewBackend("drop OData client", err)
+			}
+			invalidateHierarchy(ctx)
+			fmt.Fprintf(ctx.Output, "Dropped OData client: %s.%s\n", modName, svc.Name)
 			return nil
 		}
 	}
 
-	return fmt.Errorf("OData client not found: %s", stmt.Name)
+	return mdlerrors.NewNotFoundMsg("OData client", fmt.Sprint(stmt.Name), fmt.Sprintf("OData client not found: %s", stmt.Name))
 }
 
 // createODataService handles CREATE ODATA SERVICE command.
-func (e *Executor) createODataService(stmt *ast.CreateODataServiceStmt) error {
-	if e.writer == nil {
-		return fmt.Errorf("not connected in write mode")
+func createODataService(ctx *ExecContext, stmt *ast.CreateODataServiceStmt) error {
+
+	if !ctx.ConnectedForWrite() {
+		return mdlerrors.NewNotConnectedWrite()
 	}
 
 	if stmt.Name.Module == "" {
-		return fmt.Errorf("module name required: use CREATE ODATA SERVICE Module.Name (...)")
+		return mdlerrors.NewValidation("module name required: use create odata service Module.Name (...)")
 	}
 
-	module, err := e.findModule(stmt.Name.Module)
+	module, err := findModule(ctx, stmt.Name.Module)
 	if err != nil {
 		return err
 	}
 
 	// Check if service already exists
-	services, err := e.reader.ListPublishedODataServices()
+	services, err := ctx.Backend.ListPublishedODataServices()
 	if err == nil {
-		h, _ := e.getHierarchy()
+		h, _ := getHierarchy(ctx)
 		for _, svc := range services {
 			modID := h.FindModuleID(svc.ContainerID)
 			modName := h.GetModuleName(modID)
@@ -1203,14 +1325,14 @@ func (e *Executor) createODataService(stmt *ast.CreateODataServiceStmt) error {
 					if len(stmt.AuthenticationTypes) > 0 {
 						svc.AuthenticationTypes = stmt.AuthenticationTypes
 					}
-					if err := e.writer.UpdatePublishedODataService(svc); err != nil {
-						return fmt.Errorf("failed to update OData service: %w", err)
+					if err := ctx.Backend.UpdatePublishedODataService(svc); err != nil {
+						return mdlerrors.NewBackend("update OData service", err)
 					}
-					e.invalidateHierarchy()
-					fmt.Fprintf(e.output, "Modified OData service: %s.%s\n", modName, svc.Name)
+					invalidateHierarchy(ctx)
+					fmt.Fprintf(ctx.Output, "Modified OData service: %s.%s\n", modName, svc.Name)
 					return nil
 				}
-				return fmt.Errorf("OData service already exists: %s.%s (use CREATE OR MODIFY to update)", modName, svc.Name)
+				return mdlerrors.NewAlreadyExistsMsg("OData service", modName+"."+svc.Name, fmt.Sprintf("OData service already exists: %s.%s (use create or modify to update)", modName, svc.Name))
 			}
 		}
 	}
@@ -1218,9 +1340,9 @@ func (e *Executor) createODataService(stmt *ast.CreateODataServiceStmt) error {
 	// Resolve folder if specified
 	containerID := module.ID
 	if stmt.Folder != "" {
-		folderID, err := e.resolveFolder(module.ID, stmt.Folder)
+		folderID, err := resolveFolder(ctx, module.ID, stmt.Folder)
 		if err != nil {
-			return fmt.Errorf("failed to resolve folder %s: %w", stmt.Folder, err)
+			return mdlerrors.NewBackend(fmt.Sprintf("resolve folder %s", stmt.Folder), err)
 		}
 		containerID = folderID
 	}
@@ -1240,35 +1362,39 @@ func (e *Executor) createODataService(stmt *ast.CreateODataServiceStmt) error {
 		AuthenticationTypes: stmt.AuthenticationTypes,
 	}
 
-	// Map AST entity definitions to model entity types and entity sets
+	// Map AST entity definitions to model entity types and entity sets.
+	// Pass ctx so the executor can resolve exposed members against the
+	// entity's actual attributes and (for navigation properties) the
+	// module's associations.
 	for _, entityDef := range stmt.Entities {
-		entityType, entitySet := astEntityDefToModel(entityDef)
+		entityType, entitySet := astEntityDefToModel(ctx, entityDef)
 		newSvc.EntityTypes = append(newSvc.EntityTypes, entityType)
 		newSvc.EntitySets = append(newSvc.EntitySets, entitySet)
 	}
 
-	if err := e.writer.CreatePublishedODataService(newSvc); err != nil {
-		return fmt.Errorf("failed to create OData service: %w", err)
+	if err := ctx.Backend.CreatePublishedODataService(newSvc); err != nil {
+		return mdlerrors.NewBackend("create OData service", err)
 	}
-	e.invalidateHierarchy()
-	fmt.Fprintf(e.output, "Created OData service: %s.%s\n", stmt.Name.Module, stmt.Name.Name)
+	invalidateHierarchy(ctx)
+	fmt.Fprintf(ctx.Output, "Created OData service: %s.%s\n", stmt.Name.Module, stmt.Name.Name)
 	return nil
 }
 
 // alterODataService handles ALTER ODATA SERVICE command.
-func (e *Executor) alterODataService(stmt *ast.AlterODataServiceStmt) error {
-	if e.writer == nil {
-		return fmt.Errorf("not connected in write mode")
+func alterODataService(ctx *ExecContext, stmt *ast.AlterODataServiceStmt) error {
+
+	if !ctx.ConnectedForWrite() {
+		return mdlerrors.NewNotConnectedWrite()
 	}
 
-	services, err := e.reader.ListPublishedODataServices()
+	services, err := ctx.Backend.ListPublishedODataServices()
 	if err != nil {
-		return fmt.Errorf("failed to list published OData services: %w", err)
+		return mdlerrors.NewBackend("list published OData services", err)
 	}
 
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	for _, svc := range services {
@@ -1295,51 +1421,102 @@ func (e *Executor) alterODataService(stmt *ast.AlterODataServiceStmt) error {
 				case "publishassociations":
 					svc.PublishAssociations = strings.EqualFold(strVal, "true") || strings.EqualFold(strVal, "yes")
 				default:
-					return fmt.Errorf("unknown OData service property: %s", key)
+					return mdlerrors.NewUnsupported(fmt.Sprintf("unknown OData service property: %s", key))
 				}
 			}
-			if err := e.writer.UpdatePublishedODataService(svc); err != nil {
-				return fmt.Errorf("failed to alter OData service: %w", err)
+			if err := ctx.Backend.UpdatePublishedODataService(svc); err != nil {
+				return mdlerrors.NewBackend("alter OData service", err)
 			}
-			e.invalidateHierarchy()
-			fmt.Fprintf(e.output, "Altered OData service: %s.%s\n", modName, svc.Name)
+			invalidateHierarchy(ctx)
+			fmt.Fprintf(ctx.Output, "Altered OData service: %s.%s\n", modName, svc.Name)
 			return nil
 		}
 	}
 
-	return fmt.Errorf("OData service not found: %s", stmt.Name)
+	return mdlerrors.NewNotFoundMsg("OData service", fmt.Sprint(stmt.Name), fmt.Sprintf("OData service not found: %s", stmt.Name))
 }
 
 // dropODataService handles DROP ODATA SERVICE command.
-func (e *Executor) dropODataService(stmt *ast.DropODataServiceStmt) error {
-	if e.writer == nil {
-		return fmt.Errorf("not connected in write mode")
+func dropODataService(ctx *ExecContext, stmt *ast.DropODataServiceStmt) error {
+
+	if !ctx.ConnectedForWrite() {
+		return mdlerrors.NewNotConnectedWrite()
 	}
 
-	services, err := e.reader.ListPublishedODataServices()
+	services, err := ctx.Backend.ListPublishedODataServices()
 	if err != nil {
-		return fmt.Errorf("failed to list published OData services: %w", err)
+		return mdlerrors.NewBackend("list published OData services", err)
 	}
 
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	for _, svc := range services {
 		modID := h.FindModuleID(svc.ContainerID)
 		modName := h.GetModuleName(modID)
 		if strings.EqualFold(modName, stmt.Name.Module) && strings.EqualFold(svc.Name, stmt.Name.Name) {
-			if err := e.writer.DeletePublishedODataService(svc.ID); err != nil {
-				return fmt.Errorf("failed to drop OData service: %w", err)
+			if err := ctx.Backend.DeletePublishedODataService(svc.ID); err != nil {
+				return mdlerrors.NewBackend("drop OData service", err)
 			}
-			e.invalidateHierarchy()
-			fmt.Fprintf(e.output, "Dropped OData service: %s.%s\n", modName, svc.Name)
+			invalidateHierarchy(ctx)
+			fmt.Fprintf(ctx.Output, "Dropped OData service: %s.%s\n", modName, svc.Name)
 			return nil
 		}
 	}
 
-	return fmt.Errorf("OData service not found: %s", stmt.Name)
+	return mdlerrors.NewNotFoundMsg("OData service", fmt.Sprint(stmt.Name), fmt.Sprintf("OData service not found: %s", stmt.Name))
+}
+
+// validateServiceURL returns an error if url is not a constant reference (@Module.Name).
+// CE6825: Studio Pro requires the Service URL to be a constant, not a string literal.
+func validateServiceURL(url string) error {
+	if !strings.HasPrefix(url, "@") {
+		return mdlerrors.NewValidation("ServiceUrl must be a constant reference (e.g., @Module.ServiceUrlConstant) — Studio Pro CE6825: 'Service url' must be a constant")
+	}
+	return nil
+}
+
+// validateMetadataURL returns an error if the MetadataUrl is obviously malformed.
+// A valid value must be an http/https URL, a file:// URL, or a path that contains
+// at least one path separator or dot (indicating an extension or subdirectory).
+// Bare words like "not-a-url" are rejected to prevent silently creating broken OData client configurations.
+func validateMetadataURL(rawURL string) error {
+	if rawURL == "" {
+		return nil
+	}
+	if strings.HasPrefix(rawURL, "http://") || strings.HasPrefix(rawURL, "https://") {
+		return nil
+	}
+	if strings.HasPrefix(rawURL, "file://") {
+		return nil
+	}
+	if strings.ContainsAny(rawURL, "/\\.") {
+		return nil
+	}
+	return mdlerrors.NewValidationf("MetadataUrl %q is not a valid URL or file path: use an http/https URL, a file:// URL, or a relative path (e.g. './service/$metadata.xml')", rawURL)
+}
+
+// validateODataClientExists returns an error if no consumed OData service matching
+// the given qualified name exists in the project.
+func validateODataClientExists(ctx *ExecContext, ref ast.QualifiedName) error {
+	services, err := ctx.Backend.ListConsumedODataServices()
+	if err != nil {
+		return mdlerrors.NewBackend("list consumed OData services", err)
+	}
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return mdlerrors.NewBackend("build hierarchy", err)
+	}
+	for _, svc := range services {
+		modID := h.FindModuleID(svc.ContainerID)
+		modName := h.GetModuleName(modID)
+		if strings.EqualFold(modName, ref.Module) && strings.EqualFold(svc.Name, ref.Name) {
+			return nil
+		}
+	}
+	return mdlerrors.NewNotFoundMsg("odata client", ref.String(), fmt.Sprintf("odata client not found: %s", ref))
 }
 
 // formatExprValue formats a Mendix expression value for MDL output.
@@ -1353,31 +1530,111 @@ func formatExprValue(val string) string {
 	return "'" + strings.ReplaceAll(val, "'", "''") + "'"
 }
 
-// extractMicroflowRef strips "MICROFLOW " prefix from a microflow reference string.
-// Both "MICROFLOW Module.Name" and "Module.Name" formats are accepted.
+// extractMicroflowRef strips a leading "microflow " keyword (any case) from a
+// microflow reference string. The visitor emits uppercase `"MICROFLOW " + qn`
+// for `microflow Module.Name` property values (see visitor_odata.go); both
+// that form and a bare `Module.Name` are accepted. Issue #573.
 func extractMicroflowRef(ref string) string {
-	return strings.TrimPrefix(ref, "MICROFLOW ")
+	const prefix = "microflow "
+	if len(ref) >= len(prefix) && strings.EqualFold(ref[:len(prefix)], prefix) {
+		return ref[len(prefix):]
+	}
+	return ref
+}
+
+// assocMembership records both endpoints of an association by qualified
+// entity name, so callers can resolve "what's on the other side of
+// AssocName from Entity X".
+type assocMembership struct {
+	ParentQN string // FROM entity (CLAUDE.md: ParentPointer holds the FROM/FK side)
+	ChildQN  string // TO entity (ChildPointer holds the TO/referenced side)
+}
+
+// lookupEntityMembers returns (set of attribute names, map of association
+// name -> assocMembership) for the given entity. Both lookups are
+// best-effort — if the backend or domain model can't be resolved we
+// return empty collections rather than failing the whole publish.
+func lookupEntityMembers(ctx *ExecContext, entityQN ast.QualifiedName) (map[string]bool, map[string]*assocMembership) {
+	attrs := make(map[string]bool)
+	assocs := make(map[string]*assocMembership)
+	if ctx == nil || ctx.Backend == nil {
+		return attrs, assocs
+	}
+	module, err := findModule(ctx, entityQN.Module)
+	if err != nil {
+		return attrs, assocs
+	}
+	dm, err := ctx.Backend.GetDomainModel(module.ID)
+	if err != nil {
+		return attrs, assocs
+	}
+	// Build entity-id -> qualified-name map so we can resolve association
+	// Parent/Child IDs back to qualified names.
+	entityIDToQN := make(map[model.ID]string)
+	var thisEntity *domainmodel.Entity
+	for _, e := range dm.Entities {
+		entityIDToQN[e.ID] = entityQN.Module + "." + e.Name
+		if e.Name == entityQN.Name {
+			thisEntity = e
+		}
+	}
+	if thisEntity != nil {
+		for _, a := range thisEntity.Attributes {
+			attrs[a.Name] = true
+		}
+	}
+	for _, a := range dm.Associations {
+		parentQN := entityIDToQN[a.ParentID]
+		childQN := entityIDToQN[a.ChildID]
+		if parentQN == "" || childQN == "" {
+			continue
+		}
+		// Only include associations where this entity is on one side.
+		if parentQN != entityQN.String() && childQN != entityQN.String() {
+			continue
+		}
+		assocs[a.Name] = &assocMembership{ParentQN: parentQN, ChildQN: childQN}
+	}
+	return attrs, assocs
 }
 
 // astEntityDefToModel converts an AST PublishedEntityDef to model PublishedEntityType
 // and PublishedEntitySet. Each PUBLISH ENTITY block maps to both a type (schema) and
 // a set (runtime endpoint with CRUD modes).
-func astEntityDefToModel(def *ast.PublishedEntityDef) (*model.PublishedEntityType, *model.PublishedEntitySet) {
-	exposedName := def.ExposedName
-	if exposedName == "" {
-		// Default exposed name from the entity name
-		exposedName = def.Entity.Name
+//
+// Member kinds (attribute vs association) are auto-detected against the
+// entity's attributes and the module's associations: if a member's name
+// matches an attribute on the entity, it's an attribute; otherwise we
+// look for an association in the same module that involves this entity
+// and emit it as a PublishedAssociationEnd. The user writes the bare
+// association name (e.g. `Order_Customer as 'Orders'`) and the executor
+// fills in the target entity and qualified names from the domain model.
+func astEntityDefToModel(ctx *ExecContext, def *ast.PublishedEntityDef) (*model.PublishedEntityType, *model.PublishedEntitySet) {
+	// EntitySet ExposedName comes from the user's `AS 'X'` (typically plural,
+	// e.g. 'Customers'). EntityType ExposedName must differ — Studio Pro
+	// convention is the singular form (the entity's local name, e.g.
+	// 'Customer'). Sharing one name for both causes Mendix to fail
+	// resolving the second entity's key in a multi-entity service (CE6585).
+	entitySetExposedName := def.ExposedName
+	if entitySetExposedName == "" {
+		entitySetExposedName = def.Entity.Name
 	}
+	entityTypeExposedName := def.Entity.Name
 
 	entityType := &model.PublishedEntityType{
 		Entity:      def.Entity.String(),
-		ExposedName: exposedName,
+		ExposedName: entityTypeExposedName,
 	}
 
-	// Map AST members to model members
+	// Look up the entity's attributes and the module's associations so we
+	// can distinguish attribute exposures from association navigation
+	// properties. Failures here downgrade to "treat everything as
+	// attribute" — Mendix will then emit a missing-member error which is
+	// the right user-facing signal.
+	entityAttrs, moduleAssocs := lookupEntityMembers(ctx, def.Entity)
+
 	for _, m := range def.Members {
 		member := &model.PublishedMember{
-			Kind:        "attribute", // Default kind — cannot be distinguished from MDL syntax alone
 			Name:        m.Name,
 			ExposedName: m.ExposedName,
 			Filterable:  m.Filterable,
@@ -1387,11 +1644,32 @@ func astEntityDefToModel(def *ast.PublishedEntityDef) (*model.PublishedEntityTyp
 		if member.ExposedName == "" {
 			member.ExposedName = member.Name
 		}
+		// Auto-detect kind: attribute first, association as fallback.
+		if entityAttrs[m.Name] {
+			member.Kind = "attribute"
+		} else if assoc := moduleAssocs[m.Name]; assoc != nil {
+			member.Kind = "association"
+			member.ExposedAssociationName = m.Name
+			// Target entity = the OTHER side of the association.
+			if assoc.ParentQN == def.Entity.String() {
+				member.AssociationTargetEntity = assoc.ChildQN
+			} else {
+				member.AssociationTargetEntity = assoc.ParentQN
+			}
+			// AssociationEnd has no Filterable/Sortable/IsPartOfKey
+			// concept — clear them so the writer's bson.M doesn't
+			// leak stale attribute-shaped fields.
+			member.Filterable = false
+			member.Sortable = false
+			member.IsPartOfKey = false
+		} else {
+			member.Kind = "attribute"
+		}
 		entityType.Members = append(entityType.Members, member)
 	}
 
 	entitySet := &model.PublishedEntitySet{
-		ExposedName:    exposedName,
+		ExposedName:    entitySetExposedName,
 		EntityTypeName: def.Entity.String(),
 		ReadMode:       def.ReadMode,
 		InsertMode:     def.InsertMode,
@@ -1404,31 +1682,57 @@ func astEntityDefToModel(def *ast.PublishedEntityDef) (*model.PublishedEntityTyp
 	return entityType, entitySet
 }
 
-// fetchODataMetadata downloads the $metadata document from the service URL.
+// fetchODataMetadata downloads or reads the $metadata document.
+// Supports:
+//   - https://... or http://... (HTTP fetch)
+//   - file:///abs/path (local absolute path from normalized URL)
+//
 // Returns the metadata XML and its SHA-256 hash, or empty strings if the fetch fails.
+// Note: metadataUrl is expected to be already normalized by NormalizeURL() in createODataClient,
+// so all relative paths have been converted to absolute file:// URLs.
 func fetchODataMetadata(metadataUrl string) (metadata string, hash string, err error) {
 	if metadataUrl == "" {
 		return "", "", nil
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(metadataUrl)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to fetch $metadata from %s: %w", metadataUrl, err)
-	}
-	defer resp.Body.Close()
+	var body []byte
 
-	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("$metadata fetch returned HTTP %d from %s", resp.StatusCode, metadataUrl)
+	// At this point, metadataUrl is already normalized by NormalizeURL() in createODataClient:
+	// - Relative paths have been converted to absolute file:// URLs
+	// - HTTP(S) URLs are unchanged
+	// So we only need to distinguish file:// vs HTTP(S)
+
+	filePath := pathutil.PathFromURL(metadataUrl)
+	if filePath != "" {
+		// Local file - read directly (path is already absolute)
+		body, err = os.ReadFile(filePath)
+		if err != nil {
+			return "", "", mdlerrors.NewBackend(fmt.Sprintf("read local metadata file %s", filePath), err)
+		}
+	} else {
+		// HTTP(S) fetch
+		client := &http.Client{Timeout: 30 * time.Second}
+		resp, err := client.Get(metadataUrl)
+		if err != nil {
+			return "", "", mdlerrors.NewBackend(fmt.Sprintf("fetch $metadata from %s", metadataUrl), err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			return "", "", mdlerrors.NewValidationf("$metadata fetch returned HTTP %d from %s", resp.StatusCode, metadataUrl)
+		}
+
+		body, err = io.ReadAll(resp.Body)
+		if err != nil {
+			return "", "", mdlerrors.NewBackend("read $metadata response", err)
+		}
 	}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to read $metadata response: %w", err)
-	}
-
+	// Hash calculation (same for both HTTP and local file)
 	metadata = string(body)
 	h := sha256.Sum256(body)
 	hash = fmt.Sprintf("%x", h)
 	return metadata, hash, nil
 }
+
+// Executor wrappers for unmigrated callers.

@@ -1,3 +1,9 @@
+---
+title: GitHub Actions MDL Integration Tests
+status: draft
+date: 2026-03-16
+---
+
 # Proposal: GitHub Actions MDL Integration Tests
 
 **Status:** Draft
@@ -38,7 +44,7 @@ Today, regressions in the parser or executor can go unnoticed until someone manu
 
 ```yaml
 # .github/workflows/mdl-check.yml
-name: MDL Syntax Check
+name: MDL Syntax check
 
 on:
   push:
@@ -55,10 +61,10 @@ jobs:
         with:
           go-version: '1.26'
 
-      - name: Build mxcli
+      - name: build mxcli
         run: make build
 
-      - name: Check MDL example scripts
+      - name: check MDL example scripts
         run: |
           FAILED=0
           for f in mdl-examples/doctype-tests/*.mdl; do
@@ -105,12 +111,12 @@ jobs:
 ### How it works
 
 1. **Build** `mxcli`
-2. **Download mxbuild** from Mendix CDN using `mxcli setup mxbuild --version $VERSION`
+2. **Download mxbuild** from Mendix CDN using `mxcli setup mxbuild --version $version`
 3. **Create a blank project** using `mx create-project --app-name mdl-test`
 4. **For each `.mdl` script:**
    - Copy the blank project to a temp directory (fresh state)
-   - Execute the script with `mxcli exec script.mdl -p $PROJECT`
-   - Validate with `mx check $PROJECT`
+   - Execute the script with `mxcli exec script.mdl -p $project`
+   - Validate with `mx check $project`
 5. **Report** pass/fail per script with GitHub Actions annotations
 
 ### Workflow
@@ -141,7 +147,7 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Build mxcli
+      - name: build mxcli
         run: make build
 
       - name: Cache mxbuild
@@ -153,14 +159,14 @@ jobs:
       - name: Download mxbuild
         run: ./bin/mxcli setup mxbuild --version $MENDIX_VERSION
 
-      - name: Create blank Mendix project
+      - name: create blank Mendix project
         run: |
           mkdir -p /tmp/mdl-test-source
           cd /tmp/mdl-test-source
           ~/.mxcli/mxbuild/$MENDIX_VERSION/modeler/mx \
             create-project --app-name mdl-test
 
-      - name: Run MDL scripts and validate with mx check
+      - name: run MDL scripts and validate with mx check
         run: |
           PROJECT_DIR=/tmp/mdl-test-source
           MX=~/.mxcli/mxbuild/$MENDIX_VERSION/modeler/mx
@@ -178,7 +184,7 @@ jobs:
             cp -r "$PROJECT_DIR"/* "$WORKDIR/"
             WORK_MPR="$WORKDIR/mdl-test.mpr"
 
-            # Execute MDL
+            # execute MDL
             echo "Executing $NAME..."
             if ! ./bin/mxcli exec "$f" -p "$WORK_MPR" 2>&1; then
               echo "::error file=$f::exec failed: $NAME"

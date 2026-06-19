@@ -39,7 +39,10 @@ func (r *Reader) parseConsumedODataService(unitID, containerID string, contents 
 	svc.Validated = extractBool(raw["Validated"], false)
 	svc.Excluded = extractBool(raw["Excluded"], false)
 
-	// Microflow references (BY_NAME)
+	// Microflow references (BY_NAME). Storage names differ from the MDL
+	// property names — see writer_odata.go for the why.
+	// Both "Configuration microflow" and "Headers microflow" dropdown
+	// options are stored in the same BSON field.
 	svc.ConfigurationMicroflow = extractString(raw["ConfigurationMicroflow"])
 	svc.ErrorHandlingMicroflow = extractString(raw["ErrorHandlingMicroflow"])
 
@@ -235,6 +238,12 @@ func parsePublishedMember(raw map[string]any) *model.PublishedMember {
 	case "ODataPublish$PublishedAssociationEnd":
 		m.Kind = "association"
 		m.Name = extractString(raw["Association"])
+		// Studio Pro stores the target entity and the bare association
+		// name (separate from ExposedName, which is the navigation
+		// property). They round-trip through these fields so that
+		// ALTER ODATA SERVICE doesn't blank them out.
+		m.AssociationTargetEntity = extractString(raw["Entity"])
+		m.ExposedAssociationName = extractString(raw["ExposedAssociationName"])
 	case "ODataPublish$PublishedId":
 		m.Kind = "id"
 		m.Name = extractString(raw["Attribute"])

@@ -111,6 +111,12 @@ func (r *Reader) parseConsumedRestService(unitID, containerID string, contents [
 		}
 	}
 
+	// Parse OpenApiFile (present when created from spec; stores the raw spec text).
+	// Field names are PascalCase matching Studio Pro serialization.
+	if openApiFile, ok := raw["OpenApiFile"].(map[string]any); ok && openApiFile != nil {
+		svc.OpenApiContent = extractString(openApiFile["Content"])
+	}
+
 	// Parse Operations
 	ops := extractBsonArray(raw["Operations"])
 	for _, op := range ops {
@@ -130,6 +136,13 @@ func parseRestOperation(opMap map[string]any) *model.RestClientOperation {
 	op := &model.RestClientOperation{}
 	op.Name = extractString(opMap["Name"])
 	op.Timeout = extractInt(opMap["Timeout"])
+
+	// Parse Tags (versioned string array: [versionInt, tag1, tag2, ...])
+	for _, t := range extractBsonArray(opMap["Tags"]) {
+		if s, ok := t.(string); ok {
+			op.Tags = append(op.Tags, s)
+		}
+	}
 
 	// Parse Method (polymorphic: WithBody or WithoutBody)
 	if methodMap := extractBsonMap(opMap["Method"]); methodMap != nil {
@@ -334,7 +347,15 @@ func extractRestValue(v any) string {
 	case "Rest$StringValue":
 		return extractString(valMap["Value"])
 	case "Rest$ConstantValue":
-		return extractString(valMap["Constant"])
+		// The BSON field is "Value" (QualifiedName of the constant).
+		// Historical code wrote "Constant" — try both for backward compat.
+		if v := extractString(valMap["Value"]); v != "" {
+			return "$" + v
+		}
+		if v := extractString(valMap["Constant"]); v != "" {
+			return "$" + v
+		}
+		return ""
 	}
 	return ""
 }

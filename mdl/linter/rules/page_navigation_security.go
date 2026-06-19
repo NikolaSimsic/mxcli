@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/linter"
-	"github.com/mendixlabs/mxcli/sdk/mpr"
+	"github.com/mendixlabs/mxcli/mdl/types"
 )
 
 // PageNavigationSecurityRule checks that pages used in navigation have at least
@@ -122,7 +122,7 @@ func (r *PageNavigationSecurityRule) Check(ctx *linter.LintContext) []linter.Vio
 }
 
 // collectMenuPages recursively collects pages from navigation menu items.
-func collectMenuPages(items []*mpr.NavMenuItem, profileName string, navPages map[string][]navUsage) {
+func collectMenuPages(items []*types.NavMenuItem, profileName string, navPages map[string][]navUsage) {
 	for _, item := range items {
 		if item.Page != "" {
 			navPages[item.Page] = append(navPages[item.Page],
@@ -133,7 +133,7 @@ func collectMenuPages(items []*mpr.NavMenuItem, profileName string, navPages map
 }
 
 // buildPageRoleCountMap builds a map of qualified page name → number of allowed roles.
-func buildPageRoleCountMap(reader *mpr.Reader) map[string]int {
+func buildPageRoleCountMap(reader linter.LintReader) map[string]int {
 	result := make(map[string]int)
 
 	pages, err := reader.ListPages()

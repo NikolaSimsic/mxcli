@@ -5,6 +5,7 @@ package catalog
 import (
 	"database/sql"
 	"encoding/base64"
+	"fmt"
 	"strings"
 
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -18,11 +19,10 @@ func (b *Builder) buildPages() error {
 	}
 
 	pageStmt, err := b.tx.Prepare(`
-		INSERT INTO pages (Id, Name, QualifiedName, ModuleName, Folder, Title, URL, LayoutRef,
+		INSERT INTO pages_data (Id, Name, QualifiedName, ModuleName, Folder, Title, URL, LayoutRef,
 			Description, ParameterCount, WidgetCount, Excluded,
-			ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource,
-			SourceId, SourceBranch, SourceRevision)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ProjectId, SnapshotId)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -33,11 +33,10 @@ func (b *Builder) buildPages() error {
 	var widgetStmt *sql.Stmt
 	if b.fullMode {
 		widgetStmt, err = b.tx.Prepare(`
-			INSERT INTO widgets (Id, Name, WidgetType, ContainerId, ContainerQualifiedName, ContainerType,
-				ModuleName, Folder, EntityRef, AttributeRef, Description,
-				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource,
-				SourceId, SourceBranch, SourceRevision)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			INSERT INTO widgets_data (Id, Name, WidgetType, ContainerId, ContainerQualifiedName, ContainerType,
+				ModuleName, Folder, EntityRef, AttributeRef, MicroflowRef, NanoflowRef, Description,
+				ProjectId, SnapshotId)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`)
 		if err != nil {
 			return err
@@ -45,7 +44,7 @@ func (b *Builder) buildPages() error {
 		defer widgetStmt.Close()
 	}
 
-	projectID, projectName, snapshotID, snapshotDate, snapshotSource, sourceID, sourceBranch, sourceRevision := b.snapshotMeta()
+	projectID, snapshotID := b.snapshotMeta()
 
 	pageCount := 0
 	widgetCount := 0
@@ -92,8 +91,7 @@ func (b *Builder) buildPages() error {
 			len(pg.Parameters),
 			widgetCnt,
 			pg.Excluded,
-			projectID, projectName, snapshotID, snapshotDate, snapshotSource,
-			sourceID, sourceBranch, sourceRevision,
+			projectID, snapshotID,
 		)
 		if err != nil {
 			return err
@@ -103,7 +101,7 @@ func (b *Builder) buildPages() error {
 		// Insert widgets only in full mode
 		if b.fullMode && len(rawWidgets) > 0 {
 			for _, w := range rawWidgets {
-				_, _ = widgetStmt.Exec(
+				if _, err := widgetStmt.Exec(
 					w.ID,
 					w.Name,
 					w.WidgetType,
@@ -114,10 +112,13 @@ func (b *Builder) buildPages() error {
 					folder,
 					w.EntityRef,
 					w.AttributeRef,
+					w.MicroflowRef,
+					w.NanoflowRef,
 					"",
-					projectID, projectName, snapshotID, snapshotDate, snapshotSource,
-					sourceID, sourceBranch, sourceRevision,
-				)
+					projectID, snapshotID,
+				); err != nil {
+					return fmt.Errorf("insert widget %s for page %s: %w", w.Name, qualifiedName, err)
+				}
 				widgetCount++
 			}
 		}
@@ -138,20 +139,37 @@ func (b *Builder) buildSnippets() error {
 	}
 
 	snippetStmt, err := b.tx.Prepare(`
-		INSERT INTO snippets (Id, Name, QualifiedName, ModuleName, Folder, Description,
+		INSERT INTO snippets_data (Id, Name, QualifiedName, ModuleName, Folder, Description,
 			ParameterCount, WidgetCount,
-			ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource,
-			SourceId, SourceBranch, SourceRevision)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ProjectId, SnapshotId)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
 	}
 	defer snippetStmt.Close()
 
-	projectID, projectName, snapshotID, snapshotDate, snapshotSource, sourceID, sourceBranch, sourceRevision := b.snapshotMeta()
+	// Snippet widgets feed the same widgets_data table as page widgets (full mode
+	// only), with ContainerType=SNIPPET, so the refs projection in buildReferences
+	// emits snippet → entity/microflow/nanoflow edges automatically.
+	var widgetStmt *sql.Stmt
+	if b.fullMode {
+		widgetStmt, err = b.tx.Prepare(`
+			INSERT INTO widgets_data (Id, Name, WidgetType, ContainerId, ContainerQualifiedName, ContainerType,
+				ModuleName, Folder, EntityRef, AttributeRef, MicroflowRef, NanoflowRef, Description,
+				ProjectId, SnapshotId)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`)
+		if err != nil {
+			return err
+		}
+		defer widgetStmt.Close()
+	}
+
+	projectID, snapshotID := b.snapshotMeta()
 
 	count := 0
+	widgetCount := 0
 	for _, sn := range snippetList {
 		// Get module name
 		moduleID := b.hierarchy.findModuleID(sn.ContainerID)
@@ -159,7 +177,14 @@ func (b *Builder) buildSnippets() error {
 		qualifiedName := moduleName + "." + sn.Name
 		folder := b.hierarchy.buildFolderPath(sn.ContainerID)
 
-		_, err := snippetStmt.Exec(
+		var rawWidgets []rawWidgetInfo
+		if b.fullMode {
+			if rawData, _ := b.reader.GetRawUnit(sn.ID); rawData != nil {
+				rawWidgets = extractSnippetWidgets(rawData)
+			}
+		}
+
+		if _, err := snippetStmt.Exec(
 			string(sn.ID),
 			sn.Name,
 			qualifiedName,
@@ -167,17 +192,33 @@ func (b *Builder) buildSnippets() error {
 			folder,
 			sn.Documentation,
 			0, // ParameterCount
-			0, // WidgetCount
-			projectID, projectName, snapshotID, snapshotDate, snapshotSource,
-			sourceID, sourceBranch, sourceRevision,
-		)
-		if err != nil {
+			len(rawWidgets),
+			projectID, snapshotID,
+		); err != nil {
 			return err
 		}
 		count++
+
+		if b.fullMode {
+			for _, w := range rawWidgets {
+				if _, err := widgetStmt.Exec(
+					w.ID, w.Name, w.WidgetType,
+					string(sn.ID), qualifiedName, "SNIPPET",
+					moduleName, folder,
+					w.EntityRef, w.AttributeRef, w.MicroflowRef, w.NanoflowRef, "",
+					projectID, snapshotID,
+				); err != nil {
+					return fmt.Errorf("insert widget %s for snippet %s: %w", w.Name, qualifiedName, err)
+				}
+				widgetCount++
+			}
+		}
 	}
 
 	b.report("Snippets", count)
+	if b.fullMode {
+		b.report("Snippet widgets", widgetCount)
+	}
 	return nil
 }
 
@@ -186,24 +227,89 @@ type rawWidgetInfo struct {
 	ID           string
 	Name         string
 	WidgetType   string
-	EntityRef    string
+	EntityRef    string // datasource entity (DomainModels$DirectEntityRef.Entity)
 	AttributeRef string
+	MicroflowRef string // action/datasource microflow (Forms$MicroflowSettings.Microflow, …)
+	NanoflowRef  string // action/datasource nanoflow
 }
 
-// extractLayoutRef extracts the layout reference from raw page BSON.
+// widgetChildKeys are the keys under which a widget nests *other* widgets. The
+// per-widget ref scan skips them so a container doesn't absorb its children's
+// references (each child is visited separately by extractWidgetsRecursive).
+var widgetChildKeys = map[string]bool{
+	"Widgets": true, "Rows": true, "FooterWidgets": true, "TabPages": true,
+}
+
+// scanWidgetOwnRefs collects the entity/microflow/nanoflow a widget references in
+// its own (non-child-widget) BSON — datasource entity, on-click microflow, etc.
+// Returns the lexicographically smallest match of each kind so the result is
+// deterministic regardless of BSON map iteration order; page-level dedup in the
+// refs projection makes the per-widget choice immaterial to the final graph.
+func scanWidgetOwnRefs(w map[string]any) (entity, microflow, nanoflow string) {
+	var ents, mfs, nfs []string
+	var walk func(v any)
+	walk = func(v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			if s, ok := x["Entity"].(string); ok && s != "" {
+				ents = append(ents, s)
+			}
+			if s, ok := x["Microflow"].(string); ok && s != "" {
+				mfs = append(mfs, s)
+			}
+			if s, ok := x["Nanoflow"].(string); ok && s != "" {
+				nfs = append(nfs, s)
+			}
+			for k, val := range x {
+				if widgetChildKeys[k] {
+					continue
+				}
+				walk(val)
+			}
+		case []any:
+			for _, item := range x {
+				walk(item)
+			}
+		}
+	}
+	walk(w)
+	min := func(xs []string) string {
+		if len(xs) == 0 {
+			return ""
+		}
+		m := xs[0]
+		for _, s := range xs[1:] {
+			if s < m {
+				m = s
+			}
+		}
+		return m
+	}
+	return min(ents), min(mfs), min(nfs)
+}
+
+// extractLayoutRef extracts the layout reference from raw page BSON. Regular
+// pages (Forms$Form) carry the layout under FormCall; page templates
+// (Forms$PageTemplate) carry it under LayoutCall instead. Both nest the same
+// Form (string qualified name) / Layout (binary GUID) fields, so try FormCall
+// first and fall back to LayoutCall — without the fallback every page template
+// reports no layout (e.g. all 46 Atlas_Web_Content templates).
 func extractLayoutRef(rawData map[string]any) string {
-	formCall, ok := rawData["FormCall"].(map[string]any)
+	call, ok := rawData["FormCall"].(map[string]any)
+	if !ok {
+		call, ok = rawData["LayoutCall"].(map[string]any)
+	}
 	if !ok {
 		return ""
 	}
 
 	// Try Form field first (string layout name)
-	if formName, ok := formCall["Form"].(string); ok && formName != "" {
+	if formName, ok := call["Form"].(string); ok && formName != "" {
 		return formName
 	}
 
 	// Try Layout field (binary GUID) - extract and format
-	if layoutID := extractBinaryID(formCall["Layout"]); layoutID != "" {
+	if layoutID := extractBinaryID(call["Layout"]); layoutID != "" {
 		return layoutID // Will be a GUID string
 	}
 
@@ -264,6 +370,10 @@ func extractWidgetsRecursive(w map[string]any) []rawWidgetInfo {
 	if attrRef, ok := w["AttributeRef"].(map[string]any); ok {
 		widget.AttributeRef = extractString(attrRef["Attribute"])
 	}
+
+	// Extract datasource entity + action microflow/nanoflow references from this
+	// widget's own content (not its child widgets).
+	widget.EntityRef, widget.MicroflowRef, widget.NanoflowRef = scanWidgetOwnRefs(w)
 
 	// Skip DivContainer wrapper types - only collect their children
 	if widget.WidgetType != "Forms$DivContainer" && widget.WidgetType != "Pages$DivContainer" {
@@ -502,17 +612,16 @@ func (b *Builder) buildLayouts() error {
 	}
 
 	layoutStmt, err := b.tx.Prepare(`
-		INSERT INTO layouts (Id, Name, QualifiedName, ModuleName, Folder, LayoutType, Description,
-			ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource,
-			SourceId, SourceBranch, SourceRevision)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO layouts_data (Id, Name, QualifiedName, ModuleName, Folder, LayoutType, Description,
+			ProjectId, SnapshotId)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
 	}
 	defer layoutStmt.Close()
 
-	projectID, projectName, snapshotID, snapshotDate, snapshotSource, sourceID, sourceBranch, sourceRevision := b.snapshotMeta()
+	projectID, snapshotID := b.snapshotMeta()
 
 	count := 0
 	for _, l := range layoutList {
@@ -530,8 +639,7 @@ func (b *Builder) buildLayouts() error {
 			folder,
 			string(l.LayoutType),
 			l.Documentation,
-			projectID, projectName, snapshotID, snapshotDate, snapshotSource,
-			sourceID, sourceBranch, sourceRevision,
+			projectID, snapshotID,
 		)
 		if err != nil {
 			return err

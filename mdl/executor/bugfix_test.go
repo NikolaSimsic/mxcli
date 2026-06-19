@@ -16,12 +16,12 @@ import (
 // RETRIEVE for the same variable is caught as a duplicate (CE0111).
 // Bug #3: mxcli check passed but mx check reported CE0111.
 func TestValidateDuplicateVariableDeclareRetrieve(t *testing.T) {
-	input := `CREATE MICROFLOW Test.MF_DuplicateVar ()
-BEGIN
-  DECLARE $Count Integer = 0;
-  RETRIEVE $Count FROM Test.TestItem;
-  RETURN $Count;
-END;`
+	input := `create microflow Test.MF_DuplicateVar ()
+begin
+  declare $Count Integer = 0;
+  retrieve $Count from Test.TestItem;
+  return $Count;
+end;`
 
 	errors := validateMicroflowFromMDL(t, input)
 
@@ -40,11 +40,11 @@ END;`
 // TestValidateDuplicateVariableDeclareOnly verifies that two DECLARE statements
 // for the same variable are caught as duplicate.
 func TestValidateDuplicateVariableDeclareOnly(t *testing.T) {
-	input := `CREATE MICROFLOW Test.MF_DoubleDeclare ()
-BEGIN
-  DECLARE $X Integer = 0;
-  DECLARE $X String = 'hello';
-END;`
+	input := `create microflow Test.MF_DoubleDeclare ()
+begin
+  declare $X Integer = 0;
+  declare $X String = 'hello';
+end;`
 
 	errors := validateMicroflowFromMDL(t, input)
 
@@ -63,10 +63,10 @@ END;`
 // TestValidateNoDuplicateWhenRetrieveOnly verifies that a single RETRIEVE
 // (without prior DECLARE) does not trigger a false positive.
 func TestValidateNoDuplicateWhenRetrieveOnly(t *testing.T) {
-	input := `CREATE MICROFLOW Test.MF_RetrieveOnly ()
-BEGIN
-  RETRIEVE $Items FROM Test.SomeEntity;
-END;`
+	input := `create microflow Test.MF_RetrieveOnly ()
+begin
+  retrieve $Items from Test.SomeEntity;
+end;`
 
 	errors := validateMicroflowFromMDL(t, input)
 
@@ -80,11 +80,11 @@ END;`
 // TestValidateDuplicateVariableDeclareCreate verifies that DECLARE followed by
 // CREATE for the same variable is caught as a duplicate (CE0111).
 func TestValidateDuplicateVariableDeclareCreate(t *testing.T) {
-	input := `CREATE MICROFLOW Test.MF_DeclareCreate ()
-BEGIN
-  DECLARE $NewTodo Test.Todo;
-  $NewTodo = CREATE Test.Todo();
-END;`
+	input := `create microflow Test.MF_DeclareCreate ()
+begin
+  declare $NewTodo Test.Todo;
+  $NewTodo = create Test.Todo();
+end;`
 
 	errors := validateMicroflowFromMDL(t, input)
 
@@ -103,7 +103,7 @@ END;`
 // TestValidateEntityReservedAttributeName verifies that persistent entity attributes
 // using reserved system names (CreatedDate, ChangedDate, Owner, ChangedBy) are caught.
 func TestValidateEntityReservedAttributeName(t *testing.T) {
-	input := `CREATE PERSISTENT ENTITY Test.MyEntity (
+	input := `create persistent entity Test.MyEntity (
   Name : String(200),
   CreatedDate : DateTime,
   Status : String(50)
@@ -132,12 +132,20 @@ func TestValidateEntityReservedAttributeName(t *testing.T) {
 	}
 }
 
-// TestValidateEntityNonPersistentAllowed verifies that non-persistent entities
-// can use system attribute names without error.
-func TestValidateEntityNonPersistentAllowed(t *testing.T) {
-	input := `CREATE NON-PERSISTENT ENTITY Test.MyNPE (
-  CreatedDate : DateTime,
-  Owner : String(200)
+// TestValidateEntityNPEReservedWords verifies that non-persistent entities
+// reject runtime-reserved attribute names (CE7247). Issue #552.
+//
+// Mendix Studio Pro reports CE7247 "The name 'X' is a reserved word." on
+// NPE attributes named Owner, Type, Context, Id, CreatedDate, ChangedDate,
+// ChangedBy, etc. Previously ValidateEntity early-returned for NPEs and
+// missed these.
+func TestValidateEntityNPEReservedWords(t *testing.T) {
+	input := `create non-persistent entity Test.MyNPE (
+  Owner : String(200),
+  Type : String(50),
+  Context : String(100),
+  Id : Integer,
+  CreatedDate : DateTime
 );`
 
 	prog, errs := visitor.Build(input)
@@ -151,15 +159,46 @@ func TestValidateEntityNonPersistentAllowed(t *testing.T) {
 	}
 
 	violations := ValidateEntity(stmt)
+	expected := []string{"Owner", "Type", "Context", "Id", "CreatedDate"}
+	for _, name := range expected {
+		found := false
+		for _, v := range violations {
+			if v.RuleID == "MDL021" && strings.Contains(v.Message, "'"+name+"'") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("Expected MDL021 violation for NPE attribute %q (CE7247), got: %v", name, violations)
+		}
+	}
+}
+
+// TestValidateEntityNPENormalAttributesPass verifies that legitimate NPE
+// attribute names (non-reserved) do not trigger false positives.
+func TestValidateEntityNPENormalAttributesPass(t *testing.T) {
+	input := `create non-persistent entity Test.MyNPE (
+  Title : String(200),
+  Message : String(2000),
+  IsActive : Boolean
+);`
+
+	prog, errs := visitor.Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("Parse error: %v", errs[0])
+	}
+
+	stmt := prog.Statements[0].(*ast.CreateEntityStmt)
+	violations := ValidateEntity(stmt)
 	if len(violations) > 0 {
-		t.Errorf("Non-persistent entity should allow system attribute names, got: %v", violations)
+		t.Errorf("Normal NPE attribute names should not trigger violations, got: %v", violations)
 	}
 }
 
 // TestValidateEntityNormalAttributesPass verifies that normal attribute names
 // don't trigger false positives.
 func TestValidateEntityNormalAttributesPass(t *testing.T) {
-	input := `CREATE PERSISTENT ENTITY Test.MyEntity (
+	input := `create persistent entity Test.MyEntity (
   Name : String(200),
   Description : String(2000),
   Amount : Decimal,
@@ -182,15 +221,46 @@ func TestValidateEntityNormalAttributesPass(t *testing.T) {
 	}
 }
 
+// TestValidateEntityReservedJavaKeyword verifies that Java reserved words
+// used as attribute names (e.g. "type") are caught with MDL021 (CE7247).
+func TestValidateEntityReservedJavaKeyword(t *testing.T) {
+	input := `create persistent entity Test.MyEntity (
+  Name : String(200),
+  Type : String(50)
+);`
+
+	prog, errs := visitor.Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("Parse error: %v", errs[0])
+	}
+
+	stmt, ok := prog.Statements[0].(*ast.CreateEntityStmt)
+	if !ok {
+		t.Fatalf("Expected CreateEntityStmt, got %T", prog.Statements[0])
+	}
+
+	violations := ValidateEntity(stmt)
+	found := false
+	for _, v := range violations {
+		if v.RuleID == "MDL021" && strings.Contains(v.Message, "Type") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("Expected MDL021 violation for Java-reserved attribute 'Type', got: %v", violations)
+	}
+}
+
 // TestReturnsNothingAcceptsBarReturn verifies that RETURNS Nothing treats
 // RETURN; (no value) as valid — "Nothing" means void.
 func TestReturnsNothingAcceptsBarReturn(t *testing.T) {
-	input := `CREATE MICROFLOW Test.MF_ReturnsNothing ()
-RETURNS Nothing
-BEGIN
-  LOG INFO 'hello';
-  RETURN;
-END;`
+	input := `create microflow Test.MF_ReturnsNothing ()
+returns Nothing
+begin
+  log info 'hello';
+  return;
+end;`
 
 	prog, errs := visitor.Build(input)
 	if len(errs) > 0 {
@@ -201,14 +271,14 @@ END;`
 
 	// The return type should be TypeVoid
 	if stmt.ReturnType != nil && stmt.ReturnType.Type.Kind != ast.TypeVoid {
-		t.Errorf("Expected TypeVoid for RETURNS Nothing, got %v", stmt.ReturnType.Type.Kind)
+		t.Errorf("Expected TypeVoid for returns Nothing, got %v", stmt.ReturnType.Type.Kind)
 	}
 
 	// Validation should NOT produce errors about RETURN requiring a value
 	warnings := ValidateMicroflowBody(stmt)
 	for _, w := range warnings {
-		if strings.Contains(w, "RETURN requires a value") {
-			t.Errorf("RETURNS Nothing should not reject bare RETURN;, got: %s", w)
+		if strings.Contains(w, "return requires a value") {
+			t.Errorf("returns Nothing should not reject bare return;, got: %s", w)
 		}
 	}
 }
@@ -216,8 +286,8 @@ END;`
 // TestEnumDefaultNotDoubleQualified verifies that enum DEFAULT values are stored
 // without the enum prefix (just the value name), preventing double-qualification.
 func TestEnumDefaultNotDoubleQualified(t *testing.T) {
-	input := `CREATE PERSISTENT ENTITY Test.Item (
-  Status : Enumeration(Test.ItemStatus) DEFAULT Test.ItemStatus.Active
+	input := `create persistent entity Test.Item (
+  Status : Enumeration(Test.ItemStatus) default Test.ItemStatus.Active
 );`
 
 	prog, errs := visitor.Build(input)
@@ -427,12 +497,12 @@ func validateMicroflowFromMDL(t *testing.T, input string) []string {
 // AttributePathExpr (not nested BinaryExpr with "/" operator).
 // Issue #120: extra spaces around path separators.
 func TestAssociationNavParsing(t *testing.T) {
-	input := `CREATE MICROFLOW Test.MF_Nav()
-RETURNS String AS $Result
-BEGIN
-  DECLARE $CustName String = $Order/Test.Order_Customer/Name;
-  RETURN $CustName;
-END;`
+	input := `create microflow Test.MF_Nav()
+returns String as $Result
+begin
+  declare $CustName String = $Order/Test.Order_Customer/Name;
+  return $CustName;
+end;`
 
 	prog, errs := visitor.Build(input)
 	if len(errs) > 0 {
@@ -503,7 +573,7 @@ func TestResolveAssociationPaths(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fb := &flowBuilder{
-				reader: nil, // nil reader → no resolution, path unchanged
+				backend: nil, // nil backend → no resolution, path unchanged
 			}
 			got := fb.resolvePathSegments(tt.path)
 
@@ -512,6 +582,40 @@ func TestResolveAssociationPaths(t *testing.T) {
 				t.Errorf("resolvePathSegments() length = %d, want %d", len(got), len(tt.path))
 			}
 		})
+	}
+}
+
+func TestResolveAssociationPathsUnwrapsEmptySourceExpr(t *testing.T) {
+	fb := &flowBuilder{}
+	resolved := fb.resolveAssociationPaths(&ast.SourceExpr{
+		Expression: &ast.VariableExpr{Name: "CurrentObject"},
+	})
+
+	if _, ok := resolved.(*ast.SourceExpr); ok {
+		t.Fatalf("empty SourceExpr should unwrap to resolved inner expression, got %T", resolved)
+	}
+	if got := expressionToString(resolved); got != "$CurrentObject" {
+		t.Fatalf("resolved expression = %q, want $CurrentObject", got)
+	}
+}
+
+func TestResolveAssociationPathsKeepsNonEmptySourceExprVerbatim(t *testing.T) {
+	source := "$CurrentObject/Module.Assoc/Name\n"
+	fb := &flowBuilder{}
+	resolved := fb.resolveAssociationPaths(&ast.SourceExpr{
+		Expression: &ast.AttributePathExpr{
+			Variable: "CurrentObject",
+			Path:     []string{"Module.Assoc", "Name"},
+		},
+		Source: source,
+	})
+
+	sourceExpr, ok := resolved.(*ast.SourceExpr)
+	if !ok {
+		t.Fatalf("non-empty SourceExpr should remain SourceExpr, got %T", resolved)
+	}
+	if sourceExpr.Source != source {
+		t.Fatalf("source = %q, want %q", sourceExpr.Source, source)
 	}
 }
 

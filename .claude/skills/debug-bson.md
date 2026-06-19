@@ -9,6 +9,7 @@ Use when encountering:
 - **Studio Pro crash on open** with `RevStatusCache.CreateDeleteStatusItem` in stack trace
 - **`mx diff` crash** with "Sequence contains no matching element"
 - **CE1613** "The selected attribute/enumeration no longer exists"
+- **CE0115** "The arguments that are passed to page X do not match the expected parameters"
 - **CE0463** "The definition of this widget has changed"
 - **CE0642** "Property X is required"
 - **CE0091** validation errors on widget properties
@@ -25,10 +26,10 @@ Use when encountering:
 ### Step 1: Reproduce the Error
 
 ```bash
-# Create a page via MDL
+# create a page via MDL
 ./bin/mxcli exec script.mdl -p /path/to/app.mpr
 
-# Run mx check to get the error
+# run mx check to get the error
 reference/mxbuild/modeler/mx check /path/to/app.mpr
 ```
 
@@ -58,8 +59,8 @@ import json
 conn = sqlite3.connect('/path/to/app.mpr')
 cursor = conn.cursor()
 
-# Find the document containing the widget
-cursor.execute("SELECT UnitData FROM Unit$ WHERE ContainmentName = 'Document' AND Name = ?", ('PageName',))
+# find the document containing the widget
+cursor.execute("select UnitData from Unit$ where ContainmentName = 'Document' and Name = ?", ('PageName',))
 row = cursor.fetchone()
 doc = bson.decode(row[0])
 
@@ -72,7 +73,7 @@ print(json.dumps(doc, indent=2, default=str))
 Extract the widget's mpk to understand its schema and mode-dependent rules:
 
 ```bash
-# Find the mpk in the project's widgets folder
+# find the mpk in the project's widgets folder
 ls /path/to/project/widgets/*.mpk
 
 # Extract (mpk is a ZIP archive)
@@ -81,8 +82,8 @@ cd /tmp/mpk-widget && unzip /path/to/project/widgets/com.mendix.widget.web.Datag
 ```
 
 Key files inside the mpk:
-- **`{Widget}.xml`** — Property schema: types, defaults, enumerations, nested objects
-- **`{Widget}.editorConfig.js`** — Mode-dependent visibility rules (which properties hide/show based on other values)
+- **`{widget}.xml`** — Property schema: types, defaults, enumerations, nested objects
+- **`{widget}.editorConfig.js`** — Mode-dependent visibility rules (which properties hide/show based on other values)
 - **`package.xml`** — Package version metadata
 
 ### Step 5: Read editorConfig.js for Mode Rules
@@ -108,18 +109,18 @@ Use binary search to find the exact property causing the error:
 # Mutation test: change a single property on a known-good widget
 import bson
 
-# Read the working widget BSON
+# read the working widget BSON
 with open('working-widget.bson', 'rb') as f:
     doc = bson.decode(f.read())
 
-# Change only one property value
+# change only one property value
 # ... modify the specific property ...
 
 # Re-encode and write back
 with open('test-widget.bson', 'wb') as f:
     f.write(bson.encode(doc))
 
-# Then insert back into the MPR and run mx check
+# then insert back into the MPR and run mx check
 ```
 
 ### Step 7: Extract Fresh Templates
@@ -131,7 +132,7 @@ If the widget template is outdated, extract a fresh one:
 reference/mxbuild/modeler/mx convert -p /path/to/app.mpr
 reference/mxbuild/modeler/mx update-widgets /path/to/app.mpr
 
-# Then extract using mxcli
+# then extract using mxcli
 ./bin/mxcli extract-templates -p /path/to/app.mpr -widget "com.mendix.widget.web.datagrid.DataGrid2" -o /tmp/template.json
 ```
 
@@ -159,12 +160,12 @@ Three Mendix tools parse the same BSON but with **different strictness levels**:
 ```bash
 # Self-diff: is the project's BSON clean?
 mx diff project.mpr project.mpr output.mpr
-# Success = all BSON matches schema. Crash = some mxunit has bad properties.
+# success = all BSON matches schema. Crash = some mxunit has bad properties.
 
-# Cross-diff: compare baseline vs modified
+# cross-diff: compare baseline vs modified
 # 1. Extract baseline from git
-mkdir /tmp/baseline && cd project-dir && git archive HEAD -- *.mpr mprcontents/ | tar -x -C /tmp/baseline/
-# 2. Run diff (file names must match!)
+mkdir /tmp/baseline && cd project-dir && git archive head -- *.mpr mprcontents/ | tar -x -C /tmp/baseline/
+# 2. run diff (file names must match!)
 mx diff /tmp/baseline/App.mpr ./App.mpr /tmp/diff-output.mpr
 ```
 
@@ -172,7 +173,7 @@ mx diff /tmp/baseline/App.mpr ./App.mpr /tmp/diff-output.mpr
 
 **Detailed error** (when both sides have same-ID objects):
 ```
-Objects with ID b6fc893f-... of type Settings$ServerConfiguration do not have the same properties.
+objects with ID b6fc893f-... of type settings$ServerConfiguration do not have the same properties.
 baseNames = ApplicationRootUrl, ConstantValues, CustomSettings, ..., Tracing;
 newNames = ApplicationRootUrl, ConstantValues, ...
 ```
@@ -186,15 +187,15 @@ Sequence contains no matching element
 
 ### Finding the Offending mxunit File
 
-Write a Go tool (or use the pattern below) to compare property keys of mxcli-written files against Studio Pro-native files of the same `$Type`:
+Write a Go tool (or use the pattern below) to compare property keys of mxcli-written files against Studio Pro-native files of the same `$type`:
 
 ```go
-// Walk mprcontents/, group files by $Type, compare key sets
+// Walk mprcontents/, group files by $type, compare key sets
 // Files with EXTRA keys (vs native files of same type) = the crash cause
 // Files with MISSING keys = also crash cause for mx diff
 ```
 
-The principle: for each `$Type`, ALL instances must have the **exact same set of non-$ property names**. Any deviation → crash.
+The principle: for each `$type`, ALL instances must have the **exact same set of non-$ property names**. Any deviation → crash.
 
 ### Version-Specific Properties
 
@@ -229,7 +230,7 @@ Some properties only exist in certain Mendix versions. Before adding a property 
 
 **Symptom**: Studio Pro crashes when opening a project with `System.InvalidOperationException: Sequence contains no matching element` at `Mendix.Modeler.Storage.Mpr.MprProperty..ctor`.
 
-**Root cause**: A BSON document contains a property (field name) that does not exist in the Mendix type definition for its `$Type`. Studio Pro's `MprProperty` constructor uses `First()` to look up each BSON field in the type cache, and crashes on unrecognized fields.
+**Root cause**: A BSON document contains a property (field name) that does not exist in the Mendix type definition for its `$type`. Studio Pro's `MprProperty` constructor uses `First()` to look up each BSON field in the type cache, and crashes on unrecognized fields.
 
 **Diagnosis workflow**:
 
@@ -242,10 +243,10 @@ type_props = defaultdict(set)
 
 def walk_bson(obj, tp):
     if isinstance(obj, dict):
-        t = obj.get("$Type", "")
+        t = obj.get("$type", "")
         if t:
             for k in obj.keys():
-                if k not in ("$Type", "$ID"):
+                if k not in ("$type", "$ID"):
                     tp[t].add(k)
         for v in obj.values():
             walk_bson(v, tp)
@@ -272,7 +273,7 @@ for t, props in crash_props.items():
 
 3. **Extra properties = the crash cause**. The fix is to remove those fields from the writer function.
 
-**Example**: `DomainModels$CrossAssociation` had `ParentConnection` and `ChildConnection` copied from `DomainModels$Association`, but these fields don't exist on `CrossAssociation`. Removing them fixed the crash.
+**Example**: `DomainModels$CrossAssociation` had `ParentConnection` and `ChildConnection` copied from `DomainModels$association`, but these fields don't exist on `CrossAssociation`. Removing them fixed the crash.
 
 **Key principle**: When copying serialization code between similar types (e.g., Association → CrossAssociation), always verify which fields belong to each type by checking a baseline project's BSON.
 
@@ -282,17 +283,47 @@ for t, props in crash_props.items():
 
 **Root cause**: Two variants:
 
-1. **Association stored as Attribute**: In `ChangeActionItem` BSON, an association name was written to the `Attribute` field instead of the `Association` field. Check the executor code that builds `MemberChange` — it must query the domain model to distinguish associations from attributes.
+1. **Association stored as Attribute**: In `ChangeActionItem` BSON, an association name was written to the `attribute` field instead of the `association` field. Check the executor code that builds `MemberChange` — it must query the domain model to distinguish associations from attributes.
 
 2. **Entity treated as Enumeration**: In `CreateVariableAction` BSON, an entity qualified name was used as `DataTypes$EnumerationType` instead of `DataTypes$ObjectType`. Check `buildDataType()` in the visitor — bare qualified names default to `TypeEnumeration` and need catalog-based disambiguation.
 
 ### CE0463: Widget Definition Changed
 
-**Root cause**: Object property values inconsistent with mode-dependent visibility rules.
+**Root cause spectrum**: Studio Pro detects the stored widget definition (Type/Object) doesn't match what the runtime expects. Specific triggers seen:
 
-**Fix**: Adjust properties based on the widget's current mode. See [PAGE_BSON_SERIALIZATION.md](../../docs/03-development/PAGE_BSON_SERIALIZATION.md#ce0463-widget-definition-changed--root-cause-analysis) for the full analysis.
+1. **Missing fields on `WidgetValueType`** — e.g. `AllowUpload` added in some 11.x version (commit `ec99cdff`)
+2. **WidgetObject.Properties order ≠ WidgetType.PropertyTypes order** — Studio Pro requires identical ordering (commit `b1f4de3a`)
+3. **CustomWidget envelope incomplete** — filter widgets missing Appearance/ConditionalEditability/ConditionalVisibility/LabelTemplate (commit `7e6fee84`)
+4. **TextTemplate Translation defaults not copied** from PropertyType.ValueType.Translations into WidgetObject's `Template.Items` (commit `f9818394`)
+5. **WidgetObject Boolean values diverging from schema default** — `columnsFilterable: 'false'` while schema default is `'true'` (commit `aea000b7`)
+6. **Mode-dependent visibility violations** — object property values inconsistent with editor mode rules ([PAGE_BSON_SERIALIZATION.md](../../docs/03-development/PAGE_BSON_SERIALIZATION.md#ce0463-widget-definition-changed--root-cause-analysis))
 
-**Quick workaround**: Run `mx update-widgets` after creating pages.
+**Fix methodology (the "Studio Pro Update Widget" diff)** — *the* technique that closed CE0463 on the v0.10 fixture:
+
+1. **Snapshot mxcli output** (the failing state):
+   ```bash
+   mxcli bson dump page -p test.mpr --object MyMod.MyPage > /tmp/before.json
+   mxcli bson dump page -p test.mpr --object MyMod.MyPage --format bson > /tmp/before.bson
+   ```
+2. **Copy the project** to a path with no `.mpr.lock`, then open in Studio Pro
+3. **Right-click the failing widget → "Update widget"** (NOT "Update all widgets" — narrow scope means narrow diff). Save.
+4. **Snapshot again**:
+   ```bash
+   mxcli bson dump page -p studio-pro-copy.mpr --object MyMod.MyPage > /tmp/after.json
+   ```
+5. **Diff with UUID normalization** (UUIDs are always different — they'd dominate the diff otherwise):
+   ```python
+   # normalize: replace {"Subtype": 0, "Data": "..."} with {"Subtype": 0, "Data": "<UUID>"}
+   # strip $ID fields
+   # then diff
+   ```
+6. **What Studio Pro added/changed/removed = exact fix** mxcli needs
+
+**Pair with `mx dump-mpr` for semantic-level analysis**: `mx dump-mpr --module-names='X' --output-file=dump.json /path/to/project.mpr` gives semantic JSON (typePointer → widget property key resolves automatically). Strip UUIDs and diff to find structural drift the BSON diff would hide behind binary content.
+
+**Investigation methodology used for v0.10 CE0463 fixes** — see [WIDGET_BSON_VERSION_COMPATIBILITY.md](../../docs/03-development/WIDGET_BSON_VERSION_COMPATIBILITY.md) for the full case study and version-resilience model.
+
+**Quick workaround** (if you can't fix the root cause): Run `mx update-widgets` after creating pages.
 
 ### CE0642: Property X Is Required
 
@@ -305,6 +336,51 @@ for t, props in crash_props.items():
 **Symptoms**: New properties missing, old properties present, wrong property count.
 
 **Fix**: Extract a fresh template from a project with `mx update-widgets` applied. The Type section must match the installed widget version exactly.
+
+### CE0115: Arguments Passed to Page Do Not Match Expected Parameters
+
+**Symptom**: `mx check` reports `[CE0115] "The arguments that are passed to page 'X' do not match the expected parameters."` on an action button that uses `show_page TargetPage (Param: $currentObject)`.
+
+**Root cause**: The BSON array type indicator rule. Every Mendix BSON array must begin with an `int32` **type indicator** of `2` or `3`. This indicator is skipped by `extractBsonArray` and by Studio Pro's reader. Writing `int32(len(items))` as the first element instead produces an invalid indicator when `len ≠ 2` and `len ≠ 3` — Studio Pro cannot recognise the array and reads 0 parameter mappings.
+
+**Type indicator values**:
+| First element | Meaning |
+|---------------|---------|
+| `int32(3)` | Initialized array — used for `Items`, `DesignProperties`, and most non-empty lists |
+| `int32(2)` | Initialized empty array — used for `ParameterMappings`, `PagesForSpecializations`, `Parameters` |
+| Any other value | **Invalid** — Studio Pro ignores the entire array |
+
+**How Studio Pro stores page parameter mappings**: Studio Pro does **not** store explicit `Forms$PageParameterMapping` objects in BSON. It always writes `ParameterMappings: [2]` (type indicator only, no inline objects) and infers `$currentObject` at runtime from the enclosing widget context — DataGrid row, DataView datasource, etc. No matter what the MDL source specifies for `(Param: $currentObject)`, the correct serialization is always the empty `[2]` array.
+
+**Correct writer pattern for `Forms$FormAction`**:
+```go
+formSettings := bson.D{
+    {Key: "$ID",               Value: idToBsonBinary(generateUUID())},
+    {Key: "$Type",             Value: "Forms$FormSettings"},
+    {Key: "Form",              Value: pageName},          // BY_NAME_REFERENCE
+    {Key: "ParameterMappings", Value: bson.A{int32(2)}}, // always empty; runtime infers mapping
+    {Key: "TitleOverride",     Value: nil},
+}
+return bson.D{
+    {Key: "$ID",                    Value: idToBsonBinary(id)},
+    {Key: "$Type",                  Value: "Forms$FormAction"},
+    {Key: "DisabledDuringExecution", Value: true},
+    {Key: "FormSettings",           Value: formSettings},
+    {Key: "NumberOfPagesToClose2",  Value: ""},
+    {Key: "PagesForSpecializations", Value: bson.A{int32(2)}},
+}
+```
+
+**What NOT to do**:
+```go
+// WRONG: produces [1, {mapping}] — invalid type indicator 1
+paramMappings := bson.A{int32(len(a.ParameterMappings))}
+for _, pm := range a.ParameterMappings {
+    paramMappings = append(paramMappings, bson.D{...Forms$PageParameterMapping...})
+}
+```
+
+**Diagnostic check**: Inspect the raw `ParameterMappings` array in a Python BSON dump. If it shows `[1, {...}]` instead of `[2]`, the type indicator is wrong. Studio Pro-generated pages always show `[2]`.
 
 ## Key Principles
 

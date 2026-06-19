@@ -1,7 +1,26 @@
+---
+title: Podman Support as Docker Alternative
+status: partial
+date: 2026-03-27
+---
+
 # Proposal: Podman Support as Docker Alternative
 
-**Status:** Implemented (Phase 1 & 2)
+**Status:** Implemented (Phase 1 & 2); Phase 3 validation pending
 **Date:** 2026-03-27
+
+> **Correction (2026-06-10, issue #653):** Phases 1 & 2 shipped with a broken
+> assumption — they referenced a devcontainers feature
+> `ghcr.io/devcontainers/features/podman-in-podman:1` that **does not exist** in
+> the official or community registries (verified against
+> [containers.dev/features](https://containers.dev/features); the only nested-runtime
+> features published are `docker-in-docker` and `docker-outside-of-docker`). The
+> reference could never resolve, so every `--container-runtime podman` devcontainer
+> build failed. The root cause is that the feature's existence was never confirmed
+> and **Phase 3, step 10 (test the Podman devcontainer) was never run**. The fix
+> installs and configures rootless Podman **in the Dockerfile** instead of via a
+> feature — see "Devcontainer — Podman-in-Podman" below for the corrected approach.
+> Phase 3 (validation on a real Podman host) genuinely remains pending.
 
 ## Motivation
 
@@ -19,7 +38,7 @@ All container invocations go through 6 call sites in Go, all using `exec.Command
 |-----------|------|-------|
 | `runCompose()` | `cmd/mxcli/docker/runtime.go:281` | All compose operations (up, down, logs, shell) |
 | `runComposeOutput()` | `cmd/mxcli/docker/runtime.go:264` | Compose with captured output |
-| `Status()` | `cmd/mxcli/docker/runtime.go:208` | `docker compose ps --format json` |
+| `status()` | `cmd/mxcli/docker/runtime.go:208` | `docker compose ps --format json` |
 | `CallM2EE()` | `cmd/mxcli/docker/m2ee.go:166` | `docker compose exec` for admin API |
 | `testrunner` (2 sites) | `cmd/mxcli/testrunner/runner.go:313,445` | Compose for test execution |
 
@@ -40,8 +59,8 @@ Introduce a `containerCLI()` function that returns the container runtime binary 
 // containerCLI returns the container runtime binary ("docker" or "podman").
 // Resolution order:
 //   1. MXCLI_CONTAINER_CLI env var (explicit override)
-//   2. "docker" if available on PATH
-//   3. "podman" if available on PATH
+//   2. "docker" if available on path
+//   3. "podman" if available on path
 //   4. "docker" as fallback (will fail with a clear error at exec time)
 func containerCLI() string {
     if cli := os.Getenv("MXCLI_CONTAINER_CLI"); cli != "" {
@@ -66,10 +85,10 @@ Docker remains the default for backwards compatibility. Users with only Podman i
 **File: `cmd/mxcli/docker/runtime.go`** — new `containerCLI()` function, update 3 call sites:
 
 ```go
-// Before
+// before
 cmd := exec.Command("docker", append([]string{"compose"}, args...)...)
 
-// After
+// after
 cmd := exec.Command(containerCLI(), append([]string{"compose"}, args...)...)
 ```
 
@@ -83,22 +102,28 @@ Total: ~6 one-line changes after adding the `containerCLI()` function.
 
 Podman Compose supports Docker Compose v2 format, which is what `cmd/mxcli/docker/templates/docker-compose.yml` already uses. No changes needed to the compose template.
 
-One consideration: `docker compose ps --format json` output differs slightly between Docker and Podman. The `Status()` function in `runtime.go` parses this JSON. We need to verify and potentially handle both output formats.
+One consideration: `docker compose ps --format json` output differs slightly between Docker and Podman. The `status()` function in `runtime.go` parses this JSON. We need to verify and potentially handle both output formats.
 
 #### 3. Devcontainer — Podman-in-Podman
 
 Add a parallel devcontainer config for Podman users. The outer container is run by Podman on the host; the inner containers (Mendix app, PostgreSQL) are run by Podman inside the devcontainer.
 
-Create `.devcontainer/podman/devcontainer.json`:
+There is **no devcontainers feature for Podman** (see the Correction note above),
+so Podman is installed and configured directly in the shared `../Dockerfile`
+(`apt-get install podman uidmap slirp4netns fuse-overlayfs`, plus the config a
+systemd-less container needs: `cgroup_manager = "cgroupfs"`,
+`events_logger = "file"`, `driver = "vfs"`, a `subuid`/`subgid` mapping for
+`vscode`, and a `docker.io` search registry). The `.devcontainer/podman/devcontainer.json`
+then references no runtime feature:
 
 ```jsonc
 {
   "name": "ModelSDKGo (Podman)",
-  "build": { "dockerfile": "../Dockerfile" },
+  "build": { "dockerfile": "../Dockerfile" }, // Podman is installed in the Dockerfile
   "features": {
-    // Installs Podman inside the container for Podman-in-Podman
-    "ghcr.io/devcontainers/features/podman-in-podman:1": {}
+    "ghcr.io/devcontainers/features/github-cli:1": {}
   },
+  "runArgs": ["--security-opt", "label=disable"],
   "forwardPorts": [8080, 8090, 5432],
   "containerEnv": {
     "MXCLI_CONTAINER_CLI": "podman"
@@ -114,7 +139,10 @@ The `containerEnv` setting ensures mxcli uses `podman compose` for all inner con
 
 Update `cmd/mxcli/init.go` and `cmd/mxcli/tool_templates.go` to accept a `--container-runtime podman` flag (default: `docker`). When set to `podman`:
 
-- Use `ghcr.io/devcontainers/features/podman-in-podman:1` instead of `docker-in-docker:2`
+- Emit an empty `"features": {}` (no runtime feature) and append the rootless-Podman
+  install + config to the generated `Dockerfile` — **not** a devcontainers feature,
+  which does not exist for Podman
+- Add `"runArgs": ["--security-opt", "label=disable"]`
 - Set `MXCLI_CONTAINER_CLI=podman` in `containerEnv`
 - Add a note in the generated CLAUDE.md about the Podman setup
 
@@ -129,7 +157,7 @@ Update `cmd/mxcli/init.go` and `cmd/mxcli/tool_templates.go` to accept a `--cont
 | Area | Docker | Podman | Impact |
 |------|--------|--------|--------|
 | Compose subcommand | `docker compose` (built-in v2) | `podman compose` (v4.7+) | Require Podman 4.7+; older `podman-compose` (Python) has Compose v2 gaps |
-| `ps --format json` | Array of objects | May differ in field names | Test and normalize in `Status()` |
+| `ps --format json` | Array of objects | May differ in field names | Test and normalize in `status()` |
 | Rootless networking | N/A | Rootless containers can't bind to ports <1024 | Default ports (8080, 8090, 5432) are all >1024 — no issue |
 | Named volumes | `docker volume` | `podman volume` | Compose handles this transparently |
 | Health checks | `HEALTHCHECK` in Dockerfile | Supported since Podman 3.0 | No issue |

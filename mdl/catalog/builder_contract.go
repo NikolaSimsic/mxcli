@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mendixlabs/mxcli/sdk/mpr"
+	"github.com/mendixlabs/mxcli/mdl/types"
 )
 
 // buildContractEntities parses cached $metadata from consumed OData services
@@ -19,11 +19,11 @@ func (b *Builder) buildContractEntities() error {
 	}
 
 	entityStmt, err := b.tx.Prepare(`
-		INSERT INTO contract_entities (Id, ServiceId, ServiceQualifiedName,
+		INSERT OR IGNORE INTO contract_entities_data (Id, ServiceId, ServiceQualifiedName,
 			EntityName, EntitySetName, KeyProperties, PropertyCount, NavigationCount,
 			Summary, Description, ModuleName,
-			ProjectId, SnapshotId, SnapshotDate, SnapshotSource)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ProjectId, SnapshotId)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -31,17 +31,17 @@ func (b *Builder) buildContractEntities() error {
 	defer entityStmt.Close()
 
 	actionStmt, err := b.tx.Prepare(`
-		INSERT INTO contract_actions (Id, ServiceId, ServiceQualifiedName,
+		INSERT OR IGNORE INTO contract_actions_data (Id, ServiceId, ServiceQualifiedName,
 			ActionName, IsBound, ParameterCount, ReturnType, ModuleName,
-			ProjectId, SnapshotId, SnapshotDate, SnapshotSource)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ProjectId, SnapshotId)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
 	}
 	defer actionStmt.Close()
 
-	projectID, _, snapshotID, snapshotDate, snapshotSource, _, _, _ := b.snapshotMeta()
+	projectID, snapshotID := b.snapshotMeta()
 
 	entityCount := 0
 	actionCount := 0
@@ -55,7 +55,7 @@ func (b *Builder) buildContractEntities() error {
 		moduleName := b.hierarchy.getModuleName(moduleID)
 		svcQN := moduleName + "." + svc.Name
 
-		doc, err := mpr.ParseEdmx(svc.Metadata)
+		doc, err := types.ParseEdmx(svc.Metadata)
 		if err != nil {
 			continue // skip services with unparseable metadata
 		}
@@ -84,7 +84,7 @@ func (b *Builder) buildContractEntities() error {
 					et.Summary,
 					et.Description,
 					moduleName,
-					projectID, snapshotID, snapshotDate, snapshotSource,
+					projectID, snapshotID,
 				)
 				if err != nil {
 					return err
@@ -113,7 +113,7 @@ func (b *Builder) buildContractEntities() error {
 				len(a.Parameters),
 				retType,
 				moduleName,
-				projectID, snapshotID, snapshotDate, snapshotSource,
+				projectID, snapshotID,
 			)
 			if err != nil {
 				return err
@@ -129,6 +129,25 @@ func (b *Builder) buildContractEntities() error {
 	return nil
 }
 
+// buildContractEntityUsage links contract_entities to the external_entities that
+// consume them. Runs after both buildExternalEntities and buildContractEntities.
+// Targets the underlying _data table because contract_entities is a view.
+func (b *Builder) buildContractEntityUsage() error {
+	_, err := b.tx.Exec(`
+		UPDATE contract_entities_data
+		SET UsedByExternalEntity = (
+			SELECT ee.QualifiedName
+			FROM external_entities ee
+			JOIN odata_clients oc
+				ON oc.QualifiedName = ee.ServiceName
+			WHERE oc.Id = contract_entities_data.ServiceId
+			  AND ee.RemoteName = contract_entities_data.EntityName
+			LIMIT 1
+		)
+	`)
+	return err
+}
+
 // buildContractMessages parses cached AsyncAPI documents from business event client
 // services and populates the contract_messages catalog table.
 func (b *Builder) buildContractMessages() error {
@@ -138,17 +157,17 @@ func (b *Builder) buildContractMessages() error {
 	}
 
 	stmt, err := b.tx.Prepare(`
-		INSERT INTO contract_messages (Id, ServiceId, ServiceQualifiedName,
+		INSERT OR IGNORE INTO contract_messages_data (Id, ServiceId, ServiceQualifiedName,
 			ChannelName, OperationType, MessageName, Title, ContentType, PropertyCount,
-			ModuleName, ProjectId, SnapshotId, SnapshotDate, SnapshotSource)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ModuleName, ProjectId, SnapshotId)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 
-	projectID, _, snapshotID, snapshotDate, snapshotSource, _, _, _ := b.snapshotMeta()
+	projectID, snapshotID := b.snapshotMeta()
 
 	count := 0
 
@@ -161,7 +180,7 @@ func (b *Builder) buildContractMessages() error {
 		moduleName := b.hierarchy.getModuleName(moduleID)
 		svcQN := moduleName + "." + svc.Name
 
-		doc, err := mpr.ParseAsyncAPI(svc.Document)
+		doc, err := types.ParseAsyncAPI(svc.Document)
 		if err != nil {
 			continue
 		}
@@ -196,7 +215,7 @@ func (b *Builder) buildContractMessages() error {
 				contentType,
 				propCount,
 				moduleName,
-				projectID, snapshotID, snapshotDate, snapshotSource,
+				projectID, snapshotID,
 			)
 			if err != nil {
 				return err

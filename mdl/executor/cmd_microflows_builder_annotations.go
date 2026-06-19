@@ -5,15 +5,19 @@ package executor
 
 import (
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
-	"github.com/mendixlabs/mxcli/sdk/mpr"
 )
 
 // getStatementAnnotations extracts the annotations field from any microflow statement.
 func getStatementAnnotations(stmt ast.MicroflowStatement) *ast.ActivityAnnotations {
 	switch s := stmt.(type) {
 	case *ast.DeclareStmt:
+		return s.Annotations
+	case *ast.InheritanceSplitStmt:
+		return s.Annotations
+	case *ast.CastObjectStmt:
 		return s.Annotations
 	case *ast.MfSetStmt:
 		return s.Annotations
@@ -35,13 +39,23 @@ func getStatementAnnotations(stmt ast.MicroflowStatement) *ast.ActivityAnnotatio
 		return s.Annotations
 	case *ast.IfStmt:
 		return s.Annotations
+	case *ast.EnumSplitStmt:
+		return s.Annotations
 	case *ast.LoopStmt:
+		return s.Annotations
+	case *ast.WhileStmt:
 		return s.Annotations
 	case *ast.LogStmt:
 		return s.Annotations
 	case *ast.CallMicroflowStmt:
 		return s.Annotations
+	case *ast.CallNanoflowStmt:
+		return s.Annotations
 	case *ast.CallJavaActionStmt:
+		return s.Annotations
+	case *ast.CallJavaScriptActionStmt:
+		return s.Annotations
+	case *ast.CallWebServiceStmt:
 		return s.Annotations
 	case *ast.ExecuteDatabaseQueryStmt:
 		return s.Annotations
@@ -69,6 +83,8 @@ func getStatementAnnotations(stmt ast.MicroflowStatement) *ast.ActivityAnnotatio
 		return s.Annotations
 	case *ast.ShowMessageStmt:
 		return s.Annotations
+	case *ast.DownloadFileStmt:
+		return s.Annotations
 	case *ast.ValidationFeedbackStmt:
 		return s.Annotations
 	case *ast.RestCallStmt:
@@ -76,6 +92,18 @@ func getStatementAnnotations(stmt ast.MicroflowStatement) *ast.ActivityAnnotatio
 	default:
 		return nil
 	}
+}
+
+// stmtOwnAnchor returns the primary FlowAnchors declared on this statement's
+// @anchor annotation, or nil if absent. This is the flow-level anchor that
+// applies to the single SequenceFlow leaving the statement (and whose To
+// applies to the incoming flow when this statement is the destination).
+func stmtOwnAnchor(stmt ast.MicroflowStatement) *ast.FlowAnchors {
+	ann := getStatementAnnotations(stmt)
+	if ann == nil {
+		return nil
+	}
+	return ann.Anchor
 }
 
 // mergeStatementAnnotations extracts annotations from a statement and merges into pendingAnnotations.
@@ -99,6 +127,24 @@ func (fb *flowBuilder) mergeStatementAnnotations(stmt ast.MicroflowStatement) {
 	if ann.AnnotationText != "" {
 		fb.pendingAnnotations.AnnotationText = ann.AnnotationText
 	}
+	if len(ann.FreeAnnotations) > 0 {
+		fb.pendingAnnotations.FreeAnnotations = append(fb.pendingAnnotations.FreeAnnotations, ann.FreeAnnotations...)
+	}
+	if ann.Anchor != nil {
+		fb.pendingAnnotations.Anchor = ann.Anchor
+	}
+	if ann.TrueBranchAnchor != nil {
+		fb.pendingAnnotations.TrueBranchAnchor = ann.TrueBranchAnchor
+	}
+	if ann.FalseBranchAnchor != nil {
+		fb.pendingAnnotations.FalseBranchAnchor = ann.FalseBranchAnchor
+	}
+	if ann.IteratorAnchor != nil {
+		fb.pendingAnnotations.IteratorAnchor = ann.IteratorAnchor
+	}
+	if ann.BodyTailAnchor != nil {
+		fb.pendingAnnotations.BodyTailAnchor = ann.BodyTailAnchor
+	}
 }
 
 // applyAnnotations applies pending annotations to the activity identified by activityID.
@@ -116,8 +162,8 @@ func (fb *flowBuilder) applyAnnotations(activityID model.ID, ann *ast.ActivityAn
 				continue
 			}
 
-			// @caption, @color, and @excluded — only applicable to ActionActivity
-			if activity, ok := obj.(*microflows.ActionActivity); ok {
+			switch activity := obj.(type) {
+			case *microflows.ActionActivity:
 				if ann.Caption != "" {
 					activity.Caption = ann.Caption
 					activity.AutoGenerateCaption = false
@@ -127,6 +173,22 @@ func (fb *flowBuilder) applyAnnotations(activityID model.ID, ann *ast.ActivityAn
 				}
 				if ann.Excluded {
 					activity.Disabled = true
+				}
+			case *microflows.ExclusiveSplit:
+				// Splits carry a human-readable Caption (e.g. "Right format?")
+				// independent of the expression/rule being evaluated.
+				if ann.Caption != "" {
+					activity.Caption = ann.Caption
+				}
+			case *microflows.InheritanceSplit:
+				if ann.Caption != "" {
+					activity.Caption = ann.Caption
+				}
+			case *microflows.LoopedActivity:
+				// LOOP / WHILE activities can carry a caption just like
+				// splits and action activities.
+				if ann.Caption != "" {
+					activity.Caption = ann.Caption
 				}
 			}
 
@@ -140,6 +202,14 @@ func (fb *flowBuilder) applyAnnotations(activityID model.ID, ann *ast.ActivityAn
 	}
 }
 
+func (fb *flowBuilder) applyPendingAnnotations(activityID model.ID) {
+	if activityID == "" || fb.pendingAnnotations == nil {
+		return
+	}
+	fb.applyAnnotations(activityID, fb.pendingAnnotations)
+	fb.pendingAnnotations = nil
+}
+
 // addEndEventWithReturn creates an EndEvent with the specified return value.
 // This produces an actual EndEvent activity in the flow graph, allowing RETURN
 // to work correctly inside IF/ELSE branches and error handler bodies.
@@ -151,7 +221,7 @@ func (fb *flowBuilder) addEndEventWithReturn(s *ast.ReturnStmt) model.ID {
 
 	endEvent := &microflows.EndEvent{
 		BaseMicroflowObject: microflows.BaseMicroflowObject{
-			BaseElement: model.BaseElement{ID: model.ID(mpr.GenerateID())},
+			BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
 			Position:    model.Point{X: fb.posX, Y: fb.posY},
 			Size:        model.Size{Width: EventSize, Height: EventSize},
 		},
@@ -160,6 +230,7 @@ func (fb *flowBuilder) addEndEventWithReturn(s *ast.ReturnStmt) model.ID {
 
 	fb.objects = append(fb.objects, endEvent)
 	fb.endsWithReturn = true
+	fb.lastReturnEndID = endEvent.ID
 	fb.posX += fb.spacing / 2
 	return endEvent.ID
 }
@@ -169,7 +240,7 @@ func (fb *flowBuilder) addEndEventWithReturn(s *ast.ReturnStmt) model.ID {
 func (fb *flowBuilder) addErrorEvent() model.ID {
 	errorEvent := &microflows.ErrorEvent{
 		BaseMicroflowObject: microflows.BaseMicroflowObject{
-			BaseElement: model.BaseElement{ID: model.ID(mpr.GenerateID())},
+			BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
 			Position:    model.Point{X: fb.posX, Y: fb.posY},
 			Size:        model.Size{Width: EventSize, Height: EventSize},
 		},
@@ -197,7 +268,7 @@ func (fb *flowBuilder) attachAnnotation(text string, activityID model.ID) {
 
 	annotation := &microflows.Annotation{
 		BaseMicroflowObject: microflows.BaseMicroflowObject{
-			BaseElement: model.BaseElement{ID: model.ID(mpr.GenerateID())},
+			BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
 			Position:    model.Point{X: actX, Y: actY - 100},
 			Size:        model.Size{Width: 200, Height: 50},
 		},
@@ -206,7 +277,7 @@ func (fb *flowBuilder) attachAnnotation(text string, activityID model.ID) {
 	fb.objects = append(fb.objects, annotation)
 
 	fb.annotationFlows = append(fb.annotationFlows, &microflows.AnnotationFlow{
-		BaseElement:   model.BaseElement{ID: model.ID(mpr.GenerateID())},
+		BaseElement:   model.BaseElement{ID: model.ID(types.GenerateID())},
 		OriginID:      annotation.ID,
 		DestinationID: activityID,
 	})
@@ -216,7 +287,7 @@ func (fb *flowBuilder) attachAnnotation(text string, activityID model.ID) {
 func (fb *flowBuilder) attachFreeAnnotation(text string) {
 	annotation := &microflows.Annotation{
 		BaseMicroflowObject: microflows.BaseMicroflowObject{
-			BaseElement: model.BaseElement{ID: model.ID(mpr.GenerateID())},
+			BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
 			Position:    model.Point{X: fb.posX, Y: fb.posY - 100},
 			Size:        model.Size{Width: 200, Height: 50},
 		},

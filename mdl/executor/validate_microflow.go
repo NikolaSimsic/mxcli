@@ -63,9 +63,9 @@ func (v *microflowValidator) validate(body []ast.MicroflowStatement) {
 	if v.returnType != nil && v.returnType.Type.Kind != ast.TypeVoid {
 		if !bodyReturns(body) {
 			v.addViolation("MDL003", linter.SeverityError,
-				fmt.Sprintf("microflow returns %s but not all code paths have a RETURN statement",
+				fmt.Sprintf("microflow returns %s but not all code paths have a return statement",
 					returnTypeString(v.returnType)),
-				"Add RETURN statements to all code paths")
+				"Add return statements to all code paths")
 		}
 	}
 
@@ -80,18 +80,56 @@ func (v *microflowValidator) walkBody(body []ast.MicroflowStatement) {
 		case *ast.ValidationFeedbackStmt:
 			if isEmptyMessage(stmt.Message) {
 				v.addViolation("MDL007", linter.SeverityWarning,
-					"VALIDATION FEEDBACK has empty message template. "+
+					"validation feedback has empty message template. "+
 						"Mendix requires a non-empty feedback message (CE0091).",
-					"Add a message template to the VALIDATION FEEDBACK action")
+					"Add a message template to the validation feedback action")
 			}
 		case *ast.ReturnStmt:
 			v.checkReturn(stmt)
 		case *ast.IfStmt:
 			v.walkBody(stmt.ThenBody)
 			v.walkBody(stmt.ElseBody)
+		case *ast.EnumSplitStmt:
+			// Mendix enumeration splits map to exclusive splits with one outgoing
+			// flow per enum value. Multiple values per branch and a default (else)
+			// flow are not supported — Studio Pro will reject both with CE errors.
+			if len(stmt.ElseBody) > 0 {
+				v.addViolation("MDL008", linter.SeverityError,
+					fmt.Sprintf("case statement on '$%s' has an else branch; "+
+						"Mendix enumeration splits do not support a default case. "+
+						"Add an explicit when branch for every enum value instead.",
+						stmt.Variable),
+					"Add an explicit when branch for every enum value instead of using else")
+			}
+			for _, c := range stmt.Cases {
+				if len(c.Values) > 1 {
+					v.addViolation("MDL009", linter.SeverityError,
+						fmt.Sprintf("case statement on '$%s': when branch lists %d values (%s); "+
+							"Mendix enumeration splits require exactly one value per branch.",
+							stmt.Variable, len(c.Values), strings.Join(c.Values, ", ")),
+						"Split into separate when branches, one per enum value")
+				}
+				v.walkBody(c.Body)
+			}
+			v.walkBody(stmt.ElseBody)
+		case *ast.InheritanceSplitStmt:
+			for _, c := range stmt.Cases {
+				v.walkBody(c.Body)
+			}
+			v.walkBody(stmt.ElseBody)
 		case *ast.DeclareStmt:
-			// Track list variables declared as empty (candidates for the empty-list-in-loop anti-pattern)
 			if stmt.Type.Kind == ast.TypeListOf {
+				// A `declare` maps to a Create Variable activity, which cannot
+				// produce a list — Studio Pro rejects it with CE0053 ("type not
+				// allowed") and CE0038 ("value required"). Lists must come from a
+				// microflow parameter, a `retrieve`, or a `create list`. (#607)
+				v.addViolation("MDL040", linter.SeverityError,
+					fmt.Sprintf("declare '$%s' creates a list variable, but Mendix does not allow the "+
+						"Create Variable activity to produce a list (CE0053/CE0038). "+
+						"Pass the list as a microflow parameter, populate it with retrieve, or use create list.",
+						stmt.Variable),
+					"Accept the list as a parameter, use retrieve, or use create list — do not declare a list variable")
+				// Track list variables declared as empty (candidates for the empty-list-in-loop anti-pattern)
 				if isEmptyInit(stmt.InitialValue) {
 					v.emptyListVars[stmt.Variable] = true
 				}
@@ -103,14 +141,14 @@ func (v *microflowValidator) walkBody(body []ast.MicroflowStatement) {
 			// Check: nested loop anti-pattern
 			if v.loopDepth > 0 {
 				v.addViolation("MDL001", linter.SeverityWarning,
-					"nested LOOP detected (loop inside a loop). "+
-						"Use RETRIEVE $Match FROM $List WHERE ... LIMIT 1 for list matching instead of nested loops (O(N^2) performance).",
-					"Replace nested loop with RETRIEVE ... WHERE ... LIMIT 1 for O(N) lookup")
+					"nested loop detected (loop inside a loop). "+
+						"Use retrieve $Match from $List where ... limit 1 for list matching instead of nested loops (O(N^2) performance).",
+					"Replace nested loop with retrieve ... where ... limit 1 for O(N) lookup")
 			}
 			// Check: loop over empty declared list
 			if v.emptyListVars[stmt.ListVariable] {
 				v.addViolation("MDL002", linter.SeverityWarning,
-					fmt.Sprintf("LOOP iterates over '$%s' which was declared as an empty list and never populated. "+
+					fmt.Sprintf("loop iterates over '$%s' which was declared as an empty list and never populated. "+
 						"Pass the list as a microflow parameter instead of creating an empty variable.",
 						stmt.ListVariable),
 					"Pass the list as a microflow parameter instead of creating an empty variable")
@@ -152,19 +190,25 @@ func (v *microflowValidator) checkErrorHandlingInLoop(stmt ast.MicroflowStatemen
 func stmtActivityName(stmt ast.MicroflowStatement) string {
 	switch stmt.(type) {
 	case *ast.CreateObjectStmt:
-		return "CREATE"
+		return "create"
 	case *ast.DeleteObjectStmt:
-		return "DELETE"
+		return "delete"
 	case *ast.MfCommitStmt:
-		return "COMMIT"
+		return "commit"
 	case *ast.RetrieveStmt:
-		return "RETRIEVE"
+		return "retrieve"
 	case *ast.CallMicroflowStmt:
-		return "CALL MICROFLOW"
+		return "call microflow"
+	case *ast.CallNanoflowStmt:
+		return "call nanoflow"
 	case *ast.CallJavaActionStmt:
-		return "CALL JAVA ACTION"
+		return "call java action"
+	case *ast.CallJavaScriptActionStmt:
+		return "call javascript action"
+	case *ast.CallWebServiceStmt:
+		return "call web service"
 	case *ast.ExecuteDatabaseQueryStmt:
-		return "EXECUTE DATABASE QUERY"
+		return "execute database query"
 	default:
 		return "Activity"
 	}
@@ -178,7 +222,7 @@ func (v *microflowValidator) checkReturn(stmt *ast.ReturnStmt) {
 	// Check 1: RETURN with no value when microflow has a return type
 	if !isVoid && !hasValue {
 		v.addViolation("MDL004", linter.SeverityError,
-			fmt.Sprintf("RETURN requires a value because microflow returns %s",
+			fmt.Sprintf("return requires a value because microflow returns %s",
 				returnTypeString(v.returnType)),
 			fmt.Sprintf("Add a return value of type %s", returnTypeString(v.returnType)))
 		return
@@ -193,7 +237,7 @@ func (v *microflowValidator) checkReturn(stmt *ast.ReturnStmt) {
 			}
 		}
 		v.addViolation("MDL004", linter.SeverityError,
-			"RETURN has a value but microflow does not declare a return type",
+			"return has a value but microflow does not declare a return type",
 			"Remove the return value or add a return type to the microflow")
 		return
 	}
@@ -204,7 +248,7 @@ func (v *microflowValidator) checkReturn(stmt *ast.ReturnStmt) {
 		if retKind == ast.TypeEntity || retKind == ast.TypeListOf {
 			if isScalarLiteral(stmt.Value) {
 				v.addViolation("MDL004", linter.SeverityError,
-					fmt.Sprintf("RETURN has a %s literal but microflow returns %s",
+					fmt.Sprintf("return has a %s literal but microflow returns %s",
 						literalKindName(stmt.Value), returnTypeString(v.returnType)),
 					fmt.Sprintf("Return an object of type %s instead of a scalar literal", returnTypeString(v.returnType)))
 			}
@@ -279,8 +323,46 @@ func bodyReturns(stmts []ast.MicroflowStatement) bool {
 	case *ast.IfStmt:
 		// Both branches must return, and ELSE must be present
 		return len(s.ElseBody) > 0 && bodyReturns(s.ThenBody) && bodyReturns(s.ElseBody)
+	case *ast.WhileStmt:
+		return isUnconditionalTrueWhile(s) && !containsBreakForCurrentLoop(s.Body)
+	case *ast.EnumSplitStmt:
+		// else is not supported by Mendix; treat the split as exhaustive if
+		// every explicit case ends with a return. Unhandled enum values fall
+		// through to the next statement, so callers should add a return after
+		// end case when the split may not cover all values.
+		if len(s.Cases) == 0 {
+			return false
+		}
+		for _, c := range s.Cases {
+			if !bodyReturns(c.Body) {
+				return false
+			}
+		}
+		return true
+	case *ast.InheritanceSplitStmt:
+		if len(s.Cases) == 0 || len(s.ElseBody) == 0 || !bodyReturns(s.ElseBody) {
+			return false
+		}
+		for _, c := range s.Cases {
+			if !bodyReturns(c.Body) {
+				return false
+			}
+		}
+		return true
 	}
 	return false
+}
+
+func isUnconditionalTrueWhile(s *ast.WhileStmt) bool {
+	if s == nil {
+		return false
+	}
+	lit, ok := s.Condition.(*ast.LiteralExpr)
+	if !ok || lit.Kind != ast.LiteralBoolean {
+		return false
+	}
+	value, ok := lit.Value.(bool)
+	return ok && value
 }
 
 // checkBranchScoping detects variables declared inside IF/ELSE branches that are
@@ -294,14 +376,36 @@ func (v *microflowValidator) checkBranchScoping(body []ast.MicroflowStatement) {
 		case *ast.IfStmt:
 			// Collect vars declared in THEN branch
 			for varName := range collectDeclaredVars(stmt.ThenBody) {
-				branchVars[varName] = "IF branch"
+				branchVars[varName] = "if branch"
 			}
 			// Collect vars declared in ELSE branch
 			for varName := range collectDeclaredVars(stmt.ElseBody) {
-				branchVars[varName] = "ELSE branch"
+				branchVars[varName] = "else branch"
 			}
 			// Recurse into branches for nested scoping checks
 			v.checkBranchScoping(stmt.ThenBody)
+			v.checkBranchScoping(stmt.ElseBody)
+		case *ast.EnumSplitStmt:
+			for _, c := range stmt.Cases {
+				for varName := range collectDeclaredVars(c.Body) {
+					branchVars[varName] = "enum split branch"
+				}
+				v.checkBranchScoping(c.Body)
+			}
+			for varName := range collectDeclaredVars(stmt.ElseBody) {
+				branchVars[varName] = "enum split else branch"
+			}
+			v.checkBranchScoping(stmt.ElseBody)
+		case *ast.InheritanceSplitStmt:
+			for _, c := range stmt.Cases {
+				for varName := range collectDeclaredVars(c.Body) {
+					branchVars[varName] = "split type branch"
+				}
+				v.checkBranchScoping(c.Body)
+			}
+			for varName := range collectDeclaredVars(stmt.ElseBody) {
+				branchVars[varName] = "split type else branch"
+			}
 			v.checkBranchScoping(stmt.ElseBody)
 		case *ast.LoopStmt:
 			v.checkBranchScoping(stmt.Body)
@@ -310,7 +414,7 @@ func (v *microflowValidator) checkBranchScoping(body []ast.MicroflowStatement) {
 		// Check ON ERROR bodies
 		if eh := stmtErrorHandling(s); eh != nil && len(eh.Body) > 0 {
 			for varName := range collectDeclaredVars(eh.Body) {
-				branchVars[varName] = "ON ERROR body"
+				branchVars[varName] = "on error body"
 			}
 			v.checkBranchScoping(eh.Body)
 		}
@@ -323,7 +427,7 @@ func (v *microflowValidator) checkBranchScoping(body []ast.MicroflowStatement) {
 						v.addViolation("MDL005", linter.SeverityWarning,
 							fmt.Sprintf("variable '$%s' is declared inside %s but used outside",
 								refVar, scope),
-							fmt.Sprintf("Declare '$%s' before the IF/ELSE block", refVar))
+							fmt.Sprintf("Declare '$%s' before the if/else block", refVar))
 						// Remove to avoid duplicate warnings
 						delete(branchVars, refVar)
 					}
@@ -352,7 +456,15 @@ func collectDeclaredVars(body []ast.MicroflowStatement) map[string]bool {
 			if stmt.OutputVariable != "" {
 				vars[stmt.OutputVariable] = true
 			}
+		case *ast.CallNanoflowStmt:
+			if stmt.OutputVariable != "" {
+				vars[stmt.OutputVariable] = true
+			}
 		case *ast.CallJavaActionStmt:
+			if stmt.OutputVariable != "" {
+				vars[stmt.OutputVariable] = true
+			}
+		case *ast.CallJavaScriptActionStmt:
 			if stmt.OutputVariable != "" {
 				vars[stmt.OutputVariable] = true
 			}
@@ -371,6 +483,20 @@ func collectDeclaredVars(body []ast.MicroflowStatement) map[string]bool {
 		case *ast.CreateListStmt:
 			if stmt.Variable != "" {
 				vars[stmt.Variable] = true
+			}
+		case *ast.EnumSplitStmt:
+		case *ast.CastObjectStmt:
+			if stmt.OutputVariable != "" {
+				vars[stmt.OutputVariable] = true
+			}
+		case *ast.InheritanceSplitStmt:
+			for _, c := range stmt.Cases {
+				for varName := range collectDeclaredVars(c.Body) {
+					vars[varName] = true
+				}
+			}
+			for varName := range collectDeclaredVars(stmt.ElseBody) {
+				vars[varName] = true
 			}
 		}
 	}
@@ -396,22 +522,45 @@ func referencedVars(stmt ast.MicroflowStatement) []string {
 	case *ast.DeleteObjectStmt:
 		refs = append(refs, s.Variable)
 	case *ast.AddToListStmt:
-		refs = append(refs, s.Item, s.List)
+		if s.Value != nil {
+			refs = append(refs, exprVarRefs(s.Value)...)
+		} else {
+			refs = append(refs, s.Item)
+		}
+		refs = append(refs, s.List)
 	case *ast.RemoveFromListStmt:
 		refs = append(refs, s.Item, s.List)
 	case *ast.LogStmt:
+		refs = append(refs, exprVarRefs(s.Node)...)
 		refs = append(refs, exprVarRefs(s.Message)...)
+	case *ast.EnumSplitStmt:
+		refs = append(refs, extractVarName(s.Variable))
+	case *ast.CastObjectStmt:
+		if s.ObjectVariable != "" {
+			refs = append(refs, s.ObjectVariable)
+		}
+	case *ast.InheritanceSplitStmt:
+		refs = append(refs, s.Variable)
+		for _, c := range s.Cases {
+			for _, nested := range c.Body {
+				refs = append(refs, referencedVars(nested)...)
+			}
+		}
+		for _, nested := range s.ElseBody {
+			refs = append(refs, referencedVars(nested)...)
+		}
 	}
 	return refs
 }
 
 // extractVarName extracts the base variable name from a target that may include
-// an attribute path (e.g., "Var/Attr" → "Var").
+// a $ prefix or attribute path (e.g., "$Var/Attr" → "Var").
 func extractVarName(target string) string {
-	if before, _, ok := strings.Cut(target, "/"); ok {
+	name := strings.TrimPrefix(target, "$")
+	if before, _, ok := strings.Cut(name, "/"); ok {
 		return before
 	}
-	return target
+	return name
 }
 
 // exprVarRefs extracts variable names referenced in an expression.
@@ -436,6 +585,12 @@ func exprVarRefs(expr ast.Expression) []string {
 		}
 	case *ast.ParenExpr:
 		refs = append(refs, exprVarRefs(e.Inner)...)
+	case *ast.IfThenElseExpr:
+		refs = append(refs, exprVarRefs(e.Condition)...)
+		refs = append(refs, exprVarRefs(e.ThenExpr)...)
+		refs = append(refs, exprVarRefs(e.ElseExpr)...)
+	case *ast.SourceExpr:
+		refs = append(refs, exprVarRefs(e.Expression)...)
 	}
 	return refs
 }
@@ -453,7 +608,15 @@ func stmtErrorHandling(stmt ast.MicroflowStatement) *ast.ErrorHandlingClause {
 		return s.ErrorHandling
 	case *ast.CallMicroflowStmt:
 		return s.ErrorHandling
+	case *ast.CallNanoflowStmt:
+		return s.ErrorHandling
 	case *ast.CallJavaActionStmt:
+		return s.ErrorHandling
+	case *ast.DownloadFileStmt:
+		return s.ErrorHandling
+	case *ast.CallJavaScriptActionStmt:
+		return s.ErrorHandling
+	case *ast.CallWebServiceStmt:
 		return s.ErrorHandling
 	case *ast.ExecuteDatabaseQueryStmt:
 		return s.ErrorHandling

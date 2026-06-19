@@ -2,16 +2,49 @@
 
 package catalog
 
+// CatalogSchemaVersion is bumped whenever the schema in createTables changes
+// in a way that requires existing on-disk caches to be regenerated.
+//
+// History:
+//
+//	2 — split each domain table into <name>_data + <name> view that JOINs
+//	    snapshots, removing the denormalized ProjectName / SnapshotDate /
+//	    SnapshotSource / SourceId / SourceBranch / SourceRevision columns
+//	    from every row (issue #576).
+//	1 — initial flat schema with denormalized snapshot columns on every row.
+const CatalogSchemaVersion = "8"
+
+// MetaSchemaVersion is the catalog_meta key that records the schema version
+// the cache was built against.
+const MetaSchemaVersion = "schema_version"
+
 // createTables creates all catalog tables in the SQLite database.
+//
+// Each domain table is split into two pieces:
+//
+//   - `<name>_data` is the storage table — the columns that are genuinely
+//     owned by this entity, plus `ProjectId` and `SnapshotId` foreign keys.
+//   - `<name>` is a view that JOINs `snapshots` to surface
+//     `ProjectName`, `SnapshotDate`, `SnapshotSource`, `SourceId`,
+//     `SourceBranch`, and `SourceRevision` (whichever the table historically
+//     exposed). This preserves the column shape that existing queries
+//     — including the `objects` UNION view and ad-hoc user SQL — expect.
+//
+// Builders INSERT into `<name>_data`. Readers should use `<name>`.
+//
+// Tables that were already clean (only `ProjectId` + `SnapshotId`, no
+// denormalized columns) keep their original shape:
+// navigation_menu_items, navigation_role_homes, role_mappings, refs,
+// permissions, constant_values.
 func (c *Catalog) createTables() error {
 	schemas := []string{
-		// Catalog metadata table - for cache validation
+		// ----- Metadata + lookup tables (source of truth) -----
+
 		`CREATE TABLE IF NOT EXISTS catalog_meta (
 			Key TEXT PRIMARY KEY,
 			Value TEXT
 		)`,
 
-		// Projects table
 		`CREATE TABLE IF NOT EXISTS projects (
 			ProjectId TEXT PRIMARY KEY,
 			ProjectName TEXT,
@@ -21,7 +54,6 @@ func (c *Catalog) createTables() error {
 			SnapshotCount INTEGER DEFAULT 0
 		)`,
 
-		// Snapshots table
 		`CREATE TABLE IF NOT EXISTS snapshots (
 			SnapshotId TEXT PRIMARY KEY,
 			SnapshotName TEXT,
@@ -36,8 +68,10 @@ func (c *Catalog) createTables() error {
 			IsActive INTEGER DEFAULT 0
 		)`,
 
-		// Modules table
-		`CREATE TABLE IF NOT EXISTS modules (
+		// ----- Domain tables: <name>_data + <name> view -----
+
+		// modules
+		`CREATE TABLE IF NOT EXISTS modules_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -48,17 +82,12 @@ func (c *Catalog) createTables() error {
 			AppStoreVersion TEXT,
 			AppStoreGuid TEXT,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("modules"),
 
-		// Entities table
-		`CREATE TABLE IF NOT EXISTS entities (
+		// entities
+		`CREATE TABLE IF NOT EXISTS entities_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -75,17 +104,29 @@ func (c *Catalog) createTables() error {
 			IsExternal INTEGER DEFAULT 0,
 			ExternalService TEXT,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("entities"),
 
-		// Attributes table - stores entity attribute details
-		`CREATE TABLE IF NOT EXISTS attributes (
+		// associations
+		`CREATE TABLE IF NOT EXISTS associations_data (
+			Id TEXT PRIMARY KEY,
+			Name TEXT,
+			QualifiedName TEXT,
+			ModuleName TEXT,
+			FromEntity TEXT,
+			ToEntity TEXT,
+			AssociationType TEXT,
+			Owner TEXT,
+			StorageFormat TEXT,
+			Description TEXT,
+			ProjectId TEXT,
+			SnapshotId TEXT
+		)`,
+		viewWithFullSnapshot("associations"),
+
+		// attributes
+		`CREATE TABLE IF NOT EXISTS attributes_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			EntityId TEXT,
@@ -99,17 +140,12 @@ func (c *Catalog) createTables() error {
 			IsCalculated INTEGER DEFAULT 0,
 			Description TEXT,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("attributes"),
 
-		// Microflows table
-		`CREATE TABLE IF NOT EXISTS microflows (
+		// microflows (includes nanoflows; filtered by view below)
+		`CREATE TABLE IF NOT EXISTS microflows_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -123,21 +159,16 @@ func (c *Catalog) createTables() error {
 			Complexity INTEGER DEFAULT 1,
 			Excluded BOOLEAN DEFAULT 0,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("microflows"),
 
-		// Nanoflows view (same structure, filtered)
+		// nanoflows view (filtered subset of microflows view)
 		`CREATE VIEW IF NOT EXISTS nanoflows AS
 			SELECT * FROM microflows WHERE MicroflowType = 'NANOFLOW'`,
 
-		// Pages table
-		`CREATE TABLE IF NOT EXISTS pages (
+		// pages
+		`CREATE TABLE IF NOT EXISTS pages_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -151,17 +182,12 @@ func (c *Catalog) createTables() error {
 			WidgetCount INTEGER DEFAULT 0,
 			Excluded BOOLEAN DEFAULT 0,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("pages"),
 
-		// Snippets table
-		`CREATE TABLE IF NOT EXISTS snippets (
+		// snippets
+		`CREATE TABLE IF NOT EXISTS snippets_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -171,17 +197,12 @@ func (c *Catalog) createTables() error {
 			ParameterCount INTEGER DEFAULT 0,
 			WidgetCount INTEGER DEFAULT 0,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("snippets"),
 
-		// Layouts table
-		`CREATE TABLE IF NOT EXISTS layouts (
+		// layouts
+		`CREATE TABLE IF NOT EXISTS layouts_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -190,17 +211,12 @@ func (c *Catalog) createTables() error {
 			LayoutType TEXT,
 			Description TEXT,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("layouts"),
 
-		// Enumerations table
-		`CREATE TABLE IF NOT EXISTS enumerations (
+		// enumerations
+		`CREATE TABLE IF NOT EXISTS enumerations_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -209,17 +225,12 @@ func (c *Catalog) createTables() error {
 			Description TEXT,
 			ValueCount INTEGER DEFAULT 0,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("enumerations"),
 
-		// Java Actions table
-		`CREATE TABLE IF NOT EXISTS java_actions (
+		// java_actions
+		`CREATE TABLE IF NOT EXISTS java_actions_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -230,17 +241,74 @@ func (c *Catalog) createTables() error {
 			ReturnType TEXT,
 			ParameterCount INTEGER DEFAULT 0,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("java_actions"),
 
-		// Activities table
-		`CREATE TABLE IF NOT EXISTS activities (
+		// javascript_actions
+		`CREATE TABLE IF NOT EXISTS javascript_actions_data (
+			Id TEXT PRIMARY KEY,
+			Name TEXT,
+			QualifiedName TEXT,
+			ModuleName TEXT,
+			Folder TEXT,
+			Description TEXT,
+			ProjectId TEXT,
+			SnapshotId TEXT
+		)`,
+		viewWithFullSnapshot("javascript_actions"),
+
+		// image_collections
+		`CREATE TABLE IF NOT EXISTS image_collections_data (
+			Id TEXT PRIMARY KEY,
+			Name TEXT,
+			QualifiedName TEXT,
+			ModuleName TEXT,
+			Folder TEXT,
+			Description TEXT,
+			ProjectId TEXT,
+			SnapshotId TEXT
+		)`,
+		viewWithFullSnapshot("image_collections"),
+
+		// data_transformers
+		`CREATE TABLE IF NOT EXISTS data_transformers_data (
+			Id TEXT PRIMARY KEY,
+			Name TEXT,
+			QualifiedName TEXT,
+			ModuleName TEXT,
+			Folder TEXT,
+			Description TEXT,
+			ProjectId TEXT,
+			SnapshotId TEXT
+		)`,
+		viewWithFullSnapshot("data_transformers"),
+
+		// agent-editor documents (CustomBlobDocuments, discriminated by
+		// CustomDocumentType into agent / model / knowledge base / MCP service).
+		`CREATE TABLE IF NOT EXISTS agents_data (
+			Id TEXT PRIMARY KEY, Name TEXT, QualifiedName TEXT, ModuleName TEXT,
+			Folder TEXT, Description TEXT, ProjectId TEXT, SnapshotId TEXT
+		)`,
+		viewWithFullSnapshot("agents"),
+		`CREATE TABLE IF NOT EXISTS ai_models_data (
+			Id TEXT PRIMARY KEY, Name TEXT, QualifiedName TEXT, ModuleName TEXT,
+			Folder TEXT, Description TEXT, ProjectId TEXT, SnapshotId TEXT
+		)`,
+		viewWithFullSnapshot("ai_models"),
+		`CREATE TABLE IF NOT EXISTS knowledge_bases_data (
+			Id TEXT PRIMARY KEY, Name TEXT, QualifiedName TEXT, ModuleName TEXT,
+			Folder TEXT, Description TEXT, ProjectId TEXT, SnapshotId TEXT
+		)`,
+		viewWithFullSnapshot("knowledge_bases"),
+		`CREATE TABLE IF NOT EXISTS consumed_mcp_services_data (
+			Id TEXT PRIMARY KEY, Name TEXT, QualifiedName TEXT, ModuleName TEXT,
+			Folder TEXT, Description TEXT, ProjectId TEXT, SnapshotId TEXT
+		)`,
+		viewWithFullSnapshot("consumed_mcp_services"),
+
+		// activities
+		`CREATE TABLE IF NOT EXISTS activities_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			Caption TEXT,
@@ -256,17 +324,45 @@ func (c *Catalog) createTables() error {
 			ActionRef TEXT,
 			Description TEXT,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("activities"),
 
-		// Widgets table
-		`CREATE TABLE IF NOT EXISTS widgets (
+		// widget_definitions — widgets AVAILABLE in the project (.mpk / .def.json)
+		`CREATE TABLE IF NOT EXISTS widget_definitions_data (
+			WidgetId TEXT PRIMARY KEY,
+			MdlName TEXT,
+			DisplayName TEXT,
+			WidgetKind TEXT,
+			Version TEXT,
+			MpkPath TEXT,
+			DefPath TEXT,
+			PropertyCount INTEGER,
+			ChildSlotCount INTEGER,
+			ObjectListCount INTEGER,
+			ProjectId TEXT,
+			SnapshotId TEXT
+		)`,
+		viewWithFullSnapshot("widget_definitions"),
+
+		// widget_definition_properties — one row per property / child slot / object list
+		`CREATE TABLE IF NOT EXISTS widget_definition_properties_data (
+			Id TEXT PRIMARY KEY,
+			WidgetId TEXT,
+			PropertyKey TEXT,
+			Kind TEXT,
+			Type TEXT,
+			MdlKeyword TEXT,
+			Required INTEGER,
+			DefaultValue TEXT,
+			Description TEXT,
+			ProjectId TEXT,
+			SnapshotId TEXT
+		)`,
+		viewWithFullSnapshot("widget_definition_properties"),
+
+		// widgets — one row per widget INSTANCE (use site)
+		`CREATE TABLE IF NOT EXISTS widgets_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			WidgetType TEXT,
@@ -277,19 +373,16 @@ func (c *Catalog) createTables() error {
 			Folder TEXT,
 			EntityRef TEXT,
 			AttributeRef TEXT,
+			MicroflowRef TEXT,
+			NanoflowRef TEXT,
 			Description TEXT,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("widgets"),
 
-		// XPath expressions table
-		`CREATE TABLE IF NOT EXISTS xpath_expressions (
+		// xpath_expressions
+		`CREATE TABLE IF NOT EXISTS xpath_expressions_data (
 			Id TEXT PRIMARY KEY,
 			DocumentType TEXT,
 			DocumentId TEXT,
@@ -307,17 +400,12 @@ func (c *Catalog) createTables() error {
 			Folder TEXT,
 			Description TEXT,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("xpath_expressions"),
 
-		// OData Clients table (consumed OData services)
-		`CREATE TABLE IF NOT EXISTS odata_clients (
+		// odata_clients
+		`CREATE TABLE IF NOT EXISTS odata_clients_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -327,17 +415,12 @@ func (c *Catalog) createTables() error {
 			MetadataUrl TEXT,
 			Validated INTEGER DEFAULT 0,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("odata_clients"),
 
-		// OData Services table (published OData services)
-		`CREATE TABLE IF NOT EXISTS odata_services (
+		// odata_services
+		`CREATE TABLE IF NOT EXISTS odata_services_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -348,17 +431,12 @@ func (c *Catalog) createTables() error {
 			EntitySetCount INTEGER DEFAULT 0,
 			AuthenticationTypes TEXT,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("odata_services"),
 
-		// Workflows table
-		`CREATE TABLE IF NOT EXISTS workflows (
+		// workflows
+		`CREATE TABLE IF NOT EXISTS workflows_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -373,17 +451,12 @@ func (c *Catalog) createTables() error {
 			DecisionCount INTEGER DEFAULT 0,
 			DueDate TEXT,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("workflows"),
 
-		// Business Event Services table
-		`CREATE TABLE IF NOT EXISTS business_event_services (
+		// business_event_services
+		`CREATE TABLE IF NOT EXISTS business_event_services_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -395,17 +468,12 @@ func (c *Catalog) createTables() error {
 			PublishCount INTEGER DEFAULT 0,
 			SubscribeCount INTEGER DEFAULT 0,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("business_event_services"),
 
-		// Navigation profiles table
-		`CREATE TABLE IF NOT EXISTS navigation_profiles (
+		// navigation_profiles
+		`CREATE TABLE IF NOT EXISTS navigation_profiles_data (
 			ProfileName TEXT PRIMARY KEY,
 			Kind TEXT,
 			IsNative INTEGER DEFAULT 0,
@@ -417,16 +485,11 @@ func (c *Catalog) createTables() error {
 			RoleBasedHomeCount INTEGER DEFAULT 0,
 			OfflineEntityCount INTEGER DEFAULT 0,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("navigation_profiles"),
 
-		// Navigation menu items table
+		// Already-clean tables (no denormalized columns) — kept as plain tables.
 		`CREATE TABLE IF NOT EXISTS navigation_menu_items (
 			Id INTEGER PRIMARY KEY AUTOINCREMENT,
 			ProfileName TEXT NOT NULL,
@@ -441,7 +504,6 @@ func (c *Catalog) createTables() error {
 			SnapshotId TEXT
 		)`,
 
-		// Navigation role-based home pages table
 		`CREATE TABLE IF NOT EXISTS navigation_role_homes (
 			Id INTEGER PRIMARY KEY AUTOINCREMENT,
 			ProfileName TEXT NOT NULL,
@@ -452,8 +514,8 @@ func (c *Catalog) createTables() error {
 			SnapshotId TEXT
 		)`,
 
-		// REST Clients table (consumed REST services)
-		`CREATE TABLE IF NOT EXISTS rest_clients (
+		// rest_clients
+		`CREATE TABLE IF NOT EXISTS rest_clients_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -464,17 +526,12 @@ func (c *Catalog) createTables() error {
 			OperationCount INTEGER DEFAULT 0,
 			Documentation TEXT,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("rest_clients"),
 
-		// REST Operations table (detail table for consumed REST service operations)
-		`CREATE TABLE IF NOT EXISTS rest_operations (
+		// rest_operations — partial denormalization (ProjectId, SnapshotId, SnapshotDate, SnapshotSource)
+		`CREATE TABLE IF NOT EXISTS rest_operations_data (
 			Id TEXT PRIMARY KEY,
 			ServiceId TEXT,
 			ServiceQualifiedName TEXT,
@@ -487,13 +544,12 @@ func (c *Catalog) createTables() error {
 			Timeout INTEGER DEFAULT 0,
 			ModuleName TEXT,
 			ProjectId TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithSnapshotDateSource("rest_operations"),
 
-		// Published REST Services table
-		`CREATE TABLE IF NOT EXISTS published_rest_services (
+		// published_rest_services
+		`CREATE TABLE IF NOT EXISTS published_rest_services_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -506,17 +562,12 @@ func (c *Catalog) createTables() error {
 			OperationCount INTEGER DEFAULT 0,
 			Documentation TEXT,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("published_rest_services"),
 
-		// Published REST Operations table (detail table)
-		`CREATE TABLE IF NOT EXISTS published_rest_operations (
+		// published_rest_operations — partial denormalization
+		`CREATE TABLE IF NOT EXISTS published_rest_operations_data (
 			Id TEXT PRIMARY KEY,
 			ServiceId TEXT,
 			ServiceQualifiedName TEXT,
@@ -528,13 +579,12 @@ func (c *Catalog) createTables() error {
 			Deprecated INTEGER DEFAULT 0,
 			ModuleName TEXT,
 			ProjectId TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithSnapshotDateSource("published_rest_operations"),
 
-		// External Entities table (OData remote entities)
-		`CREATE TABLE IF NOT EXISTS external_entities (
+		// external_entities — has ProjectName in addition to SnapshotDate/Source
+		`CREATE TABLE IF NOT EXISTS external_entities_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -548,14 +598,12 @@ func (c *Catalog) createTables() error {
 			Updatable INTEGER DEFAULT 0,
 			AttributeCount INTEGER DEFAULT 0,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithProjectNameAndSnapshotDateSource("external_entities"),
 
-		// External Actions table (OData actions discovered from microflow usage)
-		`CREATE TABLE IF NOT EXISTS external_actions (
+		// external_actions
+		`CREATE TABLE IF NOT EXISTS external_actions_data (
 			Id TEXT PRIMARY KEY,
 			ServiceName TEXT,
 			ActionName TEXT,
@@ -564,14 +612,12 @@ func (c *Catalog) createTables() error {
 			CallerNames TEXT,
 			ParameterNames TEXT,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithProjectNameAndSnapshotDateSource("external_actions"),
 
-		// Business Events detail table (individual messages)
-		`CREATE TABLE IF NOT EXISTS business_events (
+		// business_events — partial denormalization
+		`CREATE TABLE IF NOT EXISTS business_events_data (
 			Id TEXT PRIMARY KEY,
 			ServiceId TEXT,
 			ServiceQualifiedName TEXT,
@@ -585,13 +631,12 @@ func (c *Catalog) createTables() error {
 			SubscribeMicroflow TEXT,
 			ModuleName TEXT,
 			ProjectId TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithSnapshotDateSource("business_events"),
 
-		// Contract entities — entity types parsed from cached $metadata on consumed OData services
-		`CREATE TABLE IF NOT EXISTS contract_entities (
+		// contract_entities — partial denormalization
+		`CREATE TABLE IF NOT EXISTS contract_entities_data (
 			Id TEXT PRIMARY KEY,
 			ServiceId TEXT,
 			ServiceQualifiedName TEXT,
@@ -603,14 +648,14 @@ func (c *Catalog) createTables() error {
 			Summary TEXT,
 			Description TEXT,
 			ModuleName TEXT,
+			UsedByExternalEntity TEXT,
 			ProjectId TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithSnapshotDateSource("contract_entities"),
 
-		// Contract actions — actions/functions parsed from cached $metadata on consumed OData services
-		`CREATE TABLE IF NOT EXISTS contract_actions (
+		// contract_actions
+		`CREATE TABLE IF NOT EXISTS contract_actions_data (
 			Id TEXT PRIMARY KEY,
 			ServiceId TEXT,
 			ServiceQualifiedName TEXT,
@@ -620,13 +665,12 @@ func (c *Catalog) createTables() error {
 			ReturnType TEXT,
 			ModuleName TEXT,
 			ProjectId TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithSnapshotDateSource("contract_actions"),
 
-		// Contract messages — messages parsed from cached AsyncAPI on business event client services
-		`CREATE TABLE IF NOT EXISTS contract_messages (
+		// contract_messages
+		`CREATE TABLE IF NOT EXISTS contract_messages_data (
 			Id TEXT PRIMARY KEY,
 			ServiceId TEXT,
 			ServiceQualifiedName TEXT,
@@ -638,12 +682,12 @@ func (c *Catalog) createTables() error {
 			PropertyCount INTEGER DEFAULT 0,
 			ModuleName TEXT,
 			ProjectId TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithSnapshotDateSource("contract_messages"),
 
-		`CREATE TABLE IF NOT EXISTS database_connections (
+		// database_connections
+		`CREATE TABLE IF NOT EXISTS database_connections_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -652,16 +696,25 @@ func (c *Catalog) createTables() error {
 			DatabaseType TEXT,
 			QueryCount INTEGER DEFAULT 0,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT,
-			SourceId TEXT,
-			SourceBranch TEXT,
-			SourceRevision TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithFullSnapshot("database_connections"),
 
-		// Role mappings table - user role to module role assignments
+		// jar_dependencies
+		`CREATE TABLE IF NOT EXISTS jar_dependencies_data (
+			Id TEXT PRIMARY KEY,
+			ModuleName TEXT,
+			GroupId TEXT,
+			ArtifactId TEXT,
+			Coordinate TEXT,
+			Version TEXT,
+			IsIncluded INTEGER DEFAULT 1,
+			ProjectId TEXT,
+			SnapshotId TEXT
+		)`,
+		viewWithFullSnapshot("jar_dependencies"),
+
+		// role_mappings, refs, permissions, constant_values — already clean
 		`CREATE TABLE IF NOT EXISTS role_mappings (
 			Id INTEGER PRIMARY KEY AUTOINCREMENT,
 			UserRoleName TEXT NOT NULL,
@@ -671,8 +724,6 @@ func (c *Catalog) createTables() error {
 			SnapshotId TEXT
 		)`,
 
-		// References table - cross-references between objects
-		// Enables queries like "find all callers of microflow X" or "find all usages of entity Y"
 		`CREATE TABLE IF NOT EXISTS refs (
 			Id INTEGER PRIMARY KEY AUTOINCREMENT,
 			SourceType TEXT NOT NULL,
@@ -687,7 +738,6 @@ func (c *Catalog) createTables() error {
 			SnapshotId TEXT
 		)`,
 
-		// Permissions table - queryable security permission matrix
 		`CREATE TABLE IF NOT EXISTS permissions (
 			Id INTEGER PRIMARY KEY AUTOINCREMENT,
 			ModuleRoleName TEXT NOT NULL,
@@ -701,8 +751,8 @@ func (c *Catalog) createTables() error {
 			SnapshotId TEXT
 		)`,
 
-		// Constants table
-		`CREATE TABLE IF NOT EXISTS constants (
+		// constants — partial denormalization
+		`CREATE TABLE IF NOT EXISTS constants_data (
 			Id TEXT PRIMARY KEY,
 			Name TEXT,
 			QualifiedName TEXT,
@@ -713,13 +763,10 @@ func (c *Catalog) createTables() error {
 			DefaultValue TEXT,
 			ExposedToClient INTEGER DEFAULT 0,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithProjectNameAndSnapshotDateSource("constants"),
 
-		// Constant values table - per-configuration constant overrides
 		`CREATE TABLE IF NOT EXISTS constant_values (
 			Id INTEGER PRIMARY KEY AUTOINCREMENT,
 			ConstantName TEXT NOT NULL,
@@ -729,7 +776,8 @@ func (c *Catalog) createTables() error {
 			SnapshotId TEXT
 		)`,
 
-		`CREATE TABLE IF NOT EXISTS json_structures (
+		// json_structures — partial denormalization
+		`CREATE TABLE IF NOT EXISTS json_structures_data (
 			Id INTEGER PRIMARY KEY AUTOINCREMENT,
 			Name TEXT NOT NULL,
 			QualifiedName TEXT NOT NULL,
@@ -740,13 +788,12 @@ func (c *Catalog) createTables() error {
 			ExportLevel TEXT,
 			Folder TEXT,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithProjectNameAndSnapshotDateSource("json_structures"),
 
-		`CREATE TABLE IF NOT EXISTS import_mappings (
+		// import_mappings
+		`CREATE TABLE IF NOT EXISTS import_mappings_data (
 			Id INTEGER PRIMARY KEY AUTOINCREMENT,
 			Name TEXT NOT NULL,
 			QualifiedName TEXT NOT NULL,
@@ -756,13 +803,12 @@ func (c *Catalog) createTables() error {
 			Documentation TEXT,
 			Folder TEXT,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithProjectNameAndSnapshotDateSource("import_mappings"),
 
-		`CREATE TABLE IF NOT EXISTS export_mappings (
+		// export_mappings
+		`CREATE TABLE IF NOT EXISTS export_mappings_data (
 			Id INTEGER PRIMARY KEY AUTOINCREMENT,
 			Name TEXT NOT NULL,
 			QualifiedName TEXT NOT NULL,
@@ -773,13 +819,13 @@ func (c *Catalog) createTables() error {
 			Documentation TEXT,
 			Folder TEXT,
 			ProjectId TEXT,
-			ProjectName TEXT,
-			SnapshotId TEXT,
-			SnapshotDate TEXT,
-			SnapshotSource TEXT
+			SnapshotId TEXT
 		)`,
+		viewWithProjectNameAndSnapshotDateSource("export_mappings"),
 
-		// Objects view - union of all object types
+		// Objects view - union of all object types.
+		// Reads through the per-table views so it picks up ProjectName /
+		// SnapshotDate / SnapshotSource from snapshots automatically.
 		`CREATE VIEW IF NOT EXISTS objects AS
 			SELECT Id, 'MODULE' as ObjectType, Name, QualifiedName, '' as ModuleName, Folder, Description,
 				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
@@ -788,6 +834,10 @@ func (c *Catalog) createTables() error {
 			SELECT Id, 'ENTITY' as ObjectType, Name, QualifiedName, ModuleName, Folder, Description,
 				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
 			FROM entities
+			UNION ALL
+			SELECT Id, 'ASSOCIATION' as ObjectType, Name, QualifiedName, ModuleName, '' as Folder, Description,
+				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
+			FROM associations
 			UNION ALL
 			SELECT Id, 'MICROFLOW' as ObjectType, Name, QualifiedName, ModuleName, Folder, Description,
 				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
@@ -820,6 +870,34 @@ func (c *Catalog) createTables() error {
 			SELECT Id, 'JAVA_ACTION' as ObjectType, Name, QualifiedName, ModuleName, Folder, Documentation as Description,
 				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
 			FROM java_actions
+			UNION ALL
+			SELECT Id, 'JAVASCRIPT_ACTION' as ObjectType, Name, QualifiedName, ModuleName, Folder, Description,
+				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
+			FROM javascript_actions
+			UNION ALL
+			SELECT Id, 'IMAGE_COLLECTION' as ObjectType, Name, QualifiedName, ModuleName, Folder, Description,
+				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
+			FROM image_collections
+			UNION ALL
+			SELECT Id, 'DATA_TRANSFORMER' as ObjectType, Name, QualifiedName, ModuleName, Folder, Description,
+				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
+			FROM data_transformers
+			UNION ALL
+			SELECT Id, 'AGENT' as ObjectType, Name, QualifiedName, ModuleName, Folder, Description,
+				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
+			FROM agents
+			UNION ALL
+			SELECT Id, 'AI_MODEL' as ObjectType, Name, QualifiedName, ModuleName, Folder, Description,
+				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
+			FROM ai_models
+			UNION ALL
+			SELECT Id, 'KNOWLEDGE_BASE' as ObjectType, Name, QualifiedName, ModuleName, Folder, Description,
+				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
+			FROM knowledge_bases
+			UNION ALL
+			SELECT Id, 'CONSUMED_MCP_SERVICE' as ObjectType, Name, QualifiedName, ModuleName, Folder, Description,
+				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
+			FROM consumed_mcp_services
 			UNION ALL
 			SELECT Id, 'ODATA_CLIENT' as ObjectType, Name, QualifiedName, ModuleName, '' as Folder, '' as Description,
 				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
@@ -871,7 +949,23 @@ func (c *Catalog) createTables() error {
 			UNION ALL
 			SELECT Id, 'CONTRACT_MESSAGE' as ObjectType, MessageName as Name, ServiceQualifiedName || '.' || MessageName as QualifiedName, ModuleName, '' as Folder, '' as Description,
 				ProjectId, '' as ProjectName, SnapshotId, SnapshotDate, SnapshotSource
-			FROM contract_messages`,
+			FROM contract_messages
+			UNION ALL
+			SELECT CAST(Id AS TEXT), 'JSON_STRUCTURE' as ObjectType, Name, QualifiedName, ModuleName, Folder, Documentation as Description,
+				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
+			FROM json_structures
+			UNION ALL
+			SELECT CAST(Id AS TEXT), 'IMPORT_MAPPING' as ObjectType, Name, QualifiedName, ModuleName, Folder, Documentation as Description,
+				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
+			FROM import_mappings
+			UNION ALL
+			SELECT CAST(Id AS TEXT), 'EXPORT_MAPPING' as ObjectType, Name, QualifiedName, ModuleName, Folder, Documentation as Description,
+				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
+			FROM export_mappings
+			UNION ALL
+			SELECT Id, 'JAR_DEPENDENCY' as ObjectType, Coordinate as Name, ModuleName || '.' || Coordinate as QualifiedName, ModuleName, '' as Folder, '' as Description,
+				ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource
+			FROM jar_dependencies`,
 
 		// FTS5 virtual tables for full-text search
 		`CREATE VIRTUAL TABLE IF NOT EXISTS strings USING fts5(
@@ -891,36 +985,40 @@ func (c *Catalog) createTables() error {
 			ModuleName
 		)`,
 
-		// Indexes for common queries
-		`CREATE INDEX IF NOT EXISTS idx_modules_name ON modules(Name)`,
-		`CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(Name)`,
-		`CREATE INDEX IF NOT EXISTS idx_entities_module ON entities(ModuleName)`,
-		`CREATE INDEX IF NOT EXISTS idx_microflows_name ON microflows(Name)`,
-		`CREATE INDEX IF NOT EXISTS idx_microflows_module ON microflows(ModuleName)`,
-		`CREATE INDEX IF NOT EXISTS idx_pages_name ON pages(Name)`,
-		`CREATE INDEX IF NOT EXISTS idx_pages_module ON pages(ModuleName)`,
-		`CREATE INDEX IF NOT EXISTS idx_layouts_name ON layouts(Name)`,
-		`CREATE INDEX IF NOT EXISTS idx_layouts_module ON layouts(ModuleName)`,
-		`CREATE INDEX IF NOT EXISTS idx_activities_microflow ON activities(MicroflowId)`,
-		`CREATE INDEX IF NOT EXISTS idx_activities_type ON activities(ActivityType)`,
-		`CREATE INDEX IF NOT EXISTS idx_widgets_container ON widgets(ContainerId)`,
-		`CREATE INDEX IF NOT EXISTS idx_widgets_type ON widgets(WidgetType)`,
-		`CREATE INDEX IF NOT EXISTS idx_xpath_document ON xpath_expressions(DocumentId)`,
+		// Indexes for common queries — target the underlying *_data tables.
+		`CREATE INDEX IF NOT EXISTS idx_modules_name ON modules_data(Name)`,
+		`CREATE INDEX IF NOT EXISTS idx_entities_name ON entities_data(Name)`,
+		`CREATE INDEX IF NOT EXISTS idx_entities_module ON entities_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_microflows_name ON microflows_data(Name)`,
+		`CREATE INDEX IF NOT EXISTS idx_microflows_module ON microflows_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_pages_name ON pages_data(Name)`,
+		`CREATE INDEX IF NOT EXISTS idx_pages_module ON pages_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_layouts_name ON layouts_data(Name)`,
+		`CREATE INDEX IF NOT EXISTS idx_layouts_module ON layouts_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_activities_microflow ON activities_data(MicroflowId)`,
+		`CREATE INDEX IF NOT EXISTS idx_activities_type ON activities_data(ActivityType)`,
+		`CREATE INDEX IF NOT EXISTS idx_widgets_container ON widgets_data(ContainerId)`,
+		`CREATE INDEX IF NOT EXISTS idx_widgets_type ON widgets_data(WidgetType)`,
+		`CREATE INDEX IF NOT EXISTS idx_widget_defs_kind ON widget_definitions_data(WidgetKind)`,
+		`CREATE INDEX IF NOT EXISTS idx_widget_defs_mdlname ON widget_definitions_data(MdlName)`,
+		`CREATE INDEX IF NOT EXISTS idx_widget_def_props_widget ON widget_definition_properties_data(WidgetId)`,
+		`CREATE INDEX IF NOT EXISTS idx_widget_def_props_kind ON widget_definition_properties_data(Kind)`,
+		`CREATE INDEX IF NOT EXISTS idx_xpath_document ON xpath_expressions_data(DocumentId)`,
 		`CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(SourceType, SourceName)`,
 		`CREATE INDEX IF NOT EXISTS idx_refs_target ON refs(TargetType, TargetName)`,
 		`CREATE INDEX IF NOT EXISTS idx_refs_kind ON refs(RefKind)`,
-		`CREATE INDEX IF NOT EXISTS idx_attributes_entity ON attributes(EntityId)`,
-		`CREATE INDEX IF NOT EXISTS idx_attributes_entity_qname ON attributes(EntityQualifiedName)`,
-		`CREATE INDEX IF NOT EXISTS idx_java_actions_name ON java_actions(Name)`,
-		`CREATE INDEX IF NOT EXISTS idx_java_actions_module ON java_actions(ModuleName)`,
-		`CREATE INDEX IF NOT EXISTS idx_odata_clients_name ON odata_clients(Name)`,
-		`CREATE INDEX IF NOT EXISTS idx_odata_clients_module ON odata_clients(ModuleName)`,
-		`CREATE INDEX IF NOT EXISTS idx_odata_services_name ON odata_services(Name)`,
-		`CREATE INDEX IF NOT EXISTS idx_odata_services_module ON odata_services(ModuleName)`,
-		`CREATE INDEX IF NOT EXISTS idx_workflows_name ON workflows(QualifiedName)`,
-		`CREATE INDEX IF NOT EXISTS idx_workflows_module ON workflows(ModuleName)`,
-		`CREATE INDEX IF NOT EXISTS idx_be_services_name ON business_event_services(QualifiedName)`,
-		`CREATE INDEX IF NOT EXISTS idx_be_services_module ON business_event_services(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_attributes_entity ON attributes_data(EntityId)`,
+		`CREATE INDEX IF NOT EXISTS idx_attributes_entity_qname ON attributes_data(EntityQualifiedName)`,
+		`CREATE INDEX IF NOT EXISTS idx_java_actions_name ON java_actions_data(Name)`,
+		`CREATE INDEX IF NOT EXISTS idx_java_actions_module ON java_actions_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_odata_clients_name ON odata_clients_data(Name)`,
+		`CREATE INDEX IF NOT EXISTS idx_odata_clients_module ON odata_clients_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_odata_services_name ON odata_services_data(Name)`,
+		`CREATE INDEX IF NOT EXISTS idx_odata_services_module ON odata_services_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_workflows_name ON workflows_data(QualifiedName)`,
+		`CREATE INDEX IF NOT EXISTS idx_workflows_module ON workflows_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_be_services_name ON business_event_services_data(QualifiedName)`,
+		`CREATE INDEX IF NOT EXISTS idx_be_services_module ON business_event_services_data(ModuleName)`,
 		`CREATE INDEX IF NOT EXISTS idx_role_mappings_user_role ON role_mappings(UserRoleName)`,
 		`CREATE INDEX IF NOT EXISTS idx_role_mappings_module_role ON role_mappings(ModuleRoleName)`,
 		`CREATE INDEX IF NOT EXISTS idx_role_mappings_module ON role_mappings(ModuleName)`,
@@ -933,29 +1031,174 @@ func (c *Catalog) createTables() error {
 		`CREATE INDEX IF NOT EXISTS idx_nav_menu_items_target_mf ON navigation_menu_items(TargetMicroflow)`,
 		`CREATE INDEX IF NOT EXISTS idx_nav_role_homes_profile ON navigation_role_homes(ProfileName)`,
 		`CREATE INDEX IF NOT EXISTS idx_nav_role_homes_role ON navigation_role_homes(UserRole)`,
-		`CREATE INDEX IF NOT EXISTS idx_rest_clients_name ON rest_clients(Name)`,
-		`CREATE INDEX IF NOT EXISTS idx_rest_clients_module ON rest_clients(ModuleName)`,
-		`CREATE INDEX IF NOT EXISTS idx_rest_operations_service ON rest_operations(ServiceId)`,
-		`CREATE INDEX IF NOT EXISTS idx_rest_operations_method ON rest_operations(HttpMethod)`,
-		`CREATE INDEX IF NOT EXISTS idx_published_rest_name ON published_rest_services(Name)`,
-		`CREATE INDEX IF NOT EXISTS idx_published_rest_module ON published_rest_services(ModuleName)`,
-		`CREATE INDEX IF NOT EXISTS idx_published_rest_ops_service ON published_rest_operations(ServiceId)`,
-		`CREATE INDEX IF NOT EXISTS idx_external_entities_service ON external_entities(ServiceName)`,
-		`CREATE INDEX IF NOT EXISTS idx_external_entities_module ON external_entities(ModuleName)`,
-		`CREATE INDEX IF NOT EXISTS idx_external_actions_service ON external_actions(ServiceName)`,
-		`CREATE INDEX IF NOT EXISTS idx_external_actions_module ON external_actions(ModuleName)`,
-		`CREATE INDEX IF NOT EXISTS idx_business_events_service ON business_events(ServiceId)`,
-		`CREATE INDEX IF NOT EXISTS idx_business_events_module ON business_events(ModuleName)`,
-		`CREATE INDEX IF NOT EXISTS idx_contract_entities_service ON contract_entities(ServiceId)`,
-		`CREATE INDEX IF NOT EXISTS idx_contract_entities_module ON contract_entities(ModuleName)`,
-		`CREATE INDEX IF NOT EXISTS idx_contract_actions_service ON contract_actions(ServiceId)`,
-		`CREATE INDEX IF NOT EXISTS idx_contract_actions_module ON contract_actions(ModuleName)`,
-		`CREATE INDEX IF NOT EXISTS idx_contract_messages_service ON contract_messages(ServiceId)`,
-		`CREATE INDEX IF NOT EXISTS idx_contract_messages_module ON contract_messages(ModuleName)`,
-		`CREATE INDEX IF NOT EXISTS idx_constants_name ON constants(Name)`,
-		`CREATE INDEX IF NOT EXISTS idx_constants_module ON constants(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_rest_clients_name ON rest_clients_data(Name)`,
+		`CREATE INDEX IF NOT EXISTS idx_rest_clients_module ON rest_clients_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_rest_operations_service ON rest_operations_data(ServiceId)`,
+		`CREATE INDEX IF NOT EXISTS idx_rest_operations_method ON rest_operations_data(HttpMethod)`,
+		`CREATE INDEX IF NOT EXISTS idx_published_rest_name ON published_rest_services_data(Name)`,
+		`CREATE INDEX IF NOT EXISTS idx_published_rest_module ON published_rest_services_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_published_rest_ops_service ON published_rest_operations_data(ServiceId)`,
+		`CREATE INDEX IF NOT EXISTS idx_external_entities_service ON external_entities_data(ServiceName)`,
+		`CREATE INDEX IF NOT EXISTS idx_external_entities_module ON external_entities_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_external_actions_service ON external_actions_data(ServiceName)`,
+		`CREATE INDEX IF NOT EXISTS idx_external_actions_module ON external_actions_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_business_events_service ON business_events_data(ServiceId)`,
+		`CREATE INDEX IF NOT EXISTS idx_business_events_module ON business_events_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_contract_entities_service ON contract_entities_data(ServiceId)`,
+		`CREATE INDEX IF NOT EXISTS idx_contract_entities_module ON contract_entities_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_contract_actions_service ON contract_actions_data(ServiceId)`,
+		`CREATE INDEX IF NOT EXISTS idx_contract_actions_module ON contract_actions_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_contract_messages_service ON contract_messages_data(ServiceId)`,
+		`CREATE INDEX IF NOT EXISTS idx_contract_messages_module ON contract_messages_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_constants_name ON constants_data(Name)`,
+		`CREATE INDEX IF NOT EXISTS idx_constants_module ON constants_data(ModuleName)`,
 		`CREATE INDEX IF NOT EXISTS idx_constant_values_constant ON constant_values(ConstantName)`,
 		`CREATE INDEX IF NOT EXISTS idx_constant_values_config ON constant_values(ConfigurationName)`,
+		`CREATE INDEX IF NOT EXISTS idx_jar_deps_module ON jar_dependencies_data(ModuleName)`,
+		`CREATE INDEX IF NOT EXISTS idx_jar_deps_coord ON jar_dependencies_data(Coordinate)`,
+
+		// --- Graph-analysis views (read the refs graph; populated by REFRESH
+		// CATALOG FULL). Module is derived from the qualified-name prefix, NOT by
+		// joining entities — that would drop non-entity targets. ---
+
+		// graph_god_nodes — degree centrality (most depended-upon / highest fan-out).
+		`CREATE VIEW IF NOT EXISTS graph_god_nodes AS
+			WITH deg AS (
+				SELECT TargetName AS Asset, COUNT(*) AS InDeg, 0 AS OutDeg
+				FROM refs WHERE TargetName != '' GROUP BY TargetName
+				UNION ALL
+				SELECT SourceName AS Asset, 0 AS InDeg, COUNT(*) AS OutDeg
+				FROM refs WHERE SourceName != '' GROUP BY SourceName
+			)
+			SELECT d.Asset,
+				(SELECT ObjectType FROM objects WHERE QualifiedName = d.Asset LIMIT 1) AS ObjectType,
+				CASE WHEN instr(d.Asset, '.') > 0 THEN substr(d.Asset, 1, instr(d.Asset, '.') - 1) ELSE d.Asset END AS ModuleName,
+				SUM(d.InDeg) AS InDegree, SUM(d.OutDeg) AS OutDegree, SUM(d.InDeg) + SUM(d.OutDeg) AS Degree,
+				MAX(gc.PageRank) AS PageRank, MAX(gc.Betweenness) AS Betweenness
+			FROM deg d
+			LEFT JOIN graph_centrality_data gc ON gc.AssetName = d.Asset
+			GROUP BY d.Asset`,
+
+		// graph_module_coupling — cross-module edges ("surprise edges").
+		`CREATE VIEW IF NOT EXISTS graph_module_coupling AS
+			SELECT substr(SourceName, 1, instr(SourceName, '.') - 1) AS SourceModule,
+				substr(TargetName, 1, instr(TargetName, '.') - 1) AS TargetModule,
+				COUNT(*) AS Edges,
+				group_concat(DISTINCT RefKind) AS RefKinds
+			FROM refs
+			WHERE instr(SourceName, '.') > 0 AND instr(TargetName, '.') > 0
+				AND substr(SourceName, 1, instr(SourceName, '.') - 1) != substr(TargetName, 1, instr(TargetName, '.') - 1)
+			GROUP BY SourceModule, TargetModule`,
+
+		// graph_module_cohesion — intra- vs inter-module edge ratio per module.
+		`CREATE VIEW IF NOT EXISTS graph_module_cohesion AS
+			WITH e AS (
+				SELECT substr(SourceName, 1, instr(SourceName, '.') - 1) AS SrcMod,
+					CASE WHEN substr(SourceName, 1, instr(SourceName, '.') - 1) = substr(TargetName, 1, instr(TargetName, '.') - 1)
+						THEN 1 ELSE 0 END AS Intra
+				FROM refs WHERE instr(SourceName, '.') > 0 AND instr(TargetName, '.') > 0
+			)
+			SELECT SrcMod AS ModuleName,
+				SUM(Intra) AS IntraEdges, SUM(1 - Intra) AS InterEdges,
+				round(100.0 * SUM(Intra) / COUNT(*), 1) AS CohesionPct
+			FROM e GROUP BY SrcMod`,
+
+		// graph_dead_assets — referenceable documents with no inbound edge.
+		// Restricted to types that *should* be referenced if used; enums/constants/
+		// layouts are excluded because their inbound edges aren't fully captured yet.
+		`CREATE VIEW IF NOT EXISTS graph_dead_assets AS
+			SELECT o.QualifiedName, o.ObjectType, o.ModuleName
+			FROM objects o
+			WHERE o.ObjectType IN ('ENTITY', 'MICROFLOW', 'NANOFLOW', 'PAGE', 'SNIPPET')
+				AND NOT EXISTS (SELECT 1 FROM refs r WHERE r.TargetName = o.QualifiedName)`,
+
+		// graph_refkind_distribution — the edge vocabulary (calibrates the others).
+		`CREATE VIEW IF NOT EXISTS graph_refkind_distribution AS
+			SELECT RefKind, SourceType, TargetType, COUNT(*) AS Count,
+				round(100.0 * COUNT(*) / (SELECT COUNT(*) FROM refs), 1) AS Pct
+			FROM refs GROUP BY RefKind, SourceType, TargetType`,
+
+		// graph_entity_hotspots — entities used by the most flows.
+		`CREATE VIEW IF NOT EXISTS graph_entity_hotspots AS
+			SELECT TargetName AS Entity,
+				COUNT(DISTINCT SourceName) AS UsedByFlows,
+				group_concat(DISTINCT ModuleName) AS AcrossModules
+			FROM refs
+			WHERE TargetType = 'ENTITY' AND SourceType IN ('MICROFLOW', 'NANOFLOW')
+			GROUP BY TargetName`,
+
+		// --- Algorithmic graph analysis (populated by REFRESH CATALOG COMMUNITIES,
+		// computed by the pure-Go mdl/catalog/graph package). ---
+
+		// communities — Leiden community membership per asset.
+		`CREATE TABLE IF NOT EXISTS communities_data (
+			AssetName TEXT, ModuleName TEXT, CommunityId INTEGER,
+			ProjectId TEXT, SnapshotId TEXT
+		)`,
+		viewWithFullSnapshot("communities"),
+
+		// graph_cycles — SCC membership for assets in a dependency cycle.
+		`CREATE TABLE IF NOT EXISTS graph_cycles_data (
+			AssetName TEXT, ModuleName TEXT, CycleId INTEGER, CycleSize INTEGER,
+			ProjectId TEXT, SnapshotId TEXT
+		)`,
+		viewWithFullSnapshot("graph_cycles"),
+
+		// graph_layers — topological layer (sequence number) per asset.
+		`CREATE TABLE IF NOT EXISTS graph_layers_data (
+			AssetName TEXT, ModuleName TEXT, Layer INTEGER,
+			ProjectId TEXT, SnapshotId TEXT
+		)`,
+		viewWithFullSnapshot("graph_layers"),
+
+		// graph_centrality — PageRank / betweenness per asset.
+		`CREATE TABLE IF NOT EXISTS graph_centrality_data (
+			AssetName TEXT, PageRank REAL, Betweenness REAL,
+			ProjectId TEXT, SnapshotId TEXT
+		)`,
+		viewWithFullSnapshot("graph_centrality"),
+
+		// community_summary — per-community size, type breakdown, dominant-module
+		// Label, and members.
+		`CREATE VIEW IF NOT EXISTS community_summary AS
+			SELECT c.CommunityId,
+				(SELECT c2.ModuleName FROM communities_data c2 WHERE c2.CommunityId = c.CommunityId
+					GROUP BY c2.ModuleName ORDER BY COUNT(*) DESC, c2.ModuleName LIMIT 1) AS Label,
+				COUNT(*) AS Size,
+				COUNT(DISTINCT c.ModuleName) AS Modules,
+				group_concat(c.AssetName) AS Members
+			FROM communities_data c GROUP BY c.CommunityId`,
+
+		// graph_module_dependencies — directed module→module edges (the facts a
+		// layering/architecture Starlark rule consumes), with kinds and counts.
+		`CREATE VIEW IF NOT EXISTS graph_module_dependencies AS
+			SELECT substr(SourceName, 1, instr(SourceName, '.') - 1) AS SourceModule,
+				substr(TargetName, 1, instr(TargetName, '.') - 1) AS TargetModule,
+				RefKind, COUNT(*) AS Edges
+			FROM refs
+			WHERE instr(SourceName, '.') > 0 AND instr(TargetName, '.') > 0
+				AND substr(SourceName, 1, instr(SourceName, '.') - 1) != substr(TargetName, 1, instr(TargetName, '.') - 1)
+			GROUP BY SourceModule, TargetModule, RefKind`,
+
+		// graph_integration_surface — cross-community edges classified into the
+		// integration mechanism a split would require (UC2 contract list).
+		`CREATE VIEW IF NOT EXISTS graph_integration_surface AS
+			SELECT cs.CommunityId AS SourceCommunity, ct.CommunityId AS TargetCommunity,
+				r.RefKind, COUNT(*) AS Edges,
+				CASE r.RefKind
+					WHEN 'associate'  THEN 'OData / shared entity'
+					WHEN 'retrieve'   THEN 'OData read'
+					WHEN 'create'     THEN 'event / REST write'
+					WHEN 'change'     THEN 'event / REST write'
+					WHEN 'call'       THEN 'REST (published microflow)'
+					WHEN 'generalize' THEN 'BLOCKER: inheritance across boundary'
+					ELSE 'review'
+				END AS Mechanism
+			FROM refs r
+			JOIN communities_data cs ON r.SourceName = cs.AssetName
+			JOIN communities_data ct ON r.TargetName = ct.AssetName
+			WHERE cs.CommunityId != ct.CommunityId
+			GROUP BY SourceCommunity, TargetCommunity, r.RefKind`,
 	}
 
 	for _, schema := range schemas {
@@ -964,5 +1207,57 @@ func (c *Catalog) createTables() error {
 		}
 	}
 
+	// Record the schema version so future opens of this cache can decide
+	// whether to migrate (drop-and-recreate) on mismatch.
+	if _, err := c.db.Exec(
+		`INSERT OR REPLACE INTO catalog_meta (Key, Value) VALUES (?, ?)`,
+		MetaSchemaVersion, CatalogSchemaVersion,
+	); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// viewWithFullSnapshot builds a "CREATE VIEW <name> AS SELECT t.*, JOINed
+// columns FROM <name>_data t LEFT JOIN snapshots s …" statement that exposes
+// ProjectName + SnapshotDate + SnapshotSource + SourceId + SourceBranch +
+// SourceRevision on top of the underlying _data table. Used for tables whose
+// pre-refactor schema had all six denormalized columns.
+func viewWithFullSnapshot(name string) string {
+	return `CREATE VIEW IF NOT EXISTS ` + name + ` AS
+		SELECT t.*,
+			s.ProjectName,
+			s.SnapshotDate,
+			s.SnapshotSource,
+			s.SourceId,
+			s.SourceBranch,
+			s.SourceRevision
+		FROM ` + name + `_data t
+		LEFT JOIN snapshots s ON s.SnapshotId = t.SnapshotId`
+}
+
+// viewWithProjectNameAndSnapshotDateSource exposes ProjectName + SnapshotDate
+// + SnapshotSource. Used for tables whose pre-refactor schema had those three
+// denormalized columns but not the Source* group.
+func viewWithProjectNameAndSnapshotDateSource(name string) string {
+	return `CREATE VIEW IF NOT EXISTS ` + name + ` AS
+		SELECT t.*,
+			s.ProjectName,
+			s.SnapshotDate,
+			s.SnapshotSource
+		FROM ` + name + `_data t
+		LEFT JOIN snapshots s ON s.SnapshotId = t.SnapshotId`
+}
+
+// viewWithSnapshotDateSource exposes SnapshotDate + SnapshotSource only.
+// Used for tables whose pre-refactor schema had only those two denormalized
+// columns (no ProjectName, no Source*).
+func viewWithSnapshotDateSource(name string) string {
+	return `CREATE VIEW IF NOT EXISTS ` + name + ` AS
+		SELECT t.*,
+			s.SnapshotDate,
+			s.SnapshotSource
+		FROM ` + name + `_data t
+		LEFT JOIN snapshots s ON s.SnapshotId = t.SnapshotId`
 }

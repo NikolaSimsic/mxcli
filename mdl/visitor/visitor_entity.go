@@ -31,8 +31,8 @@ func (b *Builder) ExitCreateEntityStatement(ctx *parser.CreateEntityStatementCon
 	// Navigate to parent CreateStatement to get annotations and doc comment
 	createStmt := findParentCreateStatement(ctx)
 	if createStmt != nil {
-		// Check for CREATE OR MODIFY
-		if createStmt.OR() != nil && createStmt.MODIFY() != nil {
+		// REPLACE is treated as MODIFY for entities — changing the UUID would drop the database table.
+		if createStmt.OR() != nil && (createStmt.MODIFY() != nil || createStmt.REPLACE() != nil) {
 			stmt.CreateOrModify = true
 		}
 
@@ -497,6 +497,9 @@ func parseAnnotationParamInt(ctx parser.IAnnotationParamContext) int {
 	}
 	paramCtx := ctx.(*parser.AnnotationParamContext)
 	if valueCtx := paramCtx.AnnotationValue(); valueCtx != nil {
+		if val, err := strconv.Atoi(strings.TrimSpace(valueCtx.GetText())); err == nil {
+			return val
+		}
 		annValue := valueCtx.(*parser.AnnotationValueContext)
 		if lit := annValue.Literal(); lit != nil {
 			litCtx := lit.(*parser.LiteralContext)
@@ -686,6 +689,20 @@ func (b *Builder) ExitAlterEntityAction(ctx *parser.AlterEntityActionContext) {
 				return
 			}
 
+			// SET ALLOW_CREATE_CHANGE_LOCALLY = true/false
+			if ctx.SET() != nil && ctx.ALLOW_CREATE_CHANGE_LOCALLY() != nil {
+				boolVal := false
+				if ctx.TRUE() != nil {
+					boolVal = true
+				}
+				b.statements = append(b.statements, &ast.AlterEntityStmt{
+					Name:      name,
+					Operation: ast.AlterEntitySetAllowCreateChangeLocally,
+					BoolValue: boolVal,
+				})
+				return
+			}
+
 			break
 		}
 		parent = parent.GetParent()
@@ -735,6 +752,10 @@ func (b *Builder) ExitDropStatement(ctx *parser.DropStatementContext) {
 		b.statements = append(b.statements, &ast.DropMicroflowStmt{
 			Name: buildQualifiedName(names[0]),
 		})
+	} else if ctx.NANOFLOW() != nil {
+		b.statements = append(b.statements, &ast.DropNanoflowStmt{
+			Name: buildQualifiedName(names[0]),
+		})
 	} else if ctx.PAGE() != nil {
 		b.statements = append(b.statements, &ast.DropPageStmt{
 			Name: buildQualifiedName(names[0]),
@@ -765,6 +786,22 @@ func (b *Builder) ExitDropStatement(ctx *parser.DropStatementContext) {
 		})
 	} else if ctx.IMAGE() != nil && ctx.COLLECTION() != nil {
 		b.statements = append(b.statements, &ast.DropImageCollectionStmt{
+			Name: buildQualifiedName(names[0]),
+		})
+	} else if ctx.MODEL() != nil {
+		b.statements = append(b.statements, &ast.DropModelStmt{
+			Name: buildQualifiedName(names[0]),
+		})
+	} else if ctx.CONSUMED() != nil && ctx.MCP() != nil && ctx.SERVICE() != nil {
+		b.statements = append(b.statements, &ast.DropConsumedMCPServiceStmt{
+			Name: buildQualifiedName(names[0]),
+		})
+	} else if ctx.KNOWLEDGE() != nil && ctx.BASE() != nil {
+		b.statements = append(b.statements, &ast.DropKnowledgeBaseStmt{
+			Name: buildQualifiedName(names[0]),
+		})
+	} else if ctx.AGENT() != nil {
+		b.statements = append(b.statements, &ast.DropAgentStmt{
 			Name: buildQualifiedName(names[0]),
 		})
 	} else if ctx.PUBLISHED() != nil && ctx.REST() != nil && ctx.SERVICE() != nil {
@@ -818,7 +855,7 @@ func (b *Builder) ExitRenameStatement(ctx *parser.RenameStatementContext) {
 			oldName := identifierOrKeywordText(ioks[0])
 			newName := identifierOrKeywordText(ioks[1])
 			b.statements = append(b.statements, &ast.RenameStmt{
-				ObjectType: "MODULE",
+				ObjectType: "module",
 				Name:       ast.QualifiedName{Module: oldName, Name: oldName},
 				NewName:    newName,
 				DryRun:     dryRun,
@@ -836,7 +873,7 @@ func (b *Builder) ExitRenameStatement(ctx *parser.RenameStatementContext) {
 
 	objectType := ""
 	if rt := ctx.RenameTarget(); rt != nil {
-		objectType = strings.ToUpper(rt.GetText())
+		objectType = strings.ToLower(rt.GetText())
 	}
 	if objectType == "" {
 		return

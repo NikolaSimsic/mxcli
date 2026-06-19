@@ -46,6 +46,10 @@ const (
 	ShowContext    // SHOW CONTEXT OF Module.Microflow [DEPTH N]
 	ShowWidgets    // SHOW WIDGETS [WHERE ...] [IN module]
 
+	ShowCommunities      // SHOW COMMUNITIES
+	ShowCommunity        // SHOW COMMUNITY OF Module.Asset
+	ShowCommunityMembers // SHOW COMMUNITY MEMBERS OF Module.Asset
+
 	// Security show types
 	ShowProjectSecurity   // SHOW PROJECT SECURITY
 	ShowModuleRoles       // SHOW MODULE ROLES [IN module]
@@ -55,6 +59,7 @@ const (
 	ShowAccessOnMicroflow // SHOW ACCESS ON MICROFLOW Module.MF
 	ShowAccessOnPage      // SHOW ACCESS ON PAGE Module.Page
 	ShowAccessOnWorkflow  // SHOW ACCESS ON WORKFLOW Module.WF
+	ShowAccessOnNanoflow  // SHOW ACCESS ON NANOFLOW Module.NF
 	ShowSecurityMatrix    // SHOW SECURITY MATRIX [IN module]
 
 	// OData show types
@@ -79,7 +84,7 @@ const (
 	ShowImageCollections      // SHOW IMAGE COLLECTIONS [IN module]
 	ShowRestClients           // SHOW REST CLIENTS [IN module]
 	ShowPublishedRestServices // SHOW PUBLISHED REST SERVICES [IN module]
-	ShowDataTransformers     // LIST DATA TRANSFORMERS [IN module]
+	ShowDataTransformers      // LIST DATA TRANSFORMERS [IN module]
 	ShowConstantValues        // SHOW CONSTANT VALUES [IN module]
 	ShowContractEntities      // SHOW CONTRACT ENTITIES FROM Module.Service
 	ShowContractActions       // SHOW CONTRACT ACTIONS FROM Module.Service
@@ -90,6 +95,10 @@ const (
 	ShowImportMappings        // SHOW IMPORT MAPPINGS [IN module]
 	ShowExportMappings        // SHOW EXPORT MAPPINGS [IN module]
 	ShowModels                // SHOW MODELS [IN module] (agent-editor Model documents)
+	ShowAgents                // SHOW AGENTS [IN module] (agent-editor Agent documents)
+	ShowKnowledgeBases        // SHOW KNOWLEDGE BASES [IN module] (agent-editor KB documents)
+	ShowConsumedMCPServices   // SHOW CONSUMED MCP SERVICES [IN module] (agent-editor MCP documents)
+	ShowJarDependencies       // LIST JAR DEPENDENCIES [IN module]
 )
 
 // String returns the human-readable name of the show object type.
@@ -157,6 +166,8 @@ func (t ShowObjectType) String() string {
 		return "ACCESS ON PAGE"
 	case ShowAccessOnWorkflow:
 		return "ACCESS ON WORKFLOW"
+	case ShowAccessOnNanoflow:
+		return "ACCESS ON NANOFLOW"
 	case ShowSecurityMatrix:
 		return "SECURITY MATRIX"
 	case ShowODataClients:
@@ -217,6 +228,14 @@ func (t ShowObjectType) String() string {
 		return "EXPORT MAPPINGS"
 	case ShowModels:
 		return "MODELS"
+	case ShowAgents:
+		return "AGENTS"
+	case ShowKnowledgeBases:
+		return "KNOWLEDGE BASES"
+	case ShowConsumedMCPServices:
+		return "CONSUMED MCP SERVICES"
+	case ShowJarDependencies:
+		return "JAR DEPENDENCIES"
 	default:
 		return "UNKNOWN"
 	}
@@ -252,6 +271,7 @@ type DescribeStmt struct {
 	Name       QualifiedName
 	WithAll    bool   // For DESCRIBE MODULE ... WITH ALL
 	Format     string // For DESCRIBE CONTRACT ... FORMAT mdl
+	Qualifier  string // For DESCRIBE JAR DEPENDENCY: the 'group:artifact' coordinate
 }
 
 func (s *DescribeStmt) isStatement() {}
@@ -295,6 +315,11 @@ const (
 	DescribeImportMapping        // DESCRIBE IMPORT MAPPING Module.Name
 	DescribeExportMapping        // DESCRIBE EXPORT MAPPING Module.Name
 	DescribeModel                // DESCRIBE MODEL Module.Name (agent-editor Model document)
+	DescribeAgent                // DESCRIBE AGENT Module.Name (agent-editor Agent document)
+	DescribeKnowledgeBase        // DESCRIBE KNOWLEDGE BASE Module.Name (agent-editor KB document)
+	DescribeConsumedMCPService   // DESCRIBE CONSUMED MCP SERVICE Module.Name (agent-editor MCP document)
+	DescribeJarDependency        // DESCRIBE JAR DEPENDENCY ModuleName 'group:artifact'
+	DescribeAuto                 // DESCRIBE Module.Name — type auto-detected at execution time
 )
 
 // String returns the human-readable name of the describe object type.
@@ -370,6 +395,16 @@ func (t DescribeObjectType) String() string {
 		return "EXPORT MAPPING"
 	case DescribeModel:
 		return "MODEL"
+	case DescribeAgent:
+		return "AGENT"
+	case DescribeKnowledgeBase:
+		return "KNOWLEDGE BASE"
+	case DescribeConsumedMCPService:
+		return "CONSUMED MCP SERVICE"
+	case DescribeJarDependency:
+		return "JAR DEPENDENCY"
+	case DescribeAuto:
+		return "AUTO"
 	default:
 		return "UNKNOWN"
 	}
@@ -398,10 +433,12 @@ func (s *RefreshStmt) isStatement() {}
 
 // RefreshCatalogStmt represents: REFRESH CATALOG [FULL] [SOURCE] [FORCE] [BACKGROUND]
 type RefreshCatalogStmt struct {
-	Full       bool // If true, do full parsing (slow but includes activities/widgets/refs)
-	Source     bool // If true, build source FTS table (implies full)
-	Force      bool // If true, force rebuild even if cache is valid
-	Background bool // If true, run in background and return immediately
+	Full        bool    // If true, do full parsing (slow but includes activities/widgets/refs)
+	Source      bool    // If true, build source FTS table (implies full)
+	Force       bool    // If true, force rebuild even if cache is valid
+	Background  bool    // If true, run in background and return immediately
+	Communities bool    // If true, run graph analysis (communities/cycles/layers/centrality); implies full
+	Resolution  float64 // Leiden resolution for the graph-analysis pass (0 = default 1.0)
 }
 
 func (s *RefreshCatalogStmt) isStatement() {}
@@ -418,8 +455,10 @@ type SetStmt struct {
 
 func (s *SetStmt) isStatement() {}
 
-// HelpStmt represents: HELP or ?
-type HelpStmt struct{}
+// HelpStmt represents: HELP [topic words...]
+type HelpStmt struct {
+	Topic []string // e.g., ["workflow", "user-task"] for HELP WORKFLOW USER-TASK
+}
 
 func (s *HelpStmt) isStatement() {}
 

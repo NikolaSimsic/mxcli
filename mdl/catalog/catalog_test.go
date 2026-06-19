@@ -3,10 +3,14 @@
 package catalog
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestNew(t *testing.T) {
@@ -96,6 +100,48 @@ func TestTables(t *testing.T) {
 	}
 }
 
+// TestTables_CoversAllViews is a drift guard: every catalog VIEW created by the
+// schema must be listed in Tables(), so SHOW CATALOG TABLES never silently omits
+// a document type. The churn is always in views — each new cataloged document
+// type adds a viewWithFullSnapshot — so enforcing "every view is listed" catches
+// the omission at test time (the failure mode that hid javascript_actions,
+// image_collections, data_transformers, the agent-editor views, and
+// navigation_profiles from SHOW CATALOG TABLES). Base tables (projects,
+// snapshots, FTS shadows, catalog_meta) are type='table' and intentionally
+// excluded from this invariant.
+func TestTables_CoversAllViews(t *testing.T) {
+	cat, err := New()
+	if err != nil {
+		t.Fatalf("Failed to create catalog: %v", err)
+	}
+	defer cat.Close()
+
+	listed := make(map[string]bool)
+	for _, tbl := range cat.Tables() {
+		listed[strings.ToLower(strings.TrimPrefix(tbl, "CATALOG."))] = true
+	}
+
+	rows, err := cat.CatalogDB().Query(
+		"SELECT name FROM sqlite_master WHERE type = 'view' ORDER BY name")
+	if err != nil {
+		t.Fatalf("Failed to enumerate views: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			t.Fatalf("Scan failed: %v", err)
+		}
+		if !listed[name] {
+			t.Errorf("catalog view %q is not listed in Tables() — add CATALOG.%s "+
+				"so SHOW CATALOG TABLES includes it", name, strings.ToUpper(name))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows error: %v", err)
+	}
+}
+
 func TestQueryEmptyTable(t *testing.T) {
 	cat, err := New()
 	if err != nil {
@@ -124,8 +170,8 @@ func TestQueryWithData(t *testing.T) {
 	defer cat.Close()
 
 	// Insert test data
-	_, err = cat.DB().Exec(
-		"INSERT INTO modules (Id, Name, QualifiedName, ModuleName) VALUES (?, ?, ?, ?)",
+	_, err = cat.CatalogDB().Exec(
+		"INSERT INTO modules_data (Id, Name, QualifiedName, ModuleName) VALUES (?, ?, ?, ?)",
 		"mod-1", "TestModule", "TestModule", "TestModule",
 	)
 	if err != nil {
@@ -142,6 +188,82 @@ func TestQueryWithData(t *testing.T) {
 	}
 	if result.Rows[0][0] != "TestModule" {
 		t.Errorf("Expected 'TestModule', got %v", result.Rows[0][0])
+	}
+}
+
+// TestObjectsView_IncludesAssociations verifies that associations are part of
+// the unified objects index (catalog schema v3). They were previously only in
+// the standalone associations table, forcing consumers to query it separately.
+func TestObjectsView_IncludesAssociations(t *testing.T) {
+	cat, err := New()
+	if err != nil {
+		t.Fatalf("Failed to create catalog: %v", err)
+	}
+	defer cat.Close()
+
+	_, err = cat.CatalogDB().Exec(
+		"INSERT INTO associations_data (Id, Name, QualifiedName, ModuleName) VALUES (?, ?, ?, ?)",
+		"assoc-1", "Order_Customer", "Sales.Order_Customer", "Sales",
+	)
+	if err != nil {
+		t.Fatalf("Failed to insert association: %v", err)
+	}
+
+	result, err := cat.Query("SELECT ObjectType FROM objects WHERE QualifiedName = 'Sales.Order_Customer'")
+	if err != nil {
+		t.Fatalf("Query failed: %v", err)
+	}
+	if result.Count != 1 {
+		t.Fatalf("Expected 1 row in objects view, got %d", result.Count)
+	}
+	if got := result.Rows[0][0]; got != "ASSOCIATION" {
+		t.Errorf("ObjectType = %v, want ASSOCIATION", got)
+	}
+}
+
+// TestObjectsView_IncludesNewDocumentTypes verifies the document types added to
+// the catalog in schema v4 (image collections, JavaScript actions, data
+// transformers) surface in the unified objects index.
+func TestObjectsView_IncludesNewDocumentTypes(t *testing.T) {
+	cases := []struct {
+		table      string
+		objectType string
+	}{
+		{"javascript_actions", "JAVASCRIPT_ACTION"},
+		{"image_collections", "IMAGE_COLLECTION"},
+		{"data_transformers", "DATA_TRANSFORMER"},
+		{"agents", "AGENT"},
+		{"ai_models", "AI_MODEL"},
+		{"knowledge_bases", "KNOWLEDGE_BASE"},
+		{"consumed_mcp_services", "CONSUMED_MCP_SERVICE"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.objectType, func(t *testing.T) {
+			cat, err := New()
+			if err != nil {
+				t.Fatalf("Failed to create catalog: %v", err)
+			}
+			defer cat.Close()
+
+			qn := "Mod." + tc.table
+			if _, err := cat.CatalogDB().Exec(
+				"INSERT INTO "+tc.table+"_data (Id, Name, QualifiedName, ModuleName) VALUES (?, ?, ?, ?)",
+				"id-1", tc.table, qn, "Mod",
+			); err != nil {
+				t.Fatalf("insert: %v", err)
+			}
+
+			result, err := cat.Query("SELECT ObjectType FROM objects WHERE QualifiedName = '" + qn + "'")
+			if err != nil {
+				t.Fatalf("query: %v", err)
+			}
+			if result.Count != 1 {
+				t.Fatalf("expected 1 row in objects view, got %d", result.Count)
+			}
+			if got := result.Rows[0][0]; got != tc.objectType {
+				t.Errorf("ObjectType = %v, want %s", got, tc.objectType)
+			}
+		})
 	}
 }
 
@@ -280,8 +402,8 @@ func TestSaveAndLoadFromFile(t *testing.T) {
 	}
 
 	cat.SetProject("proj-1", "TestApp", "10.0.0")
-	_, err = cat.DB().Exec(
-		"INSERT INTO modules (Id, Name, QualifiedName, ModuleName) VALUES (?, ?, ?, ?)",
+	_, err = cat.CatalogDB().Exec(
+		"INSERT INTO modules_data (Id, Name, QualifiedName, ModuleName) VALUES (?, ?, ?, ?)",
 		"mod-1", "MyModule", "MyModule", "MyModule",
 	)
 	if err != nil {
@@ -359,7 +481,7 @@ func TestRoleMappingsTable(t *testing.T) {
 	}
 
 	for _, m := range mappings {
-		_, err := cat.DB().Exec(
+		_, err := cat.CatalogDB().Exec(
 			"INSERT INTO role_mappings (UserRoleName, ModuleRoleName, ModuleName) VALUES (?, ?, ?)",
 			m.userRole, m.moduleRole, m.module,
 		)
@@ -413,12 +535,243 @@ func TestCreateTablesAreQueryable(t *testing.T) {
 		"java_actions", "projects", "snapshots", "catalog_meta",
 		"workflows", "odata_clients", "odata_services",
 		"business_event_services", "database_connections",
-		"role_mappings",
+		"jar_dependencies", "role_mappings",
 	}
 	for _, tbl := range coreTables {
 		_, err := cat.Query("SELECT * FROM " + tbl)
 		if err != nil {
 			t.Errorf("Failed to query table %q: %v", tbl, err)
 		}
+	}
+}
+
+// TestNormalizedViewsExposeSnapshotColumns checks that the per-table views
+// (entities, modules, etc.) still expose ProjectName / SnapshotDate /
+// SnapshotSource via JOIN on snapshots, even though those columns are no
+// longer stored on the row itself.
+func TestNormalizedViewsExposeSnapshotColumns(t *testing.T) {
+	cat, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer cat.Close()
+
+	// Seed a snapshot.
+	_, err = cat.CatalogDB().Exec(`
+		INSERT INTO snapshots (SnapshotId, SnapshotName, ProjectId, ProjectName,
+			SnapshotDate, SnapshotSource, SourceBranch, SourceRevision)
+		VALUES ('snap-1', 'Initial', 'proj-1', 'MyApp',
+			'2026-05-20 10:00:00', 'GIT', 'main', 'abc123')`)
+	if err != nil {
+		t.Fatalf("seed snapshots: %v", err)
+	}
+
+	// Seed a module pointing at that snapshot.
+	_, err = cat.CatalogDB().Exec(`
+		INSERT INTO modules_data (Id, Name, QualifiedName, ProjectId, SnapshotId)
+		VALUES ('mod-1', 'Sales', 'Sales', 'proj-1', 'snap-1')`)
+	if err != nil {
+		t.Fatalf("seed modules_data: %v", err)
+	}
+
+	// The view should surface columns sourced from the snapshots JOIN.
+	row := cat.CatalogDB().QueryRow(`
+		SELECT ProjectName, SnapshotDate, SnapshotSource, SourceBranch, SourceRevision
+		FROM modules WHERE Id = 'mod-1'`)
+	var projectName, snapshotDate, snapshotSource, sourceBranch, sourceRevision string
+	if err := row.Scan(&projectName, &snapshotDate, &snapshotSource, &sourceBranch, &sourceRevision); err != nil {
+		t.Fatalf("scan view row: %v", err)
+	}
+	if projectName != "MyApp" || snapshotSource != "GIT" || sourceBranch != "main" || sourceRevision != "abc123" {
+		t.Errorf("view did not surface snapshot columns: got (%q, %q, %q, %q, %q)",
+			projectName, snapshotDate, snapshotSource, sourceBranch, sourceRevision)
+	}
+
+	// Updating the snapshot should propagate through the view immediately.
+	if _, err := cat.CatalogDB().Exec(
+		`UPDATE snapshots SET SourceRevision = 'def456' WHERE SnapshotId = 'snap-1'`,
+	); err != nil {
+		t.Fatalf("update snapshots: %v", err)
+	}
+	row = cat.CatalogDB().QueryRow(`SELECT SourceRevision FROM modules WHERE Id = 'mod-1'`)
+	if err := row.Scan(&sourceRevision); err != nil {
+		t.Fatalf("scan after update: %v", err)
+	}
+	if sourceRevision != "def456" {
+		t.Errorf("snapshot update did not propagate via view: got %q, want %q", sourceRevision, "def456")
+	}
+}
+
+// TestCatalogSchemaVersionForcesRebuild checks that opening a cache that was
+// written against an older schema version drops the old tables/views and also
+// clears the cache-info metadata so upstream isCacheValid() / GetCacheInfo()
+// callers don't mistake the empty cache for a valid one.
+func TestCatalogSchemaVersionForcesRebuild(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/cache.sqlite"
+
+	// Save a cache to disk with the current schema and realistic cache-info
+	// metadata (the kind that isCacheValid checks), then tamper with the
+	// stored schema version in-place to simulate an old cache.
+	cat, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := cat.SetCacheInfo("/tmp/app.mpr", time.Unix(1700000000, 0), "11.8.0", "full", time.Second); err != nil {
+		t.Fatalf("SetCacheInfo: %v", err)
+	}
+	if _, err := cat.CatalogDB().Exec(
+		`INSERT INTO modules_data (Id, Name, QualifiedName, ProjectId, SnapshotId)
+		 VALUES ('mod-x', 'Stale', 'Stale', 'proj', 'snap')`,
+	); err != nil {
+		t.Fatalf("seed stale row: %v", err)
+	}
+	if err := cat.SaveToFile(path); err != nil {
+		t.Fatalf("SaveToFile: %v", err)
+	}
+	cat.Close()
+
+	// Open the saved file directly (bypassing NewFromFile's migration check)
+	// and downgrade the recorded schema version. NewFromFile next time should
+	// notice the mismatch and drop everything.
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open downgraded cache: %v", err)
+	}
+	if _, err := db.Exec(
+		`UPDATE catalog_meta SET Value = '0-old' WHERE Key = ?`, MetaSchemaVersion,
+	); err != nil {
+		db.Close()
+		t.Fatalf("downgrade schema_version: %v", err)
+	}
+	// Confirm the seeded row survived the downgrade.
+	var preCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM modules_data`).Scan(&preCount); err != nil {
+		db.Close()
+		t.Fatalf("count before migration: %v", err)
+	}
+	if preCount != 1 {
+		db.Close()
+		t.Fatalf("expected 1 seeded row before migration, got %d", preCount)
+	}
+	db.Close()
+
+	// Reopen — migration should fire, dropping the seeded row.
+	cat2, err := NewFromFile(path)
+	if err != nil {
+		t.Fatalf("NewFromFile (after downgrade): %v", err)
+	}
+	defer cat2.Close()
+
+	var count int
+	if err := cat2.CatalogDB().QueryRow(`SELECT COUNT(*) FROM modules_data`).Scan(&count); err != nil {
+		t.Fatalf("count after migration: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected migration to drop seeded rows, got %d", count)
+	}
+
+	stored, err := cat2.GetMeta(MetaSchemaVersion)
+	if err != nil {
+		t.Fatalf("GetMeta: %v", err)
+	}
+	if stored != CatalogSchemaVersion {
+		t.Errorf("schema version not bumped after migration: got %q, want %q", stored, CatalogSchemaVersion)
+	}
+
+	// Cache-info keys must be cleared so callers re-build instead of
+	// "loading" the now-empty cache. This is what mdl/executor's
+	// isCacheValid relies on to detect the wiped state.
+	info, err := cat2.GetCacheInfo()
+	if err != nil {
+		t.Fatalf("GetCacheInfo: %v", err)
+	}
+	if info.MprPath != "" {
+		t.Errorf("MprPath should be cleared after migration, got %q", info.MprPath)
+	}
+	if !info.MprModTime.IsZero() {
+		t.Errorf("MprModTime should be zero after migration, got %v", info.MprModTime)
+	}
+	if info.BuildMode != "" {
+		t.Errorf("BuildMode should be cleared after migration, got %q", info.BuildMode)
+	}
+	if !info.BuildTime.IsZero() {
+		t.Errorf("BuildTime should be zero after migration, got %v", info.BuildTime)
+	}
+}
+
+// TestPartialViewsExposeSnapshotColumns checks the two partial-denormalization
+// view helpers — viewWithSnapshotDateSource (used by rest_operations, etc.)
+// and viewWithProjectNameAndSnapshotDateSource (used by external_entities,
+// constants, etc.) — surface exactly the historical columns from their
+// pre-refactor shape, not more and not less.
+func TestPartialViewsExposeSnapshotColumns(t *testing.T) {
+	cat, err := New()
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer cat.Close()
+
+	_, err = cat.CatalogDB().Exec(`
+		INSERT INTO snapshots (SnapshotId, SnapshotName, ProjectId, ProjectName,
+			SnapshotDate, SnapshotSource, SourceBranch, SourceRevision)
+		VALUES ('snap-1', 'Initial', 'proj-1', 'MyApp',
+			'2026-05-22 10:00:00', 'GIT', 'main', 'abc123')`)
+	if err != nil {
+		t.Fatalf("seed snapshots: %v", err)
+	}
+
+	// viewWithSnapshotDateSource — business_events historically had only
+	// SnapshotDate + SnapshotSource (no ProjectName, no Source*).
+	_, err = cat.CatalogDB().Exec(`
+		INSERT INTO business_events_data (Id, ServiceId, ChannelName, MessageName,
+			ProjectId, SnapshotId)
+		VALUES ('ev-1', 'svc-1', 'ch', 'msg', 'proj-1', 'snap-1')`)
+	if err != nil {
+		t.Fatalf("seed business_events_data: %v", err)
+	}
+
+	row := cat.CatalogDB().QueryRow(
+		`SELECT SnapshotDate, SnapshotSource FROM business_events WHERE Id = 'ev-1'`)
+	var snapshotDate, snapshotSource string
+	if err := row.Scan(&snapshotDate, &snapshotSource); err != nil {
+		t.Fatalf("scan business_events view: %v", err)
+	}
+	if snapshotSource != "GIT" || snapshotDate == "" {
+		t.Errorf("business_events view did not expose snapshot columns: (%q, %q)", snapshotDate, snapshotSource)
+	}
+
+	// The pre-refactor business_events table did not have ProjectName or
+	// Source*. Confirm the view honors that — querying them should fail.
+	if _, err := cat.CatalogDB().Exec(`SELECT ProjectName FROM business_events`); err == nil {
+		t.Errorf("business_events view unexpectedly exposes ProjectName (drift from original schema)")
+	}
+	if _, err := cat.CatalogDB().Exec(`SELECT SourceBranch FROM business_events`); err == nil {
+		t.Errorf("business_events view unexpectedly exposes SourceBranch (drift from original schema)")
+	}
+
+	// viewWithProjectNameAndSnapshotDateSource — external_entities
+	// historically had ProjectName + SnapshotDate + SnapshotSource but no
+	// Source*.
+	_, err = cat.CatalogDB().Exec(`
+		INSERT INTO external_entities_data (Id, Name, ServiceName, ProjectId, SnapshotId)
+		VALUES ('ext-1', 'Customer', 'CRM', 'proj-1', 'snap-1')`)
+	if err != nil {
+		t.Fatalf("seed external_entities_data: %v", err)
+	}
+
+	row = cat.CatalogDB().QueryRow(
+		`SELECT ProjectName, SnapshotDate, SnapshotSource FROM external_entities WHERE Id = 'ext-1'`)
+	var projectName string
+	if err := row.Scan(&projectName, &snapshotDate, &snapshotSource); err != nil {
+		t.Fatalf("scan external_entities view: %v", err)
+	}
+	if projectName != "MyApp" || snapshotSource != "GIT" {
+		t.Errorf("external_entities view did not expose snapshot columns: (%q, %q, %q)",
+			projectName, snapshotDate, snapshotSource)
+	}
+
+	if _, err := cat.CatalogDB().Exec(`SELECT SourceBranch FROM external_entities`); err == nil {
+		t.Errorf("external_entities view unexpectedly exposes SourceBranch (drift from original schema)")
 	}
 }

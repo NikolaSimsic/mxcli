@@ -93,6 +93,9 @@ DELETE_BEHAVIOR: D E L E T E '_'? B E H A V I O R;
 CASCADE: C A S C A D E;
 PREVENT: P R E V E N T;
 
+// External entity capability flags
+ALLOW_CREATE_CHANGE_LOCALLY: A L L O W '_'? C R E A T E '_'? C H A N G E '_'? L O C A L L Y;
+
 // =============================================================================
 // CONNECTION KEYWORDS
 // =============================================================================
@@ -153,6 +156,16 @@ ASC: A S C;
 DESC: D E S C;
 
 // =============================================================================
+// ANCHOR ANNOTATION KEYWORDS
+// =============================================================================
+
+// Sides of an activity box a SequenceFlow can attach to, used by the
+// @anchor(from: X, to: Y) annotation and its per-branch variants.
+TOP: T O P;
+BOTTOM: B O T T O M;
+ANCHOR: A N C H O R;
+
+// =============================================================================
 // MICROFLOW KEYWORDS
 // =============================================================================
 
@@ -175,6 +188,10 @@ RETURN: R E T U R N;
 THROW: T H R O W;
 LOG: L O G;
 CALL: C A L L;
+DOWNLOAD: D O W N L O A D;
+BROWSER: B R O W S E R;
+WEB: W E B;
+RAW: R A W;
 JAVA: J A V A;
 JAVASCRIPT: J A V A S C R I P T;
 ACTION: A C T I O N;
@@ -235,6 +252,20 @@ CONTROLBAR: C O N T R O L B A R;
 SEARCH: S E A R C H;
 SEARCHBAR: S E A R C H B A R;
 NAVIGATIONLIST: N A V I G A T I O N L I S T;
+
+// Object-list container keywords for pluggable widgets (Phase 1 — issue #538).
+// Each keyword corresponds to a singular form of a Type:"object"+IsList:true
+// property in a widget's MPK XML (e.g. Accordion `groups` → GROUP).
+GROUP: G R O U P;                       // Accordion groups
+CUSTOMITEM: C U S T O M I T E M;        // PopupMenu customItems
+MARKER: M A R K E R;                    // Maps markers
+DYNAMICMARKER: D Y N A M I C M A R K E R; // Maps dynamicMarkers
+SERIES: S E R I E S;                    // AreaChart / chart series
+
+// Dual-stack keywords (Phase 2 — issue #539). LEGACY* keywords route to the
+// dojo-based native widgets even on Mendix 11+ where the pluggable React
+// equivalent has become the default for the generic keyword.
+LEGACYDATAGRID: L E G A C Y D A T A G R I D;
 
 // Button widgets
 ACTIONBUTTON: A C T I O N B U T T O N;
@@ -316,8 +347,21 @@ ATTRIBUTES: A T T R I B U T E S;
 FILTERTYPE: F I L T E R T Y P E;
 IMAGE: I M A G E;
 COLLECTION: C O L L E C T I O N;
+JAR: J A R;
+DEPENDENCY: D E P E N D E N C Y;
+DEPENDENCIES: D E P E N D E N C I E S;
+EXCLUSION: E X C L U S I O N;
+ARTIFACT: A R T I F A C T;
+INCLUDED: I N C L U D E D;
 MODEL: M O D E L;
 MODELS: M O D E L S;
+AGENT: A G E N T;
+AGENTS: A G E N T S;
+TOOL: T O O L;
+KNOWLEDGE: K N O W L E D G E;
+BASES: B A S E S;
+CONSUMED: C O N S U M E D;
+MCP: M C P;
 STATICIMAGE: S T A T I C I M A G E;
 DYNAMICIMAGE: D Y N A M I C I M A G E;
 CUSTOMCONTAINER: C U S T O M C O N T A I N E R;
@@ -441,6 +485,7 @@ REST: R E S T;
 SERVICE: S E R V I C E;
 SERVICES: S E R V I C E S;
 ODATA: O D A T A;
+OPENAPI: O P E N A P I;
 BASE: B A S E;
 AUTH: A U T H;
 AUTHENTICATION: A U T H E N T I C A T I O N;
@@ -455,6 +500,7 @@ BODY: B O D Y;
 RESPONSE: R E S P O N S E;
 REQUEST: R E Q U E S T;
 SEND: S E N D;
+RECEIVE: R E C E I V E;
 DEPRECATED: D E P R E C A T E D;
 RESOURCE: R E S O U R C E;
 JSON: J S O N;
@@ -554,6 +600,9 @@ CUSTOM_NAME_MAP: C U S T O M WS+ N A M E WS+ M A P;
 CATALOG: C A T A L O G;
 FORCE: F O R C E;
 BACKGROUND: B A C K G R O U N D;
+COMMUNITY: C O M M U N I T Y;
+COMMUNITIES: C O M M U N I T I E S;
+RESOLUTION: R E S O L U T I O N;
 CALLERS: C A L L E R S;
 CALLEES: C A L L E E S;
 REFERENCES: R E F E R E N C E S;
@@ -652,6 +701,7 @@ ACTIVITY: A C T I V I T Y;
 CONDITION: C O N D I T I O N;
 OFF: O F F;
 USERS: U S E R S;
+GROUPS: G R O U P S;
 
 // Data transformer tokens
 DATA: D A T A;
@@ -736,8 +786,11 @@ DOLLAR_STRING
     ;
 
 // Number literal (integer or decimal)
+// Note: no leading '-' here — negation is handled by unaryExpression in the parser.
+// Including '-' in the lexer caused greedy tokenisation of e.g. `$x -2` as
+// VARIABLE NUMBER_LITERAL(-2) instead of VARIABLE MINUS NUMBER_LITERAL(2).
 NUMBER_LITERAL
-    : '-'? DIGIT+ ('.' DIGIT+)? ([eE] [+-]? DIGIT+)?
+    : DIGIT+ ('.' DIGIT+)? ([eE] [+-]? DIGIT+)?
     ;
 
 // =============================================================================

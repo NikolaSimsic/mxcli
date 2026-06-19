@@ -40,6 +40,10 @@ func (b *Builder) ExitCreateRestClientStatement(ctx *parser.CreateRestClientStat
 			if sl := pc.STRING_LITERAL(); sl != nil {
 				stmt.Folder = unquoteString(sl.GetText())
 			}
+		case "openapi":
+			if sl := pc.STRING_LITERAL(); sl != nil {
+				stmt.OpenApiPath = unquoteString(sl.GetText())
+			}
 		case "authentication":
 			if pc.BASIC() != nil {
 				authDef := &ast.RestAuthDef{Scheme: "BASIC"}
@@ -49,13 +53,24 @@ func (b *Builder) ExitCreateRestClientStatement(ctx *parser.CreateRestClientStat
 						continue
 					}
 					subKey := strings.ToLower(identifierOrKeywordText(sp.IdentifierOrKeyword().(*parser.IdentifierOrKeywordContext)))
+					var val string
 					if sl := sp.STRING_LITERAL(); sl != nil {
-						switch subKey {
-						case "username":
-							authDef.Username = unquoteString(sl.GetText())
-						case "password":
-							authDef.Password = unquoteString(sl.GetText())
+						val = unquoteString(sl.GetText())
+					} else if v := sp.VARIABLE(); v != nil {
+						// $Constant reference (legacy) — keep $ prefix
+						val = v.GetText()
+					} else if sp.AT() != nil {
+						// @Module.Constant reference (preferred Mendix convention)
+						// Store with $ prefix so the writer serializes as Rest$ConstantValue
+						if qn := sp.QualifiedName(); qn != nil {
+							val = "$" + getQualifiedNameText(qn)
 						}
+					}
+					switch subKey {
+					case "username":
+						authDef.Username = val
+					case "password":
+						authDef.Password = val
 					}
 				}
 				stmt.Authentication = authDef
@@ -128,7 +143,7 @@ func parseRestClientOpProp(ctx *parser.RestClientOpPropContext, op *ast.RestOper
 
 	// Method: GET
 	if mCtx := ctx.RestHttpMethod(); mCtx != nil {
-		op.Method = strings.ToUpper(mCtx.GetText())
+		op.Method = strings.ToLower(mCtx.GetText())
 		return
 	}
 
@@ -142,10 +157,10 @@ func parseRestClientOpProp(ctx *parser.RestClientOpPropContext, op *ast.RestOper
 		}
 		switch key {
 		case "body":
-			op.BodyType = "MAPPING"
+			op.BodyType = "mapping"
 			op.BodyMapping = md
 		case "response":
-			op.ResponseType = "MAPPING"
+			op.ResponseType = "mapping"
 			op.ResponseMapping = md
 		}
 		return
@@ -154,7 +169,7 @@ func parseRestClientOpProp(ctx *parser.RestClientOpPropContext, op *ast.RestOper
 	// TEMPLATE 'string'
 	if ctx.TEMPLATE() != nil {
 		if sl := ctx.STRING_LITERAL(); sl != nil {
-			op.BodyType = "TEMPLATE"
+			op.BodyType = "template"
 			op.BodyVariable = unquoteString(sl.GetText())
 		}
 		return
@@ -166,21 +181,21 @@ func parseRestClientOpProp(ctx *parser.RestClientOpPropContext, op *ast.RestOper
 		if ctx.FROM() != nil {
 			// Body: JSON FROM $var, FILE FROM $var
 			if ctx.JSON() != nil {
-				op.BodyType = "JSON"
+				op.BodyType = "json"
 			} else if ctx.FILE_KW() != nil {
-				op.BodyType = "FILE"
+				op.BodyType = "file"
 			}
 			op.BodyVariable = varName
 		} else if ctx.AS() != nil {
 			// Response: JSON AS $var, STRING AS $var, etc.
 			if ctx.JSON() != nil {
-				op.ResponseType = "JSON"
+				op.ResponseType = "json"
 			} else if ctx.STRING_TYPE() != nil {
-				op.ResponseType = "STRING"
+				op.ResponseType = "string"
 			} else if ctx.FILE_KW() != nil {
-				op.ResponseType = "FILE"
+				op.ResponseType = "file"
 			} else if ctx.STATUS() != nil {
-				op.ResponseType = "STATUS"
+				op.ResponseType = "status"
 			}
 			op.ResponseVariable = varName
 		}
@@ -191,7 +206,7 @@ func parseRestClientOpProp(ctx *parser.RestClientOpPropContext, op *ast.RestOper
 	if ctx.NONE() != nil {
 		switch key {
 		case "response":
-			op.ResponseType = "NONE"
+			op.ResponseType = "none"
 		case "authentication":
 			// handled at service level
 		}
@@ -330,11 +345,11 @@ func (b *Builder) ExitCreatePublishedRestServiceStatement(ctx *parser.CreatePubl
 		Name: buildQualifiedName(ctx.QualifiedName()),
 	}
 
-	// Check for CREATE OR REPLACE
+	// Check for CREATE OR MODIFY (or OR REPLACE, treated identically)
 	createStmt := findParentCreateStatement(ctx)
 	if createStmt != nil {
 		if createStmt.OR() != nil && (createStmt.REPLACE() != nil || createStmt.MODIFY() != nil) {
-			stmt.CreateOrReplace = true
+			stmt.CreateOrModify = true
 		}
 	}
 
@@ -358,7 +373,9 @@ func (b *Builder) ExitCreatePublishedRestServiceStatement(ctx *parser.CreatePubl
 	// Parse resources
 	for _, resCtx := range ctx.AllPublishedRestResource() {
 		rc := resCtx.(*parser.PublishedRestResourceContext)
-		stmt.Resources = append(stmt.Resources, buildPublishedRestResourceDef(rc))
+		if res := buildPublishedRestResourceDef(rc); res != nil {
+			stmt.Resources = append(stmt.Resources, res)
+		}
 	}
 
 	b.statements = append(b.statements, stmt)
@@ -366,7 +383,11 @@ func (b *Builder) ExitCreatePublishedRestServiceStatement(ctx *parser.CreatePubl
 
 // buildPublishedRestResourceDef converts a PublishedRestResourceContext to a
 // PublishedRestResourceDef AST node. Shared by CREATE and ALTER.
+// Returns nil when the resource name token is absent (ANTLR error-recovery path).
 func buildPublishedRestResourceDef(rc *parser.PublishedRestResourceContext) *ast.PublishedRestResourceDef {
+	if rc.STRING_LITERAL() == nil {
+		return nil
+	}
 	resDef := &ast.PublishedRestResourceDef{
 		Name: unquoteString(rc.STRING_LITERAL().GetText()),
 	}
@@ -457,8 +478,9 @@ func (b *Builder) exitAlterPublishedRestServiceStatement(ctx *parser.AlterStatem
 		// ADD RESOURCE 'name' { ... }
 		if ac.ADD() != nil {
 			if rc := ac.PublishedRestResource(); rc != nil {
-				resDef := buildPublishedRestResourceDef(rc.(*parser.PublishedRestResourceContext))
-				stmt.Actions = append(stmt.Actions, &ast.PublishedRestAddResourceAction{Resource: resDef})
+				if resDef := buildPublishedRestResourceDef(rc.(*parser.PublishedRestResourceContext)); resDef != nil {
+					stmt.Actions = append(stmt.Actions, &ast.PublishedRestAddResourceAction{Resource: resDef})
+				}
 			}
 			continue
 		}

@@ -8,6 +8,7 @@ import (
 
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
+	"github.com/mendixlabs/mxcli/sdk/mpr/version"
 
 	"go.mongodb.org/mongo-driver/bson"
 )
@@ -105,13 +106,19 @@ func (w *Writer) serializeMicroflow(mf *microflows.Microflow) ([]byte, error) {
 	}
 
 	// Add Flows array (SequenceFlows and AnnotationFlows go here, not in ObjectCollection)
+	// The serialized shape depends on the project's Mendix major version.
+	// Fall back to the project default when no MPR is attached (in-memory tests).
+	majorVersion := version.DefaultVersion().MajorVersion
+	if pv := w.reader.ProjectVersion(); pv != nil {
+		majorVersion = pv.MajorVersion
+	}
 	flows := bson.A{int32(3)} // Start with array type marker
 	if mf.ObjectCollection != nil {
 		for _, flow := range mf.ObjectCollection.Flows {
-			flows = append(flows, serializeSequenceFlow(flow))
+			flows = append(flows, serializeSequenceFlow(flow, majorVersion))
 		}
 		for _, af := range mf.ObjectCollection.AnnotationFlows {
-			flows = append(flows, serializeAnnotationFlow(af))
+			flows = append(flows, serializeAnnotationFlow(af, majorVersion))
 		}
 	}
 	doc = append(doc, bson.E{Key: "Flows", Value: flows})
@@ -133,63 +140,37 @@ func (w *Writer) serializeMicroflow(mf *microflows.Microflow) ([]byte, error) {
 	// Add object collection (without flows - they're in Flows array)
 	// Parameters go in ObjectCollection.Objects, pass them here
 	if mf.ObjectCollection != nil {
-		doc = append(doc, bson.E{Key: "ObjectCollection", Value: serializeMicroflowObjectCollectionWithoutFlows(mf.ObjectCollection, mf.Parameters)})
+		doc = append(doc, bson.E{Key: "ObjectCollection", Value: serializeMicroflowObjectCollectionWithoutFlows(mf.ObjectCollection, mf.Parameters, majorVersion)})
 	}
 
-	// Add remaining optional fields
-	// ReturnVariableName is "" by default (Studio Pro convention).
-	// Only set a custom name when explicitly specified via "RETURNS xxx AS $VarName".
-	doc = append(doc, bson.E{Key: "ReturnVariableName", Value: mf.ReturnVariableName})
-	doc = append(doc, bson.E{Key: "StableId", Value: idToBsonBinary(generateUUID())})
-	doc = append(doc, bson.E{Key: "Url", Value: ""})
-	doc = append(doc, bson.E{Key: "UrlSearchParameters", Value: bson.A{int32(1)}})
+	// ReturnVariableName, StableId, Url, and UrlSearchParameters were added in
+	// Mendix 10; Mendix 9 projects do not know about these fields and Studio Pro
+	// raises metamodel errors if they're present.
+	if majorVersion >= 10 {
+		// ReturnVariableName is "" by default (Studio Pro convention).
+		// Only set a custom name when explicitly specified via "RETURNS xxx AS $VarName".
+		doc = append(doc, bson.E{Key: "ReturnVariableName", Value: mf.ReturnVariableName})
+		doc = append(doc, bson.E{Key: "StableId", Value: idToBsonBinary(generateUUID())})
+		doc = append(doc, bson.E{Key: "Url", Value: ""})
+		doc = append(doc, bson.E{Key: "UrlSearchParameters", Value: bson.A{int32(1)}})
+	}
 	doc = append(doc, bson.E{Key: "WorkflowActionInfo", Value: nil})
 
 	return bson.Marshal(doc)
 }
 
 // serializeSequenceFlow serializes a SequenceFlow to BSON with correct structure.
-func serializeSequenceFlow(flow *microflows.SequenceFlow) bson.D {
-	// Serialize CaseValues
-	caseValues := bson.A{int32(2)} // Default empty array marker
-	if flow.CaseValue != nil {
-		switch cv := flow.CaseValue.(type) {
-		case microflows.EnumerationCase:
-			caseValues = bson.A{
-				int32(2),
-				bson.D{
-					{Key: "$ID", Value: idToBsonBinary(string(cv.ID))},
-					{Key: "$Type", Value: "Microflows$EnumerationCase"},
-					{Key: "Value", Value: cv.Value},
-				},
-			}
-		case *microflows.EnumerationCase:
-			caseValues = bson.A{
-				int32(2),
-				bson.D{
-					{Key: "$ID", Value: idToBsonBinary(string(cv.ID))},
-					{Key: "$Type", Value: "Microflows$EnumerationCase"},
-					{Key: "Value", Value: cv.Value},
-				},
-			}
-		case microflows.NoCase:
-			caseValues = bson.A{
-				int32(2),
-				bson.D{
-					{Key: "$ID", Value: idToBsonBinary(string(cv.ID))},
-					{Key: "$Type", Value: "Microflows$NoCase"},
-				},
-			}
-		case *microflows.NoCase:
-			caseValues = bson.A{
-				int32(2),
-				bson.D{
-					{Key: "$ID", Value: idToBsonBinary(string(cv.ID))},
-					{Key: "$Type", Value: "Microflows$NoCase"},
-				},
-			}
-		}
-	}
+//
+// The case value shape is version-specific:
+//   - Mendix 9: inline `NewCaseValue` document (NoCase for non-decision flows,
+//     EnumerationCase for decision branches). `CaseValues` is omitted.
+//   - Mendix 10+: `CaseValues = [marker, case]` where the case is always present
+//     (at minimum a NoCase object). Studio Pro rejects `CaseValues = [marker]`
+//     alone with CE0079/CE0773 "condition value must be configured".
+func serializeSequenceFlow(flow *microflows.SequenceFlow, majorVersion int) bson.D {
+	// Build the case document. Every sequence flow needs a case — NoCase is the
+	// default when no branch condition has been set.
+	caseDoc := buildSequenceFlowCase(flow.CaseValue)
 
 	originCV := flow.OriginControlVector
 	if originCV == "" {
@@ -200,30 +181,132 @@ func serializeSequenceFlow(flow *microflows.SequenceFlow) bson.D {
 		destCV = "0;0"
 	}
 
-	return bson.D{
+	doc := bson.D{
 		{Key: "$ID", Value: idToBsonBinary(string(flow.ID))},
 		{Key: "$Type", Value: "Microflows$SequenceFlow"},
-		{Key: "CaseValues", Value: caseValues},
-		{Key: "DestinationConnectionIndex", Value: int64(flow.DestinationConnectionIndex)},
-		{Key: "DestinationPointer", Value: idToBsonBinary(string(flow.DestinationID))},
-		{Key: "IsErrorHandler", Value: flow.IsErrorHandler},
-		{Key: "Line", Value: bson.D{
-			{Key: "$ID", Value: idToBsonBinary(generateUUID())},
-			{Key: "$Type", Value: "Microflows$BezierCurve"},
-			{Key: "DestinationControlVector", Value: destCV},
-			{Key: "OriginControlVector", Value: originCV},
-		}},
-		{Key: "OriginConnectionIndex", Value: int64(flow.OriginConnectionIndex)},
-		{Key: "OriginPointer", Value: idToBsonBinary(string(flow.OriginID))},
+	}
+
+	if majorVersion <= 9 {
+		// Legacy Mendix 9 shape:
+		//   - inline NewCaseValue (no CaseValues array)
+		//   - OriginBezierVector / DestinationBezierVector are top-level strings
+		//     (no nested Line: Microflows$BezierCurve document)
+		doc = append(doc, bson.E{Key: "DestinationBezierVector", Value: destCV})
+		doc = append(doc, bson.E{Key: "DestinationConnectionIndex", Value: int32(flow.DestinationConnectionIndex)})
+		doc = append(doc, bson.E{Key: "DestinationPointer", Value: idToBsonBinary(string(flow.DestinationID))})
+		doc = append(doc, bson.E{Key: "IsErrorHandler", Value: flow.IsErrorHandler})
+		doc = append(doc, bson.E{Key: "NewCaseValue", Value: caseDoc})
+		doc = append(doc, bson.E{Key: "OriginBezierVector", Value: originCV})
+		doc = append(doc, bson.E{Key: "OriginConnectionIndex", Value: int32(flow.OriginConnectionIndex)})
+		doc = append(doc, bson.E{Key: "OriginPointer", Value: idToBsonBinary(string(flow.OriginID))})
+		return doc
+	}
+
+	// Modern format (Mx 10+): CaseValues = [marker, caseDoc].
+	doc = append(doc, bson.E{Key: "CaseValues", Value: bson.A{int32(2), caseDoc}})
+	doc = append(doc, bson.E{Key: "DestinationConnectionIndex", Value: int32(flow.DestinationConnectionIndex)})
+	doc = append(doc, bson.E{Key: "DestinationPointer", Value: idToBsonBinary(string(flow.DestinationID))})
+	doc = append(doc, bson.E{Key: "IsErrorHandler", Value: flow.IsErrorHandler})
+	doc = append(doc, bson.E{Key: "Line", Value: bson.D{
+		{Key: "$ID", Value: idToBsonBinary(generateUUID())},
+		{Key: "$Type", Value: "Microflows$BezierCurve"},
+		{Key: "DestinationControlVector", Value: destCV},
+		{Key: "OriginControlVector", Value: originCV},
+	}})
+	doc = append(doc, bson.E{Key: "OriginConnectionIndex", Value: int32(flow.OriginConnectionIndex)})
+	doc = append(doc, bson.E{Key: "OriginPointer", Value: idToBsonBinary(string(flow.OriginID))})
+	return doc
+}
+
+// buildSequenceFlowCase renders the case document for a sequence flow.
+// When no case has been set on the flow, a NoCase document is synthesised —
+// Studio Pro requires every SequenceFlow to carry an explicit case object.
+func buildSequenceFlowCase(cv microflows.CaseValue) bson.D {
+	// Normalise value receivers to pointers so each case is handled once.
+	switch c := cv.(type) {
+	case microflows.EnumerationCase:
+		cv = &c
+	case microflows.NoCase:
+		cv = &c
+	case microflows.ExpressionCase:
+		cv = &c
+	case microflows.InheritanceCase:
+		cv = &c
+	}
+
+	switch c := cv.(type) {
+	case *microflows.EnumerationCase:
+		id := string(c.ID)
+		if id == "" {
+			id = generateUUID()
+		}
+		return bson.D{
+			{Key: "$ID", Value: idToBsonBinary(id)},
+			{Key: "$Type", Value: "Microflows$EnumerationCase"},
+			{Key: "Value", Value: c.Value},
+		}
+	case *microflows.NoCase:
+		id := string(c.ID)
+		if id == "" {
+			id = generateUUID()
+		}
+		return bson.D{
+			{Key: "$ID", Value: idToBsonBinary(id)},
+			{Key: "$Type", Value: "Microflows$NoCase"},
+		}
+	case *microflows.ExpressionCase:
+		id := string(c.ID)
+		if id == "" {
+			id = generateUUID()
+		}
+		// Studio Pro always uses EnumerationCase with Value="true"/"false" on the
+		// SequenceFlow; the expression itself lives on ExclusiveSplit.SplitCondition.
+		// This applies to all Mendix versions — Microflows$ExpressionCase was a
+		// mxcli-only type that Studio Pro has never recognised.
+		return bson.D{
+			{Key: "$ID", Value: idToBsonBinary(id)},
+			{Key: "$Type", Value: "Microflows$EnumerationCase"},
+			{Key: "Value", Value: c.Expression},
+		}
+	case *microflows.InheritanceCase:
+		id := string(c.ID)
+		if id == "" {
+			id = generateUUID()
+		}
+		return bson.D{
+			{Key: "$ID", Value: idToBsonBinary(id)},
+			{Key: "$Type", Value: "Microflows$InheritanceCase"},
+			{Key: "Value", Value: c.EntityQualifiedName},
+		}
+	}
+	// Default: synthesise a NoCase document with a fresh ID.
+	return bson.D{
+		{Key: "$ID", Value: idToBsonBinary(generateUUID())},
+		{Key: "$Type", Value: "Microflows$NoCase"},
 	}
 }
 
 // serializeAnnotationFlow serializes an AnnotationFlow to BSON.
-func serializeAnnotationFlow(af *microflows.AnnotationFlow) bson.D {
+// The line shape is version-specific: Mendix 9 stores OriginBezierVector /
+// DestinationBezierVector as top-level strings, while Mendix 10+ nests them
+// inside a Microflows$BezierCurve document under `Line`.
+func serializeAnnotationFlow(af *microflows.AnnotationFlow, majorVersion int) bson.D {
+	if majorVersion <= 9 {
+		return bson.D{
+			{Key: "$ID", Value: idToBsonBinary(string(af.ID))},
+			{Key: "$Type", Value: "Microflows$AnnotationFlow"},
+			{Key: "DestinationBezierVector", Value: "0;0"},
+			{Key: "DestinationConnectionIndex", Value: int32(0)},
+			{Key: "DestinationPointer", Value: idToBsonBinary(string(af.DestinationID))},
+			{Key: "OriginBezierVector", Value: "0;0"},
+			{Key: "OriginConnectionIndex", Value: int32(0)},
+			{Key: "OriginPointer", Value: idToBsonBinary(string(af.OriginID))},
+		}
+	}
 	return bson.D{
 		{Key: "$ID", Value: idToBsonBinary(string(af.ID))},
 		{Key: "$Type", Value: "Microflows$AnnotationFlow"},
-		{Key: "DestinationConnectionIndex", Value: int64(0)},
+		{Key: "DestinationConnectionIndex", Value: int32(0)},
 		{Key: "DestinationPointer", Value: idToBsonBinary(string(af.DestinationID))},
 		{Key: "Line", Value: bson.D{
 			{Key: "$ID", Value: idToBsonBinary(generateUUID())},
@@ -231,28 +314,35 @@ func serializeAnnotationFlow(af *microflows.AnnotationFlow) bson.D {
 			{Key: "DestinationControlVector", Value: "0;0"},
 			{Key: "OriginControlVector", Value: "0;0"},
 		}},
-		{Key: "OriginConnectionIndex", Value: int64(0)},
+		{Key: "OriginConnectionIndex", Value: int32(0)},
 		{Key: "OriginPointer", Value: idToBsonBinary(string(af.OriginID))},
 	}
 }
 
 // serializeMicroflowParameter serializes a MicroflowParameter to BSON.
 // Parameters go in ObjectCollection.Objects, not in a separate collection.
-func serializeMicroflowParameter(p *microflows.MicroflowParameter, posX int) bson.D {
+//
+// DefaultValue and IsRequired were introduced in Mendix 10; emitting them on a
+// Mendix 9 project trips the Studio Pro metamodel checker, so they are gated.
+func serializeMicroflowParameter(p *microflows.MicroflowParameter, posX int, majorVersion int) bson.D {
 	// Calculate position based on index - parameters appear at the top of the microflow
 	relativeMiddlePoint := fmt.Sprintf("%d;53", 200+posX*100)
 
 	doc := bson.D{
 		{Key: "$ID", Value: idToBsonBinary(string(p.ID))},
 		{Key: "$Type", Value: "Microflows$MicroflowParameter"},
-		{Key: "DefaultValue", Value: ""},
-		{Key: "Documentation", Value: p.Documentation},
-		{Key: "HasVariableNameBeenChanged", Value: false},
-		{Key: "IsRequired", Value: true},
-		{Key: "Name", Value: p.Name},
-		{Key: "RelativeMiddlePoint", Value: relativeMiddlePoint},
-		{Key: "Size", Value: "30;30"},
 	}
+	if majorVersion >= 10 {
+		doc = append(doc, bson.E{Key: "DefaultValue", Value: ""})
+	}
+	doc = append(doc, bson.E{Key: "Documentation", Value: p.Documentation})
+	doc = append(doc, bson.E{Key: "HasVariableNameBeenChanged", Value: false})
+	if majorVersion >= 10 {
+		doc = append(doc, bson.E{Key: "IsRequired", Value: true})
+	}
+	doc = append(doc, bson.E{Key: "Name", Value: p.Name})
+	doc = append(doc, bson.E{Key: "RelativeMiddlePoint", Value: relativeMiddlePoint})
+	doc = append(doc, bson.E{Key: "Size", Value: "30;30"})
 	if p.Type != nil {
 		doc = append(doc, bson.E{Key: "VariableType", Value: serializeMicroflowDataType(p.Type)})
 	}
@@ -350,13 +440,13 @@ func serializeMicroflowDataType(dt microflows.DataType) bson.D {
 
 // serializeMicroflowObjectCollectionWithoutFlows serializes the object collection to BSON (flows are in separate Flows array).
 // Parameters are also included in the Objects array.
-func serializeMicroflowObjectCollectionWithoutFlows(oc *microflows.MicroflowObjectCollection, params []*microflows.MicroflowParameter) bson.D {
+func serializeMicroflowObjectCollectionWithoutFlows(oc *microflows.MicroflowObjectCollection, params []*microflows.MicroflowParameter, majorVersion int) bson.D {
 	// Start with array type marker, then serialize objects (NOT flows)
 	objects := bson.A{int32(3)} // Array type marker
 
 	// Add parameters first (they appear at the top of the microflow)
 	for i, p := range params {
-		objects = append(objects, serializeMicroflowParameter(p, i))
+		objects = append(objects, serializeMicroflowParameter(p, i, majorVersion))
 	}
 
 	// Add regular microflow objects
@@ -404,16 +494,18 @@ func serializeMicroflowObject(obj microflows.MicroflowObject) bson.D {
 		}
 
 	case *microflows.EndEvent:
+		// Pristine Mx 9 EndEvents carry `ReturnValue` but not a synthetic trailing
+		// line break. Adding one can make Studio Pro reject list-return EndEvents
+		// with CE0117 even though mxcli's parser accepts the expression.
+		returnValue := o.ReturnValue
 		doc := bson.D{
 			{Key: "$ID", Value: idToBsonBinary(string(o.ID))},
 			{Key: "$Type", Value: "Microflows$EndEvent"},
 			{Key: "Documentation", Value: ""},
 			{Key: "RelativeMiddlePoint", Value: pointToString(o.Position)},
+			{Key: "ReturnValue", Value: returnValue},
+			{Key: "Size", Value: sizeToString(o.Size)},
 		}
-		if o.ReturnValue != "" {
-			doc = append(doc, bson.E{Key: "ReturnValue", Value: o.ReturnValue + "\n"})
-		}
-		doc = append(doc, bson.E{Key: "Size", Value: sizeToString(o.Size)})
 		return doc
 
 	case *microflows.ErrorEvent:
@@ -450,6 +542,7 @@ func serializeMicroflowObject(obj microflows.MicroflowObject) bson.D {
 			{Key: "$ID", Value: idToBsonBinary(string(o.ID))},
 			{Key: "$Type", Value: "Microflows$ExclusiveSplit"},
 			{Key: "Caption", Value: o.Caption},
+			{Key: "Documentation", Value: o.Documentation},
 			{Key: "ErrorHandlingType", Value: string(o.ErrorHandlingType)},
 			{Key: "RelativeMiddlePoint", Value: pointToString(o.Position)},
 			{Key: "Size", Value: sizeToString(o.Size)},
@@ -463,6 +556,37 @@ func serializeMicroflowObject(obj microflows.MicroflowObject) bson.D {
 					{Key: "$Type", Value: "Microflows$ExpressionSplitCondition"},
 					{Key: "Expression", Value: sc.Expression},
 				}})
+			case *microflows.RuleSplitCondition:
+				// Mendix nests the rule reference under a RuleCall sub-document
+				// whose Microflow field holds the rule's qualified name
+				// (rules share the microflow namespace). ParameterMappings are
+				// scoped inside RuleCall too — see parser_microflow.go.
+				ruleCall := bson.D{
+					{Key: "$ID", Value: idToBsonBinary(generateUUID())},
+					{Key: "$Type", Value: "Microflows$RuleCall"},
+					{Key: "Microflow", Value: sc.RuleQualifiedName},
+				}
+				if len(sc.ParameterMappings) > 0 {
+					var mappings bson.A
+					mappings = append(mappings, int32(2)) // Array marker
+					for _, pm := range sc.ParameterMappings {
+						mapping := bson.D{
+							{Key: "$ID", Value: idToBsonBinary(string(pm.ID))},
+							{Key: "$Type", Value: "Microflows$RuleCallParameterMapping"},
+							{Key: "Parameter", Value: pm.ParameterName},
+							{Key: "Argument", Value: pm.Argument},
+						}
+						mappings = append(mappings, mapping)
+					}
+					ruleCall = append(ruleCall, bson.E{Key: "ParameterMappings", Value: mappings})
+				} else {
+					ruleCall = append(ruleCall, bson.E{Key: "ParameterMappings", Value: bson.A{int32(2)}})
+				}
+				doc = append(doc, bson.E{Key: "SplitCondition", Value: bson.D{
+					{Key: "$ID", Value: idToBsonBinary(string(sc.ID))},
+					{Key: "$Type", Value: "Microflows$RuleSplitCondition"},
+					{Key: "RuleCall", Value: ruleCall},
+				}})
 			}
 		}
 		return doc
@@ -473,6 +597,18 @@ func serializeMicroflowObject(obj microflows.MicroflowObject) bson.D {
 			{Key: "$Type", Value: "Microflows$ExclusiveMerge"},
 			{Key: "RelativeMiddlePoint", Value: pointToString(o.Position)},
 			{Key: "Size", Value: sizeToString(o.Size)},
+		}
+
+	case *microflows.InheritanceSplit:
+		return bson.D{
+			{Key: "$ID", Value: idToBsonBinary(string(o.ID))},
+			{Key: "$Type", Value: "Microflows$InheritanceSplit"},
+			{Key: "Caption", Value: o.Caption},
+			{Key: "Documentation", Value: o.Documentation},
+			{Key: "ErrorHandlingType", Value: stringOrDefault(string(o.ErrorHandlingType), "Rollback")},
+			{Key: "RelativeMiddlePoint", Value: pointToString(o.Position)},
+			{Key: "Size", Value: sizeToString(o.Size)},
+			{Key: "SplitVariableName", Value: o.VariableName},
 		}
 
 	case *microflows.LoopedActivity:
@@ -666,25 +802,48 @@ func serializeTextTemplate(text *model.Text, params []string) bson.D {
 }
 
 func (w *Writer) serializeNanoflow(nf *microflows.Nanoflow) ([]byte, error) {
-	params := make([]bson.M, 0, len(nf.Parameters))
-	for _, p := range nf.Parameters {
-		params = append(params, bson.M{
-			"$ID":           string(p.ID),
-			"$Type":         p.TypeName,
-			"Name":          p.Name,
-			"Documentation": p.Documentation,
-		})
+	// Determine project major version for version-specific serialization.
+	majorVersion := version.DefaultVersion().MajorVersion
+	if pv := w.reader.ProjectVersion(); pv != nil {
+		majorVersion = pv.MajorVersion
 	}
 
-	doc := bson.M{
-		"$ID":           string(nf.ID),
-		"$Type":         nf.TypeName,
-		"Name":          nf.Name,
-		"Documentation": nf.Documentation,
-		"MarkAsUsed":    nf.MarkAsUsed,
-		"Excluded":      nf.Excluded,
-		"Parameters":    params,
+	doc := bson.D{
+		{Key: "$ID", Value: idToBsonBinary(string(nf.ID))},
+		{Key: "$Type", Value: "Microflows$Nanoflow"},
+		{Key: "AllowedModuleRoles", Value: allowedModuleRolesArray(nf.AllowedModuleRoles)},
+		{Key: "Documentation", Value: nf.Documentation},
+		{Key: "Excluded", Value: nf.Excluded},
 	}
+
+	// Add Flows array (SequenceFlows and AnnotationFlows at root level)
+	flows := bson.A{int32(3)} // Array type marker
+	if nf.ObjectCollection != nil {
+		for _, flow := range nf.ObjectCollection.Flows {
+			flows = append(flows, serializeSequenceFlow(flow, majorVersion))
+		}
+		for _, af := range nf.ObjectCollection.AnnotationFlows {
+			flows = append(flows, serializeAnnotationFlow(af, majorVersion))
+		}
+	}
+	doc = append(doc, bson.E{Key: "Flows", Value: flows})
+
+	doc = append(doc, bson.E{Key: "MarkAsUsed", Value: nf.MarkAsUsed})
+
+	// Add return type
+	if nf.ReturnType != nil {
+		doc = append(doc, bson.E{Key: "MicroflowReturnType", Value: serializeMicroflowDataType(nf.ReturnType)})
+	}
+
+	doc = append(doc, bson.E{Key: "Name", Value: nf.Name})
+
+	// Add object collection (without flows — they're in Flows array)
+	if nf.ObjectCollection != nil {
+		doc = append(doc, bson.E{Key: "ObjectCollection", Value: serializeMicroflowObjectCollectionWithoutFlows(nf.ObjectCollection, nf.Parameters, majorVersion)})
+	}
+
+	// Parameters stored inside ObjectCollection.Objects, not as a separate key.
+
 	return bson.Marshal(doc)
 }
 

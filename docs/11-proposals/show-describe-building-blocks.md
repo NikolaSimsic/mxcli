@@ -1,3 +1,8 @@
+---
+title: SHOW/DESCRIBE Building Blocks
+status: proposed
+---
+
 # Proposal: SHOW/DESCRIBE Building Blocks
 
 ## Overview
@@ -12,7 +17,7 @@ Building Blocks are reusable widget compositions that can be dragged onto pages 
 
 | Layer | Status | Location |
 |-------|--------|----------|
-| **Go type** | Yes | `sdk/pages/pages.go` — `BuildingBlock{Name, Documentation, Widget, TemplateID}` |
+| **Go type** | Yes | `sdk/pages/pages.go` — `BuildingBlock{Name, documentation, widget, TemplateID}` |
 | **Parser** | Minimal | `sdk/mpr/parser_misc.go` line 165 — Name + Documentation only, no widgets |
 | **Reader** | Yes | `ListBuildingBlocks()` in `sdk/mpr/reader_types.go` |
 | **Generated metamodel** | Yes | Full struct in `generated/metamodel/types.go` |
@@ -25,7 +30,7 @@ Building Blocks are reusable widget compositions that can be dragged onto pages 
 ```
 Forms$BuildingBlock:
   Name: string
-  Documentation: string
+  documentation: string
   DisplayName: string
   Excluded: bool
   ExportLevel: string
@@ -36,7 +41,7 @@ Forms$BuildingBlock:
   CanvasHeight: int32
   DocumentationUrl: string
   ImageData: binary (preview thumbnail)
-  Widgets: []*Widget (same widget tree as pages)
+  widgets: []*widget (same widget tree as pages)
 ```
 
 ## Proposed MDL Syntax
@@ -44,7 +49,7 @@ Forms$BuildingBlock:
 ### SHOW BUILDING BLOCKS
 
 ```
-SHOW BUILDING BLOCKS [IN Module]
+show BUILDING BLOCKS [in module]
 ```
 
 Output table columns:
@@ -55,7 +60,7 @@ Output table columns:
 ### DESCRIBE BUILDING BLOCK
 
 ```
-DESCRIBE BUILDING BLOCK Module.Name
+describe BUILDING BLOCK Module.Name
 ```
 
 Output format (similar to DESCRIBE SNIPPET):
@@ -70,10 +75,10 @@ Output format (similar to DESCRIBE SNIPPET):
 -- Category: Cards
 BUILDING BLOCK MyModule.CustomerCard
 {
-  CONTAINER
+  container
   {
-    TEXTBOX $Name;
-    TEXTBOX $Email;
+    textbox $Name;
+    textbox $Email;
   };
 };
 /
@@ -105,8 +110,8 @@ BUILDING: 'BUILDING';
 BLOCK: 'BLOCK';
 BLOCKS: 'BLOCKS';
 
-// SHOW BUILDING BLOCKS [IN module]
-// DESCRIBE BUILDING BLOCK qualifiedName
+// show BUILDING BLOCKS [in module]
+// describe BUILDING BLOCK qualifiedName
 ```
 
 ### 4. Add Executor (mdl/executor/cmd_building_blocks.go)

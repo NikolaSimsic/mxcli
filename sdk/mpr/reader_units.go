@@ -4,11 +4,14 @@
 package mpr
 
 import (
+	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/mendixlabs/mxcli/mdl/types"
 	"go.mongodb.org/mongo-driver/bson"
 )
 
@@ -178,6 +181,8 @@ func (r *Reader) buildUnitCache() error {
 // Should be called after any write operation.
 func (r *Reader) InvalidateCache() {
 	r.unitCacheValid = false
+	r.nameIndex = nil
+	r.nameIndexBuilt = false
 }
 
 // readMprContents reads content from the mprcontents folder for v2 format.
@@ -217,40 +222,90 @@ func getTypeFromContents(contents []byte) string {
 	return ""
 }
 
-// GetRawMicroflowByName returns the raw BSON contents for a microflow by qualified name.
-// Used for debugging to compare serialized data.
-func (r *Reader) GetRawMicroflowByName(qualifiedName string) ([]byte, error) {
-	units, err := r.listUnitsByType("Microflows$Microflow")
-	if err != nil {
-		return nil, err
-	}
+// nameIndexEntry records where a named unit lives.
+type nameIndexEntry struct {
+	id         string
+	moduleName string
+}
 
-	// Build a map of container ID to module name
+// nameHeader decodes only the unit's Name field. Decoding into this small
+// struct is much cheaper than unmarshalling the whole document into
+// map[string]any (no map allocation, far less reflection).
+type nameHeader struct {
+	Name string `bson:"Name"`
+}
+
+// buildUnitNameIndex parses every unit's name once and indexes units by
+// "$Type\x00QualifiedName", so per-name lookups are O(1) instead of re-reading
+// and re-parsing every unit on each call. Idempotent; invalidated by
+// InvalidateCache after writes.
+func (r *Reader) buildUnitNameIndex() error {
+	if r.nameIndexBuilt {
+		return nil
+	}
+	units, err := r.listUnitsByType("")
+	if err != nil {
+		return err
+	}
 	modules, err := r.ListModules()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	moduleMap := make(map[string]string)
+	moduleMap := make(map[string]string, len(modules))
 	for _, m := range modules {
 		moduleMap[string(m.ID)] = m.Name
 	}
-
-	for _, u := range units {
-		// Parse just enough to get the qualified name
-		var raw map[string]any
-		if err := bson.Unmarshal(u.Contents, &raw); err != nil {
-			continue
-		}
-
-		name, _ := raw["Name"].(string)
-		// Get module name from container
-		moduleName := moduleMap[u.ContainerID]
-		if moduleName != "" && moduleName+"."+name == qualifiedName {
-			return u.Contents, nil
-		}
+	containerParent, err := r.buildContainerParent()
+	if err != nil {
+		return err
 	}
 
-	return nil, fmt.Errorf("microflow not found: %s", qualifiedName)
+	idx := make(map[string]nameIndexEntry, len(units))
+	for _, u := range units {
+		var h nameHeader
+		if err := bson.Unmarshal(u.Contents, &h); err != nil || h.Name == "" {
+			continue
+		}
+		moduleName := resolveModuleName(u.ContainerID, moduleMap, containerParent)
+		qn := h.Name
+		if moduleName != "" {
+			qn = moduleName + "." + h.Name
+		}
+		idx[u.Type+"\x00"+qn] = nameIndexEntry{id: u.ID, moduleName: moduleName}
+	}
+	r.nameIndex = idx
+	r.nameIndexBuilt = true
+	return nil
+}
+
+// lookupUnitByName resolves a (type, qualified name) to its unit via the name
+// index. Returns (nil, "", nil) when not found.
+func (r *Reader) lookupUnitByName(typePrefix, qualifiedName string) (*rawUnit, string, error) {
+	if err := r.buildUnitNameIndex(); err != nil {
+		return nil, "", err
+	}
+	e, ok := r.nameIndex[typePrefix+"\x00"+qualifiedName]
+	if !ok {
+		return nil, "", nil
+	}
+	u, err := r.getUnitByID(e.id)
+	if err != nil {
+		return nil, "", err
+	}
+	return u, e.moduleName, nil
+}
+
+// GetRawMicroflowByName returns the raw BSON contents for a microflow by qualified name.
+// Used for debugging to compare serialized data.
+func (r *Reader) GetRawMicroflowByName(qualifiedName string) ([]byte, error) {
+	u, _, err := r.lookupUnitByName("Microflows$Microflow", qualifiedName)
+	if err != nil {
+		return nil, err
+	}
+	if u == nil {
+		return nil, fmt.Errorf("microflow not found: %s", qualifiedName)
+	}
+	return u.Contents, nil
 }
 
 // RawUnitInfo contains information about a raw unit for BSON debugging.
@@ -306,54 +361,20 @@ func (r *Reader) GetRawUnitByName(objectType, qualifiedName string) (*RawUnitInf
 		return r.getRawAssociationByName(qualifiedName)
 	}
 
-	units, err := r.listUnitsByType(typePrefix)
+	u, moduleName, err := r.lookupUnitByName(typePrefix, qualifiedName)
 	if err != nil {
 		return nil, err
 	}
-
-	// Build module name map and container hierarchy for MPR v2 folder support.
-	modules, err := r.ListModules()
-	if err != nil {
-		return nil, err
+	if u == nil {
+		return nil, fmt.Errorf("%s not found: %s", objectType, qualifiedName)
 	}
-	moduleMap := make(map[string]string)
-	for _, m := range modules {
-		moduleMap[string(m.ID)] = m.Name
-	}
-	containerParent, err := r.buildContainerParent()
-	if err != nil {
-		return nil, err
-	}
-
-	for _, u := range units {
-		var raw map[string]any
-		if err := bson.Unmarshal(u.Contents, &raw); err != nil {
-			continue
-		}
-
-		name, _ := raw["Name"].(string)
-		moduleName := resolveModuleName(u.ContainerID, moduleMap, containerParent)
-
-		// Build full name, handling missing module
-		var fullName string
-		if moduleName != "" {
-			fullName = moduleName + "." + name
-		} else {
-			fullName = name
-		}
-
-		if fullName == qualifiedName {
-			return &RawUnitInfo{
-				ID:            u.ID,
-				QualifiedName: fullName,
-				Type:          u.Type,
-				ModuleName:    moduleName,
-				Contents:      u.Contents,
-			}, nil
-		}
-	}
-
-	return nil, fmt.Errorf("%s not found: %s", objectType, qualifiedName)
+	return &RawUnitInfo{
+		ID:            u.ID,
+		QualifiedName: qualifiedName,
+		Type:          u.Type,
+		ModuleName:    moduleName,
+		Contents:      u.Contents,
+	}, nil
 }
 
 // getRawEntityByName finds an entity within domain models.
@@ -586,4 +607,65 @@ func (r *Reader) ListRawUnits(objectType string) ([]*RawUnitInfo, error) {
 	}
 
 	return result, nil
+}
+
+// getUnitByID fetches a single rawUnit by its UUID string without loading all units.
+// Returns (nil, nil) when the ID is not found.
+// V1: direct SQLite BLOB lookup — O(1). V2: cache lookup + single file read — O(cache size).
+func (r *Reader) getUnitByID(id string) (*rawUnit, error) {
+	if r.version == MPRVersionV2 {
+		return r.getUnitByIDV2(id)
+	}
+	return r.getUnitByIDV1(id)
+}
+
+func (r *Reader) getUnitByIDV1(id string) (*rawUnit, error) {
+	blob := types.UUIDToBlob(id)
+	if blob == nil {
+		return nil, fmt.Errorf("invalid unit ID: %s", id)
+	}
+	row := r.db.QueryRow(
+		"SELECT UnitID, ContainerID, ContainmentName, Contents FROM Unit WHERE UnitID = ?",
+		blob,
+	)
+	var unitID, containerID []byte
+	var containmentName string
+	var contents []byte
+	if err := row.Scan(&unitID, &containerID, &containmentName, &contents); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to query unit %s: %w", id, err)
+	}
+	return &rawUnit{
+		ID:              blobToUUID(unitID),
+		ContainerID:     blobToUUID(containerID),
+		ContainmentName: containmentName,
+		Type:            getTypeFromContents(contents),
+		Contents:        contents,
+	}, nil
+}
+
+func (r *Reader) getUnitByIDV2(id string) (*rawUnit, error) {
+	if !r.unitCacheValid {
+		if err := r.buildUnitCache(); err != nil {
+			return nil, err
+		}
+	}
+	for _, cu := range r.unitCache {
+		if cu.ID == id {
+			contents, err := r.readMprContents(id)
+			if err != nil {
+				return nil, err
+			}
+			return &rawUnit{
+				ID:              cu.ID,
+				ContainerID:     cu.ContainerID,
+				ContainmentName: cu.ContainmentName,
+				Type:            cu.Type,
+				Contents:        contents,
+			}, nil
+		}
+	}
+	return nil, nil
 }

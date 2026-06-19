@@ -402,7 +402,7 @@ func parseCodeActionParameterType(raw map[string]any) javaactions.CodeActionPara
 		}
 		et.Enumeration = extractString(raw["Enumeration"])
 		return et
-	case "CodeActions$MicroflowType":
+	case "CodeActions$MicroflowType", "JavaActions$MicroflowJavaActionParameterType":
 		return &javaactions.MicroflowType{
 			BaseElement: model.BaseElement{ID: model.ID(extractBsonID(raw["$ID"]))},
 		}
@@ -461,6 +461,10 @@ func parseInnerParameterType(raw map[string]any) javaactions.CodeActionParameter
 		return &javaactions.DateTimeType{
 			BaseElement: model.BaseElement{ID: model.ID(extractBsonID(raw["$ID"]))},
 		}
+	case "CodeActions$MicroflowType", "JavaActions$MicroflowJavaActionParameterType":
+		return &javaactions.MicroflowType{
+			BaseElement: model.BaseElement{ID: model.ID(extractBsonID(raw["$ID"]))},
+		}
 	case "CodeActions$ConcreteEntityType", "CodeActions$EntityType":
 		et := &javaactions.EntityType{
 			BaseElement: model.BaseElement{ID: model.ID(extractBsonID(raw["$ID"]))},
@@ -505,7 +509,7 @@ func parseInnerParameterType(raw map[string]any) javaactions.CodeActionParameter
 	return nil
 }
 
-// ListJavaActionsFull returns all Java actions with full details.
+// ListJavaActionsFull returns all Java actions with full details, including virtual System module actions.
 func (r *Reader) ListJavaActionsFull() ([]*javaactions.JavaAction, error) {
 	units, err := r.listUnitsByType("JavaActions$JavaAction")
 	if err != nil {
@@ -520,6 +524,9 @@ func (r *Reader) ListJavaActionsFull() ([]*javaactions.JavaAction, error) {
 		}
 		result = append(result, ja)
 	}
+
+	// Append virtual System module Java actions (not stored in the MPR database)
+	result = append(result, BuildSystemJavaActionsFull()...)
 
 	return result, nil
 }

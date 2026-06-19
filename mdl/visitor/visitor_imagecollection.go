@@ -46,5 +46,10 @@ func (b *Builder) ExitCreateImageCollectionStatement(ctx *parser.CreateImageColl
 		}
 	}
 
+	createStmt := findParentCreateStatement(ctx)
+	if createStmt != nil && createStmt.OR() != nil && (createStmt.REPLACE() != nil || createStmt.MODIFY() != nil) {
+		stmt.CreateOrModify = true
+	}
+
 	b.statements = append(b.statements, stmt)
 }

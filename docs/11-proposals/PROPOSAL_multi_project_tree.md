@@ -1,3 +1,9 @@
+---
+title: Multi-Project Tree View
+status: draft
+date: 2026-04-06
+---
+
 # Proposal: Multi-Project Tree View
 
 **Status:** Draft
@@ -30,21 +36,21 @@ Each `.mpr` project becomes a collapsible root node in the tree. Modules, domain
 ```
 Mendix Projects
 ├── ProductCatalog (ProductCatalog.mpr)
-│   ├── Settings
-│   ├── Navigation
-│   ├── Project Security
-│   ├── Catalog
-│   │   ├── Domain Model
-│   │   ├── Pages
-│   │   └── Microflows
+│   ├── settings
+│   ├── navigation
+│   ├── project security
+│   ├── catalog
+│   │   ├── Domain model
+│   │   ├── pages
+│   │   └── microflows
 │   └── ...
 ├── OrderService (OrderService.mpr)
-│   ├── Settings
-│   ├── Navigation
-│   ├── Project Security
+│   ├── settings
+│   ├── navigation
+│   ├── project security
 │   ├── Orders
-│   │   ├── Domain Model
-│   │   └── Microflows
+│   │   ├── Domain model
+│   │   └── microflows
 │   └── ...
 └── Fulfillment (Fulfillment.mpr)
     └── ...
@@ -82,7 +88,7 @@ Add a new array setting alongside the existing one (backward compatible):
     "type": "array",
     "items": { "type": "string" },
     "default": [],
-    "description": "Paths to Mendix .mpr files. If empty, auto-discovers in workspace."
+    "description": "Paths to Mendix .mpr files. if empty, auto-discovers in workspace."
 }
 ```
 
@@ -120,10 +126,10 @@ class MendixProjectTreeProvider {
         if (!element) {
             // Root level
             if (this.projects.length === 1) {
-                // Single project: flat (same as today)
+                // single project: flat (same as today)
                 return this.projects[0].treeData;
             }
-            // Multiple projects: project root nodes
+            // multiple projects: project root nodes
             return this.projects.map(p => ({
                 label: p.name,
                 type: 'project',
@@ -187,21 +193,21 @@ The LSP server currently binds to one project. For multi-project, the extension 
 
 ### Phase 4: Cross-project catalog queries (future)
 
-13. Use SQLite `ATTACH DATABASE` to mount each project's catalog under an alias
-14. Enable cross-project queries: `SELECT * FROM orders.catalog.entities JOIN catalog.catalog.entities ON ...`
-15. `SHOW CALLERS OF Module.Microflow ACROSS PROJECTS` for cross-project dependency analysis
+13. Use SQLite `ATTACH database` to mount each project's catalog under an alias
+14. Enable cross-project queries: `select * from orders.catalog.entities join catalog.catalog.entities on ...`
+15. `show callers of Module.Microflow ACROSS PROJECTS` for cross-project dependency analysis
 
-SQLite natively supports attaching multiple databases to a single connection. Each project's catalog (built by `REFRESH CATALOG`) is a standalone `.db` file. By attaching them with project-scoped aliases, the existing `SELECT ... FROM CATALOG.*` syntax extends naturally to cross-project joins without a new query engine.
+SQLite natively supports attaching multiple databases to a single connection. Each project's catalog (built by `refresh catalog`) is a standalone `.db` file. By attaching them with project-scoped aliases, the existing `select ... from CATALOG.*` syntax extends naturally to cross-project joins without a new query engine.
 
 ```sql
 -- Attach project catalogs
-ATTACH 'orders/.mxcli/catalog.db' AS orders;
-ATTACH 'fulfillment/.mxcli/catalog.db' AS fulfillment;
+ATTACH 'orders/.mxcli/catalog.db' as orders;
+ATTACH 'fulfillment/.mxcli/catalog.db' as fulfillment;
 
 -- Cross-project query: which entities exist in both?
-SELECT o.name, f.name
-FROM orders.entities o
-JOIN fulfillment.entities f ON o.name = f.name;
+select o.name, f.name
+from orders.entities o
+join fulfillment.entities f on o.name = f.name;
 ```
 
 ### Phase 5: Cross-project operations (future)

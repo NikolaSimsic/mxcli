@@ -76,6 +76,55 @@ func (r *Reader) parseSnippet(unitID, containerID string, contents []byte) (*pag
 		snippet.EntityID = model.ID(entityID)
 	}
 
+	// Parse snippet parameters so callers can validate SNIPPETCALL param mappings.
+	if params, ok := raw["Parameters"].(bson.A); ok {
+		for i := 1; i < len(params); i++ {
+			var paramMap map[string]any
+			switch v := params[i].(type) {
+			case bson.D:
+				paramMap = make(map[string]any, len(v))
+				for _, elem := range v {
+					paramMap[elem.Key] = elem.Value
+				}
+			case map[string]any:
+				paramMap = v
+			}
+			if paramMap == nil {
+				continue
+			}
+			sp := &pages.SnippetParameter{}
+			if id := extractID(paramMap["$ID"]); id != "" {
+				sp.ID = model.ID(id)
+			}
+			if n, ok := paramMap["Name"].(string); ok {
+				sp.Name = n
+			}
+			if sp.Name == "" {
+				continue
+			}
+			// ParameterType: either bson.D or map[string]any
+			extractParamType := func(m map[string]any) {
+				if t, ok := m["$Type"].(string); ok {
+					sp.Type = t
+				}
+				if e, ok := m["Entity"].(string); ok {
+					sp.EntityName = e
+				}
+			}
+			switch pt := paramMap["ParameterType"].(type) {
+			case bson.D:
+				m := make(map[string]any, len(pt))
+				for _, e := range pt {
+					m[e.Key] = e.Value
+				}
+				extractParamType(m)
+			case map[string]any:
+				extractParamType(pt)
+			}
+			snippet.Parameters = append(snippet.Parameters, sp)
+		}
+	}
+
 	return snippet, nil
 }
 
@@ -710,11 +759,15 @@ func parseJsonElement(raw map[string]any) *JsonElement {
 	if v, ok := raw["PrimitiveType"].(string); ok {
 		elem.PrimitiveType = v
 	}
-	if v, ok := raw["MinOccurs"].(int32); ok {
-		elem.MinOccurs = int(v)
+	// Issue #585: Studio Pro writes these numeric facets as BSON int64;
+	// mxcli's writer emits int32. extractInt accepts both (plus int and
+	// float64). Default values for MaxLength/FractionDigits/TotalDigits
+	// stay at -1 (set in the literal above) when the field is absent.
+	if _, ok := raw["MinOccurs"]; ok {
+		elem.MinOccurs = extractInt(raw["MinOccurs"])
 	}
-	if v, ok := raw["MaxOccurs"].(int32); ok {
-		elem.MaxOccurs = int(v)
+	if _, ok := raw["MaxOccurs"]; ok {
+		elem.MaxOccurs = extractInt(raw["MaxOccurs"])
 	}
 	if v, ok := raw["Nillable"].(bool); ok {
 		elem.Nillable = v
@@ -722,14 +775,14 @@ func parseJsonElement(raw map[string]any) *JsonElement {
 	if v, ok := raw["IsDefaultType"].(bool); ok {
 		elem.IsDefaultType = v
 	}
-	if v, ok := raw["MaxLength"].(int32); ok {
-		elem.MaxLength = int(v)
+	if _, ok := raw["MaxLength"]; ok {
+		elem.MaxLength = extractInt(raw["MaxLength"])
 	}
-	if v, ok := raw["FractionDigits"].(int32); ok {
-		elem.FractionDigits = int(v)
+	if _, ok := raw["FractionDigits"]; ok {
+		elem.FractionDigits = extractInt(raw["FractionDigits"])
 	}
-	if v, ok := raw["TotalDigits"].(int32); ok {
-		elem.TotalDigits = int(v)
+	if _, ok := raw["TotalDigits"]; ok {
+		elem.TotalDigits = extractInt(raw["TotalDigits"])
 	}
 	if v, ok := raw["OriginalValue"].(string); ok {
 		elem.OriginalValue = v

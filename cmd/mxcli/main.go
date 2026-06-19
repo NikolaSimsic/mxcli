@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/mendixlabs/mxcli/mdl/backend"
 	"github.com/mendixlabs/mxcli/mdl/diaglog"
 	"github.com/mendixlabs/mxcli/mdl/executor"
 	"github.com/mendixlabs/mxcli/mdl/repl"
@@ -107,6 +108,16 @@ Examples:
 			}
 		}
 		globalJSONFlag, _ = cmd.Flags().GetBool("json")
+		globalMCPURL, _ = cmd.Flags().GetString("mcp")
+		globalMCPDial, _ = cmd.Flags().GetString("mcp-dial")
+		globalMCPConcord, _ = cmd.Flags().GetString("mcp-concord")
+		globalMCPConcordDial, _ = cmd.Flags().GetString("mcp-concord-dial")
+		globalMCPSave, _ = cmd.Flags().GetBool("mcp-save")
+		globalMCPCheck, _ = cmd.Flags().GetBool("mcp-check")
+		globalMCPRun, _ = cmd.Flags().GetBool("mcp-run")
+		globalMCPVerbose, _ = cmd.Flags().GetBool("mcp-verbose")
+		globalMCPTrace, _ = cmd.Flags().GetBool("mcp-trace")
+		globalEngineFlag, _ = cmd.Flags().GetString("engine")
 	},
 	Run: func(cmd *cobra.Command, args []string) {
 		// Get flags
@@ -119,9 +130,15 @@ Examples:
 			defer logger.Close()
 			defer exec.Close()
 
+			// Suppress status messages when stdout is a pipe so that
+			// output can be piped directly to other tools (e.g. mxcli fmt).
+			if fi, statErr := os.Stdout.Stat(); statErr == nil && (fi.Mode()&os.ModeCharDevice) == 0 {
+				exec.SetQuiet(true)
+			}
+
 			// Auto-connect if project specified
 			if projectPath != "" {
-				commands = fmt.Sprintf("CONNECT LOCAL '%s'; %s", projectPath, commands)
+				commands = fmt.Sprintf("CONNECT LOCAL '%s'; %s", visitor.QuoteString(projectPath), commands)
 			}
 
 			prog, errs := visitor.Build(commands)
@@ -145,12 +162,19 @@ Examples:
 			defer logger.Close()
 
 			r := repl.New(os.Stdin, os.Stdout)
+			// Honor MXCLI_ENGINE/--engine AND --mcp in interactive mode (the REPL
+			// defaulted to the legacy local .mpr backend and ignored both). The
+			// unified factory routes writes to the modelsdk engine or a live Studio
+			// Pro as configured. Must precede the auto-connect below, since CONNECT
+			// consumes the factory.
+			r.SetBackendFactory(newBackendFactory())
+			r.SetTracer(mcpTracer())
 			r.SetLogger(logger)
 			defer r.Close()
 
 			// Auto-connect if project specified
 			if projectPath != "" {
-				if err := r.ExecuteString(fmt.Sprintf("CONNECT LOCAL '%s';", projectPath)); err != nil {
+				if err := r.ExecuteString(fmt.Sprintf("CONNECT LOCAL '%s';", visitor.QuoteString(projectPath))); err != nil {
 					fmt.Fprintf(os.Stderr, "Error connecting: %v\n", err)
 				}
 			}
@@ -175,6 +199,22 @@ Examples:
 // globalJSONFlag is set by PersistentPreRun when --json is passed.
 var globalJSONFlag bool
 
+// globalMCPURL / globalMCPDial are set by PersistentPreRun from --mcp / --mcp-dial.
+// When globalMCPURL is non-empty, newLoggedExecutor builds an MCP backend that
+// routes model writes to a live Studio Pro while reads come from the local
+// .mpr given by -p. See docs/11-proposals/PROPOSAL_mcp_backend.md.
+var (
+	globalMCPURL         string
+	globalMCPDial        string
+	globalMCPConcord     string
+	globalMCPConcordDial string
+	globalMCPSave        bool
+	globalMCPCheck       bool
+	globalMCPRun         bool
+	globalMCPVerbose     bool
+	globalMCPTrace       bool
+)
+
 // resolveFormat returns the effective output format for a command.
 // If the global --json flag is set and the command has a --format flag, it returns "json".
 // Otherwise it returns the command's --format flag value (or the provided default).
@@ -189,11 +229,32 @@ func resolveFormat(cmd *cobra.Command, defaultFormat string) string {
 	return defaultFormat
 }
 
+// mcpTracer builds the PED tool-call tracer from --mcp-verbose / --mcp-trace.
+// Returns nil when tracing is off or --mcp is not set (tracing is meaningless
+// without the MCP backend). Output goes to stderr so stdout stays pipeable.
+// (The MCP backend selection itself lives in newBackendFactory, the unified
+// engine+MCP factory.)
+func mcpTracer() *backend.Tracer {
+	if globalMCPURL == "" {
+		return nil
+	}
+	switch {
+	case globalMCPTrace:
+		return &backend.Tracer{Level: 2, W: os.Stderr}
+	case globalMCPVerbose:
+		return &backend.Tracer{Level: 1, W: os.Stderr}
+	default:
+		return nil
+	}
+}
+
 // newLoggedExecutor creates an executor with diagnostics logging attached.
 // The caller must call logger.Close() when done (safe on nil).
 func newLoggedExecutor(mode string) (*executor.Executor, *diaglog.Logger) {
 	logger := diaglog.Init(version, mode)
 	exec := executor.New(os.Stdout)
+	exec.SetBackendFactory(newBackendFactory())
+	exec.SetTracer(mcpTracer())
 	exec.SetLogger(logger)
 	if globalJSONFlag {
 		exec.SetFormat(executor.FormatJSON)
@@ -207,7 +268,7 @@ func executeMDL(projectPath, mdlCmd string) {
 	defer logger.Close()
 	defer exec.Close()
 
-	fullCmd := fmt.Sprintf("CONNECT LOCAL '%s'; %s", projectPath, mdlCmd)
+	fullCmd := fmt.Sprintf("CONNECT LOCAL '%s'; %s", visitor.QuoteString(projectPath), mdlCmd)
 	prog, errs := visitor.Build(fullCmd)
 	if len(errs) > 0 {
 		for _, err := range errs {
@@ -238,11 +299,22 @@ func init() {
 	// Global flags
 	rootCmd.PersistentFlags().StringP("project", "p", "", "Path to Mendix project (.mpr file)")
 	rootCmd.PersistentFlags().Bool("json", false, "Output in JSON format")
+	rootCmd.PersistentFlags().String("mcp", "", "Route model writes to a live Studio Pro MCP server (e.g. http://localhost:7782/mcp); reads come from -p")
+	rootCmd.PersistentFlags().String("mcp-dial", "", "Override the TCP address dialed for --mcp (e.g. host.docker.internal:7782 from a devcontainer)")
+	rootCmd.PersistentFlags().String("mcp-concord", "", "Optional second MCP server (Concord) for capabilities the built-in server lacks: delete, save, validate, run (e.g. http://localhost:7783/mcp)")
+	rootCmd.PersistentFlags().String("mcp-concord-dial", "", "Override the TCP address dialed for --mcp-concord")
+	rootCmd.PersistentFlags().Bool("mcp-save", false, "After the command, save all changes in Studio Pro via Concord (requires --mcp-concord; the built-in server has no save tool)")
+	rootCmd.PersistentFlags().Bool("mcp-check", false, "After the command, run Studio Pro's model consistency check via Concord and print the report (requires --mcp-concord)")
+	rootCmd.PersistentFlags().Bool("mcp-run", false, "After the command, start the app in Studio Pro via Concord (run_app) and print its URL (requires --mcp-concord)")
+	rootCmd.PersistentFlags().Bool("mcp-verbose", false, "Print each PED tool call the MCP backend makes (requires --mcp)")
+	rootCmd.PersistentFlags().Bool("mcp-trace", false, "Print each MDL command with the PED tool calls it makes (implies --mcp-verbose; requires --mcp)")
+	rootCmd.PersistentFlags().String("engine", "", "Model engine: modelsdk (default), legacy (fallback for unsupported writes, e.g. SOAP). Overrides MXCLI_ENGINE.")
 	rootCmd.Flags().StringP("command", "c", "", "Execute MDL command(s) and exit")
 
 	// Check command flags
 	checkCmd.Flags().BoolP("references", "r", false, "Validate references against the project")
 	checkCmd.Flags().String("format", "text", "Output format: text, json, sarif")
+	checkCmd.Flags().Bool("post-migration", false, "Scan the project for legacy native widgets that survived a Mendix upgrade (requires -p)")
 
 	// Diff command flags
 	diffCmd.Flags().StringP("format", "f", "unified", "Output format: unified, side, struct")
@@ -285,6 +357,13 @@ func init() {
 	reportCmd.Flags().StringP("output", "o", "", "Output file path (default: stdout)")
 	reportCmd.Flags().StringSliceP("exclude", "e", nil, "Modules to exclude from report")
 
+	// Graph-report command flags
+	graphReportCmd.Flags().StringP("format", "f", "markdown", "Output format: markdown, json")
+	graphReportCmd.Flags().StringP("output", "o", "", "Output file path (default: stdout)")
+	graphReportCmd.Flags().Int("top", 15, "Max rows per section")
+	graphReportCmd.Flags().Bool("include-framework", false, "Include framework/marketplace modules")
+	graphReportCmd.Flags().StringSliceP("exclude", "e", nil, "Additional modules to exclude")
+
 	// Test command flags
 	testRunCmd.Flags().BoolP("list", "l", false, "List tests without executing")
 	testRunCmd.Flags().StringP("junit", "j", "", "Write JUnit XML results to file")
@@ -318,6 +397,7 @@ func init() {
 	rootCmd.AddCommand(searchCmd)
 	rootCmd.AddCommand(lintCmd)
 	rootCmd.AddCommand(reportCmd)
+	rootCmd.AddCommand(graphReportCmd)
 	rootCmd.AddCommand(serveCmd)
 	rootCmd.AddCommand(lspCmd)
 	rootCmd.AddCommand(projectTreeCmd)

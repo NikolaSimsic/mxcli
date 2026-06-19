@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 
@@ -108,14 +109,33 @@ func (w *Writer) DeleteModuleWithCleanup(id model.ID, moduleName string) error {
 		return err
 	}
 
-	// Remove themesource/<modulename>/ directory (lowercased module name)
+	// Remove the module's generated source directories. themesource and
+	// javasource use the lowercased module name; javascriptsource uses the
+	// original casing (with a lowercase fallback). Studio Pro deletes these when a
+	// module is removed; leaving them strands proxies/actions for a module that no
+	// longer exists in the model.
 	projectDir := filepath.Dir(w.reader.path)
-	themesourceDir := filepath.Join(projectDir, "themesource", strings.ToLower(moduleName))
-	if stat, err := os.Stat(themesourceDir); err == nil && stat.IsDir() {
-		os.RemoveAll(themesourceDir)
-	}
+	removeModuleSourceDirs(projectDir, moduleName)
 
 	return nil
+}
+
+// removeModuleSourceDirs deletes the themesource/javasource/javascriptsource
+// directories belonging to a module. Mirrored by the modelsdk backend's
+// DeleteModuleWithCleanup.
+func removeModuleSourceDirs(projectDir, moduleName string) {
+	lower := strings.ToLower(moduleName)
+	dirs := []string{
+		filepath.Join(projectDir, "themesource", lower),
+		filepath.Join(projectDir, "javasource", lower),
+		filepath.Join(projectDir, "javascriptsource", moduleName),
+		filepath.Join(projectDir, "javascriptsource", lower),
+	}
+	for _, dir := range dirs {
+		if stat, err := os.Stat(dir); err == nil && stat.IsDir() {
+			os.RemoveAll(dir)
+		}
+	}
 }
 
 // deleteChildUnits recursively deletes all units whose ContainerID matches the given parent.
@@ -234,6 +254,78 @@ func (w *Writer) serializeModuleSettings(id string) ([]byte, error) {
 		"ProtectedModuleType": "AddOn",
 		"SolutionIdentifier":  "",
 		"Version":             "1.0.0",
+	}
+	return bson.Marshal(doc)
+}
+
+// UpdateModuleSettings persists the full Projects$ModuleSettings document,
+// including all JarDependencies and their Exclusions.
+func (w *Writer) UpdateModuleSettings(ms *types.ModuleSettings) error {
+	contents, err := w.serializeModuleSettingsFull(ms)
+	if err != nil {
+		return fmt.Errorf("failed to serialize module settings: %w", err)
+	}
+	return w.updateUnit(string(ms.ID), contents)
+}
+
+// serializeModuleSettingsFull serializes a ModuleSettings with actual dependencies.
+func (w *Writer) serializeModuleSettingsFull(ms *types.ModuleSettings) ([]byte, error) {
+	exportLevel := ms.ExportLevel
+	if exportLevel == "" {
+		exportLevel = "Source"
+	}
+	protectedType := ms.ProtectedModuleType
+	if protectedType == "" {
+		protectedType = "AddOn"
+	}
+	ver := ms.Version
+	if ver == "" {
+		ver = "1.0.0"
+	}
+
+	deps := bson.A{int32(2)} // listType marker
+	for _, d := range ms.JarDependencies {
+		depID := string(d.ID)
+		if depID == "" {
+			depID = generateUUID()
+		}
+		depDoc := bson.M{
+			"$ID":        idToBsonBinary(depID),
+			"$Type":      "Projects$JarDependency",
+			"GroupId":    d.GroupID,
+			"ArtifactId": d.ArtifactID,
+			"Version":    d.Version,
+			"IsIncluded": d.IsIncluded,
+		}
+		if len(d.Exclusions) > 0 {
+			excArr := bson.A{int32(2)}
+			for _, e := range d.Exclusions {
+				excID := string(e.ID)
+				if excID == "" {
+					excID = generateUUID()
+				}
+				excArr = append(excArr, bson.M{
+					"$ID":        idToBsonBinary(excID),
+					"$Type":      "Projects$JarDependencyExclusion",
+					"GroupId":    e.GroupID,
+					"ArtifactId": e.ArtifactID,
+				})
+			}
+			depDoc["Exclusions"] = excArr
+		}
+		deps = append(deps, depDoc)
+	}
+
+	doc := bson.M{
+		"$ID":                 idToBsonBinary(string(ms.ID)),
+		"$Type":               "Projects$ModuleSettings",
+		"BasedOnVersion":      ms.BasedOnVersion,
+		"ExportLevel":         exportLevel,
+		"ExtensionName":       ms.ExtensionName,
+		"JarDependencies":     deps,
+		"ProtectedModuleType": protectedType,
+		"SolutionIdentifier":  ms.SolutionIdentifier,
+		"Version":             ver,
 	}
 	return bson.Marshal(doc)
 }

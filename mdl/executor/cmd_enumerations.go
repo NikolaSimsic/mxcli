@@ -9,14 +9,16 @@ import (
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
 	"github.com/mendixlabs/mxcli/mdl/linter"
 	"github.com/mendixlabs/mxcli/model"
 )
 
 // execCreateEnumeration handles CREATE ENUMERATION statements.
-func (e *Executor) execCreateEnumeration(s *ast.CreateEnumerationStmt) error {
-	if e.reader == nil {
-		return fmt.Errorf("not connected to a project")
+func execCreateEnumeration(ctx *ExecContext, s *ast.CreateEnumerationStmt) error {
+
+	if !ctx.Connected() {
+		return mdlerrors.NewNotConnected()
 	}
 
 	// Validate enumeration values for reserved words
@@ -25,20 +27,20 @@ func (e *Executor) execCreateEnumeration(s *ast.CreateEnumerationStmt) error {
 		for _, v := range violations {
 			msgs = append(msgs, v.Message)
 		}
-		return fmt.Errorf("invalid enumeration '%s':\n  - %s",
+		return mdlerrors.NewValidationf("invalid enumeration '%s':\n  - %s",
 			s.Name.String(), strings.Join(msgs, "\n  - "))
 	}
 
 	// Find or auto-create module
-	module, err := e.findOrCreateModule(s.Name.Module)
+	module, err := findOrCreateModule(ctx, s.Name.Module)
 	if err != nil {
 		return err
 	}
 
 	// Check if enumeration already exists
-	existingEnum := e.findEnumeration(s.Name.Module, s.Name.Name)
+	existingEnum := findEnumeration(ctx, s.Name.Module, s.Name.Name)
 	if existingEnum != nil && !s.CreateOrModify {
-		return fmt.Errorf("enumeration already exists: %s.%s (use CREATE OR MODIFY to update)", s.Name.Module, s.Name.Name)
+		return mdlerrors.NewAlreadyExistsMsg("enumeration", s.Name.Module+"."+s.Name.Name, fmt.Sprintf("enumeration already exists: %s.%s (use create or modify to update)", s.Name.Module, s.Name.Name))
 	}
 
 	// Create enumeration values
@@ -52,14 +54,7 @@ func (e *Executor) execCreateEnumeration(s *ast.CreateEnumerationStmt) error {
 		})
 	}
 
-	// If enumeration exists and CREATE OR MODIFY, delete it first
-	if existingEnum != nil && s.CreateOrModify {
-		if err := e.writer.DeleteEnumeration(existingEnum.ID); err != nil {
-			return fmt.Errorf("failed to delete existing enumeration: %w", err)
-		}
-	}
-
-	// Create enumeration
+	// Create or update enumeration
 	enum := &model.Enumeration{
 		ContainerID:   module.ID,
 		Name:          s.Name.Name,
@@ -67,25 +62,38 @@ func (e *Executor) execCreateEnumeration(s *ast.CreateEnumerationStmt) error {
 		Values:        values,
 	}
 
-	if err := e.writer.CreateEnumeration(enum); err != nil {
-		return fmt.Errorf("failed to create enumeration: %w", err)
+	if existingEnum != nil && s.CreateOrModify {
+		// In-place update: preserve the existing UUID so BSON git-diff sees a
+		// modification rather than a delete+insert pair.
+		enum.ID = existingEnum.ID
+		if err := ctx.Backend.UpdateEnumeration(enum); err != nil {
+			return mdlerrors.NewBackend("update enumeration", err)
+		}
+		invalidateHierarchy(ctx)
+		fmt.Fprintf(ctx.Output, "Modified enumeration: %s\n", s.Name)
+		return nil
+	}
+
+	if err := ctx.Backend.CreateEnumeration(enum); err != nil {
+		return mdlerrors.NewBackend("create enumeration", err)
 	}
 
 	// Invalidate hierarchy cache so the new enumeration's container is visible
-	e.invalidateHierarchy()
+	invalidateHierarchy(ctx)
 
-	fmt.Fprintf(e.output, "Created enumeration: %s\n", s.Name)
+	fmt.Fprintf(ctx.Output, "Created enumeration: %s\n", s.Name)
 	return nil
 }
 
 // findEnumeration finds an enumeration by module and name.
-func (e *Executor) findEnumeration(moduleName, enumName string) *model.Enumeration {
-	enums, err := e.reader.ListEnumerations()
+func findEnumeration(ctx *ExecContext, moduleName, enumName string) *model.Enumeration {
+
+	enums, err := ctx.Backend.ListEnumerations()
 	if err != nil {
 		return nil
 	}
 
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
 		return nil
 	}
@@ -100,52 +108,128 @@ func (e *Executor) findEnumeration(moduleName, enumName string) *model.Enumerati
 	return nil
 }
 
-// execAlterEnumeration handles ALTER ENUMERATION statements.
-func (e *Executor) execAlterEnumeration(s *ast.AlterEnumerationStmt) error {
-	// TODO: Implement ALTER ENUMERATION
-	return fmt.Errorf("ALTER ENUMERATION not yet implemented")
+// execAlterEnumeration handles ALTER ENUMERATION ADD/DROP/RENAME VALUE by
+// read-modify-writing the enumeration through the backend (engine-agnostic).
+func execAlterEnumeration(ctx *ExecContext, s *ast.AlterEnumerationStmt) error {
+	enum := findEnumeration(ctx, s.Name.Module, s.Name.Name)
+	if enum == nil {
+		return mdlerrors.NewNotFound("enumeration", s.Name.String())
+	}
+
+	switch s.Operation {
+	case ast.AlterEnumAdd:
+		for _, v := range enum.Values {
+			if v.Name == s.ValueName {
+				return mdlerrors.NewAlreadyExistsMsg("enumeration value", s.ValueName,
+					fmt.Sprintf("value '%s' already exists on enumeration %s", s.ValueName, s.Name))
+			}
+		}
+		enum.Values = append(enum.Values, model.EnumerationValue{
+			Name:    s.ValueName,
+			Caption: &model.Text{Translations: map[string]string{"en_US": s.Caption}},
+		})
+
+	case ast.AlterEnumDrop:
+		idx := -1
+		for i, v := range enum.Values {
+			if v.Name == s.ValueName {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return mdlerrors.NewNotFound("enumeration value", s.ValueName)
+		}
+		enum.Values = append(enum.Values[:idx], enum.Values[idx+1:]...)
+
+	case ast.AlterEnumRename:
+		idx := -1
+		for i, v := range enum.Values {
+			if v.Name == s.ValueName {
+				idx = i
+				break
+			}
+		}
+		if idx < 0 {
+			return mdlerrors.NewNotFound("enumeration value", s.ValueName)
+		}
+		enum.Values[idx].Name = s.NewName
+
+	default:
+		return mdlerrors.NewUnsupported("unknown ALTER ENUMERATION operation")
+	}
+
+	if err := ctx.Backend.UpdateEnumeration(enum); err != nil {
+		return mdlerrors.NewBackend("alter enumeration", err)
+	}
+	invalidateHierarchy(ctx)
+	fmt.Fprintf(ctx.Output, "Altered enumeration: %s\n", s.Name)
+	return nil
 }
 
 // execDropEnumeration handles DROP ENUMERATION statements.
-func (e *Executor) execDropEnumeration(s *ast.DropEnumerationStmt) error {
-	if e.reader == nil {
-		return fmt.Errorf("not connected to a project")
+func execDropEnumeration(ctx *ExecContext, s *ast.DropEnumerationStmt) error {
+
+	if !ctx.Connected() {
+		return mdlerrors.NewNotConnected()
 	}
 
 	// Find enumeration
-	enums, err := e.reader.ListEnumerations()
+	enums, err := ctx.Backend.ListEnumerations()
 	if err != nil {
-		return fmt.Errorf("failed to list enumerations: %w", err)
+		return mdlerrors.NewBackend("list enumerations", err)
 	}
 
+	// Collect all enumerations matching the name (and optional module).
+	type match struct {
+		enum   *model.Enumeration
+		module *model.Module
+	}
+	var matches []match
 	for _, enum := range enums {
-		if enum.Name == s.Name.Name {
-			// Check module matches
-			module, err := e.findModuleByID(enum.ContainerID)
-			if err == nil && (s.Name.Module == "" || module.Name == s.Name.Module) {
-				if err := e.writer.DeleteEnumeration(enum.ID); err != nil {
-					return fmt.Errorf("failed to delete enumeration: %w", err)
-				}
-				fmt.Fprintf(e.output, "Dropped enumeration: %s\n", s.Name)
-				return nil
-			}
+		if enum.Name != s.Name.Name {
+			continue
+		}
+		module, err := findModuleByID(ctx, enum.ContainerID)
+		if err != nil {
+			continue
+		}
+		if s.Name.Module == "" || module.Name == s.Name.Module {
+			matches = append(matches, match{enum, module})
 		}
 	}
 
-	return fmt.Errorf("enumeration not found: %s", s.Name)
+	switch len(matches) {
+	case 0:
+		return mdlerrors.NewNotFound("enumeration", s.Name.String())
+	case 1:
+		if err := ctx.Backend.DeleteEnumeration(matches[0].enum.ID); err != nil {
+			return mdlerrors.NewBackend("delete enumeration", err)
+		}
+		fmt.Fprintf(ctx.Output, "Dropped enumeration: %s.%s\n", matches[0].module.Name, s.Name.Name)
+		return nil
+	default:
+		var names []string
+		for _, m := range matches {
+			names = append(names, m.module.Name+"."+s.Name.Name)
+		}
+		return mdlerrors.NewValidationf("ambiguous enumeration name %q — found in: %s; use a fully-qualified name",
+			s.Name.Name, strings.Join(names, ", "))
+	}
 }
 
-// showEnumerations handles SHOW ENUMERATIONS command.
-func (e *Executor) showEnumerations(moduleName string) error {
-	enums, err := e.reader.ListEnumerations()
+// listEnumerations handles SHOW ENUMERATIONS command.
+func listEnumerations(ctx *ExecContext, moduleName string) error {
+
+	enums, err := ctx.Backend.ListEnumerations()
 	if err != nil {
-		return fmt.Errorf("failed to list enumerations: %w", err)
+		return mdlerrors.NewBackend("list enumerations", err)
 	}
 
 	// Get hierarchy for module/folder resolution
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	// Collect rows
@@ -182,19 +266,20 @@ func (e *Executor) showEnumerations(moduleName string) error {
 	for _, r := range rows {
 		result.Rows = append(result.Rows, []any{r.qualifiedName, r.module, r.name, r.folderPath, r.values})
 	}
-	return e.writeResult(result)
+	return writeResult(ctx, result)
 }
 
 // describeEnumeration handles DESCRIBE ENUMERATION command.
-func (e *Executor) describeEnumeration(name ast.QualifiedName) error {
-	enums, err := e.reader.ListEnumerations()
+func describeEnumeration(ctx *ExecContext, name ast.QualifiedName) error {
+
+	enums, err := ctx.Backend.ListEnumerations()
 	if err != nil {
-		return fmt.Errorf("failed to list enumerations: %w", err)
+		return mdlerrors.NewBackend("list enumerations", err)
 	}
 
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	for _, enum := range enums {
@@ -203,10 +288,10 @@ func (e *Executor) describeEnumeration(name ast.QualifiedName) error {
 		if enum.Name == name.Name && (name.Module == "" || modName == name.Module) {
 			// Output JavaDoc documentation if present
 			if enum.Documentation != "" {
-				fmt.Fprintf(e.output, "/**\n * %s\n */\n", enum.Documentation)
+				fmt.Fprintf(ctx.Output, "/**\n * %s\n */\n", enum.Documentation)
 			}
 
-			fmt.Fprintf(e.output, "CREATE OR MODIFY ENUMERATION %s.%s (\n", modName, enum.Name)
+			fmt.Fprintf(ctx.Output, "create or modify enumeration %s.%s (\n", modName, enum.Name)
 			for i, v := range enum.Values {
 				comma := ","
 				if i == len(enum.Values)-1 {
@@ -216,15 +301,15 @@ func (e *Executor) describeEnumeration(name ast.QualifiedName) error {
 				if v.Caption != nil {
 					caption = v.Caption.GetTranslation("en_US")
 				}
-				fmt.Fprintf(e.output, "  %s '%s'%s\n", v.Name, caption, comma)
+				fmt.Fprintf(ctx.Output, "  %s '%s'%s\n", v.Name, caption, comma)
 			}
-			fmt.Fprintln(e.output, ");")
-			fmt.Fprintln(e.output, "/")
+			fmt.Fprintln(ctx.Output, ");")
+			fmt.Fprintln(ctx.Output, "/")
 			return nil
 		}
 	}
 
-	return fmt.Errorf("enumeration not found: %s", name)
+	return mdlerrors.NewNotFound("enumeration", name.String())
 }
 
 // mendixReservedWords contains words that cannot be used as enumeration value names.
@@ -244,12 +329,12 @@ var mendixReservedWords = map[string]bool{
 	"public": true, "return": true, "short": true, "static": true,
 	"strictfp": true, "super": true, "switch": true, "synchronized": true,
 	"this": true, "throw": true, "throws": true, "transient": true,
-	"true": true, "try": true, "void": true, "volatile": true,
+	"true": true, "try": true, "type": true, "void": true, "volatile": true,
 	"while": true,
 	// Mendix-specific reserved identifiers
 	"changedby": true, "changeddate": true, "con": true, "context": true,
 	"createddate": true, "currentuser": true, "guid": true,
-	"id": true, "mendixobject": true, "submetaobjectname": true,
+	"id": true, "mendixobject": true, "owner": true, "submetaobjectname": true,
 }
 
 // ValidateEnumeration checks enumeration value names for reserved words.
@@ -257,8 +342,24 @@ var mendixReservedWords = map[string]bool{
 // This function does not require a project connection.
 func ValidateEnumeration(stmt *ast.CreateEnumerationStmt) []linter.Violation {
 	var violations []linter.Violation
+	seen := make(map[string]bool)
 	for _, v := range stmt.Values {
-		if mendixReservedWords[strings.ToLower(v.Name)] {
+		lower := strings.ToLower(v.Name)
+		if seen[lower] {
+			violations = append(violations, linter.Violation{
+				RuleID:   "MDL011",
+				Severity: linter.SeverityError,
+				Message: fmt.Sprintf(
+					"duplicate enumeration value name '%s'", v.Name),
+				Location: linter.Location{
+					DocumentType: "enumeration",
+					DocumentName: stmt.Name.String(),
+				},
+				Suggestion: "Each enumeration value must have a unique name",
+			})
+		}
+		seen[lower] = true
+		if mendixReservedWords[lower] {
 			violations = append(violations, linter.Violation{
 				RuleID:   "MDL010",
 				Severity: linter.SeverityError,
@@ -288,19 +389,25 @@ var mendixSystemAttributeNames = map[string]bool{
 
 // ValidateEntity checks entity attribute names for reserved system names.
 // Returns a list of structured violations with rule IDs. This function does not require a project connection.
+//
+// Two distinct checks run here:
+//   - MDL020 (mendixSystemAttributeNames): only applies to persistent entities.
+//     Owner/ChangedBy/CreatedDate/ChangedDate are auto-managed there and should
+//     be declared with the AutoX pseudo-types.
+//   - MDL021 (mendixReservedWords / CE7247): applies to ALL entity kinds.
+//     Mendix rejects these names at runtime regardless of persistence.
 func ValidateEntity(stmt *ast.CreateEntityStmt) []linter.Violation {
 	var violations []linter.Violation
-	// Only persistent entities have system attributes
-	if stmt.Kind != ast.EntityPersistent {
-		return violations
-	}
 	for _, attr := range stmt.Attributes {
-		// Skip pseudo-types — these ARE the system attributes
+		// Skip pseudo-types — these ARE the system attributes (persistent entities only).
 		if attr.Type.Kind == ast.TypeAutoOwner || attr.Type.Kind == ast.TypeAutoChangedBy ||
 			attr.Type.Kind == ast.TypeAutoCreatedDate || attr.Type.Kind == ast.TypeAutoChangedDate {
 			continue
 		}
-		if mendixSystemAttributeNames[strings.ToLower(attr.Name)] {
+		lower := strings.ToLower(attr.Name)
+		// MDL020: system-attribute conflict — only meaningful on persistent entities,
+		// where the suggested fix is to use the AutoX pseudo-type.
+		if stmt.Kind == ast.EntityPersistent && mendixSystemAttributeNames[lower] {
 			violations = append(violations, linter.Violation{
 				RuleID:   "MDL020",
 				Severity: linter.SeverityError,
@@ -312,7 +419,24 @@ func ValidateEntity(stmt *ast.CreateEntityStmt) []linter.Violation {
 					DocumentType: "entity",
 					DocumentName: stmt.Name.String(),
 				},
-				Suggestion: fmt.Sprintf("Rename to avoid conflicts (e.g., 'Custom%s')", attr.Name),
+				Suggestion: fmt.Sprintf("To use the Mendix built-in audit field, declare it with the pseudo-type: '%s: Auto%s'. To store an unrelated date, choose a different name (e.g., 'EntryDate', 'RecordDate')", attr.Name, attr.Name),
+			})
+			continue
+		}
+		// MDL021: CE7247 runtime reserved words — apply to all entity kinds
+		// including non-persistent and view entities.
+		if mendixReservedWords[lower] {
+			violations = append(violations, linter.Violation{
+				RuleID:   "MDL021",
+				Severity: linter.SeverityError,
+				Message: fmt.Sprintf(
+					"attribute '%s' is a reserved word (CE7247)",
+					attr.Name),
+				Location: linter.Location{
+					DocumentType: "entity",
+					DocumentName: stmt.Name.String(),
+				},
+				Suggestion: fmt.Sprintf("Rename to a non-reserved name (e.g., '%sValue' or '%sField')", attr.Name, attr.Name),
 			})
 		}
 	}

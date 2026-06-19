@@ -217,13 +217,15 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 	} else if ctx.VERSION() != nil {
 		b.statements = append(b.statements, &ast.ShowStmt{ObjectType: ast.ShowVersion})
 	} else if ctx.CATALOG() != nil {
-		// Check for SHOW CATALOG STATUS
+		// SHOW CATALOG STATUS or SHOW CATALOG TABLES
 		if ctx.STATUS() != nil {
 			b.statements = append(b.statements, &ast.ShowStmt{ObjectType: ast.ShowCatalogStatus})
 		} else {
-			// SHOW CATALOG TABLES (or other catalog show commands)
 			b.statements = append(b.statements, &ast.ShowStmt{ObjectType: ast.ShowCatalogTables})
 		}
+	} else if ctx.STATUS() != nil {
+		// SHOW STATUS — print connection status (path, version, module count)
+		b.statements = append(b.statements, &ast.StatusStmt{})
 	} else if ctx.CALLERS() != nil {
 		// SHOW CALLERS OF Module.Microflow [TRANSITIVE]
 		if qn := ctx.QualifiedName(); qn != nil {
@@ -280,6 +282,19 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 				Depth:      depth,
 			})
 		}
+	} else if ctx.COMMUNITY() != nil {
+		// SHOW COMMUNITY [MEMBERS] OF Module.Asset
+		ot := ast.ShowCommunity
+		if ctx.MEMBERS() != nil {
+			ot = ast.ShowCommunityMembers
+		}
+		if qn := ctx.QualifiedName(); qn != nil {
+			name := buildQualifiedName(qn)
+			b.statements = append(b.statements, &ast.ShowStmt{ObjectType: ot, Name: &name})
+		}
+	} else if ctx.COMMUNITIES() != nil {
+		// SHOW COMMUNITIES
+		b.statements = append(b.statements, &ast.ShowStmt{ObjectType: ast.ShowCommunities})
 	} else if ctx.SECURITY() != nil && ctx.PROJECT() != nil {
 		// SHOW PROJECT SECURITY
 		b.statements = append(b.statements, &ast.ShowStmt{ObjectType: ast.ShowProjectSecurity})
@@ -312,7 +327,7 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 		// SHOW DEMO USERS
 		b.statements = append(b.statements, &ast.ShowStmt{ObjectType: ast.ShowDemoUsers})
 	} else if ctx.ACCESS() != nil {
-		// SHOW ACCESS ON [MICROFLOW|PAGE] Module.Entity
+		// SHOW ACCESS ON [MICROFLOW|PAGE|WORKFLOW|NANOFLOW] Module.Entity
 		if qn := ctx.QualifiedName(); qn != nil {
 			name := buildQualifiedName(qn)
 			if ctx.MICROFLOW() != nil {
@@ -328,6 +343,11 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 			} else if ctx.WORKFLOW() != nil {
 				b.statements = append(b.statements, &ast.ShowStmt{
 					ObjectType: ast.ShowAccessOnWorkflow,
+					Name:       &name,
+				})
+			} else if ctx.NANOFLOW() != nil {
+				b.statements = append(b.statements, &ast.ShowStmt{
+					ObjectType: ast.ShowAccessOnNanoflow,
 					Name:       &name,
 				})
 			} else {
@@ -380,7 +400,7 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 		// SHOW DESIGN PROPERTIES [FOR widgetType]
 		stmt := &ast.ShowDesignPropertiesStmt{}
 		if wtk := ctx.WidgetTypeKeyword(); wtk != nil {
-			stmt.WidgetType = strings.ToUpper(wtk.GetText())
+			stmt.WidgetType = strings.ToLower(wtk.GetText())
 		}
 		b.statements = append(b.statements, stmt)
 	} else if ctx.STRUCTURE() != nil {
@@ -478,6 +498,39 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 			}
 		}
 		b.statements = append(b.statements, stmt)
+	} else if ctx.AGENTS() != nil {
+		// SHOW AGENTS [IN module] (agent-editor Agent documents)
+		stmt := &ast.ShowStmt{ObjectType: ast.ShowAgents}
+		if ctx.IN() != nil {
+			if qn := ctx.QualifiedName(); qn != nil {
+				stmt.InModule = getQualifiedNameText(qn)
+			} else if id := ctx.IDENTIFIER(); id != nil {
+				stmt.InModule = id.GetText()
+			}
+		}
+		b.statements = append(b.statements, stmt)
+	} else if ctx.KNOWLEDGE() != nil && ctx.BASES() != nil {
+		// SHOW KNOWLEDGE BASES [IN module] (agent-editor KB documents)
+		stmt := &ast.ShowStmt{ObjectType: ast.ShowKnowledgeBases}
+		if ctx.IN() != nil {
+			if qn := ctx.QualifiedName(); qn != nil {
+				stmt.InModule = getQualifiedNameText(qn)
+			} else if id := ctx.IDENTIFIER(); id != nil {
+				stmt.InModule = id.GetText()
+			}
+		}
+		b.statements = append(b.statements, stmt)
+	} else if ctx.CONSUMED() != nil && ctx.MCP() != nil && ctx.SERVICES() != nil {
+		// SHOW CONSUMED MCP SERVICES [IN module]
+		stmt := &ast.ShowStmt{ObjectType: ast.ShowConsumedMCPServices}
+		if ctx.IN() != nil {
+			if qn := ctx.QualifiedName(); qn != nil {
+				stmt.InModule = getQualifiedNameText(qn)
+			} else if id := ctx.IDENTIFIER(); id != nil {
+				stmt.InModule = id.GetText()
+			}
+		}
+		b.statements = append(b.statements, stmt)
 	} else if ctx.PUBLISHED() != nil && ctx.REST() != nil && ctx.SERVICES() != nil {
 		// SHOW PUBLISHED REST SERVICES [IN module] - must come before REST CLIENTS check
 		stmt := &ast.ShowStmt{ObjectType: ast.ShowPublishedRestServices}
@@ -564,6 +617,17 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 			}
 		}
 		b.statements = append(b.statements, stmt)
+	} else if ctx.JAR() != nil && ctx.DEPENDENCIES() != nil {
+		// LIST JAR DEPENDENCIES [IN module]
+		stmt := &ast.ShowStmt{ObjectType: ast.ShowJarDependencies}
+		if ctx.IN() != nil {
+			if qn := ctx.QualifiedName(); qn != nil {
+				stmt.InModule = getQualifiedNameText(qn)
+			} else if id := ctx.IDENTIFIER(); id != nil {
+				stmt.InModule = id.GetText()
+			}
+		}
+		b.statements = append(b.statements, stmt)
 	} else if ctx.WIDGETS() != nil {
 		// SHOW WIDGETS [WHERE ...] [IN module]
 		stmt := &ast.ShowWidgetsStmt{
@@ -635,10 +699,14 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 		return
 	}
 
-	// Handle DESCRIBE MODULE specially (uses IDENTIFIER not qualifiedName)
+	// Handle DESCRIBE MODULE specially (uses identifierOrKeyword — accepts
+	// module names that happen to match a keyword, like "Agents").
 	if ctx.MODULE() != nil {
 		var moduleName string
-		if id := ctx.IDENTIFIER(); id != nil {
+		if iok := ctx.IdentifierOrKeyword(); iok != nil {
+			moduleName = iok.GetText()
+		} else if id := ctx.IDENTIFIER(); id != nil {
+			// Fallback for older grammar versions.
 			moduleName = id.GetText()
 		}
 		b.statements = append(b.statements, &ast.DescribeStmt{
@@ -792,6 +860,37 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 		return
 	}
 
+	// Handle DESCRIBE JAR DEPENDENCY ModuleName 'group:artifact'
+	if ctx.JAR() != nil && ctx.DEPENDENCY() != nil {
+		var moduleName string
+		if qn := ctx.QualifiedName(); qn != nil {
+			moduleName = getQualifiedNameText(qn)
+		} else if id := ctx.IDENTIFIER(); id != nil {
+			moduleName = id.GetText()
+		}
+		coordinate := ""
+		if sl := ctx.STRING_LITERAL(); sl != nil {
+			coordinate = unquoteString(sl.GetText())
+		}
+		b.statements = append(b.statements, &ast.DescribeStmt{
+			ObjectType: ast.DescribeJarDependency,
+			Name:       ast.QualifiedName{Name: moduleName},
+			Qualifier:  coordinate,
+		})
+		return
+	}
+
+	// Handle DESCRIBE CONTRACT OPERATION FROM OPENAPI '/path/to/spec.json'
+	// This rule uses a STRING_LITERAL (not a qualifiedName) and needs no project connection.
+	if ctx.CONTRACT() != nil && ctx.OPERATION() != nil && ctx.FROM() != nil && ctx.OPENAPI() != nil {
+		if sl := ctx.STRING_LITERAL(); sl != nil {
+			b.statements = append(b.statements, &ast.DescribeContractFromOpenAPIStmt{
+				SpecPath: unquoteString(sl.GetText()),
+			})
+		}
+		return
+	}
+
 	// All other DESCRIBE statements use qualifiedName
 	qn := ctx.QualifiedName()
 	if qn == nil {
@@ -893,6 +992,24 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 			ObjectType: ast.DescribeModel,
 			Name:       name,
 		})
+	} else if ctx.AGENT() != nil {
+		// DESCRIBE AGENT Module.Name (agent-editor Agent document)
+		b.statements = append(b.statements, &ast.DescribeStmt{
+			ObjectType: ast.DescribeAgent,
+			Name:       name,
+		})
+	} else if ctx.KNOWLEDGE() != nil && ctx.BASE() != nil {
+		// DESCRIBE KNOWLEDGE BASE Module.Name
+		b.statements = append(b.statements, &ast.DescribeStmt{
+			ObjectType: ast.DescribeKnowledgeBase,
+			Name:       name,
+		})
+	} else if ctx.CONSUMED() != nil && ctx.MCP() != nil && ctx.SERVICE() != nil {
+		// DESCRIBE CONSUMED MCP SERVICE Module.Name
+		b.statements = append(b.statements, &ast.DescribeStmt{
+			ObjectType: ast.DescribeConsumedMCPService,
+			Name:       name,
+		})
 	} else if ctx.REST() != nil && ctx.CLIENT() != nil {
 		b.statements = append(b.statements, &ast.DescribeStmt{
 			ObjectType: ast.DescribeRestClient,
@@ -923,6 +1040,13 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 			ObjectType: ast.DescribeExportMapping,
 			Name:       name,
 		})
+	} else {
+		// Bare DESCRIBE qualifiedName — no type keyword matched, so the document
+		// type is auto-detected from the project at execution time.
+		b.statements = append(b.statements, &ast.DescribeStmt{
+			ObjectType: ast.DescribeAuto,
+			Name:       name,
+		})
 	}
 }
 
@@ -948,18 +1072,49 @@ func (b *Builder) ExitExecuteScriptStatement(ctx *parser.ExecuteScriptStatementC
 	}
 }
 
+// ExitSessionSetStatement handles session-level SET key = value
+// Grammar: sessionSetStatement: SET identifierOrKeyword EQUALS sessionSetValue
+func (b *Builder) ExitSessionSetStatement(ctx *parser.SessionSetStatementContext) {
+	keyCtx := ctx.IdentifierOrKeyword()
+	valCtx := ctx.SessionSetValue()
+	if keyCtx == nil || valCtx == nil {
+		return
+	}
+	key := keyCtx.GetText()
+	var value any
+	switch {
+	case valCtx.TRUE() != nil:
+		value = true
+	case valCtx.FALSE() != nil:
+		value = false
+	case valCtx.NUMBER_LITERAL() != nil:
+		if i, err := strconv.ParseInt(valCtx.NUMBER_LITERAL().GetText(), 10, 64); err == nil {
+			value = i
+		} else {
+			value = valCtx.NUMBER_LITERAL().GetText()
+		}
+	case valCtx.STRING_LITERAL() != nil:
+		value = unquoteString(valCtx.STRING_LITERAL().GetText())
+	case valCtx.IdentifierOrKeyword() != nil:
+		value = valCtx.IdentifierOrKeyword().GetText()
+	}
+	b.statements = append(b.statements, &ast.SetStmt{Key: key, Value: value})
+}
+
 // ExitHelpStatement handles help/exit/quit commands
-// Grammar: helpStatement: IDENTIFIER
+// Grammar: helpStatement: IDENTIFIER (identifierOrKeyword)*
 func (b *Builder) ExitHelpStatement(ctx *parser.HelpStatementContext) {
 	if id := ctx.IDENTIFIER(); id != nil {
 		cmd := strings.ToLower(id.GetText())
 		switch cmd {
 		case "help", "?":
-			b.statements = append(b.statements, &ast.HelpStmt{})
+			stmt := &ast.HelpStmt{}
+			for _, tok := range ctx.AllIdentifierOrKeyword() {
+				stmt.Topic = append(stmt.Topic, strings.ToLower(tok.GetText()))
+			}
+			b.statements = append(b.statements, stmt)
 		case "exit", "quit":
 			b.statements = append(b.statements, &ast.ExitStmt{})
-		case "status":
-			b.statements = append(b.statements, &ast.StatusStmt{})
 		}
 	}
 }
@@ -971,10 +1126,16 @@ func (b *Builder) ExitUpdateStatement(ctx *parser.UpdateStatementContext) {
 	} else if ctx.REFRESH() != nil {
 		if ctx.CATALOG() != nil {
 			stmt := &ast.RefreshCatalogStmt{
-				Full:       ctx.FULL() != nil,
-				Source:     ctx.SOURCE_KW() != nil,
-				Force:      ctx.FORCE() != nil,
-				Background: ctx.BACKGROUND() != nil,
+				Full:        ctx.FULL() != nil,
+				Source:      ctx.SOURCE_KW() != nil,
+				Force:       ctx.FORCE() != nil,
+				Background:  ctx.BACKGROUND() != nil,
+				Communities: ctx.COMMUNITIES() != nil,
+			}
+			if ctx.RESOLUTION() != nil && ctx.NUMBER_LITERAL() != nil {
+				if f, err := strconv.ParseFloat(ctx.NUMBER_LITERAL().GetText(), 64); err == nil {
+					stmt.Resolution = f
+				}
 			}
 			b.statements = append(b.statements, stmt)
 		} else {

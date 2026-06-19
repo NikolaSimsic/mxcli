@@ -39,8 +39,8 @@ func (b *Builder) ExitCreateBusinessEventServiceStatement(ctx *parser.CreateBusi
 		}
 
 		msg := &ast.BusinessEventMessageDef{}
-		if id := msgDef.IDENTIFIER(); id != nil {
-			msg.MessageName = id.GetText()
+		if iok := msgDef.IdentifierOrKeyword(); iok != nil {
+			msg.MessageName = identifierOrKeywordText(iok)
 		}
 
 		// Parse operation (PUBLISH or SUBSCRIBE)
@@ -71,8 +71,8 @@ func (b *Builder) ExitCreateBusinessEventServiceStatement(ctx *parser.CreateBusi
 			attr := &ast.BusinessEventAttributeDef{
 				TypeName: dataTypeSimpleName(attrDef.DataType()),
 			}
-			if id := attrDef.IDENTIFIER(); id != nil {
-				attr.Name = id.GetText()
+			if iok := attrDef.IdentifierOrKeyword(); iok != nil {
+				attr.Name = identifierOrKeywordText(iok)
 			}
 			msg.Attributes = append(msg.Attributes, attr)
 		}
@@ -80,11 +80,11 @@ func (b *Builder) ExitCreateBusinessEventServiceStatement(ctx *parser.CreateBusi
 		stmt.Messages = append(stmt.Messages, msg)
 	}
 
-	// Check for CREATE OR REPLACE and doc comment
+	// Check for CREATE OR MODIFY (or OR REPLACE, treated identically) and doc comment
 	createStmt := findParentCreateStatement(ctx)
 	if createStmt != nil {
 		if createStmt.OR() != nil && (createStmt.REPLACE() != nil || createStmt.MODIFY() != nil) {
-			stmt.CreateOrReplace = true
+			stmt.CreateOrModify = true
 		}
 	}
 	stmt.Documentation = findDocCommentText(ctx)
@@ -102,6 +102,15 @@ func dataTypeSimpleName(ctx parser.IDataTypeContext) string {
 	// Strip trailing length specifications like "String(200)" → "String"
 	if idx := strings.Index(text, "("); idx >= 0 {
 		text = text[:idx]
+	}
+	// Normalize to Mendix canonical casing (grammar is case-insensitive, Mendix BSON is not).
+	canonical := map[string]string{
+		"string": "String", "integer": "Integer", "long": "Long",
+		"decimal": "Decimal", "boolean": "Boolean", "datetime": "DateTime",
+		"binary": "Binary",
+	}
+	if c, ok := canonical[strings.ToLower(text)]; ok {
+		return c
 	}
 	return text
 }

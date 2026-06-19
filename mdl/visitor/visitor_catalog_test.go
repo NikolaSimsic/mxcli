@@ -162,3 +162,66 @@ func TestRefreshCatalog(t *testing.T) {
 		})
 	}
 }
+
+func TestShowCommunityStatements(t *testing.T) {
+	cases := []struct {
+		input    string
+		wantType ast.ShowObjectType
+		wantName string
+	}{
+		{"SHOW COMMUNITIES", ast.ShowCommunities, ""},
+		{"SHOW COMMUNITY OF Sales.Order", ast.ShowCommunity, "Sales.Order"},
+		{"show community members of Sales.Order", ast.ShowCommunityMembers, "Sales.Order"},
+	}
+	for _, c := range cases {
+		t.Run(c.input, func(t *testing.T) {
+			prog, errs := Build(c.input)
+			if len(errs) > 0 {
+				t.Fatalf("parse error: %v", errs[0])
+			}
+			stmt, ok := prog.Statements[0].(*ast.ShowStmt)
+			if !ok {
+				t.Fatalf("expected ShowStmt, got %T", prog.Statements[0])
+			}
+			if stmt.ObjectType != c.wantType {
+				t.Errorf("ObjectType: got %v, want %v", stmt.ObjectType, c.wantType)
+			}
+			gotName := ""
+			if stmt.Name != nil {
+				gotName = stmt.Name.String()
+			}
+			if gotName != c.wantName {
+				t.Errorf("Name: got %q, want %q", gotName, c.wantName)
+			}
+		})
+	}
+}
+
+func TestRefreshCatalogCommunities(t *testing.T) {
+	cases := []struct {
+		input          string
+		wantResolution float64
+	}{
+		{"REFRESH CATALOG COMMUNITIES", 0},
+		{"REFRESH CATALOG COMMUNITIES RESOLUTION 1.5", 1.5},
+		{"refresh catalog communities resolution 0.5", 0.5},
+	}
+	for _, c := range cases {
+		t.Run(c.input, func(t *testing.T) {
+			prog, errs := Build(c.input)
+			if len(errs) > 0 {
+				t.Fatalf("parse error: %v", errs[0])
+			}
+			stmt, ok := prog.Statements[0].(*ast.RefreshCatalogStmt)
+			if !ok {
+				t.Fatalf("expected RefreshCatalogStmt, got %T", prog.Statements[0])
+			}
+			if !stmt.Communities {
+				t.Error("expected Communities=true")
+			}
+			if stmt.Resolution != c.wantResolution {
+				t.Errorf("Resolution: got %v, want %v", stmt.Resolution, c.wantResolution)
+			}
+		})
+	}
+}

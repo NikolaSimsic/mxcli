@@ -21,7 +21,7 @@ import (
 func buildCatalogFull(t *testing.T, env *testEnv) {
 	t.Helper()
 	if err := env.executor.Execute(&ast.RefreshCatalogStmt{Full: true, Force: true}); err != nil {
-		t.Fatalf("REFRESH CATALOG FULL FORCE failed: %v", err)
+		t.Fatalf("refresh catalog full force failed: %v", err)
 	}
 }
 
@@ -44,7 +44,7 @@ func countRefs(t *testing.T, env *testEnv, sourceName, targetName, refKind strin
 		conditions = append(conditions, fmt.Sprintf("RefKind = '%s'", refKind))
 	}
 
-	query := "SELECT COUNT(*) AS cnt FROM refs WHERE " + strings.Join(conditions, " AND ")
+	query := "select count(*) as cnt from refs where " + strings.Join(conditions, " and ")
 	result, err := env.executor.catalog.Query(query)
 	if err != nil {
 		t.Fatalf("refs query failed: %v", err)
@@ -86,19 +86,19 @@ func TestCatalogRefs_MicroflowCallsMicroflow(t *testing.T) {
 	mod := testModule
 
 	// Create target microflow
-	if err := env.executeMDL(fmt.Sprintf(`CREATE MICROFLOW %s.TargetMf () RETURNS Boolean
-BEGIN
-  RETURN true;
-END;`, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.TargetMf () returns Boolean
+begin
+  return true;
+end;`, mod)); err != nil {
 		t.Fatalf("Failed to create target microflow: %v", err)
 	}
 
 	// Create caller microflow
-	if err := env.executeMDL(fmt.Sprintf(`CREATE MICROFLOW %s.CallerMf () RETURNS Boolean
-BEGIN
-  $Result = CALL MICROFLOW %s.TargetMf ();
-  RETURN $Result;
-END;`, mod, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.CallerMf () returns Boolean
+begin
+  $Result = call microflow %s.TargetMf ();
+  return $Result;
+end;`, mod, mod)); err != nil {
 		t.Fatalf("Failed to create caller microflow: %v", err)
 	}
 
@@ -112,15 +112,15 @@ func TestCatalogRefs_MicroflowCreatesEntity(t *testing.T) {
 
 	mod := testModule
 
-	if err := env.executeMDL(fmt.Sprintf(`CREATE OR MODIFY PERSISTENT ENTITY %s.RefCustomer (Name: String(100));`, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create or modify persistent entity %s.RefCustomer (Name: String(100));`, mod)); err != nil {
 		t.Fatalf("Failed to create entity: %v", err)
 	}
 
-	if err := env.executeMDL(fmt.Sprintf(`CREATE MICROFLOW %s.CreatorMf () RETURNS Boolean
-BEGIN
-  $Obj = CREATE %s.RefCustomer;
-  RETURN true;
-END;`, mod, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.CreatorMf () returns Boolean
+begin
+  $Obj = create %s.RefCustomer;
+  return true;
+end;`, mod, mod)); err != nil {
 		t.Fatalf("Failed to create microflow: %v", err)
 	}
 
@@ -134,15 +134,15 @@ func TestCatalogRefs_MicroflowRetrievesEntity(t *testing.T) {
 
 	mod := testModule
 
-	if err := env.executeMDL(fmt.Sprintf(`CREATE OR MODIFY PERSISTENT ENTITY %s.RefProduct (Code: String(50));`, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create or modify persistent entity %s.RefProduct (Code: String(50));`, mod)); err != nil {
 		t.Fatalf("Failed to create entity: %v", err)
 	}
 
-	if err := env.executeMDL(fmt.Sprintf(`CREATE MICROFLOW %s.RetrieverMf () RETURNS Boolean
-BEGIN
-  RETRIEVE $Items FROM %s.RefProduct;
-  RETURN true;
-END;`, mod, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.RetrieverMf () returns Boolean
+begin
+  retrieve $Items from %s.RefProduct;
+  return true;
+end;`, mod, mod)); err != nil {
 		t.Fatalf("Failed to create microflow: %v", err)
 	}
 
@@ -150,26 +150,49 @@ END;`, mod, mod)); err != nil {
 	assertRefExists(t, env, mod+".RetrieverMf", mod+".RefProduct", "retrieve")
 }
 
-func TestCatalogRefs_Association(t *testing.T) {
-	t.Skip("TODO: association references not yet extracted into refs table (RefKindAssociate defined but unused)")
-
+// A microflow that only takes/returns an entity (never create/retrieve) still
+// references it via its parameter and return type.
+func TestCatalogRefs_MicroflowParameterAndReturn(t *testing.T) {
 	env := setupTestEnv(t)
 	defer env.teardown()
 
 	mod := testModule
 
-	if err := env.executeMDL(fmt.Sprintf(`CREATE OR MODIFY PERSISTENT ENTITY %s.RefParent (Name: String(100));`, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create or modify persistent entity %s.RefAcct (Name: String(50));`, mod)); err != nil {
 		t.Fatal(err)
 	}
-	if err := env.executeMDL(fmt.Sprintf(`CREATE OR MODIFY PERSISTENT ENTITY %s.RefChild (Label: String(100));`, mod)); err != nil {
-		t.Fatal(err)
-	}
-	if err := env.executeMDL(fmt.Sprintf(`CREATE ASSOCIATION %s.RefChild_RefParent FROM %s.RefChild TO %s.RefParent;`, mod, mod, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.PassThru ($Acct: %s.RefAcct) returns %s.RefAcct
+begin
+  return $Acct;
+end;`, mod, mod, mod)); err != nil {
 		t.Fatal(err)
 	}
 
 	buildCatalogFull(t, env)
+	assertRefExists(t, env, mod+".PassThru", mod+".RefAcct", "parameter")
+	assertRefExists(t, env, mod+".PassThru", mod+".RefAcct", "return")
+}
+
+func TestCatalogRefs_Association(t *testing.T) {
+	env := setupTestEnv(t)
+	defer env.teardown()
+
+	mod := testModule
+
+	if err := env.executeMDL(fmt.Sprintf(`create or modify persistent entity %s.RefParent (Name: String(100));`, mod)); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.executeMDL(fmt.Sprintf(`create or modify persistent entity %s.RefChild (Label: String(100));`, mod)); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.executeMDL(fmt.Sprintf(`create association %s.RefChild_RefParent from %s.RefChild to %s.RefParent;`, mod, mod, mod)); err != nil {
+		t.Fatal(err)
+	}
+
+	buildCatalogFull(t, env)
+	// An association emits an `associate` ref to each endpoint (FROM and TO).
 	assertRefExists(t, env, mod+".RefChild_RefParent", mod+".RefParent", "associate")
+	assertRefExists(t, env, mod+".RefChild_RefParent", mod+".RefChild", "associate")
 }
 
 func TestCatalogRefs_MultipleRefKindsToSameTarget(t *testing.T) {
@@ -178,17 +201,17 @@ func TestCatalogRefs_MultipleRefKindsToSameTarget(t *testing.T) {
 
 	mod := testModule
 
-	if err := env.executeMDL(fmt.Sprintf(`CREATE OR MODIFY PERSISTENT ENTITY %s.RefOrder (OrderNum: String(50));`, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create or modify persistent entity %s.RefOrder (OrderNum: String(50));`, mod)); err != nil {
 		t.Fatal(err)
 	}
 
 	// Microflow that both creates and retrieves the same entity
-	if err := env.executeMDL(fmt.Sprintf(`CREATE MICROFLOW %s.MultiRefMf () RETURNS Boolean
-BEGIN
-  $Obj = CREATE %s.RefOrder;
-  RETRIEVE $List FROM %s.RefOrder;
-  RETURN true;
-END;`, mod, mod, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.MultiRefMf () returns Boolean
+begin
+  $Obj = create %s.RefOrder;
+  retrieve $List from %s.RefOrder;
+  return true;
+end;`, mod, mod, mod)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -203,7 +226,7 @@ func TestCatalogRefs_NoReferences(t *testing.T) {
 
 	mod := testModule
 
-	if err := env.executeMDL(fmt.Sprintf(`CREATE OR MODIFY PERSISTENT ENTITY %s.Orphan (Name: String(100));`, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create or modify persistent entity %s.Orphan (Name: String(100));`, mod)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -225,19 +248,19 @@ func TestCatalogRefs_ShowCallersOf(t *testing.T) {
 	mod := testModule
 
 	// Create target
-	if err := env.executeMDL(fmt.Sprintf(`CREATE MICROFLOW %s.CalleeA () RETURNS Boolean
-BEGIN
-  RETURN true;
-END;`, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.CalleeA () returns Boolean
+begin
+  return true;
+end;`, mod)); err != nil {
 		t.Fatal(err)
 	}
 
 	// Create caller
-	if err := env.executeMDL(fmt.Sprintf(`CREATE MICROFLOW %s.CallerA () RETURNS Boolean
-BEGIN
-  $R = CALL MICROFLOW %s.CalleeA ();
-  RETURN $R;
-END;`, mod, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.CallerA () returns Boolean
+begin
+  $R = call microflow %s.CalleeA ();
+  return $R;
+end;`, mod, mod)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -250,7 +273,7 @@ END;`, mod, mod)); err != nil {
 		Name:       parseQualifiedName(mod + ".CalleeA"),
 	})
 	if err != nil {
-		t.Fatalf("SHOW CALLERS failed: %v", err)
+		t.Fatalf("show callers failed: %v", err)
 	}
 
 	output := env.output.String()
@@ -266,19 +289,19 @@ func TestCatalogRefs_ShowCalleesOf(t *testing.T) {
 	mod := testModule
 
 	// Create callee
-	if err := env.executeMDL(fmt.Sprintf(`CREATE MICROFLOW %s.CalleeB () RETURNS Boolean
-BEGIN
-  RETURN true;
-END;`, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.CalleeB () returns Boolean
+begin
+  return true;
+end;`, mod)); err != nil {
 		t.Fatal(err)
 	}
 
 	// Create caller
-	if err := env.executeMDL(fmt.Sprintf(`CREATE MICROFLOW %s.CallerB () RETURNS Boolean
-BEGIN
-  $R = CALL MICROFLOW %s.CalleeB ();
-  RETURN $R;
-END;`, mod, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.CallerB () returns Boolean
+begin
+  $R = call microflow %s.CalleeB ();
+  return $R;
+end;`, mod, mod)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -290,7 +313,7 @@ END;`, mod, mod)); err != nil {
 		Name:       parseQualifiedName(mod + ".CallerB"),
 	})
 	if err != nil {
-		t.Fatalf("SHOW CALLEES failed: %v", err)
+		t.Fatalf("show callees failed: %v", err)
 	}
 
 	output := env.output.String()
@@ -306,26 +329,26 @@ func TestCatalogRefs_ShowCallersTransitive(t *testing.T) {
 	mod := testModule
 
 	// Create chain: CallerC1 -> CallerC2 -> CalleeC
-	if err := env.executeMDL(fmt.Sprintf(`CREATE MICROFLOW %s.CalleeC () RETURNS Boolean
-BEGIN
-  RETURN true;
-END;`, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.CalleeC () returns Boolean
+begin
+  return true;
+end;`, mod)); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := env.executeMDL(fmt.Sprintf(`CREATE MICROFLOW %s.CallerC2 () RETURNS Boolean
-BEGIN
-  $R = CALL MICROFLOW %s.CalleeC ();
-  RETURN $R;
-END;`, mod, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.CallerC2 () returns Boolean
+begin
+  $R = call microflow %s.CalleeC ();
+  return $R;
+end;`, mod, mod)); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := env.executeMDL(fmt.Sprintf(`CREATE MICROFLOW %s.CallerC1 () RETURNS Boolean
-BEGIN
-  $R = CALL MICROFLOW %s.CallerC2 ();
-  RETURN $R;
-END;`, mod, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.CallerC1 () returns Boolean
+begin
+  $R = call microflow %s.CallerC2 ();
+  return $R;
+end;`, mod, mod)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -338,7 +361,7 @@ END;`, mod, mod)); err != nil {
 		Name:       parseQualifiedName(mod + ".CalleeC"),
 	})
 	if err != nil {
-		t.Fatalf("SHOW CALLERS failed: %v", err)
+		t.Fatalf("show callers failed: %v", err)
 	}
 	output := env.output.String()
 	if !strings.Contains(output, mod+".CallerC2") {
@@ -353,7 +376,7 @@ END;`, mod, mod)); err != nil {
 		Transitive: true,
 	})
 	if err != nil {
-		t.Fatalf("SHOW CALLERS TRANSITIVE failed: %v", err)
+		t.Fatalf("show callers transitive failed: %v", err)
 	}
 	output = env.output.String()
 	if !strings.Contains(output, mod+".CallerC2") {
@@ -370,25 +393,25 @@ func TestCatalogRefs_ShowReferencesTo(t *testing.T) {
 
 	mod := testModule
 
-	if err := env.executeMDL(fmt.Sprintf(`CREATE OR MODIFY PERSISTENT ENTITY %s.RefTarget (Name: String(100));`, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create or modify persistent entity %s.RefTarget (Name: String(100));`, mod)); err != nil {
 		t.Fatal(err)
 	}
 
 	// Microflow creates the entity
-	if err := env.executeMDL(fmt.Sprintf(`CREATE MICROFLOW %s.RefCreator () RETURNS Boolean
-BEGIN
-  $Obj = CREATE %s.RefTarget;
-  RETURN true;
-END;`, mod, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.RefCreator () returns Boolean
+begin
+  $Obj = create %s.RefTarget;
+  return true;
+end;`, mod, mod)); err != nil {
 		t.Fatal(err)
 	}
 
 	// Another microflow retrieves it
-	if err := env.executeMDL(fmt.Sprintf(`CREATE MICROFLOW %s.RefRetriever () RETURNS Boolean
-BEGIN
-  RETRIEVE $List FROM %s.RefTarget;
-  RETURN true;
-END;`, mod, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.RefRetriever () returns Boolean
+begin
+  retrieve $List from %s.RefTarget;
+  return true;
+end;`, mod, mod)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -400,7 +423,7 @@ END;`, mod, mod)); err != nil {
 		Name:       parseQualifiedName(mod + ".RefTarget"),
 	})
 	if err != nil {
-		t.Fatalf("SHOW REFERENCES TO failed: %v", err)
+		t.Fatalf("show references to failed: %v", err)
 	}
 
 	output := env.output.String()
@@ -412,13 +435,62 @@ END;`, mod, mod)); err != nil {
 	}
 }
 
+// TestCatalogRefs_ShowContextResolvesTypes guards against the case-mismatch that
+// silently broke SHOW CONTEXT's relationship sections: they filter on
+// TargetType/SourceType, but those literals were lowercase ('entity') while the
+// refs builder stores uppercase ('ENTITY'), and SQLite '=' is case-sensitive — so
+// "Entities Used" / "Microflows Using This Entity" always rendered empty.
+func TestCatalogRefs_ShowContextResolvesTypes(t *testing.T) {
+	env := setupTestEnv(t)
+	defer env.teardown()
+
+	mod := testModule
+
+	if err := env.executeMDL(fmt.Sprintf(`create or modify persistent entity %s.CtxEntity (Name: String(100));`, mod)); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.CtxCreator () returns Boolean
+begin
+  $Obj = create %s.CtxEntity;
+  return true;
+end;`, mod, mod)); err != nil {
+		t.Fatal(err)
+	}
+
+	buildCatalogFull(t, env)
+
+	// Microflow context must list the entity it uses (TargetType = 'ENTITY').
+	env.output.Reset()
+	if err := env.executor.Execute(&ast.ShowStmt{
+		ObjectType: ast.ShowContext,
+		Name:       parseQualifiedName(mod + ".CtxCreator"),
+	}); err != nil {
+		t.Fatalf("show context of microflow failed: %v", err)
+	}
+	if mfCtx := env.output.String(); !strings.Contains(mfCtx, mod+".CtxEntity") {
+		t.Errorf("microflow context should list the entity it uses:\n%s", mfCtx)
+	}
+
+	// Entity context must list the microflow that uses it (SourceType = 'MICROFLOW').
+	env.output.Reset()
+	if err := env.executor.Execute(&ast.ShowStmt{
+		ObjectType: ast.ShowContext,
+		Name:       parseQualifiedName(mod + ".CtxEntity"),
+	}); err != nil {
+		t.Fatalf("show context of entity failed: %v", err)
+	}
+	if entCtx := env.output.String(); !strings.Contains(entCtx, mod+".CtxCreator") {
+		t.Errorf("entity context should list the microflow using it:\n%s", entCtx)
+	}
+}
+
 func TestCatalogRefs_ShowReferencesNoResults(t *testing.T) {
 	env := setupTestEnv(t)
 	defer env.teardown()
 
 	mod := testModule
 
-	if err := env.executeMDL(fmt.Sprintf(`CREATE OR MODIFY PERSISTENT ENTITY %s.Unreferenced (Name: String(100));`, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create or modify persistent entity %s.Unreferenced (Name: String(100));`, mod)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -430,7 +502,7 @@ func TestCatalogRefs_ShowReferencesNoResults(t *testing.T) {
 		Name:       parseQualifiedName(mod + ".Unreferenced"),
 	})
 	if err != nil {
-		t.Fatalf("SHOW REFERENCES TO failed: %v", err)
+		t.Fatalf("show references to failed: %v", err)
 	}
 
 	output := env.output.String()
@@ -445,15 +517,15 @@ func TestCatalogRefs_ShowImpactOf(t *testing.T) {
 
 	mod := testModule
 
-	if err := env.executeMDL(fmt.Sprintf(`CREATE OR MODIFY PERSISTENT ENTITY %s.ImpactEntity (Name: String(100));`, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create or modify persistent entity %s.ImpactEntity (Name: String(100));`, mod)); err != nil {
 		t.Fatal(err)
 	}
 
-	if err := env.executeMDL(fmt.Sprintf(`CREATE MICROFLOW %s.ImpactMf () RETURNS Boolean
-BEGIN
-  $Obj = CREATE %s.ImpactEntity;
-  RETURN true;
-END;`, mod, mod)); err != nil {
+	if err := env.executeMDL(fmt.Sprintf(`create microflow %s.ImpactMf () returns Boolean
+begin
+  $Obj = create %s.ImpactEntity;
+  return true;
+end;`, mod, mod)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -465,7 +537,7 @@ END;`, mod, mod)); err != nil {
 		Name:       parseQualifiedName(mod + ".ImpactEntity"),
 	})
 	if err != nil {
-		t.Fatalf("SHOW IMPACT failed: %v", err)
+		t.Fatalf("show impact failed: %v", err)
 	}
 
 	output := env.output.String()

@@ -55,6 +55,95 @@ END WORKFLOW;`
 	}
 }
 
+// TestWorkflowVisitor_UserTask_QuotedIdentifier is the regression test for
+// issue #403: user task names written as "quoted-identifiers" caused a nil
+// pointer dereference in buildWorkflowUserTask because the grammar only
+// accepted bare IDENTIFIER tokens.
+func TestWorkflowVisitor_UserTask_QuotedIdentifier(t *testing.T) {
+	input := `CREATE WORKFLOW Module.WF_Test
+BEGIN
+  USER TASK "ut1" 'Review'
+    PAGE Module.Page
+  OUTCOMES
+    'Approve' { }
+    'Reject' { };
+END WORKFLOW;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		for _, err := range errs {
+			t.Errorf("Parse error: %v", err)
+		}
+		t.FailNow()
+	}
+
+	if len(prog.Statements) != 1 {
+		t.Fatalf("Expected 1 statement, got %d", len(prog.Statements))
+	}
+
+	stmt, ok := prog.Statements[0].(*ast.CreateWorkflowStmt)
+	if !ok {
+		t.Fatalf("Expected CreateWorkflowStmt, got %T", prog.Statements[0])
+	}
+	if len(stmt.Activities) == 0 {
+		t.Fatal("Expected at least 1 activity")
+	}
+	userTask, ok := stmt.Activities[0].(*ast.WorkflowUserTaskNode)
+	if !ok {
+		t.Fatalf("Expected WorkflowUserTaskNode, got %T", stmt.Activities[0])
+	}
+	// Quotes must be stripped: "ut1" → ut1
+	if userTask.Name != "ut1" {
+		t.Errorf("Expected task name %q, got %q", "ut1", userTask.Name)
+	}
+	if userTask.Caption != "Review" {
+		t.Errorf("Expected caption %q, got %q", "Review", userTask.Caption)
+	}
+	if len(userTask.Outcomes) != 2 {
+		t.Fatalf("Expected 2 outcomes, got %d", len(userTask.Outcomes))
+	}
+}
+
+// TestWorkflowVisitor_JumpTo_QuotedIdentifier is the regression test for
+// the JUMP TO "name" variant of the same underlying issue.
+func TestWorkflowVisitor_JumpTo_QuotedIdentifier(t *testing.T) {
+	input := `CREATE WORKFLOW Module.WF_Test
+BEGIN
+  USER TASK "target" 'Target task'
+    OUTCOMES 'Done' { };
+  JUMP TO "target";
+END WORKFLOW;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		for _, err := range errs {
+			t.Errorf("Parse error: %v", err)
+		}
+		t.FailNow()
+	}
+
+	stmt, ok := prog.Statements[0].(*ast.CreateWorkflowStmt)
+	if !ok {
+		t.Fatalf("Expected CreateWorkflowStmt, got %T", prog.Statements[0])
+	}
+
+	// Find the JumpTo activity
+	var jumpTo *ast.WorkflowJumpToNode
+	for _, act := range stmt.Activities {
+		if jt, ok := act.(*ast.WorkflowJumpToNode); ok {
+			jumpTo = jt
+			break
+		}
+	}
+	if jumpTo == nil {
+		t.Fatal("Expected a WorkflowJumpToNode in activities")
+	}
+	// Quotes must be stripped: "target" → target
+	if jumpTo.Target != "target" {
+		t.Errorf("Expected jump target %q, got %q", "target", jumpTo.Target)
+	}
+}
+
 func TestWorkflowVisitor_BoundaryEventNonInterrupting(t *testing.T) {
 	input := `CREATE WORKFLOW M.TestWF
 BEGIN
@@ -612,7 +701,7 @@ func TestAlterWorkflow_SetDisplay(t *testing.T) {
 	if !ok {
 		t.Fatalf("Expected SetWorkflowPropertyOp, got %T", stmt.Operations[0])
 	}
-	if op.Property != "DISPLAY" {
+	if op.Property != "display" {
 		t.Errorf("Expected Property 'DISPLAY', got %q", op.Property)
 	}
 	if op.Value != "New Display Name" {
@@ -645,10 +734,10 @@ func TestAlterWorkflow_MultipleOperations(t *testing.T) {
 		prop  string
 		value string
 	}{
-		{"DISPLAY", "Updated Approval"},
-		{"DESCRIPTION", "Updated description"},
-		{"EXPORT_LEVEL", "Hidden"},
-		{"DUE_DATE", "PT48H"},
+		{"display", "Updated Approval"},
+		{"description", "Updated description"},
+		{"export_level", "Hidden"},
+		{"due_date", "PT48H"},
 	}
 
 	for i, check := range checks {
@@ -685,7 +774,7 @@ func TestAlterWorkflow_SetActivityPage(t *testing.T) {
 	if !ok {
 		t.Fatalf("Expected SetActivityPropertyOp, got %T", stmt.Operations[0])
 	}
-	if op.Property != "PAGE" {
+	if op.Property != "page" {
 		t.Errorf("Expected Property 'PAGE', got %q", op.Property)
 	}
 	if op.ActivityRef != "Review" {
@@ -716,7 +805,7 @@ func TestAlterWorkflow_SetActivityWithAtPosition(t *testing.T) {
 	if op.AtPosition != 2 {
 		t.Errorf("Expected AtPosition 2, got %d", op.AtPosition)
 	}
-	if op.Property != "DESCRIPTION" {
+	if op.Property != "description" {
 		t.Errorf("Expected Property 'DESCRIPTION', got %q", op.Property)
 	}
 	if op.Value != "Updated desc" {
@@ -1002,7 +1091,7 @@ func TestAlterWorkflow_SetParameter(t *testing.T) {
 	if !ok {
 		t.Fatalf("Expected SetWorkflowPropertyOp, got %T", stmt.Operations[0])
 	}
-	if op.Property != "PARAMETER" {
+	if op.Property != "parameter" {
 		t.Errorf("Expected Property 'PARAMETER', got %q", op.Property)
 	}
 	if op.Value != "$ctx" {
@@ -1029,7 +1118,7 @@ func TestAlterWorkflow_SetOverviewPage(t *testing.T) {
 	if !ok {
 		t.Fatalf("Expected SetWorkflowPropertyOp, got %T", stmt.Operations[0])
 	}
-	if op.Property != "OVERVIEW_PAGE" {
+	if op.Property != "overview_page" {
 		t.Errorf("Expected Property 'OVERVIEW_PAGE', got %q", op.Property)
 	}
 	if op.Entity.Module != "M" || op.Entity.Name != "AdminPage" {
@@ -1056,7 +1145,7 @@ func TestAlterWorkflow_SetActivityTargeting(t *testing.T) {
 	}
 
 	mfOp := stmt.Operations[0].(*ast.SetActivityPropertyOp)
-	if mfOp.Property != "TARGETING_MICROFLOW" {
+	if mfOp.Property != "targeting_microflow" {
 		t.Errorf("Expected Property 'TARGETING_MICROFLOW', got %q", mfOp.Property)
 	}
 	if mfOp.Microflow.Name != "GetReviewers" {
@@ -1064,12 +1153,60 @@ func TestAlterWorkflow_SetActivityTargeting(t *testing.T) {
 	}
 
 	xpOp := stmt.Operations[1].(*ast.SetActivityPropertyOp)
-	if xpOp.Property != "TARGETING_XPATH" {
+	if xpOp.Property != "targeting_xpath" {
 		t.Errorf("Expected Property 'TARGETING_XPATH', got %q", xpOp.Property)
 	}
 	if xpOp.Value != "[Role = 'Manager']" {
 		t.Errorf("Expected Value \"[Role = 'Manager']\", got %q", xpOp.Value)
 	}
+}
+
+// TestAlterWorkflow_DropBoundaryEvent_KeywordActivityRef verifies that using a keyword
+// token (e.g. "activity") as an activity reference in DROP BOUNDARY EVENT does not panic
+// — regression for issue #430 where AlterActivityRef() returned nil causing a panic via
+// a bare type assertion with no nil guard.
+func TestAlterWorkflow_DropBoundaryEvent_KeywordActivityRef(t *testing.T) {
+	// "activity" is a keyword token; alterActivityRef now uses identifierOrKeyword so
+	// this must parse without panicking and produce a DropBoundaryEventOp with ref "activity".
+	input := `ALTER WORKFLOW M.WF DROP BOUNDARY EVENT ON activity;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		for _, e := range errs {
+			t.Errorf("Parse error: %v", e)
+		}
+		t.FailNow()
+	}
+
+	stmt, ok := prog.Statements[0].(*ast.AlterWorkflowStmt)
+	if !ok || len(stmt.Operations) == 0 {
+		t.Fatal("Expected AlterWorkflowStmt with at least 1 operation")
+	}
+	op, ok := stmt.Operations[0].(*ast.DropBoundaryEventOp)
+	if !ok {
+		t.Fatalf("Expected DropBoundaryEventOp, got %T", stmt.Operations[0])
+	}
+	if op.ActivityRef != "activity" {
+		t.Errorf("ActivityRef = %q, want %q", op.ActivityRef, "activity")
+	}
+}
+
+// TestAlterWorkflow_DropBoundaryEvent_NilGuard verifies that a malformed
+// DROP BOUNDARY EVENT (activity ref missing) does not panic — it must return
+// nil silently rather than dereferencing a nil AlterActivityRef context.
+func TestAlterWorkflow_DropBoundaryEvent_NilGuard(t *testing.T) {
+	// Intentionally omit the activity ref to trigger ANTLR error recovery.
+	// The visitor must not panic; it is acceptable to get a parse error or to
+	// produce 0 operations (the nil-guard returns nil from buildAlterWorkflowAction).
+	input := `ALTER WORKFLOW M.WF DROP BOUNDARY EVENT ON ;`
+
+	// Must not panic.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("panic in visitor for malformed DROP BOUNDARY EVENT: %v", r)
+		}
+	}()
+	Build(input) //nolint:errcheck
 }
 
 func TestAlterWorkflow_SetActivityDueDate(t *testing.T) {
@@ -1085,7 +1222,7 @@ func TestAlterWorkflow_SetActivityDueDate(t *testing.T) {
 
 	stmt := prog.Statements[0].(*ast.AlterWorkflowStmt)
 	op := stmt.Operations[0].(*ast.SetActivityPropertyOp)
-	if op.Property != "DUE_DATE" {
+	if op.Property != "due_date" {
 		t.Errorf("Expected Property 'DUE_DATE', got %q", op.Property)
 	}
 	if op.Value != "PT72H" {

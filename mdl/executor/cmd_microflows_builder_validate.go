@@ -12,14 +12,23 @@ import (
 // ValidateMicroflowBody validates the microflow body for semantic errors without building objects.
 // This is used by the check command to validate scripts without executing them.
 func ValidateMicroflowBody(s *ast.CreateMicroflowStmt) []string {
-	// Build variable maps from parameters
+	return validateFlowBody(s.Parameters, s.Body)
+}
+
+// ValidateNanoflowBody validates the nanoflow body for semantic errors without building objects.
+// This is used by the check command to validate scripts without executing them.
+func ValidateNanoflowBody(s *ast.CreateNanoflowStmt) []string {
+	return validateFlowBody(s.Parameters, s.Body)
+}
+
+// validateFlowBody validates parameters and body statements for semantic errors.
+func validateFlowBody(params []ast.MicroflowParam, body []ast.MicroflowStatement) []string {
 	varTypes := make(map[string]string)
 	declaredVars := make(map[string]string)
 
 	var paramErrors []string
-	for _, p := range s.Parameters {
+	for _, p := range params {
 		if p.Type.EntityRef != nil {
-			// Reject bare entity names (empty module) — e.g., "Object" instead of "System.Workflow"
 			if p.Type.EntityRef.Module == "" {
 				paramErrors = append(paramErrors, fmt.Sprintf(
 					"parameter '$%s': entity type '%s' is missing module prefix (use 'Module.%s')",
@@ -33,7 +42,6 @@ func ValidateMicroflowBody(s *ast.CreateMicroflowStmt) []string {
 				varTypes[p.Name] = entityQN
 			}
 		} else {
-			// Primitive type parameters
 			declaredVars[p.Name] = p.Type.Kind.String()
 		}
 	}
@@ -41,15 +49,13 @@ func ValidateMicroflowBody(s *ast.CreateMicroflowStmt) []string {
 		return paramErrors
 	}
 
-	// Create a validation-only flow builder
 	fb := &flowBuilder{
 		varTypes:     varTypes,
 		declaredVars: declaredVars,
 		errors:       []string{},
 	}
 
-	// Validate the body statements
-	fb.validateStatements(s.Body)
+	fb.validateStatements(body)
 
 	return fb.errors
 }
@@ -59,6 +65,14 @@ func (fb *flowBuilder) validateStatements(stmts []ast.MicroflowStatement) {
 	for _, stmt := range stmts {
 		fb.validateStatement(stmt)
 	}
+}
+
+func (fb *flowBuilder) validateScopedStatements(stmts []ast.MicroflowStatement) {
+	scoped := *fb
+	scoped.varTypes = cloneStringMap(fb.varTypes)
+	scoped.declaredVars = cloneStringMap(fb.declaredVars)
+	scoped.validateStatements(stmts)
+	fb.errors = scoped.errors
 }
 
 // validateStatement validates a single statement for semantic errors.
@@ -87,11 +101,28 @@ func (fb *flowBuilder) validateStatement(stmt ast.MicroflowStatement) {
 		}
 
 	case *ast.IfStmt:
-		// Validate then branch
-		fb.validateStatements(s.ThenBody)
-		// Validate else branch if present
+		fb.validateScopedStatements(s.ThenBody)
 		if len(s.ElseBody) > 0 {
-			fb.validateStatements(s.ElseBody)
+			fb.validateScopedStatements(s.ElseBody)
+		}
+
+	case *ast.EnumSplitStmt:
+		if count := enumSplitBranchCount(s); count > maxEnumSplitBranches {
+			fb.addError("enum split has %d branches; at most %d branches are supported", count, maxEnumSplitBranches)
+		}
+		for _, c := range s.Cases {
+			fb.validateScopedStatements(c.Body)
+		}
+		if len(s.ElseBody) > 0 {
+			fb.validateScopedStatements(s.ElseBody)
+		}
+
+	case *ast.InheritanceSplitStmt:
+		for _, c := range s.Cases {
+			fb.validateScopedStatements(c.Body)
+		}
+		if len(s.ElseBody) > 0 {
+			fb.validateScopedStatements(s.ElseBody)
 		}
 
 	case *ast.LoopStmt:
@@ -109,10 +140,7 @@ func (fb *flowBuilder) validateStatement(stmt ast.MicroflowStatement) {
 		fb.validateStatements(s.Body)
 
 	case *ast.CreateObjectStmt:
-		// Check for duplicate variable — CREATE implicitly declares the variable
-		if s.Variable != "" && fb.isVariableDeclared(s.Variable) {
-			fb.addError("duplicate variable name '$%s' — CREATE implicitly declares the variable, remove the preceding DECLARE (CE0111)", s.Variable)
-		}
+		fb.validateOutputVariable(s.Variable, "create")
 		// Register created variable as entity type
 		if s.Variable != "" && s.EntityType.Module != "" {
 			fb.varTypes[s.Variable] = s.EntityType.Module + "." + s.EntityType.Name
@@ -125,8 +153,30 @@ func (fb *flowBuilder) validateStatement(stmt ast.MicroflowStatement) {
 	case *ast.CallMicroflowStmt:
 		// Register result variable if assigned
 		if s.OutputVariable != "" {
-			// We don't know the return type, so just mark it as declared
-			fb.declaredVars[s.OutputVariable] = "Unknown"
+			fb.validateOutputVariable(s.OutputVariable, "call microflow")
+			mfQN := s.MicroflowName.Module + "." + s.MicroflowName.Name
+			if returnType := fb.lookupMicroflowReturnType(mfQN); returnType != nil {
+				fb.registerResultVariableType(s.OutputVariable, returnType)
+			} else {
+				// We don't know the return type, so just mark it as declared
+				fb.declaredVars[s.OutputVariable] = "Unknown"
+			}
+		}
+		// Validate error handler body if present
+		if s.ErrorHandling != nil && len(s.ErrorHandling.Body) > 0 {
+			fb.validateStatements(s.ErrorHandling.Body)
+		}
+
+	case *ast.CallNanoflowStmt:
+		// Register result variable if assigned
+		if s.OutputVariable != "" {
+			fb.validateOutputVariable(s.OutputVariable, "call nanoflow")
+			nfQN := s.NanoflowName.Module + "." + s.NanoflowName.Name
+			if returnType := fb.lookupNanoflowReturnType(nfQN); returnType != nil {
+				fb.registerResultVariableType(s.OutputVariable, returnType)
+			} else {
+				fb.declaredVars[s.OutputVariable] = "Unknown"
+			}
 		}
 		// Validate error handler body if present
 		if s.ErrorHandling != nil && len(s.ErrorHandling.Body) > 0 {
@@ -136,6 +186,7 @@ func (fb *flowBuilder) validateStatement(stmt ast.MicroflowStatement) {
 	case *ast.CallJavaActionStmt:
 		// Register result variable if assigned
 		if s.OutputVariable != "" {
+			fb.validateOutputVariable(s.OutputVariable, "call java action")
 			fb.declaredVars[s.OutputVariable] = "Unknown"
 		}
 		// Validate error handler body if present
@@ -143,8 +194,34 @@ func (fb *flowBuilder) validateStatement(stmt ast.MicroflowStatement) {
 			fb.validateStatements(s.ErrorHandling.Body)
 		}
 
+	case *ast.DownloadFileStmt:
+		if s.ErrorHandling != nil && len(s.ErrorHandling.Body) > 0 {
+			fb.validateStatements(s.ErrorHandling.Body)
+		}
+
+	case *ast.CallJavaScriptActionStmt:
+		// Register result variable if assigned
+		if s.OutputVariable != "" {
+			fb.validateOutputVariable(s.OutputVariable, "call javascript action")
+			fb.declaredVars[s.OutputVariable] = "Unknown"
+		}
+		// Validate error handler body if present
+		if s.ErrorHandling != nil && len(s.ErrorHandling.Body) > 0 {
+			fb.validateStatements(s.ErrorHandling.Body)
+		}
+
+	case *ast.CallWebServiceStmt:
+		if s.OutputVariable != "" {
+			fb.validateOutputVariable(s.OutputVariable, "call web service")
+			fb.declaredVars[s.OutputVariable] = "Unknown"
+		}
+		if s.ErrorHandling != nil && len(s.ErrorHandling.Body) > 0 {
+			fb.validateStatements(s.ErrorHandling.Body)
+		}
+
 	case *ast.ExecuteDatabaseQueryStmt:
 		if s.OutputVariable != "" {
+			fb.validateOutputVariable(s.OutputVariable, "execute database query")
 			fb.declaredVars[s.OutputVariable] = "Unknown"
 		}
 		if s.ErrorHandling != nil && len(s.ErrorHandling.Body) > 0 {
@@ -154,6 +231,7 @@ func (fb *flowBuilder) validateStatement(stmt ast.MicroflowStatement) {
 	case *ast.CallExternalActionStmt:
 		// Register result variable if assigned
 		if s.OutputVariable != "" {
+			fb.validateOutputVariable(s.OutputVariable, "call external action")
 			fb.declaredVars[s.OutputVariable] = "Unknown"
 		}
 		// Validate error handler body if present
@@ -164,6 +242,7 @@ func (fb *flowBuilder) validateStatement(stmt ast.MicroflowStatement) {
 	case *ast.RestCallStmt:
 		// Register result variable if assigned
 		if s.OutputVariable != "" {
+			fb.validateOutputVariable(s.OutputVariable, "rest call")
 			// Type depends on result handling
 			switch s.Result.Type {
 			case ast.RestResultString:
@@ -188,6 +267,7 @@ func (fb *flowBuilder) validateStatement(stmt ast.MicroflowStatement) {
 	case *ast.SendRestRequestStmt:
 		// Register output variable if assigned
 		if s.OutputVariable != "" {
+			fb.validateOutputVariable(s.OutputVariable, "send rest request")
 			fb.declaredVars[s.OutputVariable] = "Unknown" // Type depends on operation response mapping
 		}
 		// Validate error handler body if present
@@ -211,10 +291,7 @@ func (fb *flowBuilder) validateStatement(stmt ast.MicroflowStatement) {
 		// No error handling to validate
 
 	case *ast.RetrieveStmt:
-		// Check for duplicate variable — RETRIEVE implicitly declares the variable
-		if s.Variable != "" && fb.isVariableDeclared(s.Variable) {
-			fb.addError("duplicate variable name '$%s' — RETRIEVE implicitly declares the variable, remove the preceding DECLARE (CE0111)", s.Variable)
-		}
+		fb.validateOutputVariable(s.Variable, "retrieve")
 		// Register retrieved variable
 		if s.Variable != "" && s.Source.Module != "" {
 			if s.StartVariable != "" {
@@ -231,6 +308,60 @@ func (fb *flowBuilder) validateStatement(stmt ast.MicroflowStatement) {
 			fb.validateStatements(s.ErrorHandling.Body)
 		}
 
-		// Other statement types don't need validation for variable declarations
+	case *ast.CreateListStmt:
+		fb.validateOutputVariable(s.Variable, "create list")
+		if s.Variable != "" && s.EntityType.Module != "" {
+			fb.varTypes[s.Variable] = "List of " + s.EntityType.Module + "." + s.EntityType.Name
+		}
+
+	case *ast.ListOperationStmt:
+		fb.validateOutputVariable(s.OutputVariable, "list operation")
+		if s.OutputVariable != "" {
+			fb.declaredVars[s.OutputVariable] = "Unknown"
+		}
+
+	case *ast.AggregateListStmt:
+		fb.validateOutputVariable(s.OutputVariable, "aggregate list")
+		if s.OutputVariable != "" {
+			fb.declaredVars[s.OutputVariable] = "Unknown"
+		}
+
+	case *ast.ImportFromMappingStmt:
+		fb.validateOutputVariable(s.OutputVariable, "import mapping")
+		if s.OutputVariable != "" {
+			fb.declaredVars[s.OutputVariable] = "Unknown"
+		}
+		if s.ErrorHandling != nil && len(s.ErrorHandling.Body) > 0 {
+			fb.validateStatements(s.ErrorHandling.Body)
+		}
+
+	case *ast.ExportToMappingStmt:
+		fb.validateOutputVariable(s.OutputVariable, "export mapping")
+		if s.OutputVariable != "" {
+			fb.declaredVars[s.OutputVariable] = "String"
+		}
+		if s.ErrorHandling != nil && len(s.ErrorHandling.Body) > 0 {
+			fb.validateStatements(s.ErrorHandling.Body)
+		}
+
+	case *ast.TransformJsonStmt:
+		fb.validateOutputVariable(s.OutputVariable, "transform json")
+		if s.OutputVariable != "" {
+			fb.declaredVars[s.OutputVariable] = "String"
+		}
+		if s.ErrorHandling != nil && len(s.ErrorHandling.Body) > 0 {
+			fb.validateStatements(s.ErrorHandling.Body)
+		}
+
+		// Other statement types don't declare variables.
+	}
+}
+
+func (fb *flowBuilder) validateOutputVariable(varName, statement string) {
+	if varName == "" {
+		return
+	}
+	if fb.isVariableDeclared(varName) {
+		fb.addError("duplicate variable name '$%s' — %s output variable is already declared in this scope (CE0111)", varName, statement)
 	}
 }

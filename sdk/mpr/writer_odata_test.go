@@ -7,6 +7,7 @@ import (
 
 	"github.com/mendixlabs/mxcli/model"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 func TestSerializeConsumedODataService(t *testing.T) {
@@ -101,10 +102,20 @@ func TestSerializeConsumedODataServiceWithHttpConfig(t *testing.T) {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
 
-	// Microflow references
+	// Microflow reference. Studio Pro stores both the "Configuration
+	// microflow" and "Headers microflow" dropdown options in the single
+	// `ConfigurationMicroflow` BSON field — it picks the dropdown label
+	// from the microflow's return type, not from which field carries the
+	// reference. Older mxcli fixes tried `ConfigurationEntityMicroflow` /
+	// `HeaderListMicroflow` / a separate `HeadersMicroflow`; Studio Pro
+	// silently ignores all three, leaving the dropdown stuck on
+	// "Constants only".
 	assertField(t, raw, "ConfigurationMicroflow", "MyModule.ConfigureMF")
 	assertField(t, raw, "ErrorHandlingMicroflow", "MyModule.HandleErrorMF")
 	assertField(t, raw, "ProxyHost", "MyModule.ProxyHostConst")
+	if _, exists := raw["HeadersMicroflow"]; exists {
+		t.Errorf("HeadersMicroflow leaked into BSON — Studio Pro stores both microflow dropdown options under ConfigurationMicroflow")
+	}
 
 	// HTTP Configuration
 	httpCfg, ok := raw["HttpConfiguration"].(map[string]any)
@@ -158,7 +169,7 @@ func TestSerializePublishedODataService(t *testing.T) {
 		AuthenticationTypes: []string{"Basic", "Session"},
 		EntityTypes: []*model.PublishedEntityType{
 			{
-				BaseElement: model.BaseElement{ID: "et-1"},
+				BaseElement: model.BaseElement{ID: "11111111-1111-1111-1111-111111111111"},
 				Entity:      "MyModule.Customer",
 				ExposedName: "Customers",
 				Members: []*model.PublishedMember{
@@ -255,7 +266,10 @@ func TestSerializePublishedODataService(t *testing.T) {
 		t.Fatalf("ChildMembers[0]: expected map, got %T", members[0])
 	}
 	assertField(t, m0, "$Type", "ODataPublish$PublishedAttribute")
-	assertField(t, m0, "Attribute", "Name")
+	// Attribute is the fully-qualified Module.Entity.AttributeName — Studio
+	// Pro requires qualified references, and using bare names made the
+	// second entity in a multi-entity service silently fail to resolve.
+	assertField(t, m0, "Attribute", "MyModule.Customer.Name")
 	assertField(t, m0, "ExposedName", "CustomerName")
 	if v, ok := m0["Filterable"].(bool); !ok || !v {
 		t.Errorf("Member Filterable: expected true, got %v", m0["Filterable"])
@@ -281,6 +295,20 @@ func TestSerializePublishedODataService(t *testing.T) {
 	}
 	assertField(t, esMap, "$Type", "ODataPublish$EntitySet")
 	assertField(t, esMap, "ExposedName", "Customers")
+
+	// Issue #595: EntityTypePointer must reference the owning EntityType.
+	// Without it, Studio Pro's EntitySet.Check NREs (it can't navigate from
+	// the set to its type). The map lookup in serializePublishedODataService
+	// was previously keyed by ExposedName instead of the qualified entity
+	// name, so the resolved ID was always empty and the pointer was omitted.
+	etID := etMap["$ID"].(primitive.Binary)
+	esPointer, ok := esMap["EntityTypePointer"].(primitive.Binary)
+	if !ok {
+		t.Fatalf("EntityTypePointer: expected primitive.Binary, got %T (%v)", esMap["EntityTypePointer"], esMap["EntityTypePointer"])
+	}
+	if string(esPointer.Data) != string(etID.Data) {
+		t.Errorf("EntityTypePointer = %x, want %x (entity type $ID)", esPointer.Data, etID.Data)
+	}
 
 	if v, ok := esMap["UsePaging"].(bool); !ok || !v {
 		t.Errorf("UsePaging: expected true, got %v", esMap["UsePaging"])

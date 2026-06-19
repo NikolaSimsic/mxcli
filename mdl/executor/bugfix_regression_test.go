@@ -9,8 +9,10 @@ import (
 	"testing"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/backend/mock"
 	"github.com/mendixlabs/mxcli/mdl/visitor"
 	"github.com/mendixlabs/mxcli/model"
+	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
 )
 
@@ -24,8 +26,8 @@ func TestLoopEndKeyword_WhileLoop(t *testing.T) {
 		LoopSource: &microflows.WhileLoopCondition{WhileExpression: "$Counter < 10"},
 	}
 	got := loopEndKeyword(loop)
-	if got != "END WHILE" {
-		t.Errorf("loopEndKeyword(WhileLoop) = %q, want %q", got, "END WHILE")
+	if got != "end while" {
+		t.Errorf("loopEndKeyword(WhileLoop) = %q, want %q", got, "end while")
 	}
 }
 
@@ -38,8 +40,8 @@ func TestLoopEndKeyword_ForEachLoop(t *testing.T) {
 		},
 	}
 	got := loopEndKeyword(loop)
-	if got != "END LOOP" {
-		t.Errorf("loopEndKeyword(ForEachLoop) = %q, want %q", got, "END LOOP")
+	if got != "end loop" {
+		t.Errorf("loopEndKeyword(ForEachLoop) = %q, want %q", got, "end loop")
 	}
 }
 
@@ -47,8 +49,8 @@ func TestLoopEndKeyword_ForEachLoop(t *testing.T) {
 func TestLoopEndKeyword_NilSource(t *testing.T) {
 	loop := &microflows.LoopedActivity{}
 	got := loopEndKeyword(loop)
-	if got != "END LOOP" {
-		t.Errorf("loopEndKeyword(nil) = %q, want %q", got, "END LOOP")
+	if got != "end loop" {
+		t.Errorf("loopEndKeyword(nil) = %q, want %q", got, "end loop")
 	}
 }
 
@@ -60,8 +62,159 @@ func TestFormatActivity_WhileLoop(t *testing.T) {
 		LoopSource:          &microflows.WhileLoopCondition{WhileExpression: "$Counter <= $N"},
 	}
 	got := e.formatActivity(obj, nil, nil)
-	if got != "WHILE $Counter <= $N" {
-		t.Errorf("got %q, want %q", got, "WHILE $Counter <= $N")
+	if got != "while $Counter <= $N" {
+		t.Errorf("got %q, want %q", got, "while $Counter <= $N")
+	}
+}
+
+func TestAddLoopStatement_PreservesAnnotatedPosition(t *testing.T) {
+	fb := &flowBuilder{
+		posX:         350,
+		posY:         200,
+		spacing:      HorizontalSpacing,
+		varTypes:     map[string]string{"Items": "List of Test.Item"},
+		declaredVars: map[string]string{},
+		measurer:     &layoutMeasurer{varTypes: map[string]string{"Items": "List of Test.Item"}},
+	}
+
+	stmt := &ast.LoopStmt{
+		LoopVariable: "Item",
+		ListVariable: "Items",
+		Annotations: &ast.ActivityAnnotations{
+			Position: &ast.Position{X: 350, Y: 200},
+		},
+	}
+
+	id := fb.addLoopStatement(stmt)
+	if id == "" {
+		t.Fatal("expected loop activity ID")
+	}
+
+	loop, ok := fb.objects[len(fb.objects)-1].(*microflows.LoopedActivity)
+	if !ok {
+		t.Fatalf("expected LoopedActivity, got %T", fb.objects[len(fb.objects)-1])
+	}
+	if loop.Position.X != 350 || loop.Position.Y != 200 {
+		t.Fatalf("got loop position (%d, %d), want (350, 200)", loop.Position.X, loop.Position.Y)
+	}
+	wantNextX := 350 + loop.Size.Width/2 + HorizontalSpacing
+	if fb.posX != wantNextX {
+		t.Fatalf("got next posX %d, want %d", fb.posX, wantNextX)
+	}
+}
+
+func TestAddWhileStatement_PreservesAnnotatedPosition(t *testing.T) {
+	fb := &flowBuilder{
+		posX:         420,
+		posY:         180,
+		spacing:      HorizontalSpacing,
+		varTypes:     map[string]string{},
+		declaredVars: map[string]string{},
+		measurer:     &layoutMeasurer{varTypes: map[string]string{}},
+	}
+
+	stmt := &ast.WhileStmt{
+		Condition: &ast.BinaryExpr{
+			Left:     &ast.VariableExpr{Name: "Count"},
+			Operator: "<",
+			Right:    &ast.LiteralExpr{Kind: ast.LiteralInteger, Value: int64(10)},
+		},
+		Annotations: &ast.ActivityAnnotations{
+			Position: &ast.Position{X: 420, Y: 180},
+		},
+	}
+
+	id := fb.addWhileStatement(stmt)
+	if id == "" {
+		t.Fatal("expected while activity ID")
+	}
+
+	loop, ok := fb.objects[len(fb.objects)-1].(*microflows.LoopedActivity)
+	if !ok {
+		t.Fatalf("expected LoopedActivity, got %T", fb.objects[len(fb.objects)-1])
+	}
+	if loop.Position.X != 420 || loop.Position.Y != 180 {
+		t.Fatalf("got while position (%d, %d), want (420, 180)", loop.Position.X, loop.Position.Y)
+	}
+	wantNextX := 420 + loop.Size.Width/2 + HorizontalSpacing
+	if fb.posX != wantNextX {
+		t.Fatalf("got next posX %d, want %d", fb.posX, wantNextX)
+	}
+}
+
+func TestAddLogMessageAction_PreservesNodeExpression(t *testing.T) {
+	fb := &flowBuilder{
+		posX:     100,
+		posY:     200,
+		spacing:  HorizontalSpacing,
+		measurer: &layoutMeasurer{},
+	}
+
+	stmt := &ast.LogStmt{
+		Level: ast.LogInfo,
+		Node: &ast.ConstantRefExpr{
+			QualifiedName: ast.QualifiedName{Module: "TestModule", Name: "SecurityLogNode"},
+		},
+		Message: &ast.LiteralExpr{Kind: ast.LiteralString, Value: "User added"},
+	}
+
+	id := fb.addLogMessageAction(stmt)
+	if id == "" {
+		t.Fatal("expected log activity ID")
+	}
+
+	activity, ok := fb.objects[len(fb.objects)-1].(*microflows.ActionActivity)
+	if !ok {
+		t.Fatalf("expected ActionActivity, got %T", fb.objects[len(fb.objects)-1])
+	}
+
+	action, ok := activity.Action.(*microflows.LogMessageAction)
+	if !ok {
+		t.Fatalf("expected LogMessageAction, got %T", activity.Action)
+	}
+
+	if action.LogNodeName != "@TestModule.SecurityLogNode" {
+		t.Fatalf("got log node %q, want %q", action.LogNodeName, "@TestModule.SecurityLogNode")
+	}
+}
+
+func TestAddLogMessageAction_TemplateLiteralDoesNotKeepQuotes(t *testing.T) {
+	fb := &flowBuilder{
+		posX:     100,
+		posY:     200,
+		spacing:  HorizontalSpacing,
+		measurer: &layoutMeasurer{},
+	}
+
+	stmt := &ast.LogStmt{
+		Level: ast.LogInfo,
+		Node:  &ast.LiteralExpr{Kind: ast.LiteralString, Value: "App"},
+		Message: &ast.LiteralExpr{
+			Kind:  ast.LiteralString,
+			Value: "Order {1}",
+		},
+		Template: []ast.TemplateParam{
+			{Index: 1, Value: &ast.VariableExpr{Name: "OrderNumber"}},
+		},
+	}
+
+	id := fb.addLogMessageAction(stmt)
+	if id == "" {
+		t.Fatal("expected log activity ID")
+	}
+
+	activity, ok := fb.objects[len(fb.objects)-1].(*microflows.ActionActivity)
+	if !ok {
+		t.Fatalf("expected ActionActivity, got %T", fb.objects[len(fb.objects)-1])
+	}
+
+	action, ok := activity.Action.(*microflows.LogMessageAction)
+	if !ok {
+		t.Fatalf("expected LogMessageAction, got %T", activity.Action)
+	}
+
+	if got := action.MessageTemplate.Translations["en_US"]; got != "Order {1}" {
+		t.Fatalf("got message template %q, want %q", got, "Order {1}")
 	}
 }
 
@@ -113,8 +266,8 @@ func TestOutputConstantMDL_WithComment(t *testing.T) {
 		t.Fatalf("outputConstantMDL: %v", err)
 	}
 	gotStr := buf.String()
-	if !strings.Contains(gotStr, "COMMENT 'Maximum retry attempts'") {
-		t.Errorf("expected COMMENT clause in output, got:\n%s", gotStr)
+	if !strings.Contains(gotStr, "comment 'Maximum retry attempts'") {
+		t.Errorf("expected comment clause in output, got:\n%s", gotStr)
 	}
 }
 
@@ -131,8 +284,8 @@ func TestOutputConstantMDL_WithoutComment(t *testing.T) {
 		t.Fatalf("outputConstantMDL: %v", err)
 	}
 	gotStr := buf.String()
-	if strings.Contains(gotStr, "COMMENT") {
-		t.Errorf("expected no COMMENT clause, got:\n%s", gotStr)
+	if strings.Contains(gotStr, "comment") {
+		t.Errorf("expected no comment clause, got:\n%s", gotStr)
 	}
 }
 
@@ -150,8 +303,8 @@ func TestOutputConstantMDL_CommentEscapesSingleQuotes(t *testing.T) {
 		t.Fatalf("outputConstantMDL: %v", err)
 	}
 	gotStr := buf.String()
-	if !strings.Contains(gotStr, "COMMENT 'It''s a test'") {
-		t.Errorf("expected escaped quote in COMMENT, got:\n%s", gotStr)
+	if !strings.Contains(gotStr, "comment 'It''s a test'") {
+		t.Errorf("expected escaped quote in comment, got:\n%s", gotStr)
 	}
 }
 
@@ -236,7 +389,7 @@ func TestFormatActivity_EndEvent_EnumReturn(t *testing.T) {
 		ReturnValue:         "Module.Status.Active",
 	}
 	got := e.formatActivity(obj, nil, nil)
-	want := "RETURN Module.Status.Active;"
+	want := "return Module.Status.Active;"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -250,7 +403,7 @@ func TestFormatActivity_EndEvent_VariableReturn(t *testing.T) {
 		ReturnValue:         "Result",
 	}
 	got := e.formatActivity(obj, nil, nil)
-	want := "RETURN $Result;"
+	want := "return $Result;"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -262,11 +415,11 @@ func TestFormatActivity_EndEvent_VariableReturn(t *testing.T) {
 
 // TestParseInlineIfThenElse verifies the parser handles inline if-then-else in SET.
 func TestParseInlineIfThenElse(t *testing.T) {
-	input := `CREATE MICROFLOW Test.InlineIf ()
-BEGIN
-  DECLARE $X Integer = 0;
-  SET $X = if $X > 10 then 1 else 0;
-END;`
+	input := `create microflow Test.InlineIf ()
+begin
+  declare $X Integer = 0;
+  set $X = if $X > 10 then 1 else 0;
+end;`
 
 	prog, errs := visitor.Build(input)
 	if len(errs) > 0 {
@@ -291,7 +444,7 @@ END;`
 		}
 	}
 	if !found {
-		t.Error("Expected SET with IfThenElseExpr, not found in parsed body")
+		t.Error("Expected set with IfThenElseExpr, not found in parsed body")
 	}
 }
 
@@ -396,14 +549,14 @@ func TestDeriveColumnName_CaptionSpecialChars(t *testing.T) {
 // =============================================================================
 
 // TestResolveMemberChange_FallbackWithoutReader verifies that resolveMemberChange
-// falls back to dot-contains heuristic when no reader is available.
+// falls back to the member-name shape heuristic when no metadata is available.
 // Regression: https://github.com/mendixlabs/mxcli/issues/50
 func TestResolveMemberChange_FallbackWithoutReader(t *testing.T) {
 	fb := &flowBuilder{
 		// reader is nil — simulates no project context
 	}
 
-	// Without reader: a name without dot should default to attribute
+	// Without backend: a name without dot should default to attribute
 	mc := &microflows.MemberChange{}
 	fb.resolveMemberChange(mc, "Label", "Demo.Child")
 	if mc.AttributeQualifiedName != "Demo.Child.Label" {
@@ -421,5 +574,340 @@ func TestResolveMemberChange_FallbackWithoutReader(t *testing.T) {
 	}
 	if mc2.AttributeQualifiedName != "" {
 		t.Errorf("expected empty attribute, got %q", mc2.AttributeQualifiedName)
+	}
+}
+
+func TestResolveMemberChange_FallbackWithoutReader_QualifiedAttributeStaysAttribute(t *testing.T) {
+	fb := &flowBuilder{}
+
+	mc := &microflows.MemberChange{}
+	fb.resolveMemberChange(mc, "Demo.Child.Label", "Demo.Child")
+
+	if mc.AttributeQualifiedName != "Demo.Child.Label" {
+		t.Errorf("expected qualified attribute preserved, got %q", mc.AttributeQualifiedName)
+	}
+	if mc.AssociationQualifiedName != "" {
+		t.Errorf("expected empty association, got %q", mc.AssociationQualifiedName)
+	}
+}
+
+func TestCallMicroflowResultType_ResolvesSubsequentChangeMember(t *testing.T) {
+	moduleID := model.ID("module-1")
+	backend := &mock.MockBackend{
+		GetModuleByNameFunc: func(name string) (*model.Module, error) {
+			if name != "MfTest" {
+				return nil, nil
+			}
+			return &model.Module{
+				BaseElement: model.BaseElement{ID: moduleID},
+				Name:        "MfTest",
+			}, nil
+		},
+		ListMicroflowsFunc: func() ([]*microflows.Microflow, error) {
+			return []*microflows.Microflow{
+				{
+					ContainerID: moduleID,
+					Name:        "M012_CreateEntity",
+					ReturnType: &microflows.ObjectType{
+						EntityQualifiedName: "MfTest.Product",
+					},
+				},
+			}, nil
+		},
+		GetDomainModelFunc: func(id model.ID) (*domainmodel.DomainModel, error) {
+			if id != moduleID {
+				return nil, nil
+			}
+			return &domainmodel.DomainModel{
+				ContainerID: moduleID,
+				Entities: []*domainmodel.Entity{
+					{
+						Name: "Product",
+						Attributes: []*domainmodel.Attribute{
+							{
+								Name: "Price",
+								Type: &domainmodel.DecimalAttributeType{},
+							},
+						},
+					},
+				},
+			}, nil
+		},
+	}
+
+	fb := &flowBuilder{
+		varTypes:     map[string]string{},
+		declaredVars: map[string]string{},
+		backend:      backend,
+	}
+
+	fb.addCallMicroflowAction(&ast.CallMicroflowStmt{
+		OutputVariable: "Product",
+		MicroflowName:  ast.QualifiedName{Module: "MfTest", Name: "M012_CreateEntity"},
+	})
+	fb.addChangeObjectAction(&ast.ChangeObjectStmt{
+		Variable: "Product",
+		Changes: []ast.ChangeItem{
+			{
+				Attribute: "Price",
+				Value:     &ast.LiteralExpr{Value: 10.0, Kind: ast.LiteralDecimal},
+			},
+		},
+	})
+
+	if got := fb.varTypes["Product"]; got != "MfTest.Product" {
+		t.Fatalf("expected call result type MfTest.Product, got %q", got)
+	}
+
+	activity, ok := fb.objects[len(fb.objects)-1].(*microflows.ActionActivity)
+	if !ok {
+		t.Fatalf("expected last object to be ActionActivity, got %T", fb.objects[len(fb.objects)-1])
+	}
+	changeAction, ok := activity.Action.(*microflows.ChangeObjectAction)
+	if !ok {
+		t.Fatalf("expected last action to be ChangeObjectAction, got %T", activity.Action)
+	}
+	if len(changeAction.Changes) != 1 {
+		t.Fatalf("expected one member change, got %d", len(changeAction.Changes))
+	}
+	if got := changeAction.Changes[0].AttributeQualifiedName; got != "MfTest.Product.Price" {
+		t.Fatalf("expected qualified attribute MfTest.Product.Price, got %q", got)
+	}
+}
+
+func TestEmptyChangeObjectRefreshesInClient(t *testing.T) {
+	fb := &flowBuilder{posX: 100, posY: 100, spacing: HorizontalSpacing}
+
+	id := fb.addChangeObjectAction(&ast.ChangeObjectStmt{Variable: "Object"})
+	if id == "" || len(fb.objects) != 1 {
+		t.Fatalf("expected one change object activity, got id=%q objects=%d", id, len(fb.objects))
+	}
+
+	activity, ok := fb.objects[0].(*microflows.ActionActivity)
+	if !ok {
+		t.Fatalf("object type = %T, want *microflows.ActionActivity", fb.objects[0])
+	}
+	action, ok := activity.Action.(*microflows.ChangeObjectAction)
+	if !ok {
+		t.Fatalf("action type = %T, want *microflows.ChangeObjectAction", activity.Action)
+	}
+	if !action.RefreshInClient {
+		t.Fatal("empty change object must refresh in client to remain valid without member changes or commit")
+	}
+
+	id = fb.addChangeObjectAction(&ast.ChangeObjectStmt{
+		Variable: "Object",
+		Changes: []ast.ChangeItem{{
+			Attribute: "Name",
+			Value:     &ast.LiteralExpr{Kind: ast.LiteralString, Value: "changed"},
+		}},
+	})
+	if id == "" || len(fb.objects) != 2 {
+		t.Fatalf("expected second change object activity, got id=%q objects=%d", id, len(fb.objects))
+	}
+	activity, ok = fb.objects[1].(*microflows.ActionActivity)
+	if !ok {
+		t.Fatalf("object type = %T, want *microflows.ActionActivity", fb.objects[1])
+	}
+	action, ok = activity.Action.(*microflows.ChangeObjectAction)
+	if !ok {
+		t.Fatalf("action type = %T, want *microflows.ChangeObjectAction", activity.Action)
+	}
+	if action.RefreshInClient {
+		t.Fatal("non-empty change object must not infer refresh in client")
+	}
+}
+
+func TestListFindAttributeEqualsExpressionUsesAttributeOperation(t *testing.T) {
+	fb := &flowBuilder{
+		posX:    100,
+		posY:    100,
+		spacing: HorizontalSpacing,
+		varTypes: map[string]string{
+			"Items": "List of Demo.Item",
+		},
+	}
+
+	id := fb.addListOperationAction(&ast.ListOperationStmt{
+		OutputVariable: "ExistingItem",
+		Operation:      ast.ListOpFind,
+		InputVariable:  "Items",
+		Condition: &ast.BinaryExpr{
+			Left:     &ast.IdentifierExpr{Name: "Code"},
+			Operator: "=",
+			Right: &ast.AttributePathExpr{
+				Variable: "IteratorItem",
+				Path:     []string{"ExternalCode"},
+			},
+		},
+	})
+	if id == "" || len(fb.objects) != 1 {
+		t.Fatalf("expected one list operation activity, got id=%q objects=%d", id, len(fb.objects))
+	}
+
+	activity, ok := fb.objects[0].(*microflows.ActionActivity)
+	if !ok {
+		t.Fatalf("object type = %T, want *microflows.ActionActivity", fb.objects[0])
+	}
+	action, ok := activity.Action.(*microflows.ListOperationAction)
+	if !ok {
+		t.Fatalf("action type = %T, want *microflows.ListOperationAction", activity.Action)
+	}
+	op, ok := action.Operation.(*microflows.FindByAttributeOperation)
+	if !ok {
+		t.Fatalf("operation type = %T, want *microflows.FindByAttributeOperation", action.Operation)
+	}
+	if op.Attribute != "Demo.Item.Code" {
+		t.Fatalf("Attribute = %q, want Demo.Item.Code", op.Attribute)
+	}
+	if op.Expression != "$IteratorItem/ExternalCode" {
+		t.Fatalf("Expression = %q, want $IteratorItem/ExternalCode", op.Expression)
+	}
+}
+
+func TestListFindUnknownListTypeFallsBackToExpressionOperation(t *testing.T) {
+	fb := &flowBuilder{
+		posX:    100,
+		posY:    100,
+		spacing: HorizontalSpacing,
+	}
+
+	id := fb.addListOperationAction(&ast.ListOperationStmt{
+		OutputVariable: "ExistingItem",
+		Operation:      ast.ListOpFind,
+		InputVariable:  "Items",
+		Condition: &ast.BinaryExpr{
+			Left:     &ast.IdentifierExpr{Name: "Code"},
+			Operator: "=",
+			Right:    &ast.LiteralExpr{Kind: ast.LiteralString, Value: "A"},
+		},
+	})
+	if id == "" || len(fb.objects) != 1 {
+		t.Fatalf("expected one list operation activity, got id=%q objects=%d", id, len(fb.objects))
+	}
+
+	activity, ok := fb.objects[0].(*microflows.ActionActivity)
+	if !ok {
+		t.Fatalf("object type = %T, want *microflows.ActionActivity", fb.objects[0])
+	}
+	action, ok := activity.Action.(*microflows.ListOperationAction)
+	if !ok {
+		t.Fatalf("action type = %T, want *microflows.ListOperationAction", activity.Action)
+	}
+	if _, ok := action.Operation.(*microflows.FindByAttributeOperation); ok {
+		t.Fatal("expected expression fallback, got *microflows.FindByAttributeOperation")
+	}
+	op, ok := action.Operation.(*microflows.FindOperation)
+	if !ok {
+		t.Fatalf("operation type = %T, want *microflows.FindOperation", action.Operation)
+	}
+	if op.Expression == "" {
+		t.Fatal("expected expression fallback to preserve the condition")
+	}
+}
+
+func TestCallMicroflowUnknownResultTypeStillDeclaresVariable(t *testing.T) {
+	fb := &flowBuilder{
+		varTypes:     map[string]string{"Result": "Old.ModuleEntity"},
+		declaredVars: map[string]string{},
+	}
+
+	fb.addCallMicroflowAction(&ast.CallMicroflowStmt{
+		OutputVariable: "Result",
+		MicroflowName:  ast.QualifiedName{Module: "Missing", Name: "Unknown"},
+	})
+
+	if _, ok := fb.varTypes["Result"]; ok {
+		t.Fatalf("expected stale entity typing to be cleared, got %q", fb.varTypes["Result"])
+	}
+	if got := fb.declaredVars["Result"]; got != "Unknown" {
+		t.Fatalf("expected Result to remain declared as Unknown, got %q", got)
+	}
+	if !fb.isVariableDeclared("Result") {
+		t.Fatal("expected Result to remain declared after unresolved call return type")
+	}
+}
+
+func TestValidateMicroflowReferencesSkipsExcludedMicroflow(t *testing.T) {
+	moduleID := model.ID("module-1")
+	backend := &mock.MockBackend{
+		IsConnectedFunc: func() bool { return true },
+		ListModulesFunc: func() ([]*model.Module, error) {
+			return []*model.Module{{
+				BaseElement: model.BaseElement{ID: moduleID},
+				Name:        "SyntheticAudit",
+			}}, nil
+		},
+		ListMicroflowsFunc: func() ([]*microflows.Microflow, error) {
+			return nil, nil
+		},
+	}
+	ctx, _ := newMockCtx(t, withBackend(backend))
+
+	stmt := &ast.CreateMicroflowStmt{
+		Excluded: true,
+		Name:     ast.QualifiedName{Module: "SyntheticAudit", Name: "ExcludedLegacyFlow"},
+		Body: []ast.MicroflowStatement{
+			&ast.CallMicroflowStmt{
+				MicroflowName: ast.QualifiedName{Module: "SyntheticAudit", Name: "DeletedScaffoldFlow"},
+			},
+		},
+	}
+
+	if err := validate(ctx, stmt); err != nil {
+		t.Fatalf("excluded microflow reference validation returned error: %v", err)
+	}
+}
+
+func TestValidateMicroflowReferencesReportsIncludedMissingMicroflow(t *testing.T) {
+	moduleID := model.ID("module-1")
+	backend := &mock.MockBackend{
+		IsConnectedFunc: func() bool { return true },
+		ListModulesFunc: func() ([]*model.Module, error) {
+			return []*model.Module{{
+				BaseElement: model.BaseElement{ID: moduleID},
+				Name:        "SyntheticAudit",
+			}}, nil
+		},
+		ListMicroflowsFunc: func() ([]*microflows.Microflow, error) {
+			return nil, nil
+		},
+	}
+	ctx, _ := newMockCtx(t, withBackend(backend))
+
+	stmt := &ast.CreateMicroflowStmt{
+		Name: ast.QualifiedName{Module: "SyntheticAudit", Name: "IncludedFlow"},
+		Body: []ast.MicroflowStatement{
+			&ast.CallMicroflowStmt{
+				MicroflowName: ast.QualifiedName{Module: "SyntheticAudit", Name: "DeletedScaffoldFlow"},
+			},
+		},
+	}
+
+	err := validate(ctx, stmt)
+	if err == nil {
+		t.Fatal("expected missing microflow reference error")
+	}
+	if !strings.Contains(err.Error(), "microflow not found: SyntheticAudit.DeletedScaffoldFlow") {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+}
+
+// =============================================================================
+// Issue #476: Business event MESSAGE attribute names reject reserved keywords
+// =============================================================================
+
+// TestBusinessEvent_KeywordAttributeNames verifies that reserved keywords (Date,
+// Amount, etc.) are accepted as MESSAGE attribute names and message names.
+func TestBusinessEvent_KeywordAttributeNames(t *testing.T) {
+	input := `CREATE BUSINESS EVENT SERVICE MyModule.Events
+(ServiceName: 'Svc', EventNamePrefix: 'com.test')
+{
+  MESSAGE OrderCreated (Date: DateTime, Amount: Decimal) PUBLISH ENTITY MyModule.Order;
+};`
+
+	_, errs := visitor.Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("issue #476: keyword attribute names rejected: %v", errs[0])
 	}
 }

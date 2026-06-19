@@ -8,13 +8,11 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
 // Catalog provides SQL querying over Mendix project metadata.
 type Catalog struct {
-	db            *sql.DB
+	db            CatalogDB
 	projectID     string
 	projectName   string
 	mendixVersion string
@@ -58,17 +56,15 @@ type ProgressFunc func(table string, count int)
 
 // New creates a new catalog with an in-memory SQLite database.
 func New() (*Catalog, error) {
-	db, err := sql.Open("sqlite", ":memory:")
+	db, err := NewSqliteCatalogDB()
 	if err != nil {
 		return nil, fmt.Errorf("failed to open in-memory database: %w", err)
 	}
+	return NewFromDB(db)
+}
 
-	// Enable foreign keys
-	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to enable foreign keys: %w", err)
-	}
-
+// NewFromDB creates a catalog from an existing CatalogDB.
+func NewFromDB(db CatalogDB) (*Catalog, error) {
 	c := &Catalog{
 		db:        db,
 		projectID: "default",
@@ -106,6 +102,7 @@ func (c *Catalog) Tables() []string {
 	return []string{
 		"CATALOG.MODULES",
 		"CATALOG.ENTITIES",
+		"CATALOG.ASSOCIATIONS",
 		"CATALOG.ATTRIBUTES",
 		"CATALOG.MICROFLOWS",
 		"CATALOG.NANOFLOWS",
@@ -114,8 +111,18 @@ func (c *Catalog) Tables() []string {
 		"CATALOG.LAYOUTS",
 		"CATALOG.ENUMERATIONS",
 		"CATALOG.JAVA_ACTIONS",
+		"CATALOG.JAVASCRIPT_ACTIONS",
+		"CATALOG.IMAGE_COLLECTIONS",
+		"CATALOG.DATA_TRANSFORMERS",
+		"CATALOG.AGENTS",
+		"CATALOG.AI_MODELS",
+		"CATALOG.KNOWLEDGE_BASES",
+		"CATALOG.CONSUMED_MCP_SERVICES",
+		"CATALOG.NAVIGATION_PROFILES",
 		"CATALOG.ACTIVITIES",
 		"CATALOG.WIDGETS",
+		"CATALOG.WIDGET_DEFINITIONS",
+		"CATALOG.WIDGET_DEFINITION_PROPERTIES",
 		"CATALOG.XPATH_EXPRESSIONS",
 		"CATALOG.REFS",
 		"CATALOG.ROLE_MAPPINGS",
@@ -128,6 +135,7 @@ func (c *Catalog) Tables() []string {
 		"CATALOG.ODATA_SERVICES",
 		"CATALOG.BUSINESS_EVENT_SERVICES",
 		"CATALOG.DATABASE_CONNECTIONS",
+		"CATALOG.JAR_DEPENDENCIES",
 		"CATALOG.CONSTANTS",
 		"CATALOG.CONSTANT_VALUES",
 		"CATALOG.REST_CLIENTS",
@@ -145,6 +153,19 @@ func (c *Catalog) Tables() []string {
 		"CATALOG.EXPORT_MAPPINGS",
 		"CATALOG.STRINGS",
 		"CATALOG.SOURCE",
+		"CATALOG.GRAPH_GOD_NODES",
+		"CATALOG.GRAPH_MODULE_COUPLING",
+		"CATALOG.GRAPH_MODULE_COHESION",
+		"CATALOG.GRAPH_DEAD_ASSETS",
+		"CATALOG.GRAPH_REFKIND_DISTRIBUTION",
+		"CATALOG.GRAPH_ENTITY_HOTSPOTS",
+		"CATALOG.COMMUNITIES",
+		"CATALOG.COMMUNITY_SUMMARY",
+		"CATALOG.GRAPH_CYCLES",
+		"CATALOG.GRAPH_LAYERS",
+		"CATALOG.GRAPH_CENTRALITY",
+		"CATALOG.GRAPH_MODULE_DEPENDENCIES",
+		"CATALOG.GRAPH_INTEGRATION_SURFACE",
 	}
 }
 
@@ -193,8 +214,8 @@ func (c *Catalog) Query(sqlQuery string) (*QueryResult, error) {
 	return result, rows.Err()
 }
 
-// DB returns the underlying database connection for direct access.
-func (c *Catalog) DB() *sql.DB {
+// CatalogDB returns the underlying database abstraction.
+func (c *Catalog) CatalogDB() CatalogDB {
 	return c.db
 }
 
@@ -262,16 +283,21 @@ type CacheInfo struct {
 }
 
 // NewFromFile opens a catalog from a persisted SQLite file.
+//
+// Applies the current schema to the loaded database via CREATE TABLE IF NOT
+// EXISTS so cache files written by older mxcli builds gain newly-added tables
+// (e.g. widget_definitions) without forcing a full catalog rebuild. The new
+// tables will be empty until the next REFRESH CATALOG runs, but they're
+// queryable and won't trigger "no such table" errors.
+//
+// If the cached file was written against a different CatalogSchemaVersion,
+// every table, view, and index is dropped before recreation. The cache will
+// be empty until the next REFRESH CATALOG runs — the alternative (silently
+// querying stale rows with the wrong column shape) is worse.
 func NewFromFile(path string) (*Catalog, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := NewSqliteCatalogDBFromFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open catalog file: %w", err)
-	}
-
-	// Enable foreign keys
-	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to enable foreign keys: %w", err)
 	}
 
 	c := &Catalog{
@@ -281,32 +307,126 @@ func NewFromFile(path string) (*Catalog, error) {
 		built:     true, // Assume built if loading from file
 	}
 
+	if err := c.migrateIfSchemaMismatch(); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("failed to migrate cached catalog: %w", err)
+	}
+
+	// Idempotent schema upgrade — adds any tables/indexes the cached file
+	// doesn't have yet. Existing data is untouched (unless dropped above).
+	// createTables also records the current schema version in catalog_meta.
+	if err := c.createTables(); err != nil {
+		c.Close()
+		return nil, fmt.Errorf("failed to apply schema to cached catalog: %w", err)
+	}
+
 	return c, nil
+}
+
+// migrateIfSchemaMismatch drops every user table, view, and index when the
+// cache's recorded CatalogSchemaVersion differs from the current one. The
+// catalog_meta table itself is preserved so callers can still introspect what
+// happened. If the catalog_meta table doesn't exist yet (fresh cache), this
+// is a no-op.
+func (c *Catalog) migrateIfSchemaMismatch() error {
+	var hasMeta int
+	if err := c.db.QueryRow(
+		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='catalog_meta'`,
+	).Scan(&hasMeta); err != nil {
+		return fmt.Errorf("probing catalog_meta: %w", err)
+	}
+	if hasMeta == 0 {
+		return nil // fresh cache, nothing to migrate from
+	}
+
+	stored, err := c.GetMeta(MetaSchemaVersion)
+	if err != nil {
+		return fmt.Errorf("reading schema version: %w", err)
+	}
+	if stored == CatalogSchemaVersion {
+		return nil
+	}
+
+	// Drop every user object except catalog_meta itself.
+	//
+	// FTS5 virtual tables (strings, source) are intentionally skipped — they
+	// are queried via FTS module hooks that can fail to load across
+	// reconnections in modernc.org/sqlite, and their schema is stable across
+	// catalog versions. They'll be reused as-is; their rows are derived from
+	// the dropped tables and get rebuilt on the next REFRESH CATALOG anyway.
+	for _, kind := range []string{"view", "index", "table"} {
+		rows, err := c.db.Query(
+			`SELECT name, sql FROM sqlite_master
+			 WHERE type=? AND name NOT LIKE 'sqlite_%' AND name != 'catalog_meta'`,
+			kind,
+		)
+		if err != nil {
+			return fmt.Errorf("listing %ss: %w", kind, err)
+		}
+		type item struct{ name, sqlText string }
+		var items []item
+		for rows.Next() {
+			var it item
+			var sqlText sql.NullString
+			if err := rows.Scan(&it.name, &sqlText); err != nil {
+				rows.Close()
+				return err
+			}
+			it.sqlText = sqlText.String
+			items = append(items, it)
+		}
+		rows.Close()
+		for _, it := range items {
+			if kind == "table" && strings.Contains(strings.ToUpper(it.sqlText), "VIRTUAL TABLE") {
+				continue
+			}
+			stmt := fmt.Sprintf(`DROP %s IF EXISTS %q`, strings.ToUpper(kind), it.name)
+			if _, err := c.db.Exec(stmt); err != nil {
+				return fmt.Errorf("dropping %s %s: %w", kind, it.name, err)
+			}
+		}
+	}
+
+	// Clear cache-info metadata so upstream isCacheValid() (in mdl/executor)
+	// sees this as an unbuilt cache and triggers a rebuild on next access.
+	// Without this, the file still claims a valid MprPath / MprModTime /
+	// BuildMode and callers happily "load" an empty catalog.
+	for _, key := range []string{
+		MetaMprPath, MetaMprModTime, MetaMendixVersion,
+		MetaBuildMode, MetaBuildTime, MetaBuildDuration,
+	} {
+		if _, err := c.db.Exec(`DELETE FROM catalog_meta WHERE Key = ?`, key); err != nil {
+			return fmt.Errorf("clearing cache-info key %s: %w", key, err)
+		}
+	}
+
+	return nil
 }
 
 // SaveToFile saves the catalog to a SQLite file.
 // This copies the in-memory database to a file for persistence.
+// Requires the underlying CatalogDB to be a *SqliteCatalogDB.
 func (c *Catalog) SaveToFile(path string) error {
-	// Open destination file database
-	destDB, err := sql.Open("sqlite", path)
-	if err != nil {
-		return fmt.Errorf("failed to create catalog file: %w", err)
+	sdb, ok := c.db.(*SqliteCatalogDB)
+	if !ok {
+		return fmt.Errorf("SaveToFile requires a SQLite-backed catalog")
 	}
-	defer destDB.Close()
+	rawDB := sdb.RawDB()
 
 	// Use SQLite backup API via VACUUM INTO (SQLite 3.27+)
 	// Fall back to manual copy if not available
-	_, err = c.db.Exec(fmt.Sprintf("VACUUM INTO '%s'", path))
+	safePath := strings.ReplaceAll(path, "'", "''")
+	_, err := rawDB.Exec(fmt.Sprintf("VACUUM INTO '%s'", safePath))
 	if err != nil {
 		// Fall back: export and import
-		return c.saveToFileManual(path)
+		return c.saveToFileManual(path, rawDB)
 	}
 
 	return nil
 }
 
 // saveToFileManual saves by dumping and restoring (fallback method).
-func (c *Catalog) saveToFileManual(path string) error {
+func (c *Catalog) saveToFileManual(path string, rawDB *sql.DB) error {
 	// Open destination
 	destDB, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -315,7 +435,7 @@ func (c *Catalog) saveToFileManual(path string) error {
 	defer destDB.Close()
 
 	// Get list of tables
-	rows, err := c.db.Query("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+	rows, err := rawDB.Query("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
 	if err != nil {
 		return err
 	}
@@ -339,7 +459,7 @@ func (c *Catalog) saveToFileManual(path string) error {
 		}
 
 		// Copy data
-		srcRows, err := c.db.Query(fmt.Sprintf("SELECT * FROM %s", t.name))
+		srcRows, err := rawDB.Query(fmt.Sprintf("SELECT * FROM %s", t.name))
 		if err != nil {
 			return err
 		}
@@ -377,7 +497,7 @@ func (c *Catalog) saveToFileManual(path string) error {
 	}
 
 	// Copy views
-	rows, err = c.db.Query("SELECT sql FROM sqlite_master WHERE type='view'")
+	rows, err = rawDB.Query("SELECT sql FROM sqlite_master WHERE type='view'")
 	if err != nil {
 		return err
 	}
@@ -394,7 +514,7 @@ func (c *Catalog) saveToFileManual(path string) error {
 	rows.Close()
 
 	// Copy indexes
-	rows, err = c.db.Query("SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")
+	rows, err = rawDB.Query("SELECT sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL")
 	if err != nil {
 		return err
 	}

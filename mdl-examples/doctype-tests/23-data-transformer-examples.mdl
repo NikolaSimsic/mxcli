@@ -1,25 +1,31 @@
+-- @version: 11.9+
 -- ============================================================================
 -- Data Transformer Examples
 -- ============================================================================
 --
--- Demonstrates creating, describing, listing, and dropping data transformers.
+-- Demonstrates creating, describing, listing, and modifying data transformers.
+--
+-- This script leaves two transformers in the project (DtTest.FlattenNested and
+-- DtTest.WeatherTransform) so the result can be inspected in Studio Pro. The
+-- cleanup DROP statements at the end are commented out and preceded by `exit;`;
+-- flip them on (and remove the exit) if you want to re-run idempotently.
 --
 -- Prerequisites:
 --   - Mendix 11.9+ (Data Transformers require >= 11.9)
 --
 -- ============================================================================
 
-CREATE MODULE DtTest;
+create module DtTest;
 
 -- ############################################################################
 -- PART 1: SIMPLE SINGLE-LINE JSLT TRANSFORMER
 -- ############################################################################
 
 -- Flatten a nested JSON object using a single-line JSLT expression.
-CREATE DATA TRANSFORMER DtTest.FlattenNested
-SOURCE JSON '{"wrapper": {"value": 42, "label": "hello"}}'
+create data transformer DtTest.FlattenNested
+source json '{"wrapper": {"value": 42, "label": "hello"}}'
 {
-  JSLT '{"value": .wrapper.value, "label": .wrapper.label}';
+  jslt '{"value": .wrapper.value, "label": .wrapper.label}';
 };
 
 -- ############################################################################
@@ -27,10 +33,10 @@ SOURCE JSON '{"wrapper": {"value": 42, "label": "hello"}}'
 -- ############################################################################
 
 -- Extract key fields from a weather API response using a multi-line JSLT step.
-CREATE DATA TRANSFORMER DtTest.WeatherTransform
-SOURCE JSON '{"latitude": 51.9, "longitude": 4.5, "timezone": "Europe/Amsterdam", "current": {"time": "2024-01-15T14:00", "temperature_2m": 12.8, "wind_speed_10m": 18.3, "weather_code": 3}}'
+create data transformer DtTest.WeatherTransform
+source json '{"latitude": 51.9, "longitude": 4.5, "timezone": "Europe/Amsterdam", "current": {"time": "2024-01-15T14:00", "temperature_2m": 12.8, "wind_speed_10m": 18.3, "weather_code": 3}}'
 {
-  JSLT $$
+  jslt $$
 {
   "lat":        .latitude,
   "lon":        .longitude,
@@ -47,17 +53,50 @@ SOURCE JSON '{"latitude": 51.9, "longitude": 4.5, "timezone": "Europe/Amsterdam"
 -- ############################################################################
 
 -- List all data transformers in the project
-LIST DATA TRANSFORMERS;
+list data transformers;
 
 -- List data transformers in a specific module
-LIST DATA TRANSFORMERS IN DtTest;
+list data transformers in DtTest;
 
 -- Describe a transformer (outputs a re-executable CREATE statement)
-DESCRIBE DATA TRANSFORMER DtTest.WeatherTransform;
+describe data transformer DtTest.WeatherTransform;
 
 -- ############################################################################
--- PART 4: DROP
+-- PART 4: CREATE OR MODIFY (idempotent upsert)
 -- ############################################################################
+--
+-- CREATE OR MODIFY updates an existing transformer in-place, preserving its
+-- UUID. Re-run-safe: if the transformer doesn't exist it is created; if it
+-- does exist its steps are replaced without changing the document identity.
+--
+-- Here we modify the WeatherTransform created in PART 2 to project a smaller,
+-- renamed shape — the transformer stays in the project for Studio Pro to inspect.
 
-DROP DATA TRANSFORMER DtTest.FlattenNested;
-DROP DATA TRANSFORMER DtTest.WeatherTransform;
+create or modify data transformer DtTest.WeatherTransform
+source json '{"latitude": 51.9, "longitude": 4.5, "timezone": "Europe/Amsterdam", "current": {"temperature_2m": 12.8}}'
+{
+  jslt $$
+{
+  "lat":      .latitude,
+  "lon":      .longitude,
+  "timezone": .timezone,
+  "temp":     .current.temperature_2m
+}
+  $$;
+};
+
+describe data transformer DtTest.WeatherTransform;
+
+-- ############################################################################
+-- PART 5: CLEANUP (disabled)
+-- ############################################################################
+--
+-- Halt here so the script leaves DtTest.FlattenNested and DtTest.WeatherTransform
+-- in the project for Studio Pro inspection. To re-run this script idempotently,
+-- remove the `exit;` and uncomment the DROP statements below.
+
+exit;
+
+-- drop data transformer DtTest.FlattenNested;
+-- drop data transformer DtTest.WeatherTransform;
+-- drop module DtTest;

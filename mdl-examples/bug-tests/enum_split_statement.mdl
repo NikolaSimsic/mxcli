@@ -1,0 +1,28 @@
+create module EnumSplitExample;
+
+create enumeration EnumSplitExample.Status (
+  Open,
+  Pending,
+  Closed
+);
+/
+
+create microflow EnumSplitExample.RouteStatus (
+  $Status: enum EnumSplitExample.Status
+)
+returns boolean as $IsOpen
+begin
+  declare $IsOpen boolean = false;
+  case $Status
+    when Open then
+      set $IsOpen = true;
+    when Pending then
+      set $IsOpen = false;
+    when Closed then
+      set $IsOpen = false;
+    when (empty) then
+      set $IsOpen = false;
+  end case;
+  return $IsOpen;
+end;
+/

@@ -91,18 +91,15 @@ func buildNotExpression(ctx parser.INotExpressionContext) ast.Expression {
 	}
 	notCtx := ctx.(*parser.NotExpressionContext)
 
-	// Build comparison expression
-	comp := buildComparisonExpression(notCtx.ComparisonExpression())
-
-	// Check for NOT prefix
+	// not(expr) — parens are mandatory (Mendix CE0117 rejects bare "not expr")
 	if notCtx.NOT() != nil {
 		return &ast.UnaryExpr{
 			Operator: "NOT",
-			Operand:  comp,
+			Operand:  buildExpression(notCtx.Expression()),
 		}
 	}
 
-	return comp
+	return buildComparisonExpression(notCtx.ComparisonExpression())
 }
 
 // buildComparisonExpression handles comparison expressions.
@@ -445,8 +442,8 @@ func buildListOperationAsFunction(ctx parser.IListOperationContext) ast.Expressi
 		funcExpr.Arguments = append(funcExpr.Arguments, &ast.VariableExpr{Name: varName})
 	}
 
-	// Get expression argument (for FIND/FILTER)
-	if expr := listOpCtx.Expression(); expr != nil {
+	// Get expression arguments (for FIND/FILTER/RANGE)
+	for _, expr := range listOpCtx.AllExpression() {
 		funcExpr.Arguments = append(funcExpr.Arguments, buildExpression(expr))
 	}
 
@@ -555,9 +552,14 @@ func buildFunctionCall(ctx parser.IFunctionCallContext) ast.Expression {
 
 	funcExpr := &ast.FunctionCallExpr{}
 
-	// Get function name from FunctionName rule
+	// Get function name. `functionCall` accepts either a built-in `functionName`
+	// (length, find, ...) or a `qualifiedName` (Module.Rule, Module.SubMicroflow)
+	// so that describe → check roundtrips preserve rule-based split conditions
+	// and sub-microflow calls used in expression position.
 	if fn := funcCtx.FunctionName(); fn != nil {
 		funcExpr.Name = fn.GetText()
+	} else if qn := funcCtx.QualifiedName(); qn != nil {
+		funcExpr.Name = buildQualifiedName(qn).String()
 	}
 
 	// Get arguments

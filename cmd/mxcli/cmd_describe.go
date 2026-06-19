@@ -5,17 +5,25 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
+	modelsdk "github.com/mendixlabs/mxcli"
+	"github.com/mendixlabs/mxcli/mdl/catalog"
 	"github.com/mendixlabs/mxcli/mdl/executor"
 	"github.com/mendixlabs/mxcli/mdl/visitor"
 	"github.com/spf13/cobra"
 )
 
 var describeCmd = &cobra.Command{
-	Use:   "describe <type> <name>",
+	Use:   "describe [<type>] <name>",
 	Short: "Describe a project element",
 	Long: `Describe an element from a Mendix project in MDL syntax.
+
+The <type> is optional for a qualified document name: 'describe MyModule.Customer'
+auto-detects the document type. Pass the type explicitly to disambiguate (a name
+can match both an entity and a document, for example) or for forms that have no
+single qualified name (module, settings, navigation, module role).
 
 Types:
   module           Describe a module (all contents)
@@ -40,6 +48,11 @@ Types:
   imagecollection  Describe an image collection (also: "image collection")
   businesseventservice  Describe a business event service (also: "business event service")
   databaseconnection    Describe a database connection (also: "database connection")
+  agent            Describe an AI agent (also: "agent")
+  aimodel          Describe an AI model (also: "model", "ai model")
+  knowledgebase    Describe a knowledge base (also: "knowledge base")
+  consumedmcpservice  Describe a consumed MCP service (also: "consumed mcp service")
+  datatransformer  Describe a data transformer (also: "data transformer")
   modulerole       Describe a module role
   userrole         Describe a user role
   projectsecurity  Show project security settings
@@ -49,6 +62,8 @@ Types:
   systemoverview   Module dependency graph (requires --format elk)
 
 Example:
+  mxcli describe -p app.mpr MyModule.Customer          # type auto-detected
+  mxcli describe -p app.mpr MyModule.ProcessOrder      # type auto-detected
   mxcli describe -p app.mpr module MyModule
   mxcli describe -p app.mpr entity MyModule.Customer
   mxcli describe -p app.mpr microflow MyModule.ProcessOrder
@@ -61,13 +76,36 @@ Example:
   mxcli describe -p app.mpr settings Settings
   mxcli describe -p app.mpr navigation Responsive
   mxcli describe -p app.mpr --format elk systemoverview SystemOverview
+  mxcli describe -p app.mpr agent MyModule.MyAgent
+  mxcli describe -p app.mpr model MyModule.GPT4
+  mxcli describe -p app.mpr knowledge base MyModule.ProductDocs
+  mxcli describe -p app.mpr consumed mcp service MyModule.FilesystemMCP
+  mxcli describe -p app.mpr data transformer MyModule.TransformCustomer
 `,
-	Args: cobra.MinimumNArgs(2),
+	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		projectPath, _ := cmd.Flags().GetString("project")
 		if projectPath == "" {
 			fmt.Fprintln(os.Stderr, "Error: --project (-p) is required")
 			os.Exit(1)
+		}
+
+		// Type auto-detection: with a single argument (a name, no type), look up
+		// the document's type from the project and prepend it so the rest of the
+		// dispatch is unchanged.
+		if len(args) == 1 {
+			detected, candidates, err := resolveDescribeType(projectPath, args[0])
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				fmt.Fprintf(os.Stderr, "hint: pass the type explicitly, e.g. 'describe <type> %s'\n", args[0])
+				os.Exit(1)
+			}
+			if len(candidates) > 0 {
+				fmt.Fprintf(os.Stderr, "Error: %q is ambiguous — it matches: %s\n", args[0], strings.Join(candidates, ", "))
+				fmt.Fprintf(os.Stderr, "Specify the type, e.g. 'describe %s %s'\n", candidates[0], args[0])
+				os.Exit(1)
+			}
+			args = append([]string{detected}, args...)
 		}
 
 		// Support multi-word types: "business event service Module.Name" → type="BUSINESS EVENT SERVICE", name="Module.Name"
@@ -135,12 +173,22 @@ Example:
 			mdlCmd = fmt.Sprintf("DESCRIBE NAVIGATION %s", name)
 		case "NAVPROFILE":
 			mdlCmd = fmt.Sprintf("DESCRIBE NAVIGATION %s", name)
+		case "AGENT":
+			mdlCmd = fmt.Sprintf("DESCRIBE AGENT %s", name)
+		case "AIMODEL", "AI MODEL", "MODEL":
+			mdlCmd = fmt.Sprintf("DESCRIBE MODEL %s", name)
+		case "KNOWLEDGEBASE", "KNOWLEDGE BASE":
+			mdlCmd = fmt.Sprintf("DESCRIBE KNOWLEDGE BASE %s", name)
+		case "CONSUMEDMCPSERVICE", "CONSUMED MCP SERVICE", "MCP SERVICE":
+			mdlCmd = fmt.Sprintf("DESCRIBE CONSUMED MCP SERVICE %s", name)
+		case "DATATRANSFORMER", "DATA TRANSFORMER":
+			mdlCmd = fmt.Sprintf("DESCRIBE DATA TRANSFORMER %s", name)
 		case "SYSTEMOVERVIEW":
 			mdlCmd = "" // handled directly by format-specific path
 		default:
 			fmt.Fprintf(os.Stderr, "Unknown type: %s\n", strings.Join(args[:len(args)-1], " "))
-			fmt.Fprintln(os.Stderr, "Valid types: module, entity, association, enumeration, constant, microflow, nanoflow, workflow, page, snippet, layout, javaaction, jsonstructure, importmapping, exportmapping, restclient, odataclient, odataservice, imagecollection, businesseventservice, databaseconnection, modulerole, userrole, projectsecurity, settings, demouser, navigation, systemoverview")
-			fmt.Fprintln(os.Stderr, "Multi-word types also accepted: json structure, import mapping, export mapping, rest client, image collection, business event service, etc.")
+			fmt.Fprintln(os.Stderr, "Valid types: module, entity, association, enumeration, constant, microflow, nanoflow, workflow, page, snippet, layout, javaaction, jsonstructure, importmapping, exportmapping, restclient, odataclient, odataservice, imagecollection, businesseventservice, databaseconnection, agent, aimodel, knowledgebase, consumedmcpservice, datatransformer, modulerole, userrole, projectsecurity, settings, demouser, navigation, systemoverview")
+			fmt.Fprintln(os.Stderr, "Multi-word types also accepted: json structure, import mapping, export mapping, rest client, image collection, business event service, agent, model, knowledge base, consumed mcp service, data transformer, etc.")
 			os.Exit(1)
 		}
 
@@ -150,7 +198,7 @@ Example:
 		exec.SetQuiet(true) // suppress status messages for programmatic output
 
 		// Connect
-		connectProg, _ := visitor.Build(fmt.Sprintf("CONNECT LOCAL '%s'", projectPath))
+		connectProg, _ := visitor.Build(fmt.Sprintf("CONNECT LOCAL '%s'", visitor.QuoteString(projectPath)))
 		for _, stmt := range connectProg.Statements {
 			if err := exec.Execute(stmt); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -184,6 +232,11 @@ Example:
 				}
 			} else if upper == "MICROFLOW" {
 				if err := exec.MicroflowELK(name); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					os.Exit(1)
+				}
+			} else if upper == "NANOFLOW" {
+				if err := exec.NanoflowELK(name); err != nil {
 					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 					os.Exit(1)
 				}
@@ -226,4 +279,211 @@ Example:
 			}
 		}
 	},
+}
+
+// objectTypeToDescribe maps a catalog `objects` view ObjectType to the `describe`
+// keyword. Only directly describable types with a `Module.Name` shape are listed.
+var objectTypeToDescribe = map[string]string{
+	"MODULE":                 "module",
+	"ENTITY":                 "entity",
+	"EXTERNAL_ENTITY":        "entity",
+	"ASSOCIATION":            "association",
+	"MICROFLOW":              "microflow",
+	"NANOFLOW":               "nanoflow",
+	"PAGE":                   "page",
+	"SNIPPET":                "snippet",
+	"LAYOUT":                 "layout",
+	"ENUMERATION":            "enumeration",
+	"CONSTANT":               "constant",
+	"JAVA_ACTION":            "javaaction",
+	"WORKFLOW":               "workflow",
+	"JSON_STRUCTURE":         "jsonstructure",
+	"IMPORT_MAPPING":         "importmapping",
+	"EXPORT_MAPPING":         "exportmapping",
+	"ODATA_CLIENT":           "odataclient",
+	"ODATA_SERVICE":          "odataservice",
+	"REST_CLIENT":            "restclient",
+	"BUSINESS_EVENT_SERVICE": "businesseventservice",
+	"DATABASE_CONNECTION":    "databaseconnection",
+	"IMAGE_COLLECTION":       "imagecollection",
+	"DATA_TRANSFORMER":       "datatransformer",
+	"AGENT":                  "agent",
+	"AI_MODEL":               "model",
+	"KNOWLEDGE_BASE":         "knowledgebase",
+	"CONSUMED_MCP_SERVICE":   "consumedmcpservice",
+	// JAVASCRIPT_ACTION is cataloged but has no `describe` CLI form, so it is
+	// intentionally omitted from auto-detect.
+}
+
+// unitTypeToDescribe maps a top-level unit's BSON $Type to the `describe`
+// keyword. Used by the live-reader fallback. Only directly describable document
+// types are listed (page templates, building blocks, rules, etc. are absent so
+// they don't resolve).
+var unitTypeToDescribe = map[string]string{
+	"Microflows$Microflow":         "microflow",
+	"Microflows$Nanoflow":          "nanoflow",
+	"Forms$Page":                   "page",
+	"Forms$Snippet":                "snippet",
+	"Forms$Layout":                 "layout",
+	"Enumerations$Enumeration":     "enumeration",
+	"Constants$Constant":           "constant",
+	"JavaActions$JavaAction":       "javaaction",
+	"JsonStructures$JsonStructure": "jsonstructure",
+	"ImportMappings$ImportMapping": "importmapping",
+	"ExportMappings$ExportMapping": "exportmapping",
+	"Images$ImageCollection":       "imagecollection",
+	"Workflows$Workflow":           "workflow",
+}
+
+// resolveDescribeType auto-detects the `describe` type for a qualified document
+// name. It prefers the catalog cache (an O(1) index, when `.mxcli/catalog.db`
+// exists) and falls back to a live project scan when the catalog is absent or
+// has no entry for the name (e.g. a document added since the last build). It
+// returns the single matching type, the candidate list when the name is
+// ambiguous (an entity and a document can share a name), or an error when
+// nothing matches.
+func resolveDescribeType(projectPath, name string) (string, []string, error) {
+	matches := resolveViaCatalog(projectPath, name)
+	if len(matches) == 0 {
+		var err error
+		matches, err = resolveViaReader(projectPath, name)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+	return chooseDescribeType(name, matches)
+}
+
+// chooseDescribeType collapses raw matches (which may contain duplicates and
+// empty strings) into a single type, a candidate list, or a not-found error.
+func chooseDescribeType(name string, matches []string) (string, []string, error) {
+	seen := map[string]bool{}
+	var uniq []string
+	for _, m := range matches {
+		if m != "" && !seen[m] {
+			seen[m] = true
+			uniq = append(uniq, m)
+		}
+	}
+	switch len(uniq) {
+	case 0:
+		return "", nil, fmt.Errorf("no describable document named %q found in the project", name)
+	case 1:
+		return uniq[0], nil, nil
+	default:
+		return "", uniq, nil
+	}
+}
+
+// resolveViaCatalog looks the name up in the catalog cache. Returns nil (so the
+// caller falls back to a live scan) when the catalog is missing, unreadable, or
+// has no matching row. Best-effort: any error is treated as a miss.
+func resolveViaCatalog(projectPath, name string) []string {
+	dbPath := filepath.Join(filepath.Dir(projectPath), ".mxcli", "catalog.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil
+	}
+	cat, err := catalog.NewFromFile(dbPath)
+	if err != nil {
+		return nil
+	}
+	defer cat.Close()
+
+	// Only trust a cache that matches the current project file. A stale cache
+	// (the .mpr changed since it was built) could resolve a renamed/deleted name
+	// to the wrong type, so fall back to the authoritative live scan instead.
+	if !catalogMatchesProject(cat, projectPath) {
+		return nil
+	}
+
+	q := "'" + strings.ReplaceAll(name, "'", "''") + "'"
+	var out []string
+	// The objects view is a complete index (associations included as of catalog
+	// schema v3), so a single query covers every auto-detectable type.
+	if res, err := cat.Query("SELECT DISTINCT ObjectType FROM objects WHERE QualifiedName = " + q); err == nil {
+		for _, row := range res.Rows {
+			if len(row) > 0 {
+				out = append(out, objectTypeToDescribe[fmt.Sprintf("%v", row[0])])
+			}
+		}
+	}
+	return out
+}
+
+// catalogMatchesProject reports whether the cached catalog was built from the
+// current project file and is still up to date — same MPR path and unchanged
+// modification time (Unix seconds, mirroring isCacheValid). Any read failure or
+// mismatch is treated as "not fresh" so the caller live-scans (safe but slower).
+func catalogMatchesProject(cat *catalog.Catalog, projectPath string) bool {
+	info, err := cat.GetCacheInfo()
+	if err != nil {
+		return false
+	}
+	fi, err := os.Stat(projectPath)
+	if err != nil {
+		return false
+	}
+	if info.MprModTime.Unix() != fi.ModTime().Unix() {
+		return false
+	}
+	// Compare absolute paths when both resolve; a path mismatch means the cache
+	// is for a different .mpr in the same directory.
+	if info.MprPath != "" {
+		a, err1 := filepath.Abs(info.MprPath)
+		b, err2 := filepath.Abs(projectPath)
+		if err1 == nil && err2 == nil && a != b {
+			return false
+		}
+	}
+	return true
+}
+
+// resolveViaReader scans the live project for the name. Authoritative but slower
+// than the catalog (it enumerates documents). Covers top-level documents plus
+// entities and associations (including cross-module associations).
+func resolveViaReader(projectPath, name string) ([]string, error) {
+	reader, err := modelsdk.Open(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	var out []string
+	// Top-level documents (microflow, page, snippet, enumeration, ...).
+	if units, err := reader.ListRawUnits(""); err == nil {
+		for _, u := range units {
+			if u.QualifiedName == name {
+				out = append(out, unitTypeToDescribe[u.Type])
+			}
+		}
+	}
+
+	// Entities and associations live inside the domain model, keyed by module.
+	moduleName := map[string]string{}
+	if modules, err := reader.ListModules(); err == nil {
+		for _, m := range modules {
+			moduleName[string(m.ID)] = m.Name
+		}
+	}
+	if dms, err := reader.ListDomainModels(); err == nil {
+		for _, dm := range dms {
+			mn := moduleName[string(dm.ContainerID)]
+			for _, e := range dm.Entities {
+				if mn+"."+e.Name == name {
+					out = append(out, "entity")
+				}
+			}
+			for _, a := range dm.Associations {
+				if mn+"."+a.Name == name {
+					out = append(out, "association")
+				}
+			}
+			for _, a := range dm.CrossAssociations {
+				if mn+"."+a.Name == name {
+					out = append(out, "association")
+				}
+			}
+		}
+	}
+	return out, nil
 }

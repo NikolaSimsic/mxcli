@@ -127,17 +127,17 @@
       "view/item/context": [
         {
           "command": "mendix.showContext",
-          "when": "view == mendixProjectTree && viewItem =~ /^(entity|microflow|nanoflow|page|snippet|enumeration)$/",
+          "when": "view == mendixProjectTree && viewItem =~ /^(entity|microflow|nanoflow|page|snippet|enumeration|workflow|constant|layout|jsonstructure|importmapping|exportmapping|restclient|agent|aimodel|knowledgebase|consumedmcpservice|datatransformer)$/",
           "group": "mendix@1"
         },
         {
           "command": "mendix.showImpact",
-          "when": "view == mendixProjectTree && viewItem =~ /^(entity|microflow|nanoflow|page|snippet|enumeration|association)$/",
+          "when": "view == mendixProjectTree && viewItem =~ /^(entity|microflow|nanoflow|page|snippet|enumeration|association|workflow|constant|jsonstructure|importmapping|exportmapping|restclient|agent|aimodel|knowledgebase|consumedmcpservice|datatransformer)$/",
           "group": "mendix@2"
         },
         {
           "command": "mendix.showReferences",
-          "when": "view == mendixProjectTree && viewItem =~ /^(entity|microflow|nanoflow|page|snippet|enumeration|association)$/",
+          "when": "view == mendixProjectTree && viewItem =~ /^(entity|microflow|nanoflow|page|snippet|enumeration|association|workflow|constant|jsonstructure|importmapping|exportmapping|restclient|agent|aimodel|knowledgebase|consumedmcpservice|datatransformer)$/",
           "group": "mendix@3"
         },
         {
@@ -152,17 +152,17 @@
         },
         {
           "command": "mendix.openElement",
-          "when": "view == mendixProjectTree && viewItem =~ /^(entity|microflow|nanoflow|page|snippet|enumeration|association|modulerole|userrole|projectsecurity|demouser)$/",
+          "when": "view == mendixProjectTree && viewItem =~ /^(entity|microflow|nanoflow|page|snippet|enumeration|association|workflow|constant|layout|javaaction|javascriptaction|scheduledevent|buildingblock|pagetemplate|imagecollection|jsonstructure|importmapping|exportmapping|restclient|businesseventservice|databaseconnection|publishedrestservice|odataclient|odataservice|modulerole|userrole|projectsecurity|demouser|agent|aimodel|knowledgebase|consumedmcpservice|datatransformer)$/",
           "group": "mendix@6"
         },
         {
           "command": "mendix.previewDiagram",
-          "when": "view == mendixProjectTree && viewItem =~ /^(domainmodel|entity|microflow|page|systemoverview)$/",
+          "when": "view == mendixProjectTree && viewItem =~ /^(domainmodel|entity|microflow|nanoflow|page|systemoverview)$/",
           "group": "mendix@7"
         },
         {
           "command": "mendix.previewDiagramWithSource",
-          "when": "view == mendixProjectTree && viewItem =~ /^(microflow|entity|domainmodel|externalentity|page)$/",
+          "when": "view == mendixProjectTree && viewItem =~ /^(microflow|nanoflow|entity|domainmodel|externalentity|page)$/",
           "group": "mendix@8"
         }
       ],

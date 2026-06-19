@@ -1,0 +1,38 @@
+create module SampleModule;
+
+create persistent entity SampleModule.Item (
+  Name: string(200)
+);
+
+create java action SampleModule.Recalculate(
+  CompanyId: string,
+  RecalculateAll: boolean not null,
+  ItemList: list of SampleModule.Item
+) returns void as $$
+$$;
+
+create microflow SampleModule.ACT_RecalculateOpenItems ()
+returns Void
+begin
+  call java action SampleModule.Recalculate(
+    CompanyId       = empty,
+    RecalculateAll  = true,
+    ItemList        = empty
+  );
+  return;
+end;
+/
+
+create microflow SampleModule.ACT_RecalculateForCompany (
+  $CompanyId: String
+)
+returns Void
+begin
+  call java action SampleModule.Recalculate(
+    CompanyId       = $CompanyId,
+    RecalculateAll  = false,
+    ItemList        = empty
+  );
+  return;
+end;
+/

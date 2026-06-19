@@ -3,6 +3,7 @@
 package executor
 
 import (
+	"context"
 	"strings"
 )
 
@@ -43,10 +44,10 @@ func buildPropertyTypeKeyMap(w map[string]any, withFallback bool) map[string]str
 // extractCustomWidgetAttribute extracts the attribute from a CustomWidget (e.g., ComboBox).
 // Specifically looks for attributeAssociation or attributeEnumeration properties by key,
 // avoiding false matches from other properties that also have AttributeRef (e.g., CaptionAttribute).
-func (e *Executor) extractCustomWidgetAttribute(w map[string]any) string {
+func extractCustomWidgetAttribute(ctx *ExecContext, w map[string]any) string {
 	// Try association attribute first, then enumeration attribute
 	for _, key := range []string{"attributeAssociation", "attributeEnumeration"} {
-		if attr := e.extractCustomWidgetPropertyAttributeRef(w, key); attr != "" {
+		if attr := extractCustomWidgetPropertyAttributeRef(ctx, w, key); attr != "" {
 			return attr
 		}
 	}
@@ -54,7 +55,7 @@ func (e *Executor) extractCustomWidgetAttribute(w map[string]any) string {
 }
 
 // extractCustomWidgetType extracts the widget type ID from a CustomWidget.
-func (e *Executor) extractCustomWidgetType(w map[string]any) string {
+func extractCustomWidgetType(ctx *ExecContext, w map[string]any) string {
 	typeObj, ok := w["Type"].(map[string]any)
 	if !ok {
 		return ""
@@ -63,30 +64,30 @@ func (e *Executor) extractCustomWidgetType(w map[string]any) string {
 		// Return short name based on widget ID (uppercase for MDL keywords)
 		switch widgetID {
 		case "com.mendix.widget.web.combobox.Combobox":
-			return "COMBOBOX"
+			return "combobox"
 		case "com.mendix.widget.web.datagrid.Datagrid":
-			return "DATAGRID2"
+			return "datagrid2"
 		case "com.mendix.widget.web.gallery.Gallery":
-			return "GALLERY"
+			return "gallery"
 		case "com.mendix.widget.web.datagridtextfilter.DatagridTextFilter":
-			return "TEXTFILTER"
+			return "textfilter"
 		case "com.mendix.widget.web.datagridnumberfilter.DatagridNumberFilter":
-			return "NUMBERFILTER"
+			return "numberfilter"
 		case "com.mendix.widget.web.datagriddropdownfilter.DatagridDropdownFilter":
-			return "DROPDOWNFILTER"
+			return "dropdownfilter"
 		case "com.mendix.widget.web.datagriddatefilter.DatagridDateFilter":
-			return "DATEFILTER"
+			return "datefilter"
 		case "com.mendix.widget.web.dropdownsort.DropdownSort":
-			return "DROPDOWNSORT"
+			return "dropdownsort"
 		case "com.mendix.widget.web.image.Image":
-			return "IMAGE"
+			return "image"
 		default:
 			// Extract last part of widget ID and uppercase it
 			parts := strings.Split(widgetID, ".")
 			if len(parts) > 0 {
-				return strings.ToUpper(parts[len(parts)-1])
+				return strings.ToLower(parts[len(parts)-1])
 			}
-			return strings.ToUpper(widgetID)
+			return strings.ToLower(widgetID)
 		}
 	}
 	return ""
@@ -94,9 +95,9 @@ func (e *Executor) extractCustomWidgetType(w map[string]any) string {
 
 // extractComboBoxDataSource extracts the datasource from a ComboBox CustomWidget in association mode.
 // Returns nil for enumeration mode (no datasource).
-func (e *Executor) extractComboBoxDataSource(w map[string]any) *rawDataSource {
+func extractComboBoxDataSource(ctx *ExecContext, w map[string]any) *rawDataSource {
 	// Check if optionsSourceType is "association" first
-	sourceType := e.extractCustomWidgetPropertyString(w, "optionsSourceType")
+	sourceType := extractCustomWidgetPropertyString(ctx, w, "optionsSourceType")
 	if sourceType != "association" {
 		return nil
 	}
@@ -130,14 +131,14 @@ func (e *Executor) extractComboBoxDataSource(w map[string]any) *rawDataSource {
 			continue
 		}
 		if ds, ok := dsVal.(map[string]any); ok && ds != nil {
-			return e.parseCustomWidgetDataSource(ds)
+			return parseCustomWidgetDataSource(ctx, ds)
 		}
 	}
 	return nil
 }
 
 // extractDataGrid2DataSource extracts the datasource from a DataGrid2 CustomWidget.
-func (e *Executor) extractDataGrid2DataSource(w map[string]any) *rawDataSource {
+func extractDataGrid2DataSource(ctx *ExecContext, w map[string]any) *rawDataSource {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
 		return nil
@@ -187,7 +188,7 @@ func (e *Executor) extractDataGrid2DataSource(w map[string]any) *rawDataSource {
 					if !ok {
 						continue
 					}
-					col := rawSortColumn{Order: "ASC"}
+					col := rawSortColumn{Order: "asc"}
 					// Extract attribute from AttributeRef
 					if attrRef, ok := sortItem["AttributeRef"].(map[string]any); ok {
 						col.Attribute = shortAttributeName(extractString(attrRef["Attribute"]))
@@ -195,7 +196,7 @@ func (e *Executor) extractDataGrid2DataSource(w map[string]any) *rawDataSource {
 					// Extract sort order
 					sortOrder := extractString(sortItem["SortOrder"])
 					if sortOrder == "Descending" {
-						col.Order = "DESC"
+						col.Order = "desc"
 					}
 					if col.Attribute != "" {
 						result.SortColumns = append(result.SortColumns, col)
@@ -222,14 +223,14 @@ func (e *Executor) extractDataGrid2DataSource(w map[string]any) *rawDataSource {
 
 // extractDataGrid2Columns extracts the columns from a DataGrid2 CustomWidget.
 // entityContext is the resolved entity context from the DataGrid2's datasource.
-func (e *Executor) extractDataGrid2Columns(w map[string]any, entityContext ...string) []rawDataGridColumn {
+func extractDataGrid2Columns(ctx *ExecContext, w map[string]any, entityContext ...string) []rawDataGridColumn {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
 		return nil
 	}
 
 	// Build column property key map from Type.ObjectType.PropertyTypes -> columns -> ValueType.ObjectType.PropertyTypes
-	colPropKeyMap := e.buildColumnPropertyKeyMap(w)
+	colPropKeyMap := buildColumnPropertyKeyMap(ctx, w)
 
 	// Search through properties for columns
 	props := getBsonArrayElements(obj["Properties"])
@@ -248,9 +249,9 @@ func (e *Executor) extractDataGrid2Columns(w map[string]any, entityContext ...st
 			continue
 		}
 
-		ctx := ""
+		entCtx := ""
 		if len(entityContext) > 0 {
-			ctx = entityContext[0]
+			entCtx = entityContext[0]
 		}
 		var columns []rawDataGridColumn
 		for _, colObj := range objects {
@@ -258,7 +259,7 @@ func (e *Executor) extractDataGrid2Columns(w map[string]any, entityContext ...st
 			if !ok {
 				continue
 			}
-			col := e.extractDataGrid2Column(colMap, colPropKeyMap, ctx)
+			col := extractDataGrid2Column(ctx, colMap, colPropKeyMap, entCtx)
 			if col.Attribute != "" || col.Caption != "" {
 				columns = append(columns, col)
 			}
@@ -272,7 +273,7 @@ func (e *Executor) extractDataGrid2Columns(w map[string]any, entityContext ...st
 
 // buildColumnPropertyKeyMap builds a map from TypePointer ID to property key
 // for column-level properties (alignment, wrapText, etc.) from the widget Type.
-func (e *Executor) buildColumnPropertyKeyMap(w map[string]any) map[string]string {
+func buildColumnPropertyKeyMap(ctx *ExecContext, w map[string]any) map[string]string {
 	result := make(map[string]string)
 	widgetType, ok := w["Type"].(map[string]any)
 	if !ok {
@@ -331,7 +332,7 @@ func (e *Executor) buildColumnPropertyKeyMap(w map[string]any) map[string]string
 // - "dynamicText": TextTemplate for dynamic text (when showContentAs = "dynamicText")
 // - "alignment": enum value ("left", "center", "right")
 // - "wrapText": boolean ("true", "false")
-func (e *Executor) extractDataGrid2Column(colObj map[string]any, colPropKeyMap map[string]string, entityContext string) rawDataGridColumn {
+func extractDataGrid2Column(ctx *ExecContext, colObj map[string]any, colPropKeyMap map[string]string, entityContext string) rawDataGridColumn {
 	col := rawDataGridColumn{}
 
 	// Track if we've found the header to avoid overwriting with dynamicText's TextTemplate
@@ -434,6 +435,25 @@ func (e *Executor) extractDataGrid2Column(colObj map[string]any, colPropKeyMap m
 			}
 			continue
 		}
+		// Route header / dynamicText by property key so the read result doesn't
+		// depend on property iteration order. The writer emits properties
+		// alphabetically, which puts dynamicText before header — the old
+		// "first TextTemplate is the header" heuristic was wrong for that order.
+		if propKey == "header" {
+			if text, tt := extractTextTemplateText(value); text != "" {
+				col.Caption = text
+				col.CaptionParams = extractTextTemplateParameters(ctx, tt)
+				foundHeader = true
+			}
+			continue
+		}
+		if propKey == "dynamicText" {
+			if text, tt := extractTextTemplateText(value); text != "" {
+				col.DynamicText = text
+				col.DynamicTextParams = extractTextTemplateParameters(ctx, tt)
+			}
+			continue
+		}
 
 		// Check for AttributeRef (attribute property)
 		if col.Attribute == "" {
@@ -465,7 +485,7 @@ func (e *Executor) extractDataGrid2Column(colObj map[string]any, colPropKeyMap m
 			if len(widgets) > 0 {
 				for _, w := range widgets {
 					if wMap, ok := w.(map[string]any); ok {
-						col.ContentWidgets = append(col.ContentWidgets, e.parseRawWidget(wMap, entityContext)...)
+						col.ContentWidgets = append(col.ContentWidgets, parseRawWidget(ctx, wMap, entityContext)...)
 					}
 				}
 			}
@@ -485,12 +505,12 @@ func (e *Executor) extractDataGrid2Column(colObj map[string]any, colPropKeyMap m
 						if !foundHeader {
 							// First TextTemplate with text is the header
 							col.Caption = text
-							col.CaptionParams = e.extractTextTemplateParameters(textTemplate)
+							col.CaptionParams = extractTextTemplateParameters(ctx, textTemplate)
 							foundHeader = true
 						} else if col.DynamicText == "" {
 							// Second TextTemplate is dynamicText (if showContentAs = dynamicText)
 							col.DynamicText = text
-							col.DynamicTextParams = e.extractTextTemplateParameters(textTemplate)
+							col.DynamicTextParams = extractTextTemplateParameters(ctx, textTemplate)
 						}
 						break
 					}
@@ -503,12 +523,37 @@ func (e *Executor) extractDataGrid2Column(colObj map[string]any, colPropKeyMap m
 
 // extractDataGrid2ControlBar extracts the CONTROLBAR widgets from a DataGrid2 CustomWidget.
 // DataGrid2 stores header/filter widgets in the 'filtersPlaceholder' property, same as Gallery.
-func (e *Executor) extractDataGrid2ControlBar(w map[string]any) []rawWidget {
-	return e.extractGalleryWidgetsByPropertyKey(w, "filtersPlaceholder")
+func extractDataGrid2ControlBar(ctx *ExecContext, w map[string]any) []rawWidget {
+	return extractGalleryWidgetsByPropertyKey(ctx, w, "filtersPlaceholder")
+}
+
+// extractTextTemplateText finds the first non-empty Text item inside a
+// WidgetValue's TextTemplate (Forms$ClientTemplate → Texts$Text → Items[]).
+// Returns the text and the TextTemplate map so callers can also pull
+// Parameters from it. Returns ("", nil) when the value has no template text.
+func extractTextTemplateText(value map[string]any) (string, map[string]any) {
+	textTemplate, ok := value["TextTemplate"].(map[string]any)
+	if !ok || textTemplate == nil {
+		return "", nil
+	}
+	template, ok := textTemplate["Template"].(map[string]any)
+	if !ok || template == nil {
+		return "", nil
+	}
+	for _, item := range getBsonArrayElements(template["Items"]) {
+		itemMap, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if text := extractString(itemMap["Text"]); text != "" {
+			return text, textTemplate
+		}
+	}
+	return "", nil
 }
 
 // extractTextTemplateParameters extracts parameters from a TextTemplate (Forms$ClientTemplate).
-func (e *Executor) extractTextTemplateParameters(textTemplate map[string]any) []string {
+func extractTextTemplateParameters(ctx *ExecContext, textTemplate map[string]any) []string {
 	params := getBsonArrayElements(textTemplate["Parameters"])
 	if params == nil || len(params) == 0 {
 		return nil
@@ -525,12 +570,26 @@ func (e *Executor) extractTextTemplateParameters(textTemplate map[string]any) []
 			continue
 		}
 
-		// Check for SourceVariable (page/snippet parameter reference)
+		// Check for SourceVariable (page parameter / local variable / snippet parameter)
 		sourceVarName := ""
+		isLocalVariable := false
 		if srcVar, ok := pMap["SourceVariable"].(map[string]any); ok && srcVar != nil {
-			if paramName, ok := srcVar["PageParameter"].(string); ok && paramName != "" {
-				sourceVarName = paramName
+			// Local page-level variable — Studio Pro UI emits this form for
+			// $varName references that bind to a Variables entry.
+			if name, ok := srcVar["LocalVariable"].(string); ok && name != "" {
+				sourceVarName = name
+				isLocalVariable = true
+			} else if name, ok := srcVar["PageParameter"].(string); ok && name != "" {
+				sourceVarName = name
+			} else if name, ok := srcVar["SnippetParameter"].(string); ok && name != "" {
+				sourceVarName = name
 			}
+		}
+
+		// Local variable: emit as bare $varName (no .attribute suffix).
+		if isLocalVariable {
+			result = append(result, "$"+sourceVarName)
+			continue
 		}
 
 		// Check for AttributeRef
@@ -556,7 +615,7 @@ func (e *Executor) extractTextTemplateParameters(textTemplate map[string]any) []
 
 // extractGalleryDataSource extracts the datasource from a Gallery widget.
 // Handles both Forms$Gallery and CustomWidgets$CustomWidget Gallery formats.
-func (e *Executor) extractGalleryDataSource(w map[string]any) *rawDataSource {
+func extractGalleryDataSource(ctx *ExecContext, w map[string]any) *rawDataSource {
 	// First check for CustomWidget Gallery format (datasource in Object.Properties)
 	if obj, ok := w["Object"].(map[string]any); ok {
 		props := getBsonArrayElements(obj["Properties"])
@@ -575,7 +634,7 @@ func (e *Executor) extractGalleryDataSource(w map[string]any) *rawDataSource {
 				continue
 			}
 			if ds, ok := dsVal.(map[string]any); ok && ds != nil {
-				result := e.parseCustomWidgetDataSource(ds)
+				result := parseCustomWidgetDataSource(ctx, ds)
 				if result != nil {
 					return result
 				}
@@ -606,13 +665,13 @@ func (e *Executor) extractGalleryDataSource(w map[string]any) *rawDataSource {
 				if !ok {
 					continue
 				}
-				col := rawSortColumn{Order: "ASC"}
+				col := rawSortColumn{Order: "asc"}
 				if attrRef, ok := sortItem["AttributeRef"].(map[string]any); ok {
 					col.Attribute = shortAttributeName(extractString(attrRef["Attribute"]))
 				}
 				sortOrder := extractString(sortItem["SortOrder"])
 				if sortOrder == "Descending" {
-					col.Order = "DESC"
+					col.Order = "desc"
 				}
 				if col.Attribute != "" {
 					result.SortColumns = append(result.SortColumns, col)
@@ -637,7 +696,7 @@ func (e *Executor) extractGalleryDataSource(w map[string]any) *rawDataSource {
 }
 
 // parseCustomWidgetDataSource parses datasource from CustomWidget property format.
-func (e *Executor) parseCustomWidgetDataSource(ds map[string]any) *rawDataSource {
+func parseCustomWidgetDataSource(ctx *ExecContext, ds map[string]any) *rawDataSource {
 	dsType := extractString(ds["$Type"])
 	switch dsType {
 	case "CustomWidgets$CustomWidgetXPathSource":
@@ -655,13 +714,13 @@ func (e *Executor) parseCustomWidgetDataSource(ds map[string]any) *rawDataSource
 				if !ok {
 					continue
 				}
-				col := rawSortColumn{Order: "ASC"}
+				col := rawSortColumn{Order: "asc"}
 				if attrRef, ok := sortItem["AttributeRef"].(map[string]any); ok {
 					col.Attribute = shortAttributeName(extractString(attrRef["Attribute"]))
 				}
 				sortOrder := extractString(sortItem["SortOrder"])
 				if sortOrder == "Descending" {
-					col.Order = "DESC"
+					col.Order = "desc"
 				}
 				if col.Attribute != "" {
 					result.SortColumns = append(result.SortColumns, col)
@@ -696,20 +755,20 @@ func (e *Executor) parseCustomWidgetDataSource(ds map[string]any) *rawDataSource
 
 // extractGalleryContent extracts the content widgets from a CustomWidget Gallery.
 // entityContext is the resolved entity context from the Gallery's datasource.
-func (e *Executor) extractGalleryContent(w map[string]any, entityContext ...string) []rawWidget {
-	ctx := ""
+func extractGalleryContent(ctx *ExecContext, w map[string]any, entityContext ...string) []rawWidget {
+	entCtx := ""
 	if len(entityContext) > 0 {
-		ctx = entityContext[0]
+		entCtx = entityContext[0]
 	}
-	return e.extractGalleryWidgetsByPropertyKey(w, "content", ctx)
+	return extractGalleryWidgetsByPropertyKey(ctx, w, "content", entCtx)
 }
 
 // extractGalleryWidgetsByPropertyKey extracts widgets from a named property of a CustomWidget Gallery.
 // entityContext is the resolved entity context to propagate to child widgets.
-func (e *Executor) extractGalleryWidgetsByPropertyKey(w map[string]any, targetKey string, entityContext ...string) []rawWidget {
-	ctx := ""
+func extractGalleryWidgetsByPropertyKey(ctx *ExecContext, w map[string]any, targetKey string, entityContext ...string) []rawWidget {
+	entCtx := ""
 	if len(entityContext) > 0 {
-		ctx = entityContext[0]
+		entCtx = entityContext[0]
 	}
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
@@ -754,7 +813,7 @@ func (e *Executor) extractGalleryWidgetsByPropertyKey(w map[string]any, targetKe
 			if !ok {
 				continue
 			}
-			result = append(result, e.parseRawWidget(wgtMap, ctx)...)
+			result = append(result, parseRawWidget(ctx, wgtMap, entCtx)...)
 		}
 		return result
 	}
@@ -782,7 +841,7 @@ func (e *Executor) extractGalleryWidgetsByPropertyKey(w map[string]any, targetKe
 				if !ok {
 					continue
 				}
-				result = append(result, e.parseRawWidget(wgtMap, ctx)...)
+				result = append(result, parseRawWidget(ctx, wgtMap, entCtx)...)
 			}
 			if len(result) > 0 {
 				return result
@@ -794,12 +853,12 @@ func (e *Executor) extractGalleryWidgetsByPropertyKey(w map[string]any, targetKe
 }
 
 // extractGalleryFilters extracts the filter widgets from a CustomWidget Gallery.
-func (e *Executor) extractGalleryFilters(w map[string]any) []rawWidget {
-	return e.extractGalleryWidgetsByPropertyKey(w, "filtersPlaceholder")
+func extractGalleryFilters(ctx *ExecContext, w map[string]any) []rawWidget {
+	return extractGalleryWidgetsByPropertyKey(ctx, w, "filtersPlaceholder")
 }
 
 // extractGallerySelection extracts the selection mode from a CustomWidget Gallery.
-func (e *Executor) extractGallerySelection(w map[string]any) string {
+func extractGallerySelection(ctx *ExecContext, w map[string]any) string {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
 		return ""
@@ -825,18 +884,18 @@ func (e *Executor) extractGallerySelection(w map[string]any) string {
 }
 
 // extractFilterAttributes extracts the filter attributes from a TextFilter/NumberFilter widget.
-func (e *Executor) extractFilterAttributes(w map[string]any) []string {
+func extractFilterAttributes(ctx *ExecContext, w map[string]any) []string {
 	// Use the generic property extraction helper
-	return e.extractCustomWidgetPropertyAttributes(w, "attributes")
+	return extractCustomWidgetPropertyAttributes(ctx, w, "attributes")
 }
 
 // extractFilterExpression extracts the default filter expression from a TextFilter widget.
-func (e *Executor) extractFilterExpression(w map[string]any) string {
-	return e.extractCustomWidgetPropertyString(w, "defaultFilter")
+func extractFilterExpression(ctx *ExecContext, w map[string]any) string {
+	return extractCustomWidgetPropertyString(ctx, w, "defaultFilter")
 }
 
 // extractCustomWidgetPropertyAttributeRef extracts an AttributeRef value from a named CustomWidget property.
-func (e *Executor) extractCustomWidgetPropertyAttributeRef(w map[string]any, propertyKey string) string {
+func extractCustomWidgetPropertyAttributeRef(ctx *ExecContext, w map[string]any, propertyKey string) string {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
 		return ""
@@ -876,7 +935,7 @@ func (e *Executor) extractCustomWidgetPropertyAttributeRef(w map[string]any, pro
 //
 // This is the symmetric counterpart of extractCustomWidgetPropertyAttributeRef,
 // handling the EntityRef storage format instead of AttributeRef.
-func (e *Executor) extractCustomWidgetPropertyAssociation(w map[string]any, propertyKey string) string {
+func extractCustomWidgetPropertyAssociation(ctx *ExecContext, w map[string]any, propertyKey string) string {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
 		return ""
@@ -919,7 +978,7 @@ func (e *Executor) extractCustomWidgetPropertyAssociation(w map[string]any, prop
 }
 
 // extractCustomWidgetPropertyString extracts a string property value from a CustomWidget.
-func (e *Executor) extractCustomWidgetPropertyString(w map[string]any, propertyKey string) string {
+func extractCustomWidgetPropertyString(ctx *ExecContext, w map[string]any, propertyKey string) string {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
 		return ""
@@ -956,7 +1015,7 @@ func (e *Executor) extractCustomWidgetPropertyString(w map[string]any, propertyK
 }
 
 // extractCustomWidgetPropertyAttributes extracts attribute references from a CustomWidget property.
-func (e *Executor) extractCustomWidgetPropertyAttributes(w map[string]any, propertyKey string) []string {
+func extractCustomWidgetPropertyAttributes(ctx *ExecContext, w map[string]any, propertyKey string) []string {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
 		return nil
@@ -1017,7 +1076,7 @@ func (e *Executor) extractCustomWidgetPropertyAttributes(w map[string]any, prope
 }
 
 // extractCustomWidgetID extracts the full widget ID from a CustomWidget (e.g. "com.mendix.widget.custom.switch.Switch").
-func (e *Executor) extractCustomWidgetID(w map[string]any) string {
+func extractCustomWidgetID(ctx *ExecContext, w map[string]any) string {
 	typeObj, ok := w["Type"].(map[string]any)
 	if !ok {
 		return ""
@@ -1031,9 +1090,9 @@ func (e *Executor) extractCustomWidgetID(w map[string]any) string {
 // isKnownCustomWidgetType returns true for widget types that have dedicated DESCRIBE extractors.
 func isKnownCustomWidgetType(widgetType string) bool {
 	switch widgetType {
-	case "COMBOBOX", "DATAGRID2", "GALLERY", "IMAGE",
-		"TEXTFILTER", "NUMBERFILTER", "DROPDOWNFILTER", "DATEFILTER",
-		"DROPDOWNSORT":
+	case "combobox", "datagrid2", "gallery", "image",
+		"textfilter", "numberfilter", "dropdownfilter", "datefilter",
+		"dropdownsort":
 		return true
 	}
 	return false
@@ -1041,7 +1100,7 @@ func isKnownCustomWidgetType(widgetType string) bool {
 
 // extractExplicitProperties extracts non-default property values from a CustomWidget BSON.
 // Returns attribute references and primitive values for properties that differ from defaults.
-func (e *Executor) extractExplicitProperties(w map[string]any) []rawExplicitProp {
+func extractExplicitProperties(ctx *ExecContext, w map[string]any) []rawExplicitProp {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
 		return nil
@@ -1097,22 +1156,22 @@ func (e *Executor) extractExplicitProperties(w map[string]any) []rawExplicitProp
 }
 
 // extractImageProperties extracts properties from a pluggable Image CustomWidget.
-func (e *Executor) extractImageProperties(w map[string]any, widget *rawWidget) {
-	widget.ImageType = e.extractCustomWidgetPropertyString(w, "datasource")
-	widget.ImageUrl = e.extractCustomWidgetPropertyTextTemplate(w, "imageUrl")
-	widget.AlternativeText = e.extractCustomWidgetPropertyTextTemplate(w, "alternativeText")
-	widget.ImageWidth = e.extractCustomWidgetPropertyString(w, "width")
-	widget.ImageHeight = e.extractCustomWidgetPropertyString(w, "height")
-	widget.WidthUnit = e.extractCustomWidgetPropertyString(w, "widthUnit")
-	widget.HeightUnit = e.extractCustomWidgetPropertyString(w, "heightUnit")
-	widget.DisplayAs = e.extractCustomWidgetPropertyString(w, "displayAs")
-	widget.Responsive = e.extractCustomWidgetPropertyString(w, "responsive")
-	widget.OnClickType = e.extractCustomWidgetPropertyString(w, "onClickType")
-	widget.Action = e.extractCustomWidgetPropertyAction(w, "onClick")
+func extractImageProperties(ctx *ExecContext, w map[string]any, widget *rawWidget) {
+	widget.ImageType = extractCustomWidgetPropertyString(ctx, w, "datasource")
+	widget.ImageUrl = extractCustomWidgetPropertyTextTemplate(ctx, w, "imageUrl")
+	widget.AlternativeText = extractCustomWidgetPropertyTextTemplate(ctx, w, "alternativeText")
+	widget.ImageWidth = extractCustomWidgetPropertyString(ctx, w, "width")
+	widget.ImageHeight = extractCustomWidgetPropertyString(ctx, w, "height")
+	widget.WidthUnit = extractCustomWidgetPropertyString(ctx, w, "widthUnit")
+	widget.HeightUnit = extractCustomWidgetPropertyString(ctx, w, "heightUnit")
+	widget.DisplayAs = extractCustomWidgetPropertyString(ctx, w, "displayAs")
+	widget.Responsive = extractCustomWidgetPropertyString(ctx, w, "responsive")
+	widget.OnClickType = extractCustomWidgetPropertyString(ctx, w, "onClickType")
+	widget.Action = extractCustomWidgetPropertyAction(ctx, w, "onClick")
 }
 
 // extractCustomWidgetPropertyTextTemplate extracts text from a TextTemplate property of a CustomWidget.
-func (e *Executor) extractCustomWidgetPropertyTextTemplate(w map[string]any, propertyKey string) string {
+func extractCustomWidgetPropertyTextTemplate(ctx *ExecContext, w map[string]any, propertyKey string) string {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
 		return ""
@@ -1156,7 +1215,7 @@ func (e *Executor) extractCustomWidgetPropertyTextTemplate(w map[string]any, pro
 
 // extractCustomWidgetPropertyAction extracts an action description from a CustomWidget property.
 // Returns a formatted string like "CALL_MICROFLOW Module.Flow" or "SHOW_PAGE Module.Page".
-func (e *Executor) extractCustomWidgetPropertyAction(w map[string]any, propertyKey string) string {
+func extractCustomWidgetPropertyAction(ctx *ExecContext, w map[string]any, propertyKey string) string {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
 		return ""
@@ -1188,19 +1247,19 @@ func (e *Executor) extractCustomWidgetPropertyAction(w map[string]any, propertyK
 		case "Forms$MicroflowAction", "Pages$MicroflowClientAction":
 			if settings, ok := action["MicroflowSettings"].(map[string]any); ok {
 				if mf := extractString(settings["Microflow"]); mf != "" {
-					return "CALL_MICROFLOW " + mf
+					return "microflow " + mf
 				}
 			}
 		case "Forms$CallNanoflowClientAction", "Pages$CallNanoflowClientAction":
 			if settings, ok := action["NanoflowSettings"].(map[string]any); ok {
 				if nf := extractString(settings["Nanoflow"]); nf != "" {
-					return "CALL_NANOFLOW " + nf
+					return "nanoflow " + nf
 				}
 			}
 		case "Forms$FormAction", "Pages$FormAction":
 			if settings, ok := action["PageSettings"].(map[string]any); ok {
 				if page := extractString(settings["Page"]); page != "" {
-					return "SHOW_PAGE " + page
+					return "show_page " + page
 				}
 			}
 		case "Forms$NoAction", "Pages$NoAction":
@@ -1208,4 +1267,8 @@ func (e *Executor) extractCustomWidgetPropertyAction(w map[string]any, propertyK
 		}
 	}
 	return ""
+}
+
+func (e *Executor) extractCustomWidgetPropertyAssociation(w map[string]any, propertyKey string) string {
+	return extractCustomWidgetPropertyAssociation(e.newExecContext(context.Background()), w, propertyKey)
 }

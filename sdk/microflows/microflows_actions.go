@@ -17,11 +17,12 @@ type MicroflowAction interface {
 // CreateObjectAction creates a new object.
 type CreateObjectAction struct {
 	model.BaseElement
-	EntityID            model.ID        `json:"entityId"`
-	EntityQualifiedName string          `json:"entityQualifiedName"` // BY_NAME_REFERENCE
-	OutputVariable      string          `json:"outputVariable,omitempty"`
-	Commit              CommitType      `json:"commit"`
-	InitialMembers      []*MemberChange `json:"initialMembers,omitempty"`
+	ErrorHandlingType   ErrorHandlingType `json:"errorHandlingType,omitempty"`
+	EntityID            model.ID          `json:"entityId"`
+	EntityQualifiedName string            `json:"entityQualifiedName"` // BY_NAME_REFERENCE
+	OutputVariable      string            `json:"outputVariable,omitempty"`
+	Commit              CommitType        `json:"commit"`
+	InitialMembers      []*MemberChange   `json:"initialMembers,omitempty"`
 }
 
 func (CreateObjectAction) isMicroflowAction() {}
@@ -29,10 +30,11 @@ func (CreateObjectAction) isMicroflowAction() {}
 // ChangeObjectAction changes an existing object.
 type ChangeObjectAction struct {
 	model.BaseElement
-	ChangeVariable  string          `json:"changeVariable"`
-	Commit          CommitType      `json:"commit"`
-	RefreshInClient bool            `json:"refreshInClient"`
-	Changes         []*MemberChange `json:"changes,omitempty"`
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
+	ChangeVariable    string            `json:"changeVariable"`
+	Commit            CommitType        `json:"commit"`
+	RefreshInClient   bool              `json:"refreshInClient"`
+	Changes           []*MemberChange   `json:"changes,omitempty"`
 }
 
 func (ChangeObjectAction) isMicroflowAction() {}
@@ -154,9 +156,15 @@ const (
 // SortItem represents a sort specification.
 type SortItem struct {
 	model.BaseElement
-	AttributeID            model.ID      `json:"attributeId"`
-	AttributeQualifiedName string        `json:"attributeQualifiedName,omitempty"` // BY_NAME_REFERENCE: Module.Entity.Attribute
-	Direction              SortDirection `json:"direction"`
+	AttributeID            model.ID        `json:"attributeId"`
+	AttributeQualifiedName string          `json:"attributeQualifiedName,omitempty"` // BY_NAME_REFERENCE: Module.Entity.Attribute
+	EntityRefSteps         []EntityRefStep `json:"entityRefSteps,omitempty"`
+	Direction              SortDirection   `json:"direction"`
+}
+
+type EntityRefStep struct {
+	Association       string `json:"association,omitempty"`
+	DestinationEntity string `json:"destinationEntity,omitempty"`
 }
 
 // SortDirection represents sort order.
@@ -175,6 +183,8 @@ type AggregateListAction struct {
 	Function               AggregateFunction `json:"function"`
 	AttributeID            model.ID          `json:"attributeId,omitempty"`
 	AttributeQualifiedName string            `json:"attributeQualifiedName,omitempty"` // BY_NAME_REFERENCE: Module.Entity.Attribute
+	UseExpression          bool              `json:"useExpression,omitempty"`          // true when Expression is used instead of Attribute
+	Expression             string            `json:"expression,omitempty"`             // Mendix expression string (when UseExpression=true)
 }
 
 func (AggregateListAction) isMicroflowAction() {}
@@ -188,6 +198,7 @@ const (
 	AggregateFunctionAverage AggregateFunction = "Average"
 	AggregateFunctionMin     AggregateFunction = "Minimum"
 	AggregateFunctionMax     AggregateFunction = "Maximum"
+	AggregateFunctionReduce  AggregateFunction = "Reduce"
 )
 
 // ListOperationAction performs list operations.
@@ -292,6 +303,38 @@ type EqualsOperation struct {
 
 func (EqualsOperation) isListOperation() {}
 
+// FindByAttributeOperation finds an element by attribute or association value.
+type FindByAttributeOperation struct {
+	model.BaseElement
+	ListVariable string `json:"listVariable"`
+	Attribute    string `json:"attribute,omitempty"`
+	Association  string `json:"association,omitempty"`
+	Expression   string `json:"expression"`
+}
+
+func (FindByAttributeOperation) isListOperation() {}
+
+// FilterByAttributeOperation filters a list by attribute or association value.
+type FilterByAttributeOperation struct {
+	model.BaseElement
+	ListVariable string `json:"listVariable"`
+	Attribute    string `json:"attribute,omitempty"`
+	Association  string `json:"association,omitempty"`
+	Expression   string `json:"expression"`
+}
+
+func (FilterByAttributeOperation) isListOperation() {}
+
+// ListRangeOperation gets a range of elements from a list.
+type ListRangeOperation struct {
+	model.BaseElement
+	ListVariable     string `json:"listVariable"`
+	LimitExpression  string `json:"limitExpression,omitempty"`
+	OffsetExpression string `json:"offsetExpression,omitempty"`
+}
+
+func (ListRangeOperation) isListOperation() {}
+
 // List Actions
 
 // CreateListAction creates an empty list.
@@ -329,9 +372,10 @@ const (
 // CreateVariableAction creates a variable.
 type CreateVariableAction struct {
 	model.BaseElement
-	VariableName string   `json:"variableName"`
-	DataType     DataType `json:"dataType,omitempty"`
-	InitialValue string   `json:"initialValue,omitempty"`
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
+	VariableName      string            `json:"variableName"`
+	DataType          DataType          `json:"dataType,omitempty"`
+	InitialValue      string            `json:"initialValue,omitempty"`
 }
 
 func (CreateVariableAction) isMicroflowAction() {}
@@ -339,8 +383,9 @@ func (CreateVariableAction) isMicroflowAction() {}
 // ChangeVariableAction changes a variable.
 type ChangeVariableAction struct {
 	model.BaseElement
-	VariableName string `json:"variableName"`
-	Value        string `json:"value"`
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
+	VariableName      string            `json:"variableName"`
+	Value             string            `json:"value"`
 }
 
 func (ChangeVariableAction) isMicroflowAction() {}
@@ -359,6 +404,7 @@ func (CastAction) isMicroflowAction() {}
 // ShowPageAction shows a page.
 type ShowPageAction struct {
 	model.BaseElement
+	ErrorHandlingType     ErrorHandlingType       `json:"errorHandlingType,omitempty"`
 	PageID                model.ID                `json:"pageId,omitempty"`
 	PageName              string                  `json:"pageName,omitempty"` // Qualified name for BY_NAME_REFERENCE (e.g., "Module.PageName")
 	FormSettingsID        model.ID                `json:"formSettingsId,omitempty"`
@@ -403,7 +449,8 @@ func (ShowHomePageAction) isMicroflowAction() {}
 // ClosePageAction closes the current page.
 type ClosePageAction struct {
 	model.BaseElement
-	NumberOfPages int `json:"numberOfPages"`
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
+	NumberOfPages     int               `json:"numberOfPages"`
 }
 
 func (ClosePageAction) isMicroflowAction() {}
@@ -411,10 +458,11 @@ func (ClosePageAction) isMicroflowAction() {}
 // ShowMessageAction shows a message to the user.
 type ShowMessageAction struct {
 	model.BaseElement
-	Template           *model.Text `json:"template,omitempty"`
-	Type               MessageType `json:"type"`
-	Blocking           bool        `json:"blocking"`
-	TemplateParameters []string    `json:"templateParameters,omitempty"` // Expressions for {1}, {2}, etc.
+	ErrorHandlingType  ErrorHandlingType `json:"errorHandlingType,omitempty"`
+	Template           *model.Text       `json:"template,omitempty"`
+	Type               MessageType       `json:"type"`
+	Blocking           bool              `json:"blocking"`
+	TemplateParameters []string          `json:"templateParameters,omitempty"` // Expressions for {1}, {2}, etc.
 }
 
 func (ShowMessageAction) isMicroflowAction() {}
@@ -431,13 +479,14 @@ const (
 // ValidationFeedbackAction shows validation feedback.
 type ValidationFeedbackAction struct {
 	model.BaseElement
-	ObjectVariable     string      `json:"objectVariable"`
-	AttributeName      string      `json:"attributeName,omitempty"`   // BY_NAME_REFERENCE (e.g., "Module.Entity.Attribute")
-	AssociationName    string      `json:"associationName,omitempty"` // BY_NAME_REFERENCE (e.g., "Module.AssociationName")
-	AttributeID        model.ID    `json:"attributeId,omitempty"`     // Deprecated: use AttributeName
-	AssociationID      model.ID    `json:"associationId,omitempty"`   // Deprecated: use AssociationName
-	Template           *model.Text `json:"template,omitempty"`
-	TemplateParameters []string    `json:"templateParameters,omitempty"` // Expressions for {1}, {2}, etc. placeholders
+	ErrorHandlingType  ErrorHandlingType `json:"errorHandlingType,omitempty"`
+	ObjectVariable     string            `json:"objectVariable"`
+	AttributeName      string            `json:"attributeName,omitempty"`   // BY_NAME_REFERENCE (e.g., "Module.Entity.Attribute")
+	AssociationName    string            `json:"associationName,omitempty"` // BY_NAME_REFERENCE (e.g., "Module.AssociationName")
+	AttributeID        model.ID          `json:"attributeId,omitempty"`     // Deprecated: use AttributeName
+	AssociationID      model.ID          `json:"associationId,omitempty"`   // Deprecated: use AssociationName
+	Template           *model.Text       `json:"template,omitempty"`
+	TemplateParameters []string          `json:"templateParameters,omitempty"` // Expressions for {1}, {2}, etc. placeholders
 }
 
 func (ValidationFeedbackAction) isMicroflowAction() {}
@@ -445,8 +494,9 @@ func (ValidationFeedbackAction) isMicroflowAction() {}
 // DownloadFileAction downloads a file.
 type DownloadFileAction struct {
 	model.BaseElement
-	FileDocument  string `json:"fileDocument"`
-	ShowInBrowser bool   `json:"showInBrowser"`
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
+	FileDocument      string            `json:"fileDocument"`
+	ShowInBrowser     bool              `json:"showInBrowser"`
 }
 
 func (DownloadFileAction) isMicroflowAction() {}
@@ -463,6 +513,34 @@ type MicroflowCallAction struct {
 }
 
 func (MicroflowCallAction) isMicroflowAction() {}
+
+// NanoflowCallAction calls a nanoflow.
+// NOTE: The BSON field name is OutputVariableName (not ResultVariableName as in
+// MicroflowCallAction). This matches the generated metamodel in
+// generated/metamodel/types.go (MicroflowsNanoflowCallAction).
+type NanoflowCallAction struct {
+	model.BaseElement
+	ErrorHandlingType  ErrorHandlingType `json:"errorHandlingType,omitempty"`
+	NanoflowCall       *NanoflowCall     `json:"nanoflowCall,omitempty"`
+	OutputVariableName string            `json:"outputVariableName,omitempty"`
+	UseReturnVariable  bool              `json:"useReturnVariable"`
+}
+
+func (NanoflowCallAction) isMicroflowAction() {}
+
+// NanoflowCall represents a call to a nanoflow with its parameters.
+type NanoflowCall struct {
+	model.BaseElement
+	Nanoflow          string                          `json:"nanoflow,omitempty"` // Qualified name string
+	ParameterMappings []*NanoflowCallParameterMapping `json:"parameterMappings,omitempty"`
+}
+
+// NanoflowCallParameterMapping maps a parameter to an argument.
+type NanoflowCallParameterMapping struct {
+	model.BaseElement
+	Parameter string `json:"parameter,omitempty"` // Parameter qualified name
+	Argument  string `json:"argument,omitempty"`
+}
 
 // MicroflowCall represents a call to a microflow with its parameters.
 type MicroflowCall struct {
@@ -489,6 +567,25 @@ type JavaActionCallAction struct {
 }
 
 func (JavaActionCallAction) isMicroflowAction() {}
+
+// JavaScriptActionCallAction calls a JavaScript action.
+type JavaScriptActionCallAction struct {
+	model.BaseElement
+	ErrorHandlingType  ErrorHandlingType                   `json:"errorHandlingType,omitempty"`
+	JavaScriptAction   string                              `json:"javaScriptAction,omitempty"` // Qualified name string
+	ParameterMappings  []*JavaScriptActionParameterMapping `json:"parameterMappings,omitempty"`
+	OutputVariableName string                              `json:"outputVariableName,omitempty"`
+	UseReturnVariable  bool                                `json:"useReturnVariable"`
+}
+
+func (JavaScriptActionCallAction) isMicroflowAction() {}
+
+// JavaScriptActionParameterMapping maps a JavaScript action parameter.
+type JavaScriptActionParameterMapping struct {
+	model.BaseElement
+	Parameter string                   `json:"parameter,omitempty"` // Parameter qualified name
+	Value     CodeActionParameterValue `json:"value,omitempty"`
+}
 
 // JavaActionParameterMapping maps a Java action parameter.
 type JavaActionParameterMapping struct {
@@ -533,6 +630,15 @@ type BasicCodeActionParameterValue struct {
 
 func (BasicCodeActionParameterValue) isCodeActionParameterValue() {}
 
+// MicroflowParameterValue is a microflow reference passed to a Java action
+// microflow parameter. An empty Microflow keeps Studio Pro's placeholder value.
+type MicroflowParameterValue struct {
+	model.BaseElement
+	Microflow string `json:"microflow,omitempty"` // BY_NAME_REFERENCE: qualified microflow name
+}
+
+func (MicroflowParameterValue) isCodeActionParameterValue() {}
+
 // EntityTypeCodeActionParameterValue is an entity type passed at a call site for a type parameter.
 type EntityTypeCodeActionParameterValue struct {
 	model.BaseElement
@@ -550,6 +656,13 @@ type CallExternalAction struct {
 	ParameterMappings    []*ExternalActionParameterMapping `json:"parameterMappings,omitempty"`
 	ResultVariableName   string                            `json:"resultVariableName,omitempty"`
 	UseReturnVariable    bool                              `json:"useReturnVariable"`
+	// ResultDataType is the Mendix kind name ("Boolean", "String", "Integer",
+	// "Decimal", "DateTime", "Void", "Object", "List") of the action's return
+	// type, resolved from the consumed service's cached $metadata at write
+	// time. If empty, the writer omits VariableDataType from BSON — which
+	// triggers Mendix's CE7269 "return type has changed" when the schema
+	// declares any return type.
+	ResultDataType string `json:"resultDataType,omitempty"`
 }
 
 func (CallExternalAction) isMicroflowAction() {}
@@ -565,13 +678,15 @@ type ExternalActionParameterMapping struct {
 // WebServiceCallAction calls a web service.
 type WebServiceCallAction struct {
 	model.BaseElement
-	ServiceID         model.ID `json:"serviceId,omitempty"`
-	OperationName     string   `json:"operationName,omitempty"`
-	SendMappingID     model.ID `json:"sendMappingId,omitempty"`
-	ReceiveMappingID  model.ID `json:"receiveMappingId,omitempty"`
-	OutputVariable    string   `json:"outputVariable,omitempty"`
-	UseReturnVariable bool     `json:"useReturnVariable"`
-	TimeoutExpression string   `json:"timeoutExpression,omitempty"`
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
+	RawBSON           []byte            `json:"-"`
+	ServiceID         model.ID          `json:"serviceId,omitempty"`
+	OperationName     string            `json:"operationName,omitempty"`
+	SendMappingID     model.ID          `json:"sendMappingId,omitempty"`
+	ReceiveMappingID  model.ID          `json:"receiveMappingId,omitempty"`
+	OutputVariable    string            `json:"outputVariable,omitempty"`
+	UseReturnVariable bool              `json:"useReturnVariable"`
+	TimeoutExpression string            `json:"timeoutExpression,omitempty"`
 }
 
 func (WebServiceCallAction) isMicroflowAction() {}
@@ -595,11 +710,11 @@ func (RestCallAction) isMicroflowAction() {}
 // BSON type: Microflows$RestOperationCallAction
 type RestOperationCallAction struct {
 	model.BaseElement
-	ErrorHandlingType    ErrorHandlingType       `json:"errorHandlingType,omitempty"`
-	Operation            string                  `json:"operation,omitempty"`            // BY_NAME: Module.Service.Operation
-	OutputVariable       *RestOutputVar          `json:"outputVariable,omitempty"`       // null or Microflows$OutputVariable
-	BodyVariable         *RestBodyVar            `json:"bodyVariable,omitempty"`         // null or nested object
-	ParameterMappings    []*RestParameterMapping `json:"parameterMappings,omitempty"`    // path parameter bindings
+	ErrorHandlingType      ErrorHandlingType            `json:"errorHandlingType,omitempty"`
+	Operation              string                       `json:"operation,omitempty"`              // BY_NAME: Module.Service.Operation
+	OutputVariable         *RestOutputVar               `json:"outputVariable,omitempty"`         // null or Microflows$OutputVariable
+	BodyVariable           *RestBodyVar                 `json:"bodyVariable,omitempty"`           // null or nested object
+	ParameterMappings      []*RestParameterMapping      `json:"parameterMappings,omitempty"`      // path parameter bindings
 	QueryParameterMappings []*RestQueryParameterMapping `json:"queryParameterMappings,omitempty"` // query parameter bindings
 }
 
@@ -739,10 +854,11 @@ func (ResultHandlingHttpResponse) isResultHandling() {}
 // ResultHandlingMapping uses an import mapping.
 type ResultHandlingMapping struct {
 	model.BaseElement
-	MappingID      model.ID `json:"mappingId"`
-	ResultEntityID model.ID `json:"resultEntityId,omitempty"`
-	ResultVariable string   `json:"resultVariable,omitempty"`
-	SingleObject   bool     `json:"singleObject,omitempty"` // true when mapping returns a single object (not a list)
+	MappingID             model.ID `json:"mappingId"`
+	ResultEntityID        model.ID `json:"resultEntityId,omitempty"`
+	ResultVariable        string   `json:"resultVariable,omitempty"`
+	SingleObject          bool     `json:"singleObject,omitempty"` // true when mapping returns a single object (not a list)
+	ForceSingleOccurrence *bool    `json:"forceSingleOccurrence,omitempty"`
 }
 
 func (ResultHandlingMapping) isResultHandling() {}
@@ -756,11 +872,12 @@ type ErrorHandling struct {
 // LogMessageAction logs a message.
 type LogMessageAction struct {
 	model.BaseElement
-	LogLevel              LogLevel    `json:"logLevel"`
-	LogNodeName           string      `json:"logNodeName,omitempty"`
-	MessageTemplate       *model.Text `json:"messageTemplate,omitempty"`
-	TemplateParameters    []string    `json:"templateParameters,omitempty"` // Expressions for {1}, {2}, etc. placeholders
-	IncludeLastStackTrace bool        `json:"includeLastStackTrace"`
+	ErrorHandlingType     ErrorHandlingType `json:"errorHandlingType,omitempty"`
+	LogLevel              LogLevel          `json:"logLevel"`
+	LogNodeName           string            `json:"logNodeName,omitempty"`
+	MessageTemplate       *model.Text       `json:"messageTemplate,omitempty"`
+	TemplateParameters    []string          `json:"templateParameters,omitempty"` // Expressions for {1}, {2}, etc. placeholders
+	IncludeLastStackTrace bool              `json:"includeLastStackTrace"`
 }
 
 func (LogMessageAction) isMicroflowAction() {}

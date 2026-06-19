@@ -119,6 +119,7 @@
   - [SHOW CALLERS / CALLEES](tools/callers-callees.md)
   - [SHOW REFERENCES / IMPACT](tools/references-impact.md)
   - [SHOW CONTEXT](tools/show-context.md)
+  - [Graph Analysis](tools/graph-analysis.md)
   - [Full-Text Search](tools/search.md)
 - [Catalog Queries](tools/catalog.md)
   - [REFRESH CATALOG](tools/refresh-catalog.md)
@@ -155,6 +156,7 @@
   - [mxcli docker run](tools/docker-run.md)
   - [OQL Queries](tools/oql.md)
   - [Dev Container Setup](tools/devcontainer.md)
+- [Live Studio Pro Sync (MCP)](tools/mcp-connect.md)
 
 ---
 
@@ -251,6 +253,16 @@
   - [CREATE WORKFLOW](reference/workflow/create-workflow.md)
   - [DROP WORKFLOW](reference/workflow/drop-workflow.md)
 - [OData and Integration Statements](reference/odata/README.md)
+- [Integration Statements](reference/integration/README.md)
+  - [CREATE JSON STRUCTURE](reference/integration/create-json-structure.md)
+  - [CREATE IMPORT MAPPING](reference/integration/create-import-mapping.md)
+  - [CREATE EXPORT MAPPING](reference/integration/create-export-mapping.md)
+  - [CREATE DATA TRANSFORMER](reference/integration/create-data-transformer.md)
+- [Agent Editor Statements](reference/agent/README.md)
+  - [CREATE MODEL](reference/agent/create-model.md)
+  - [CREATE KNOWLEDGE BASE](reference/agent/create-knowledge-base.md)
+  - [CREATE CONSUMED MCP SERVICE](reference/agent/create-consumed-mcp-service.md)
+  - [CREATE AGENT](reference/agent/create-agent.md)
 - [Business Event Statements](reference/business-event/README.md)
   - [CREATE BUSINESS EVENT SERVICE](reference/business-event/create-business-event-service.md)
   - [DROP BUSINESS EVENT SERVICE](reference/business-event/drop-business-event-service.md)
@@ -279,6 +291,9 @@
   - [DROP FOLDER](reference/organization/drop-folder.md)
   - [MOVE](reference/organization/move.md)
   - [MOVE FOLDER](reference/organization/move-folder.md)
+- [JAR Dependency Statements](reference/jar-dependency/README.md)
+  - [ALTER MODULE JAR DEPENDENCY](reference/jar-dependency/alter-module-jar-dependency.md)
+  - [LIST / DESCRIBE JAR DEPENDENCY](reference/jar-dependency/list-describe-jar-dependency.md)
 - [Session Statements](reference/session/README.md)
   - [SET](reference/session/set.md)
   - [SHOW STATUS](reference/session/show-status.md)
@@ -305,6 +320,7 @@
   - [SQLite Schema](internals/catalog-schema.md)
   - [FTS5 Full-Text Search](internals/fts5.md)
   - [Reference Tracking](internals/reference-tracking.md)
+- [MCP Backend: Script-to-Tool-Call Cost](internals/mcp-backend-cost.md)
 
 ---
 
@@ -312,6 +328,7 @@
 
 - [Capabilities Overview](reference/capabilities.md)
 - [Customizing AI Generation](guides/customizing-ai.md)
+- [Marketplace Content](guides/marketplace.md)
 
 ---
 
@@ -326,3 +343,10 @@
 - [Glossary](appendixes/glossary.md)
 - [TypeScript SDK Equivalence](appendixes/sdk-equivalence.md)
 - [Changelog](appendixes/changelog.md)
+
+---
+
+# Blog
+
+- [Blog](blog/index.md)
+  - [Introducing mxcli](blog/introduction.md)

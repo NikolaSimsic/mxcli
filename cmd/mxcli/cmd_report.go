@@ -52,7 +52,7 @@ Examples:
 		defer logger.Close()
 		defer exec.Close()
 
-		connectProg, _ := visitor.Build(fmt.Sprintf("CONNECT LOCAL '%s'", projectPath))
+		connectProg, _ := visitor.Build(fmt.Sprintf("CONNECT LOCAL '%s'", visitor.QuoteString(projectPath)))
 		for _, stmt := range connectProg.Statements {
 			if err := exec.Execute(stmt); err != nil {
 				fmt.Fprintf(os.Stderr, "Error connecting: %v\n", err)
@@ -78,13 +78,8 @@ Examples:
 		}
 
 		// Create lint context
-		ctx := linter.NewLintContext(cat)
+		ctx := linter.NewLintContext(cat, exec.Backend())
 		ctx.SetExcludedModules(excludeModules)
-
-		// Set reader so rules that inspect raw BSON work
-		if reader := exec.Reader(); reader != nil {
-			ctx.SetReader(reader)
-		}
 
 		// Create linter and register all rules
 		lint := linter.New(ctx)
@@ -96,6 +91,7 @@ Examples:
 		lint.AddRule(rules.NewValidationFeedbackRule())
 		lint.AddRule(rules.NewImageSourceRule())
 		lint.AddRule(rules.NewEmptyContainerRule())
+		lint.AddRule(rules.NewGallerySelectionListenerRule())
 		lint.AddRule(rules.NewPageNavigationSecurityRule())
 		lint.AddRule(rules.NewNoEntityAccessRulesRule())
 		lint.AddRule(rules.NewWeakPasswordPolicyRule())

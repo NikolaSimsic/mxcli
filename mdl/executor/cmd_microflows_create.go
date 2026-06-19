@@ -8,9 +8,10 @@ import (
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
+	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
-	"github.com/mendixlabs/mxcli/sdk/mpr"
 )
 
 // isBuiltinModuleEntity returns true for modules whose entities are defined
@@ -22,13 +23,27 @@ func isBuiltinModuleEntity(moduleName string) bool {
 }
 
 // execCreateMicroflow handles CREATE MICROFLOW statements.
-func (e *Executor) execCreateMicroflow(s *ast.CreateMicroflowStmt) error {
-	if e.writer == nil {
-		return fmt.Errorf("not connected to a project")
+// loadRestServices returns all consumed REST services, or nil if no backend.
+func loadRestServices(ctx *ExecContext) ([]*model.ConsumedRestService, error) {
+	if !ctx.Connected() {
+		return nil, nil
+	}
+	svcs, err := ctx.Backend.ListConsumedRestServices()
+	return svcs, err
+}
+
+func execCreateMicroflow(ctx *ExecContext, s *ast.CreateMicroflowStmt) error {
+	if !ctx.ConnectedForWrite() {
+		return mdlerrors.NewNotConnectedWrite()
+	}
+
+	// Validate name is not empty
+	if strings.TrimSpace(s.Name.Name) == "" {
+		return mdlerrors.NewValidation("microflow name must not be empty")
 	}
 
 	// Find or auto-create module
-	module, err := e.findOrCreateModule(s.Name.Module)
+	module, err := findOrCreateModule(ctx, s.Name.Module)
 	if err != nil {
 		return err
 	}
@@ -36,9 +51,9 @@ func (e *Executor) execCreateMicroflow(s *ast.CreateMicroflowStmt) error {
 	// Resolve folder if specified
 	containerID := module.ID
 	if s.Folder != "" {
-		folderID, err := e.resolveFolder(module.ID, s.Folder)
+		folderID, err := resolveFolder(ctx, module.ID, s.Folder)
 		if err != nil {
-			return fmt.Errorf("failed to resolve folder %s: %w", s.Folder, err)
+			return mdlerrors.NewBackend("resolve folder "+s.Folder, err)
 		}
 		containerID = folderID
 	}
@@ -46,29 +61,48 @@ func (e *Executor) execCreateMicroflow(s *ast.CreateMicroflowStmt) error {
 	// Check if microflow with same name already exists in this module
 	var existingID model.ID
 	var existingContainerID model.ID
-	existingMicroflows, err := e.reader.ListMicroflows()
+	var existingAllowedRoles []model.ID
+	preserveAllowedRoles := false
+	existingMicroflows, err := ctx.Backend.ListMicroflows()
 	if err != nil {
-		return fmt.Errorf("failed to check existing microflows: %w", err)
+		return mdlerrors.NewBackend("check existing microflows", err)
 	}
 	for _, existing := range existingMicroflows {
-		if existing.Name == s.Name.Name && e.getModuleID(existing.ContainerID) == module.ID {
+		if existing.Name == s.Name.Name && getModuleID(ctx, existing.ContainerID) == module.ID {
 			if !s.CreateOrModify {
-				return fmt.Errorf("microflow '%s.%s' already exists (use CREATE OR REPLACE to overwrite)", s.Name.Module, s.Name.Name)
+				return mdlerrors.NewAlreadyExistsMsg("microflow", s.Name.Module+"."+s.Name.Name, "microflow '"+s.Name.Module+"."+s.Name.Name+"' already exists (use create or modify to overwrite)")
 			}
 			existingID = existing.ID
 			existingContainerID = existing.ContainerID
+			existingAllowedRoles = cloneRoleIDs(existing.AllowedModuleRoles)
+			preserveAllowedRoles = true
 			break
 		}
 	}
 
 	// For CREATE OR REPLACE/MODIFY, reuse the existing ID to preserve references
-	microflowID := model.ID(mpr.GenerateID())
+	qualifiedName := s.Name.Module + "." + s.Name.Name
+	microflowID := model.ID(types.GenerateID())
 	if existingID != "" {
 		microflowID = existingID
 		// Keep the original folder unless a new folder is explicitly specified
 		if s.Folder == "" {
 			containerID = existingContainerID
 		}
+	} else if dropped := consumeDroppedMicroflow(ctx, qualifiedName); dropped != nil {
+		// A prior DROP MICROFLOW in the same session removed the unit. Reuse
+		// its original UnitID and (unless a new folder is specified)
+		// ContainerID so that Studio Pro sees the rewrite as an in-place
+		// update rather than a delete+insert pair, which produces
+		// ".mpr does not look like a Mendix Studio Pro project file" errors.
+		microflowID = dropped.ID
+		if s.Folder == "" && dropped.ContainerID != "" {
+			containerID = dropped.ContainerID
+		}
+		// consumeDroppedMicroflow removed the cache entry, so we own this
+		// slice — no need to clone it again.
+		existingAllowedRoles = dropped.AllowedRoles
+		preserveAllowedRoles = true
 	}
 
 	// Build the microflow
@@ -83,15 +117,20 @@ func (e *Executor) execCreateMicroflow(s *ast.CreateMicroflowStmt) error {
 		MarkAsUsed:               false,
 		Excluded:                 s.Excluded,
 	}
+	if preserveAllowedRoles {
+		mf.AllowedModuleRoles = existingAllowedRoles
+	} else {
+		mf.AllowedModuleRoles = defaultDocumentAccessRoles(ctx, module)
+	}
 
 	// Build entity resolver function for parameter/return types
 	entityResolver := func(qn ast.QualifiedName) model.ID {
 		// Get all domain models and build module name map
-		dms, err := e.reader.ListDomainModels()
+		dms, err := ctx.Backend.ListDomainModels()
 		if err != nil {
 			return ""
 		}
-		modules, _ := e.reader.ListModules()
+		modules, _ := ctx.Backend.ListModules()
 		moduleNames := make(map[model.ID]string)
 		for _, m := range modules {
 			moduleNames[m.ID] = m.Name
@@ -112,27 +151,34 @@ func (e *Executor) execCreateMicroflow(s *ast.CreateMicroflowStmt) error {
 	}
 
 	// Validate and add parameters
-	for _, p := range s.Parameters {
+	for i, p := range s.Parameters {
 		// Validate entity references for List and Entity types.
 		// Built-in modules (e.g. System) are not stored in the MPR domain models;
 		// their types are serialized by qualified name and resolved at runtime.
 		if p.Type.EntityRef != nil && !isBuiltinModuleEntity(p.Type.EntityRef.Module) {
 			entityID := entityResolver(*p.Type.EntityRef)
 			if entityID == "" {
-				return fmt.Errorf("entity '%s.%s' not found for parameter '%s'",
-					p.Type.EntityRef.Module, p.Type.EntityRef.Name, p.Name)
+				// Bare qualified name in microflow context is treated as TypeEntity by the
+				// visitor, but it may actually be an enumeration. Try enum lookup before failing.
+				if found := findEnumeration(ctx, p.Type.EntityRef.Module, p.Type.EntityRef.Name); found != nil {
+					s.Parameters[i].Type = ast.DataType{Kind: ast.TypeEnumeration, EnumRef: p.Type.EntityRef}
+					p = s.Parameters[i]
+				} else {
+					return mdlerrors.NewNotFoundMsg("entity", p.Type.EntityRef.Module+"."+p.Type.EntityRef.Name,
+						fmt.Sprintf("entity '%s.%s' not found for parameter '%s'", p.Type.EntityRef.Module, p.Type.EntityRef.Name, p.Name))
+				}
 			}
 		}
 		// Validate enumeration references for Enumeration types
 		if p.Type.Kind == ast.TypeEnumeration && p.Type.EnumRef != nil {
-			if found := e.findEnumeration(p.Type.EnumRef.Module, p.Type.EnumRef.Name); found == nil {
-				return fmt.Errorf("enumeration '%s.%s' not found for parameter '%s'",
-					p.Type.EnumRef.Module, p.Type.EnumRef.Name, p.Name)
+			if found := findEnumeration(ctx, p.Type.EnumRef.Module, p.Type.EnumRef.Name); found == nil {
+				return mdlerrors.NewNotFoundMsg("enumeration", p.Type.EnumRef.Module+"."+p.Type.EnumRef.Name,
+					fmt.Sprintf("enumeration '%s.%s' not found for parameter '%s'", p.Type.EnumRef.Module, p.Type.EnumRef.Name, p.Name))
 			}
 		}
 		param := &microflows.MicroflowParameter{
 			BaseElement: model.BaseElement{
-				ID: model.ID(mpr.GenerateID()),
+				ID: model.ID(types.GenerateID()),
 			},
 			ContainerID: mf.ID,
 			Name:        p.Name,
@@ -149,15 +195,15 @@ func (e *Executor) execCreateMicroflow(s *ast.CreateMicroflowStmt) error {
 		if s.ReturnType.Type.EntityRef != nil && !isBuiltinModuleEntity(s.ReturnType.Type.EntityRef.Module) {
 			entityID := entityResolver(*s.ReturnType.Type.EntityRef)
 			if entityID == "" {
-				return fmt.Errorf("entity '%s.%s' not found for return type",
-					s.ReturnType.Type.EntityRef.Module, s.ReturnType.Type.EntityRef.Name)
+				return mdlerrors.NewNotFoundMsg("entity", s.ReturnType.Type.EntityRef.Module+"."+s.ReturnType.Type.EntityRef.Name,
+					fmt.Sprintf("entity '%s.%s' not found for return type", s.ReturnType.Type.EntityRef.Module, s.ReturnType.Type.EntityRef.Name))
 			}
 		}
 		// Validate enumeration references for return type
 		if s.ReturnType.Type.Kind == ast.TypeEnumeration && s.ReturnType.Type.EnumRef != nil {
-			if found := e.findEnumeration(s.ReturnType.Type.EnumRef.Module, s.ReturnType.Type.EnumRef.Name); found == nil {
-				return fmt.Errorf("enumeration '%s.%s' not found for return type",
-					s.ReturnType.Type.EnumRef.Module, s.ReturnType.Type.EnumRef.Name)
+			if found := findEnumeration(ctx, s.ReturnType.Type.EnumRef.Module, s.ReturnType.Type.EnumRef.Name); found == nil {
+				return mdlerrors.NewNotFoundMsg("enumeration", s.ReturnType.Type.EnumRef.Module+"."+s.ReturnType.Type.EnumRef.Name,
+					fmt.Sprintf("enumeration '%s.%s' not found for return type", s.ReturnType.Type.EnumRef.Module, s.ReturnType.Type.EnumRef.Name))
 			}
 		}
 		mf.ReturnType = convertASTToMicroflowDataType(s.ReturnType.Type, entityResolver)
@@ -190,7 +236,9 @@ func (e *Executor) execCreateMicroflow(s *ast.CreateMicroflowStmt) error {
 		}
 	}
 	// Get hierarchy for resolving page/microflow references
-	hierarchy, _ := e.getHierarchy()
+	hierarchy, _ := getHierarchy(ctx)
+
+	restServices, _ := loadRestServices(ctx)
 
 	builder := &flowBuilder{
 		posX:         200,
@@ -200,8 +248,9 @@ func (e *Executor) execCreateMicroflow(s *ast.CreateMicroflowStmt) error {
 		varTypes:     varTypes,
 		declaredVars: declaredVars,
 		measurer:     &layoutMeasurer{varTypes: varTypes},
-		reader:       e.reader,
+		backend:      ctx.Backend,
 		hierarchy:    hierarchy,
+		restServices: restServices,
 	}
 
 	mf.ObjectCollection = builder.buildFlowGraph(s.Body, s.ReturnType)
@@ -219,22 +268,22 @@ func (e *Executor) execCreateMicroflow(s *ast.CreateMicroflowStmt) error {
 
 	// Create or update the microflow
 	if existingID != "" {
-		if err := e.writer.UpdateMicroflow(mf); err != nil {
-			return fmt.Errorf("failed to update microflow: %w", err)
+		if err := ctx.Backend.UpdateMicroflow(mf); err != nil {
+			return mdlerrors.NewBackend("update microflow", err)
 		}
-		fmt.Fprintf(e.output, "Replaced microflow: %s.%s\n", s.Name.Module, s.Name.Name)
+		fmt.Fprintf(ctx.Output, "Replaced microflow: %s.%s\n", s.Name.Module, s.Name.Name)
 	} else {
-		if err := e.writer.CreateMicroflow(mf); err != nil {
-			return fmt.Errorf("failed to create microflow: %w", err)
+		if err := ctx.Backend.CreateMicroflow(mf); err != nil {
+			return mdlerrors.NewBackend("create microflow", err)
 		}
-		fmt.Fprintf(e.output, "Created microflow: %s.%s\n", s.Name.Module, s.Name.Name)
+		fmt.Fprintf(ctx.Output, "Created microflow: %s.%s\n", s.Name.Module, s.Name.Name)
 	}
 
 	// Track the created microflow so it can be resolved by subsequent page creations
 	returnEntityName := extractEntityFromReturnType(mf.ReturnType)
-	e.trackCreatedMicroflow(s.Name.Module, s.Name.Name, mf.ID, containerID, returnEntityName)
+	ctx.trackCreatedMicroflow(s.Name.Module, s.Name.Name, mf.ID, containerID, returnEntityName)
 
 	// Invalidate hierarchy cache so the new microflow's container is visible
-	e.invalidateHierarchy()
+	invalidateHierarchy(ctx)
 	return nil
 }

@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -50,7 +51,17 @@ var widgetInitCmd = &cobra.Command{
 	Long: `Scan the project's widgets/ directory, extract .def.json for each .mpk,
 and generate skill documentation in .claude/skills/widgets/.
 
-This enables CREATE PAGE to use any project widget via the pluggable engine.`,
+This enables CREATE PAGE to use any project widget via the pluggable engine.
+
+Each run compares the generated content against any existing .def.json.
+Unchanged files are reported as "up to date"; content drift (e.g. when
+mxcli was upgraded and now emits additional fields like objectLists) is
+auto-refreshed without needing --force.
+
+Requires --project (-p) to locate the project's widgets/ directory.`,
+	Example: `  mxcli widget init -p /path/to/app.mpr
+  mxcli widget init -p app.mpr
+  mxcli widget init -p app.mpr --force   # rewrite every .def.json even when content matches`,
 	RunE: runWidgetInit,
 }
 
@@ -68,6 +79,7 @@ func init() {
 	widgetExtractCmd.MarkFlagRequired("mpk")
 
 	widgetInitCmd.Flags().StringP("project", "p", "", "Path to .mpr project file")
+	widgetInitCmd.Flags().Bool("force", false, "Rewrite every .def.json unconditionally (default auto-refreshes only when content drifts)")
 	widgetInitCmd.MarkFlagRequired("project")
 
 	widgetDocsCmd.Flags().StringP("project", "p", "", "Path to .mpr project file")
@@ -102,11 +114,11 @@ func runWidgetExtract(cmd *cobra.Command, args []string) error {
 	// Determine MDL name
 	mdlName := mdlNameOverride
 	if mdlName == "" {
-		mdlName = deriveMDLName(mpkDef.ID)
+		mdlName = executor.DeriveMDLName(mpkDef.ID)
 	}
 
 	// Generate .def.json
-	defJSON := generateDefJSON(mpkDef, mdlName)
+	defJSON := executor.GenerateDefJSON(mpkDef, mdlName)
 
 	// Determine output filename
 	filename := strings.ToLower(mdlName) + ".def.json"
@@ -134,281 +146,78 @@ func runWidgetExtract(cmd *cobra.Command, args []string) error {
 // deriveMDLName derives an uppercase MDL keyword from a widget ID.
 // e.g. "com.mendix.widget.web.combobox.Combobox" → "COMBOBOX"
 // e.g. "com.company.widget.MyCustomWidget" → "MYCUSTOMWIDGET"
-func deriveMDLName(widgetID string) string {
-	parts := strings.Split(widgetID, ".")
-	name := parts[len(parts)-1]
-	return strings.ToUpper(name)
-}
-
-// generateDefJSON creates a skeleton WidgetDefinition from an mpk.WidgetDefinition.
-// Properties are handled explicitly from MDL via the engine's explicit property pass,
-// so no propertyMappings or childSlots are generated here.
-func generateDefJSON(mpkDef *mpk.WidgetDefinition, mdlName string) *executor.WidgetDefinition {
-	widgetKind := "custom"
-	if mpkDef.IsPluggable {
-		widgetKind = "pluggable"
-	}
-	def := &executor.WidgetDefinition{
-		WidgetID:        mpkDef.ID,
-		MDLName:         mdlName,
-		WidgetKind:      widgetKind,
-		TemplateFile:    strings.ToLower(mdlName) + ".json",
-		DefaultEditable: "Always",
-	}
-
-	// Generate property mappings and child slots from MPK property definitions.
-	// Two passes: datasource first (association depends on entityContext set by datasource).
-	var assocMappings []executor.PropertyMapping
-	for _, p := range mpkDef.Properties {
-		switch p.Type {
-		case "widgets":
-			container := strings.ToUpper(p.Key)
-			if p.Key == "content" {
-				container = "TEMPLATE"
-			}
-			def.ChildSlots = append(def.ChildSlots, executor.ChildSlotMapping{
-				PropertyKey:  p.Key,
-				MDLContainer: container,
-				Operation:    "widgets",
-			})
-		case "datasource":
-			def.PropertyMappings = append(def.PropertyMappings, executor.PropertyMapping{
-				PropertyKey: p.Key,
-				Source:      "DataSource",
-				Operation:   "datasource",
-			})
-		case "attribute":
-			def.PropertyMappings = append(def.PropertyMappings, executor.PropertyMapping{
-				PropertyKey: p.Key,
-				Source:      "Attribute",
-				Operation:   "attribute",
-			})
-		case "association":
-			assocMappings = append(assocMappings, executor.PropertyMapping{
-				PropertyKey: p.Key,
-				Source:      "Association",
-				Operation:   "association",
-			})
-		case "selection":
-			def.PropertyMappings = append(def.PropertyMappings, executor.PropertyMapping{
-				PropertyKey: p.Key,
-				Source:      "Selection",
-				Operation:   "selection",
-				Default:     p.DefaultValue,
-			})
-		case "boolean", "integer", "decimal", "string", "enumeration":
-			m := executor.PropertyMapping{
-				PropertyKey: p.Key,
-				Operation:   "primitive",
-			}
-			if p.DefaultValue != "" {
-				m.Value = p.DefaultValue
-			}
-			def.PropertyMappings = append(def.PropertyMappings, m)
-		}
-	}
-	// Append association mappings after datasource (association requires prior entityContext)
-	def.PropertyMappings = append(def.PropertyMappings, assocMappings...)
-
-	return def
-}
+// Helpers deriveMDLName / generateDefJSON / makeObjectListMapping /
+// deriveObjectListKeyword / operationForType live in
+// mdl/executor/widget_defs.go so both the CLI command and the in-executor
+// refresh-catalog path share them.
 
 func runWidgetInit(cmd *cobra.Command, args []string) error {
 	projectPath, _ := cmd.Flags().GetString("project")
-	projectDir := filepath.Dir(projectPath)
-	widgetsDir := filepath.Join(projectDir, "widgets")
-	outputDir := filepath.Join(projectDir, ".mxcli", "widgets")
+	force, _ := cmd.Flags().GetBool("force")
+	return ExtractWidgetDefinitions(projectPath, force, true)
+}
 
-	// Load built-in registry to skip widgets that already have hand-crafted definitions
-	builtinRegistry, _ := executor.NewWidgetRegistry()
-
-	// Scan widgets/ for .mpk files
-	matches, err := filepath.Glob(filepath.Join(widgetsDir, "*.mpk"))
-	if err != nil {
-		return fmt.Errorf("failed to scan widgets directory: %w", err)
+// ExtractWidgetDefinitions scans `projectDir/widgets/` for .mpk files and
+// generates/refreshes `projectDir/.mxcli/widgets/<name>.def.json` for each.
+// Auto-refreshes definitions whose generated content has drifted. When
+// `force` is true, every existing def.json is rewritten regardless. When
+// `verbose` is false, suppresses per-widget output but keeps the summary.
+//
+// Delegates core extraction to executor.RefreshWidgetDefinitions; this CLI
+// wrapper also generates the widget skill .md docs.
+func ExtractWidgetDefinitions(projectPath string, force bool, verbose bool) error {
+	var output io.Writer
+	if verbose {
+		output = os.Stdout
 	}
-	if len(matches) == 0 {
-		fmt.Println("No .mpk files found in widgets/ directory.")
+	stats, err := executor.RefreshWidgetDefinitions(projectPath, force, output)
+	if err != nil {
+		return err
+	}
+
+	if stats.Extracted+stats.Refreshed+stats.UpToDate+stats.Skipped == 0 {
+		if verbose {
+			fmt.Println("No .mpk files found in widgets/ directory.")
+		}
 		return nil
 	}
 
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("failed to create output directory: %w", err)
+	if verbose {
+		fmt.Printf("\nExtracted: %d new, %d refreshed, %d up to date, %d skipped (built-in or unparseable)\n",
+			stats.Extracted, stats.Refreshed, stats.UpToDate, stats.Skipped)
+	} else if stats.Extracted > 0 || stats.Refreshed > 0 {
+		fmt.Printf("  Widget definitions: %d new, %d refreshed\n", stats.Extracted, stats.Refreshed)
 	}
 
-	var extracted, skipped int
-	for _, mpkPath := range matches {
-		mpkDef, err := mpk.ParseMPK(mpkPath)
-		if err != nil {
-			log.Printf("warning: skipping %s: %v", filepath.Base(mpkPath), err)
-			skipped++
-			continue
-		}
-
-		mdlName := deriveMDLName(mpkDef.ID)
-		filename := strings.ToLower(mdlName) + ".def.json"
-		outPath := filepath.Join(outputDir, filename)
-
-		// Skip widgets that have hand-crafted built-in definitions (e.g., COMBOBOX, GALLERY)
-		if builtinRegistry != nil {
-			if _, ok := builtinRegistry.GetByWidgetID(mpkDef.ID); ok {
-				skipped++
-				continue
-			}
-		}
-
-		// Skip if already exists on disk
-		if _, err := os.Stat(outPath); err == nil {
-			skipped++
-			continue
-		}
-
-		defJSON := generateDefJSON(mpkDef, mdlName)
-		data, err := json.MarshalIndent(defJSON, "", "  ")
-		if err != nil {
-			log.Printf("warning: skipping %s: %v", mpkDef.ID, err)
-			skipped++
-			continue
-		}
-		data = append(data, '\n')
-
-		if err := os.WriteFile(outPath, data, 0644); err != nil {
-			return fmt.Errorf("failed to write %s: %w", outPath, err)
-		}
-		kind := "custom"
-		if mpkDef.IsPluggable {
-			kind = "pluggable"
-		}
-		fmt.Printf("  %-12s %-20s %s\n", kind, mdlName, mpkDef.ID)
-		extracted++
+	if verbose {
+		fmt.Println("\nGenerating widget documentation...")
 	}
-
-	fmt.Printf("\nExtracted: %d, Skipped: %d (existing or unparseable)\n", extracted, skipped)
-
-	// Also generate docs
-	fmt.Println("\nGenerating widget documentation...")
-	return generateWidgetDocs(projectDir)
+	return generateWidgetDocs(projectPath)
 }
 
 func runWidgetDocs(cmd *cobra.Command, args []string) error {
 	projectPath, _ := cmd.Flags().GetString("project")
-	projectDir := filepath.Dir(projectPath)
-	return generateWidgetDocs(projectDir)
+	return generateWidgetDocs(projectPath)
 }
 
-func generateWidgetDocs(projectDir string) error {
-	widgetsDir := filepath.Join(projectDir, "widgets")
-	docsDir := filepath.Join(projectDir, ".claude", "skills", "widgets")
-	// Also try .ai-context
-	if _, err := os.Stat(filepath.Join(projectDir, ".ai-context")); err == nil {
-		docsDir = filepath.Join(projectDir, ".ai-context", "skills", "widgets")
-	}
-
-	if err := os.MkdirAll(docsDir, 0755); err != nil {
-		return fmt.Errorf("failed to create docs directory: %w", err)
-	}
-
-	matches, err := filepath.Glob(filepath.Join(widgetsDir, "*.mpk"))
+// generateWidgetDocs is a thin CLI wrapper around executor.RegenerateWidgetDocs.
+// The full implementation (including .def.json-driven object-list / child-slot
+// documentation) lives in mdl/executor/widget_defs.go so refresh catalog can
+// regenerate docs alongside def refresh.
+func generateWidgetDocs(projectPath string) error {
+	generated, err := executor.RegenerateWidgetDocs(projectPath)
 	if err != nil {
-		return fmt.Errorf("failed to scan widgets directory: %w", err)
+		return err
 	}
-
-	var generated int
-	var indexEntries []string
-
-	for _, mpkPath := range matches {
-		mpkDef, err := mpk.ParseMPK(mpkPath)
-		if err != nil {
-			continue
+	if generated > 0 {
+		projectDir := filepath.Dir(projectPath)
+		docsDir := filepath.Join(projectDir, ".claude", "skills", "widgets")
+		if _, statErr := os.Stat(filepath.Join(projectDir, ".ai-context")); statErr == nil {
+			docsDir = filepath.Join(projectDir, ".ai-context", "skills", "widgets")
 		}
-
-		mdlName := deriveMDLName(mpkDef.ID)
-		filename := strings.ToLower(mdlName) + ".md"
-		outPath := filepath.Join(docsDir, filename)
-
-		doc := generateWidgetDoc(mpkDef, mdlName)
-
-		if err := os.WriteFile(outPath, []byte(doc), 0644); err != nil {
-			log.Printf("warning: failed to write %s: %v", filename, err)
-			continue
-		}
-
-		kind := "CUSTOMWIDGET"
-		if mpkDef.IsPluggable {
-			kind = "PLUGGABLEWIDGET"
-		}
-		indexEntries = append(indexEntries, fmt.Sprintf("| `%s` | %s | `%s` | %s | %d |",
-			kind, mdlName, mpkDef.ID, mpkDef.Name, len(mpkDef.Properties)))
-		generated++
+		fmt.Printf("Generated %d widget docs in %s\n", generated, docsDir)
 	}
-
-	// Write index
-	var indexBuf strings.Builder
-	indexBuf.WriteString("# Available Widgets\n\n")
-	indexBuf.WriteString("Generated by `mxcli widget docs`. See individual files for property details.\n\n")
-	indexBuf.WriteString("| Prefix | Name | Widget ID | Display Name | Props |\n")
-	indexBuf.WriteString("|--------|------|-----------|--------------|-------|\n")
-	for _, entry := range indexEntries {
-		indexBuf.WriteString(entry)
-		indexBuf.WriteString("\n")
-	}
-	indexBuf.WriteString("\n**Usage in MDL:**\n```sql\n")
-	indexBuf.WriteString("-- React pluggable widgets\n")
-	indexBuf.WriteString("PLUGGABLEWIDGET 'com.mendix.widget.custom.badge.Badge' badge1\n\n")
-	indexBuf.WriteString("-- Legacy custom widgets\n")
-	indexBuf.WriteString("CUSTOMWIDGET 'com.company.OldWidget' legacy1\n")
-	indexBuf.WriteString("```\n")
-
-	indexPath := filepath.Join(docsDir, "_index.md")
-	if err := os.WriteFile(indexPath, []byte(indexBuf.String()), 0644); err != nil {
-		return fmt.Errorf("failed to write index: %w", err)
-	}
-
-	fmt.Printf("Generated %d widget docs in %s\n", generated, docsDir)
 	return nil
-}
-
-func generateWidgetDoc(mpkDef *mpk.WidgetDefinition, mdlName string) string {
-	var buf strings.Builder
-
-	prefix := "CUSTOMWIDGET"
-	if mpkDef.IsPluggable {
-		prefix = "PLUGGABLEWIDGET"
-	}
-
-	buf.WriteString(fmt.Sprintf("# %s\n\n", mpkDef.Name))
-	buf.WriteString(fmt.Sprintf("- **Widget ID:** `%s`\n", mpkDef.ID))
-	buf.WriteString(fmt.Sprintf("- **Type:** %s\n", prefix))
-	buf.WriteString(fmt.Sprintf("- **Version:** %s\n\n", mpkDef.Version))
-
-	buf.WriteString("## MDL Example\n\n```sql\n")
-	buf.WriteString(fmt.Sprintf("%s '%s' widget1\n", prefix, mpkDef.ID))
-	buf.WriteString("```\n\n")
-
-	if len(mpkDef.Properties) > 0 {
-		buf.WriteString("## Properties\n\n")
-		buf.WriteString("| Property | Type | Required | Default | Description |\n")
-		buf.WriteString("|----------|------|----------|---------|-------------|\n")
-
-		for _, prop := range mpkDef.Properties {
-			if prop.IsSystem {
-				continue
-			}
-			req := ""
-			if prop.Required {
-				req = "Yes"
-			}
-			desc := prop.Description
-			if len(desc) > 80 {
-				desc = desc[:77] + "..."
-			}
-			buf.WriteString(fmt.Sprintf("| `%s` | %s | %s | %s | %s |\n",
-				prop.Key, prop.Type, req, prop.DefaultValue, desc))
-		}
-	}
-
-	buf.WriteString("\n")
-	return buf.String()
 }
 
 func runWidgetList(cmd *cobra.Command, args []string) error {

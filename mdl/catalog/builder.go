@@ -3,33 +3,96 @@
 package catalog
 
 import (
-	"database/sql"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
+	"github.com/mendixlabs/mxcli/sdk/javaactions"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
-	"github.com/mendixlabs/mxcli/sdk/mpr"
 	"github.com/mendixlabs/mxcli/sdk/pages"
+	"github.com/mendixlabs/mxcli/sdk/security"
 	"github.com/mendixlabs/mxcli/sdk/workflows"
 )
+
+// CatalogReader defines the read-only backend surface used by the catalog builder.
+// Both *mpr.Reader and backend.FullBackend satisfy this interface.
+type CatalogReader interface {
+	// Project path — used to locate widgets/*.mpk and .mxcli/widgets/*.def.json
+	// when building the widget_definitions catalog table.
+	Path() string
+
+	// Infrastructure
+	GetRawUnit(id model.ID) (map[string]any, error)
+	ListRawUnitsByType(typePrefix string) ([]*types.RawUnit, error)
+	ListUnits() ([]*types.UnitInfo, error)
+	ListFolders() ([]*types.FolderInfo, error)
+
+	// Modules
+	ListModules() ([]*model.Module, error)
+
+	// Settings & security
+	GetProjectSettings() (*model.ProjectSettings, error)
+	GetProjectSecurity() (*security.ProjectSecurity, error)
+	GetNavigation() (*types.NavigationDocument, error)
+
+	// Domain models & enumerations
+	ListDomainModels() ([]*domainmodel.DomainModel, error)
+	ListEnumerations() ([]*model.Enumeration, error)
+	ListConstants() ([]*model.Constant, error)
+
+	// Microflows & nanoflows
+	ListMicroflows() ([]*microflows.Microflow, error)
+	ListNanoflows() ([]*microflows.Nanoflow, error)
+
+	// Pages, layouts & snippets
+	ListPages() ([]*pages.Page, error)
+	ListLayouts() ([]*pages.Layout, error)
+	ListSnippets() ([]*pages.Snippet, error)
+
+	// Workflows
+	ListWorkflows() ([]*workflows.Workflow, error)
+
+	// Java actions
+	ListJavaActionsFull() ([]*javaactions.JavaAction, error)
+
+	// Services
+	ListConsumedODataServices() ([]*model.ConsumedODataService, error)
+	ListPublishedODataServices() ([]*model.PublishedODataService, error)
+	ListConsumedRestServices() ([]*model.ConsumedRestService, error)
+	ListPublishedRestServices() ([]*model.PublishedRestService, error)
+	ListBusinessEventServices() ([]*model.BusinessEventService, error)
+	ListDatabaseConnections() ([]*model.DatabaseConnection, error)
+	ListModuleSettings() ([]*types.ModuleSettings, error)
+
+	// Mappings & JSON structures
+	ListImportMappings() ([]*model.ImportMapping, error)
+	ListExportMappings() ([]*model.ExportMapping, error)
+	ListJsonStructures() ([]*types.JsonStructure, error)
+}
 
 // DescribeFunc generates MDL source for a given object type and qualified name.
 type DescribeFunc func(objectType string, qualifiedName string) (string, error)
 
 // Builder populates catalog tables from MPR data.
 type Builder struct {
-	catalog      *Catalog
-	reader       *mpr.Reader
-	snapshot     *Snapshot
-	progress     ProgressFunc
-	hierarchy    *hierarchy
-	tx           *sql.Tx // Transaction for batched inserts
-	fullMode     bool    // If true, do full parsing (activities/widgets)
-	sourceMode   bool    // If true, build source FTS table (implies full)
-	describeFunc DescribeFunc
+	catalog         *Catalog
+	reader          CatalogReader
+	snapshot        *Snapshot
+	progress        ProgressFunc
+	hierarchy       *hierarchy
+	tx              CatalogTx // Transaction for batched inserts
+	fullMode        bool      // If true, do full parsing (activities/widgets)
+	sourceMode      bool      // If true, build source FTS table (implies full)
+	communitiesMode bool      // If true, run the graph-analysis pass (reads refs)
+	resolution      float64   // Leiden resolution for the graph-analysis pass
+	describeFunc    DescribeFunc
+
+	// Built-in widget definitions supplied by the caller — used to populate
+	// the widget_definitions catalog table alongside project widgets/.
+	builtinWidgetMetas []WidgetDefinitionMeta
 
 	// Document caches — avoid redundant BSON parsing across builder phases.
 	// Each List* call on the reader re-parses ALL documents from BSON.
@@ -42,6 +105,7 @@ type Builder struct {
 	workflowCache           []*workflows.Workflow
 	businessEventCache      []*model.BusinessEventService
 	databaseConnectionCache []*model.DatabaseConnection
+	moduleSettingsCache     []*types.ModuleSettings
 }
 
 // SetFullMode enables or disables full parsing mode.
@@ -54,6 +118,16 @@ func (b *Builder) SetFullMode(full bool) {
 func (b *Builder) SetSourceMode(source bool) {
 	b.sourceMode = source
 	if source {
+		b.fullMode = true
+	}
+}
+
+// SetCommunitiesMode enables the graph-analysis pass (communities/cycles/layers/
+// centrality) at the given Leiden resolution. Implies full mode (it reads refs).
+func (b *Builder) SetCommunitiesMode(on bool, resolution float64) {
+	b.communitiesMode = on
+	b.resolution = resolution
+	if on {
 		b.fullMode = true
 	}
 }
@@ -148,7 +222,7 @@ func (h *hierarchy) buildFolderPath(containerID model.ID) string {
 }
 
 // NewBuilder creates a new catalog builder.
-func NewBuilder(catalog *Catalog, reader *mpr.Reader) *Builder {
+func NewBuilder(catalog *Catalog, reader CatalogReader) *Builder {
 	return &Builder{
 		catalog: catalog,
 		reader:  reader,
@@ -245,6 +319,17 @@ func (b *Builder) cachedDatabaseConnections() ([]*model.DatabaseConnection, erro
 	return b.databaseConnectionCache, nil
 }
 
+func (b *Builder) cachedModuleSettings() ([]*types.ModuleSettings, error) {
+	if b.moduleSettingsCache == nil {
+		var err error
+		b.moduleSettingsCache, err = b.reader.ListModuleSettings()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return b.moduleSettingsCache, nil
+}
+
 // Build populates all catalog tables from MPR data.
 func (b *Builder) Build(progress ProgressFunc) error {
 	b.progress = progress
@@ -284,6 +369,10 @@ func (b *Builder) Build(progress ProgressFunc) error {
 		return fmt.Errorf("failed to build entities: %w", err)
 	}
 
+	if err := b.buildAssociations(); err != nil {
+		return fmt.Errorf("failed to build associations: %w", err)
+	}
+
 	if err := b.buildEnumerations(); err != nil {
 		return fmt.Errorf("failed to build enumerations: %w", err)
 	}
@@ -298,6 +387,22 @@ func (b *Builder) Build(progress ProgressFunc) error {
 
 	if err := b.buildJavaActions(); err != nil {
 		return fmt.Errorf("failed to build java actions: %w", err)
+	}
+
+	if err := b.buildSimpleNamedDocs("JavaScriptActions$JavaScriptAction", "javascript_actions", "JavaScript Actions"); err != nil {
+		return fmt.Errorf("failed to build javascript actions: %w", err)
+	}
+
+	if err := b.buildSimpleNamedDocs("Images$ImageCollection", "image_collections", "Image Collections"); err != nil {
+		return fmt.Errorf("failed to build image collections: %w", err)
+	}
+
+	if err := b.buildSimpleNamedDocs("DataTransformers$DataTransformer", "data_transformers", "Data Transformers"); err != nil {
+		return fmt.Errorf("failed to build data transformers: %w", err)
+	}
+
+	if err := b.buildAgentEditorDocs(); err != nil {
+		return fmt.Errorf("failed to build agent-editor documents: %w", err)
 	}
 
 	if err := b.buildMicroflows(); err != nil {
@@ -332,8 +437,16 @@ func (b *Builder) Build(progress ProgressFunc) error {
 		return fmt.Errorf("failed to build business event services: %w", err)
 	}
 
+	if err := b.buildWidgetDefinitions(); err != nil {
+		return fmt.Errorf("failed to build widget definitions: %w", err)
+	}
+
 	if err := b.buildDatabaseConnections(); err != nil {
 		return fmt.Errorf("failed to build database connections: %w", err)
+	}
+
+	if err := b.buildJarDependencies(); err != nil {
+		return fmt.Errorf("failed to build jar dependencies: %w", err)
 	}
 
 	if err := b.buildRestClients(); err != nil {
@@ -358,6 +471,10 @@ func (b *Builder) Build(progress ProgressFunc) error {
 
 	if err := b.buildContractEntities(); err != nil {
 		return fmt.Errorf("failed to build contract entities: %w", err)
+	}
+
+	if err := b.buildContractEntityUsage(); err != nil {
+		return fmt.Errorf("failed to build contract entity usage: %w", err)
 	}
 
 	if err := b.buildContractMessages(); err != nil {
@@ -407,6 +524,12 @@ func (b *Builder) Build(progress ProgressFunc) error {
 	// Build source FTS table (source mode only)
 	if err := b.buildSource(); err != nil {
 		return fmt.Errorf("failed to build source: %w", err)
+	}
+
+	// Graph analysis (communities/cycles/layers/centrality) — only when requested
+	// via REFRESH CATALOG COMMUNITIES; reads the refs table built above.
+	if err := b.buildGraphAnalysis(); err != nil {
+		return fmt.Errorf("failed to build graph analysis: %w", err)
 	}
 
 	// Update snapshot with object count
@@ -487,14 +610,11 @@ func (b *Builder) updateSnapshotCount() {
 	b.snapshot.ObjectCount = count
 }
 
-// snapshotMeta returns common snapshot metadata for inserts.
-func (b *Builder) snapshotMeta() (projectID, projectName, snapshotID, snapshotDate, snapshotSource, sourceID, sourceBranch, sourceRevision string) {
-	return b.catalog.projectID,
-		b.catalog.projectName,
-		b.snapshot.ID,
-		b.snapshot.Date.Format("2006-01-02 15:04:05"),
-		string(b.snapshot.Source),
-		b.snapshot.SourceID,
-		b.snapshot.Branch,
-		b.snapshot.Revision
+// snapshotMeta returns the foreign-key columns that every domain table row
+// carries: the project ID and the snapshot ID. Project name, snapshot date,
+// source, branch, and revision are no longer copied per-row — they live on
+// the projects/snapshots lookup tables and are surfaced via the per-table
+// views (see tables.go and issue #576).
+func (b *Builder) snapshotMeta() (projectID, snapshotID string) {
+	return b.catalog.projectID, b.snapshot.ID
 }

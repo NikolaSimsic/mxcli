@@ -26,9 +26,12 @@ type CreateODataClientStmt struct {
 	HttpPassword      string // Mendix expression for password
 	ClientCertificate string
 
-	// Microflow references
-	ConfigurationMicroflow string // MICROFLOW Module.ConfigureMF
-	ErrorHandlingMicroflow string // MICROFLOW Module.HandleErrorMF
+	// Microflow reference. Both `ConfigurationMicroflow` and the legacy
+	// `HeadersMicroflow` MDL keywords write to this same field; Studio
+	// Pro distinguishes the two dropdown options by the microflow's
+	// return type, not by BSON field.
+	ConfigurationMicroflow string // microflow Module.ConfigureMF or Module.SetHeadersMF
+	ErrorHandlingMicroflow string // microflow Module.HandleErrorMF
 
 	// Proxy constant references
 	ProxyHost     string
@@ -121,18 +124,24 @@ type DropODataServiceStmt struct {
 func (s *DropODataServiceStmt) isStatement() {}
 
 // CreateExternalEntityStmt represents: CREATE [OR MODIFY] EXTERNAL ENTITY Module.Name FROM ODATA CLIENT Module.Service (...) (attrs);
+//
+// Scalar property fields are pointers so the executor can distinguish
+// "omitted by user" (nil → preserve existing value on CREATE OR MODIFY)
+// from "explicitly set to zero" (e.g. Countable: false). Treating omitted
+// fields as zero on modify silently corrupted entities — see issue #594.
 type CreateExternalEntityStmt struct {
-	Name           QualifiedName
-	ServiceRef     QualifiedName // FROM ODATA CLIENT ...
-	EntitySet      string
-	RemoteName     string
-	Countable      bool
-	Creatable      bool
-	Deletable      bool
-	Updatable      bool
-	Attributes     []Attribute // reuse from ast_entity.go
-	Documentation  string
-	CreateOrModify bool
+	Name                     QualifiedName
+	ServiceRef               QualifiedName // FROM ODATA CLIENT ...
+	EntitySet                *string
+	RemoteName               *string
+	Countable                *bool
+	Creatable                *bool
+	Deletable                *bool
+	Updatable                *bool
+	AllowCreateChangeLocally *bool       // "Allow creating and changing locally" flag
+	Attributes               []Attribute // reuse from ast_entity.go
+	Documentation            string
+	CreateOrModify           bool
 }
 
 func (s *CreateExternalEntityStmt) isStatement() {}

@@ -117,6 +117,15 @@ CREATE PERSISTENT ENTITY DmTest.Cars (
 	t.Logf("Position: (%d, %d)", stmt.Position.X, stmt.Position.Y)
 }
 
+func TestUnquoteString_DecodesEscapes(t *testing.T) {
+	input := `'Line 1\nLine 2\tTabbed\\Path''s'`
+	got := unquoteString(input)
+	want := "Line 1\nLine 2\tTabbed\\Path's"
+	if got != want {
+		t.Fatalf("unquoteString(%q) = %q, want %q", input, got, want)
+	}
+}
+
 func TestIndexParsing(t *testing.T) {
 	input := `CREATE PERSISTENT ENTITY DmTest.Cars (
 	CarId: String NOT NULL,
@@ -303,6 +312,11 @@ func TestLogWithTemplateSyntax(t *testing.T) {
 		t.Errorf("Expected log level INFO, got %s", logStmt.Level)
 	}
 
+	nodeLit, ok := logStmt.Node.(*ast.LiteralExpr)
+	if !ok || nodeLit.Kind != ast.LiteralString || nodeLit.Value != "OrderService" {
+		t.Fatalf("Expected node string literal 'OrderService', got %#v", logStmt.Node)
+	}
+
 	if len(logStmt.Template) != 1 {
 		t.Errorf("Expected 1 template parameter, got %d", len(logStmt.Template))
 	}
@@ -354,6 +368,40 @@ func TestLogWithMultipleParams(t *testing.T) {
 	}
 
 	t.Log("LOG with multiple template params parsed successfully")
+}
+
+func TestLogWithNodeExpressionConstant(t *testing.T) {
+	input := `CREATE MICROFLOW TestModule.LogNodeExprTest () RETURNS Boolean
+	BEGIN
+		LOG INFO NODE @TestModule.SecurityLogNode 'User added';
+		RETURN true;
+	END;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		for _, err := range errs {
+			t.Errorf("Parse error: %v", err)
+		}
+		return
+	}
+
+	stmt, ok := prog.Statements[0].(*ast.CreateMicroflowStmt)
+	if !ok {
+		t.Fatalf("Expected CreateMicroflowStmt, got %T", prog.Statements[0])
+	}
+
+	logStmt, ok := stmt.Body[0].(*ast.LogStmt)
+	if !ok {
+		t.Fatalf("Expected LogStmt, got %T", stmt.Body[0])
+	}
+
+	node, ok := logStmt.Node.(*ast.ConstantRefExpr)
+	if !ok {
+		t.Fatalf("Expected ConstantRefExpr for node, got %T", logStmt.Node)
+	}
+	if node.QualifiedName.Module != "TestModule" || node.QualifiedName.Name != "SecurityLogNode" {
+		t.Fatalf("Unexpected node constant: %s.%s", node.QualifiedName.Module, node.QualifiedName.Name)
+	}
 }
 
 // =============================================================================
@@ -494,6 +542,41 @@ END;`
 	t.Log("IF/THEN/ELSE parsed correctly - actions in correct branches")
 }
 
+func TestIfThenEmptyElsePreservesElsePresence(t *testing.T) {
+	input := `create microflow Test.EmptyElse()
+returns String
+begin
+  if $latestHttpResponse != empty then
+    return 'error';
+  else
+  end if;
+  return empty;
+end;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		for _, err := range errs {
+			t.Errorf("Parse error: %v", err)
+		}
+		return
+	}
+
+	stmt := prog.Statements[0].(*ast.CreateMicroflowStmt)
+	if len(stmt.Body) == 0 {
+		t.Fatal("expected microflow body")
+	}
+	ifStmt, ok := stmt.Body[0].(*ast.IfStmt)
+	if !ok {
+		t.Fatalf("expected first statement to be IfStmt, got %T", stmt.Body[0])
+	}
+	if !ifStmt.HasElse {
+		t.Fatal("expected explicit empty else to be preserved")
+	}
+	if len(ifStmt.ElseBody) != 0 {
+		t.Fatalf("empty else body length = %d, want 0", len(ifStmt.ElseBody))
+	}
+}
+
 // TestValidationFeedbackInsideIf verifies VALIDATION FEEDBACK works inside IF blocks.
 // Bug Report: "VALIDATION FEEDBACK Not Recognized"
 func TestValidationFeedbackInsideIf(t *testing.T) {
@@ -555,6 +638,89 @@ END;`
 	}
 
 	t.Log("VALIDATION FEEDBACK inside IF block parsed correctly")
+}
+
+func TestValidationFeedbackObjectAndAssociationTargets(t *testing.T) {
+	input := `CREATE MICROFLOW Sales.ValidateOrder ($OrderForm: Sales.OrderForm)
+RETURNS Boolean
+BEGIN
+  VALIDATION FEEDBACK $OrderForm MESSAGE 'Select a value';
+  VALIDATION FEEDBACK $OrderForm/Sales.OrderForm_Customer MESSAGE 'Select a customer';
+  RETURN false;
+END;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		for _, err := range errs {
+			t.Errorf("Parse error: %v", err)
+		}
+		return
+	}
+
+	stmt := prog.Statements[0].(*ast.CreateMicroflowStmt)
+	if len(stmt.Body) < 2 {
+		t.Fatalf("Expected at least two body statements, got %d", len(stmt.Body))
+	}
+
+	objectFeedback, ok := stmt.Body[0].(*ast.ValidationFeedbackStmt)
+	if !ok {
+		t.Fatalf("Expected object-only validation feedback, got %T", stmt.Body[0])
+	}
+	if objectFeedback.AttributePath == nil {
+		t.Fatal("Expected object-only AttributePath to be set")
+	}
+	if objectFeedback.AttributePath.Variable != "OrderForm" {
+		t.Errorf("Expected object-only variable 'OrderForm', got %q", objectFeedback.AttributePath.Variable)
+	}
+	if len(objectFeedback.AttributePath.Path) != 0 || len(objectFeedback.AttributePath.Segments) != 0 {
+		t.Errorf("Expected object-only validation feedback to have no path, got path=%v segments=%v",
+			objectFeedback.AttributePath.Path, objectFeedback.AttributePath.Segments)
+	}
+
+	associationFeedback, ok := stmt.Body[1].(*ast.ValidationFeedbackStmt)
+	if !ok {
+		t.Fatalf("Expected association validation feedback, got %T", stmt.Body[1])
+	}
+	if associationFeedback.AttributePath == nil {
+		t.Fatal("Expected association AttributePath to be set")
+	}
+	if associationFeedback.AttributePath.Variable != "OrderForm" {
+		t.Errorf("Expected association variable 'OrderForm', got %q", associationFeedback.AttributePath.Variable)
+	}
+	if len(associationFeedback.AttributePath.Path) != 1 || associationFeedback.AttributePath.Path[0] != "Sales.OrderForm_Customer" {
+		t.Errorf("Expected association path Sales.OrderForm_Customer, got %v", associationFeedback.AttributePath.Path)
+	}
+	if len(associationFeedback.AttributePath.Segments) != 1 ||
+		associationFeedback.AttributePath.Segments[0].Separator != "/" ||
+		associationFeedback.AttributePath.Segments[0].Name != "Sales.OrderForm_Customer" {
+		t.Errorf("Expected slash-qualified association segment, got %v", associationFeedback.AttributePath.Segments)
+	}
+}
+
+func TestSharedAttributePathKeepsQualifiedSlashSegment(t *testing.T) {
+	input := `CREATE MICROFLOW Sales.UpdateOrder ($Order: Sales.Order)
+RETURNS Boolean
+BEGIN
+  SET $Order/Sales.Order_Customer = empty;
+  RETURN true;
+END;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		for _, err := range errs {
+			t.Errorf("Parse error: %v", err)
+		}
+		return
+	}
+
+	stmt := prog.Statements[0].(*ast.CreateMicroflowStmt)
+	setStmt, ok := stmt.Body[0].(*ast.MfSetStmt)
+	if !ok {
+		t.Fatalf("Expected MfSetStmt, got %T", stmt.Body[0])
+	}
+	if setStmt.Target != "$Order/Sales.Order_Customer" {
+		t.Fatalf("Target = %q, want $Order/Sales.Order_Customer", setStmt.Target)
+	}
 }
 
 // TestRollbackStatement verifies the ROLLBACK statement parses correctly.
@@ -1111,6 +1277,65 @@ END;`
 	}
 }
 
+func TestEnhanceErrorMessage_QuotedGrantAttribute(t *testing.T) {
+	tests := []struct {
+		name     string
+		msg      string
+		wantHint bool
+	}{
+		{
+			name:     "READ with quoted attribute",
+			msg:      `line 1:51 no viable alternative at input 'READ"Attr1"'`,
+			wantHint: true,
+		},
+		{
+			name:     "WRITE with quoted attribute",
+			msg:      `line 1:75 no viable alternative at input 'WRITE"Attr1"'`,
+			wantHint: true,
+		},
+		{
+			name:     "quoted string where access right expected",
+			msg:      `mismatched input '"Attr2"' expecting {CREATE, DELETE, READ, WRITE}`,
+			wantHint: true,
+		},
+		{
+			name:     "unrelated error does not trigger",
+			msg:      `no viable alternative at input 'CREATE PERSISTENT'`,
+			wantHint: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := enhanceErrorMessage(tt.msg)
+			hasHint := strings.Contains(result, "Attribute-level GRANT")
+			if hasHint != tt.wantHint {
+				t.Errorf("expected hint=%v\n  input:  %s\n  output: %s", tt.wantHint, tt.msg, result)
+			}
+		})
+	}
+}
+
+func TestParseError_QuotedGrantAttribute(t *testing.T) {
+	input := `GRANT Mod.Role ON Mod.Entity (READ "Attr1", "Attr2");`
+	_, errs := Build(input)
+	if len(errs) == 0 {
+		t.Fatal("expected parse errors for quoted GRANT attribute")
+	}
+	found := false
+	for _, err := range errs {
+		if strings.Contains(err.Error(), "Attribute-level GRANT") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("expected GRANT-attribute hint in error messages, got:\n")
+		for _, err := range errs {
+			t.Errorf("  %v", err)
+		}
+	}
+}
+
 // TestEnumDefaultQuotedIdentifier verifies that quoted identifiers in enum
 // DEFAULT values are unquoted correctly (issue #11 / BUG-004).
 // e.g. DEFAULT MaisonElegance."FormSubmissionStatus".StatusNew should store
@@ -1480,5 +1705,511 @@ func TestCalculatedAttributeOnNonPersistentEntity(t *testing.T) {
 	}
 	if !stmt.Attributes[0].Calculated {
 		t.Error("Value attribute should be calculated")
+	}
+}
+
+func TestAnnotationBeforePositionIsFreeFloating(t *testing.T) {
+	input := `CREATE MICROFLOW Synthetic.Check ()
+RETURNS Boolean AS $Success
+BEGIN
+  @annotation 'free note'
+  @position(100, 200)
+  LOG INFO NODE 'SyntheticLog' 'message';
+  RETURN true;
+END;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected parse errors: %v", errs)
+	}
+
+	stmt := prog.Statements[0].(*ast.CreateMicroflowStmt)
+	logStmt, ok := stmt.Body[0].(*ast.LogStmt)
+	if !ok {
+		t.Fatalf("Expected LogStmt, got %T", stmt.Body[0])
+	}
+	if logStmt.Annotations == nil {
+		t.Fatal("expected annotations")
+	}
+	if got := logStmt.Annotations.FreeAnnotations; len(got) != 1 || got[0] != "free note" {
+		t.Fatalf("free annotations = %#v, want [free note]", got)
+	}
+	if logStmt.Annotations.AnnotationText != "" {
+		t.Fatalf("attached annotation = %q, want empty", logStmt.Annotations.AnnotationText)
+	}
+}
+
+func TestMultipleAnnotationsBeforePositionStayFreeFloating(t *testing.T) {
+	input := `CREATE MICROFLOW Synthetic.Check ()
+RETURNS Boolean AS $Success
+BEGIN
+  @annotation 'first free note'
+  @annotation 'second free note'
+  @annotation 'third free note'
+  @position(100, 200)
+  LOG INFO NODE 'SyntheticLog' 'message';
+  RETURN true;
+END;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected parse errors: %v", errs)
+	}
+
+	stmt := prog.Statements[0].(*ast.CreateMicroflowStmt)
+	logStmt, ok := stmt.Body[0].(*ast.LogStmt)
+	if !ok {
+		t.Fatalf("Expected LogStmt, got %T", stmt.Body[0])
+	}
+	if logStmt.Annotations == nil {
+		t.Fatal("expected annotations")
+	}
+	want := []string{"first free note", "second free note", "third free note"}
+	if got := logStmt.Annotations.FreeAnnotations; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("free annotations = %#v, want %#v", got, want)
+	}
+	if logStmt.Annotations.AnnotationText != "" {
+		t.Fatalf("attached annotation = %q, want empty", logStmt.Annotations.AnnotationText)
+	}
+}
+
+func TestAnnotationAfterPositionStaysAttached(t *testing.T) {
+	input := `CREATE MICROFLOW Synthetic.Check ()
+RETURNS Boolean AS $Success
+BEGIN
+  @position(100, 200)
+  @annotation 'attached note'
+  LOG INFO NODE 'SyntheticLog' 'message';
+  RETURN true;
+END;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected parse errors: %v", errs)
+	}
+
+	stmt := prog.Statements[0].(*ast.CreateMicroflowStmt)
+	logStmt, ok := stmt.Body[0].(*ast.LogStmt)
+	if !ok {
+		t.Fatalf("Expected LogStmt, got %T", stmt.Body[0])
+	}
+	if logStmt.Annotations == nil {
+		t.Fatal("expected annotations")
+	}
+	if logStmt.Annotations.AnnotationText != "attached note" {
+		t.Fatalf("attached annotation = %q, want attached note", logStmt.Annotations.AnnotationText)
+	}
+	if len(logStmt.Annotations.FreeAnnotations) != 0 {
+		t.Fatalf("free annotations = %#v, want empty", logStmt.Annotations.FreeAnnotations)
+	}
+}
+
+func TestMicroflowPositionAnnotationAcceptsNegativeCoordinates(t *testing.T) {
+	input := `CREATE MICROFLOW Synthetic.Check ()
+BEGIN
+  @position(-150, -210)
+  LOG INFO NODE 'SyntheticLog' 'message';
+END;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected parse errors: %v", errs)
+	}
+
+	stmt := prog.Statements[0].(*ast.CreateMicroflowStmt)
+	logStmt, ok := stmt.Body[0].(*ast.LogStmt)
+	if !ok {
+		t.Fatalf("Expected LogStmt, got %T", stmt.Body[0])
+	}
+	if logStmt.Annotations == nil || logStmt.Annotations.Position == nil {
+		t.Fatal("expected position annotation")
+	}
+	if got := *logStmt.Annotations.Position; got.X != -150 || got.Y != -210 {
+		t.Fatalf("position = (%d, %d), want (-150, -210)", got.X, got.Y)
+	}
+}
+
+func TestCallJavaActionAcceptsEmptyArguments(t *testing.T) {
+	input := `CREATE MICROFLOW Synthetic.Check ()
+RETURNS Boolean AS $Success
+BEGIN
+  $Total = CALL JAVA ACTION Synthetic.Recalculate(CompanyId = empty, RecalculateAll = true, ItemList = empty);
+  RETURN true;
+END;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected parse errors: %v", errs)
+	}
+
+	stmt := prog.Statements[0].(*ast.CreateMicroflowStmt)
+	callStmt, ok := stmt.Body[0].(*ast.CallJavaActionStmt)
+	if !ok {
+		t.Fatalf("body[0] = %T, want *ast.CallJavaActionStmt", stmt.Body[0])
+	}
+	for _, idx := range []int{0, 2} {
+		lit, ok := callStmt.Arguments[idx].Value.(*ast.LiteralExpr)
+		if !ok {
+			t.Fatalf("argument %d value = %T, want *ast.LiteralExpr", idx, callStmt.Arguments[idx].Value)
+		}
+		if lit.Kind != ast.LiteralNull {
+			t.Fatalf("argument %d kind = %v, want LiteralNull", idx, lit.Kind)
+		}
+	}
+}
+
+func TestDeclareAndLogTemplatePreserveMultilineSourceWhitespace(t *testing.T) {
+	input := `CREATE MICROFLOW Synthetic.Check ()
+RETURNS Boolean AS $Success
+BEGIN
+  DECLARE $Endpoint String = @Synthetic.Endpoint
++ '/items?page=' + toString($Page)
++ '&token=' + (if $Token!=empty then $Token/Value
+else
+'');
+  LOG INFO NODE 'SyntheticLog' 'Processed {1} items for {2}' WITH ({1} = toString($Count)
+
+, {2} = $Endpoint);
+  RETURN true;
+END;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected parse errors: %v", errs)
+	}
+
+	stmt := prog.Statements[0].(*ast.CreateMicroflowStmt)
+	decl, ok := stmt.Body[0].(*ast.DeclareStmt)
+	if !ok {
+		t.Fatalf("Expected DeclareStmt, got %T", stmt.Body[0])
+	}
+	logStmt, ok := stmt.Body[1].(*ast.LogStmt)
+	if !ok {
+		t.Fatalf("Expected LogStmt, got %T", stmt.Body[1])
+	}
+
+	declSource, ok := decl.InitialValue.(*ast.SourceExpr)
+	if !ok {
+		t.Fatalf("Expected SourceExpr declare value, got %T", decl.InitialValue)
+	}
+	wantDecl := "@Synthetic.Endpoint\n+ '/items?page=' + toString($Page)\n+ '&token=' + (if $Token!=empty then $Token/Value\nelse\n'')"
+	if declSource.Source != wantDecl {
+		t.Fatalf("declare source = %q, want %q", declSource.Source, wantDecl)
+	}
+
+	firstParam, ok := logStmt.Template[0].Value.(*ast.SourceExpr)
+	if !ok {
+		t.Fatalf("Expected SourceExpr first log template param, got %T", logStmt.Template[0].Value)
+	}
+	if firstParam.Source != "toString($Count)\n\n" {
+		t.Fatalf("template param source = %q, want trailing blank line", firstParam.Source)
+	}
+}
+
+func TestActionExpressionSlotsPreserveSourceWhitespace(t *testing.T) {
+	input := `CREATE MICROFLOW Synthetic.PreserveExpressionSlots (
+  $Input: String,
+  $Count: Integer,
+  $Flag: Boolean,
+  $OtherFlag: Boolean
+)
+RETURNS Boolean AS $Result
+BEGIN
+  $Created = CREATE Synthetic.Entity (Name = if $Count=0 then 'zero'
+else 'many'
+, Description = 'sample');
+  CHANGE $Created (Name = 'updated'
+, Description = 'sample');
+  $Loaded = CALL JAVA ACTION Synthetic.LoadValue(envVarName = 'SYNTHETIC_VALUE'
+, defaultValue = @Synthetic.DefaultValue);
+  IF isMatch( $Input, '[0-9]+') THEN
+    SHOW MESSAGE 'Value {1}' TYPE Information OBJECTS [if $Flag then 'enabled'
+else 'disabled'
+, $Input];
+  END IF;
+  RETURN $Flag
+and
+$OtherFlag;
+END;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected parse errors: %v", errs)
+	}
+
+	mf := prog.Statements[0].(*ast.CreateMicroflowStmt)
+
+	createStmt := mf.Body[0].(*ast.CreateObjectStmt)
+	if source, ok := createStmt.Changes[0].Value.(*ast.SourceExpr); !ok {
+		t.Fatalf("expected create assignment SourceExpr, got %T", createStmt.Changes[0].Value)
+	} else if !strings.Contains(source.Source, "\nelse 'many'\n") {
+		t.Fatalf("create assignment source lost line breaks: %q", source.Source)
+	}
+
+	changeStmt := mf.Body[1].(*ast.ChangeObjectStmt)
+	if source, ok := changeStmt.Changes[0].Value.(*ast.SourceExpr); !ok {
+		t.Fatalf("expected change assignment SourceExpr, got %T", changeStmt.Changes[0].Value)
+	} else if !strings.Contains(source.Source, "\n") {
+		t.Fatalf("change assignment source lost trailing separator whitespace: %q", source.Source)
+	}
+
+	callStmt := mf.Body[2].(*ast.CallJavaActionStmt)
+	if source, ok := callStmt.Arguments[0].Value.(*ast.SourceExpr); !ok {
+		t.Fatalf("expected call argument SourceExpr, got %T", callStmt.Arguments[0].Value)
+	} else if !strings.Contains(source.Source, "\n") {
+		t.Fatalf("call argument source lost trailing separator whitespace: %q", source.Source)
+	}
+
+	ifStmt := mf.Body[3].(*ast.IfStmt)
+	if source, ok := ifStmt.Condition.(*ast.SourceExpr); !ok {
+		t.Fatalf("expected if condition SourceExpr, got %T", ifStmt.Condition)
+	} else if source.Source != "isMatch( $Input, '[0-9]+')" {
+		t.Fatalf("if condition source = %q", source.Source)
+	}
+
+	showStmt := ifStmt.ThenBody[0].(*ast.ShowMessageStmt)
+	if source, ok := showStmt.TemplateArgs[0].(*ast.SourceExpr); !ok {
+		t.Fatalf("expected show-message argument SourceExpr, got %T", showStmt.TemplateArgs[0])
+	} else if !strings.Contains(source.Source, "\nelse 'disabled'\n") {
+		t.Fatalf("show-message argument source lost line breaks: %q", source.Source)
+	}
+
+	returnStmt := mf.Body[4].(*ast.ReturnStmt)
+	if source, ok := returnStmt.Value.(*ast.SourceExpr); !ok {
+		t.Fatalf("expected return SourceExpr, got %T", returnStmt.Value)
+	} else if source.Source != "$Flag\nand\n$OtherFlag" {
+		t.Fatalf("return source = %q", source.Source)
+	}
+}
+
+func TestRetrieveXPathPreservesOriginalPathSpacing(t *testing.T) {
+	input := `CREATE MICROFLOW Synthetic.PreserveXPathPathSpacing ()
+BEGIN
+  RETRIEVE $Items FROM Synthetic.Item
+    WHERE Synthetic.Item_Group/Synthetic.Group/Synthetic.Group_Company = $Company;
+END;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected parse errors: %v", errs)
+	}
+
+	mf := prog.Statements[0].(*ast.CreateMicroflowStmt)
+	retrieveStmt := mf.Body[0].(*ast.RetrieveStmt)
+	source, ok := retrieveStmt.Where.(*ast.SourceExpr)
+	if !ok {
+		t.Fatalf("expected retrieve XPath SourceExpr, got %T", retrieveStmt.Where)
+	}
+	want := "Synthetic.Item_Group/Synthetic.Group/Synthetic.Group_Company = $Company"
+	if source.Source != want {
+		t.Fatalf("XPath source = %q, want %q", source.Source, want)
+	}
+}
+
+func TestRetrieveMultipleXPathPredicatesPreservePredicateBoundaries(t *testing.T) {
+	input := `CREATE MICROFLOW Synthetic.PreserveXPathPredicates (
+  $Token: Synthetic.Token
+)
+BEGIN
+  RETRIEVE $Items FROM Synthetic.Item
+    WHERE [CreatedAt > $Token/CreatedAt or (CreatedAt = $Token/CreatedAt and ItemId > $Token/ItemId)]
+    [CreatedAt < '[%CurrentDateTime%]']
+    [ExternalId != empty];
+END;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected parse errors: %v", errs)
+	}
+
+	mf := prog.Statements[0].(*ast.CreateMicroflowStmt)
+	retrieveStmt := mf.Body[0].(*ast.RetrieveStmt)
+	source, ok := retrieveStmt.Where.(*ast.SourceExpr)
+	if !ok {
+		t.Fatalf("expected retrieve XPath SourceExpr, got %T", retrieveStmt.Where)
+	}
+	want := "[CreatedAt > $Token/CreatedAt or (CreatedAt = $Token/CreatedAt and ItemId > $Token/ItemId)][CreatedAt < '[%CurrentDateTime%]'][ExternalId != empty]"
+	if source.Source != want {
+		t.Fatalf("XPath source = %q, want %q", source.Source, want)
+	}
+}
+
+func TestTrailingExpressionWhitespacePreservedForRoundtripSlots(t *testing.T) {
+	input := `CREATE MICROFLOW Synthetic.PreserveTrailingExpressionWhitespace (
+  $Object: Synthetic.Entity
+)
+RETURNS Boolean AS $Result
+BEGIN
+  DECLARE $Prefix String = 'Hello'
+;
+  SET $Prefix = substring($Prefix, 0, 1)
+;
+  CHANGE $Object (Name = $Prefix );
+  LOG INFO NODE @Synthetic.LogNode
+ 'Processed {1}' WITH ({1} = $Prefix );
+  RETURN true;
+END;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected parse errors: %v", errs)
+	}
+
+	mf := prog.Statements[0].(*ast.CreateMicroflowStmt)
+	decl := mf.Body[0].(*ast.DeclareStmt)
+	if source, ok := decl.InitialValue.(*ast.SourceExpr); !ok {
+		t.Fatalf("expected declare initial value SourceExpr, got %T", decl.InitialValue)
+	} else if source.Source != "'Hello'\n" {
+		t.Fatalf("declare source = %q", source.Source)
+	}
+
+	setStmt := mf.Body[1].(*ast.MfSetStmt)
+	if source, ok := setStmt.Value.(*ast.SourceExpr); !ok {
+		t.Fatalf("expected set value SourceExpr, got %T", setStmt.Value)
+	} else if source.Source != "substring($Prefix, 0, 1)\n" {
+		t.Fatalf("set source = %q", source.Source)
+	}
+
+	changeStmt := mf.Body[2].(*ast.ChangeObjectStmt)
+	if source, ok := changeStmt.Changes[0].Value.(*ast.SourceExpr); !ok {
+		t.Fatalf("expected change value SourceExpr, got %T", changeStmt.Changes[0].Value)
+	} else if source.Source != "$Prefix " {
+		t.Fatalf("change source = %q", source.Source)
+	}
+
+	logStmt := mf.Body[3].(*ast.LogStmt)
+	if source, ok := logStmt.Node.(*ast.SourceExpr); !ok {
+		t.Fatalf("expected log node SourceExpr, got %T", logStmt.Node)
+	} else if source.Source != "@Synthetic.LogNode\n" {
+		t.Fatalf("log node source = %q", source.Source)
+	}
+	if source, ok := logStmt.Template[0].Value.(*ast.SourceExpr); !ok {
+		t.Fatalf("expected log template SourceExpr, got %T", logStmt.Template[0].Value)
+	} else if source.Source != "$Prefix " {
+		t.Fatalf("template source = %q", source.Source)
+	}
+}
+
+func TestRetrieveRangeExpressionsPreserveTrailingWhitespace(t *testing.T) {
+	input := `CREATE MICROFLOW Synthetic.PreserveRetrieveRangeWhitespace (
+  $UseFirstPage: Boolean,
+  $PageSize: Integer,
+  $PageNumber: Integer
+)
+RETURNS List OF Synthetic.Entity
+BEGIN
+  RETRIEVE $Items FROM Synthetic.Entity
+    LIMIT $PageSize
+
+    OFFSET IF $UseFirstPage THEN 0
+ELSE
+$PageSize * ($PageNumber - 1)
+;
+  RETURN $Items;
+END;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("unexpected parse errors: %v", errs)
+	}
+
+	mf := prog.Statements[0].(*ast.CreateMicroflowStmt)
+	retrieveStmt, ok := mf.Body[0].(*ast.RetrieveStmt)
+	if !ok {
+		t.Fatalf("expected RetrieveStmt, got %T", mf.Body[0])
+	}
+	if retrieveStmt.Limit != "$PageSize\n" {
+		t.Fatalf("limit source = %q", retrieveStmt.Limit)
+	}
+	wantOffset := "IF $UseFirstPage THEN 0\nELSE\n$PageSize * ($PageNumber - 1)\n"
+	if retrieveStmt.Offset != wantOffset {
+		t.Fatalf("offset source = %q, want %q", retrieveStmt.Offset, wantOffset)
+	}
+}
+
+func TestShouldPreserveExpressionSourceIgnoresStringLiteralPunctuation(t *testing.T) {
+	if shouldPreserveExpressionSource("'Processed {1} items!'") {
+		t.Fatal("plain string literal punctuation should not force SourceExpr preservation")
+	}
+	if shouldPreserveExpressionSource("'Owner''s item: {1}'") {
+		t.Fatal("escaped quotes and colon inside a string literal should not force SourceExpr preservation")
+	}
+	if !shouldPreserveExpressionSource("$Token!=empty") {
+		t.Fatal("compact operators outside string literals should preserve source")
+	}
+	if !shouldPreserveExpressionSource("substring($Text,0,find($Text, '.'))") {
+		t.Fatal("compact comma-separated arguments should preserve source")
+	}
+	if !shouldPreserveExpressionSource("not($Object/Flag)") {
+		t.Fatal("compact not() expressions should preserve source")
+	}
+}
+
+func TestRenameModule_ObjectTypeIsLowercase(t *testing.T) {
+	prog, errs := Build("RENAME MODULE OldMod TO NewMod;")
+	if len(errs) > 0 {
+		t.Fatalf("Parse errors: %v", errs)
+	}
+	if len(prog.Statements) != 1 {
+		t.Fatalf("Expected 1 statement, got %d", len(prog.Statements))
+	}
+	stmt, ok := prog.Statements[0].(*ast.RenameStmt)
+	if !ok {
+		t.Fatalf("Expected *ast.RenameStmt, got %T", prog.Statements[0])
+	}
+	if stmt.ObjectType != "module" {
+		t.Errorf("Expected ObjectType %q, got %q — executor switch uses lowercase", "module", stmt.ObjectType)
+	}
+	if stmt.Name.Module != "OldMod" {
+		t.Errorf("Expected old name OldMod, got %s", stmt.Name.Module)
+	}
+	if stmt.NewName != "NewMod" {
+		t.Errorf("Expected new name NewMod, got %s", stmt.NewName)
+	}
+}
+
+func TestCreateEnumeration_DocCommentCarriedToAST(t *testing.T) {
+	input := `/**
+ * Priority levels for tasks.
+ */
+create enumeration DmTest.Priority (
+  LOW 'Low',
+  HIGH 'High'
+);`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("Parse errors: %v", errs)
+	}
+	if len(prog.Statements) != 1 {
+		t.Fatalf("Expected 1 statement, got %d", len(prog.Statements))
+	}
+	stmt, ok := prog.Statements[0].(*ast.CreateEnumerationStmt)
+	if !ok {
+		t.Fatalf("Expected *ast.CreateEnumerationStmt, got %T", prog.Statements[0])
+	}
+	if stmt.Documentation != "Priority levels for tasks." {
+		t.Errorf("Documentation = %q, want %q — enum-level JavaDoc must reach the AST so the writer can persist it", stmt.Documentation, "Priority levels for tasks.")
+	}
+}
+
+func TestCreateOrReplaceEnumeration_FlagsCreateOrModify(t *testing.T) {
+	input := `create or replace enumeration DmTest.Priority (
+  LOW 'Low'
+);`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("Parse errors: %v", errs)
+	}
+	if len(prog.Statements) != 1 {
+		t.Fatalf("Expected 1 statement, got %d", len(prog.Statements))
+	}
+	stmt, ok := prog.Statements[0].(*ast.CreateEnumerationStmt)
+	if !ok {
+		t.Fatalf("Expected *ast.CreateEnumerationStmt, got %T", prog.Statements[0])
+	}
+	if !stmt.CreateOrModify {
+		t.Error("CREATE OR REPLACE should set CreateOrModify=true so the executor takes the update path")
 	}
 }

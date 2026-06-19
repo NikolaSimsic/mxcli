@@ -15,6 +15,7 @@ type CreateRestClientStmt struct {
 	Documentation  string
 	Folder         string // Folder path within module
 	CreateOrModify bool   // True if CREATE OR MODIFY was used
+	OpenApiPath    string // Non-empty = spec-driven; operations come from spec not OPERATION blocks
 }
 
 func (s *CreateRestClientStmt) isStatement() {}
@@ -32,15 +33,15 @@ type RestOperationDef struct {
 	Documentation    string
 	Method           string // "GET", "POST", "PUT", "PATCH", "DELETE"
 	Path             string
-	Parameters       []RestParamDef       // path parameters
-	QueryParameters  []RestParamDef       // query parameters
-	Headers          []RestHeaderDef      // HTTP headers
-	BodyType         string               // "JSON", "FILE", "TEMPLATE", "MAPPING", "" (none)
-	BodyVariable     string               // e.g. "$ItemData" or template string
-	BodyMapping      *RestMappingDef      // for MAPPING body
-	ResponseType     string               // "JSON", "STRING", "FILE", "STATUS", "NONE", "MAPPING"
-	ResponseVariable string               // e.g. "$CreatedItem"
-	ResponseMapping  *RestMappingDef      // for MAPPING response
+	Parameters       []RestParamDef  // path parameters
+	QueryParameters  []RestParamDef  // query parameters
+	Headers          []RestHeaderDef // HTTP headers
+	BodyType         string          // "JSON", "FILE", "TEMPLATE", "MAPPING", "" (none)
+	BodyVariable     string          // e.g. "$ItemData" or template string
+	BodyMapping      *RestMappingDef // for MAPPING body
+	ResponseType     string          // "JSON", "STRING", "FILE", "STATUS", "NONE", "MAPPING"
+	ResponseVariable string          // e.g. "$CreatedItem"
+	ResponseMapping  *RestMappingDef // for MAPPING response
 	Timeout          int
 }
 
@@ -85,6 +86,14 @@ type DropRestClientStmt struct {
 
 func (s *DropRestClientStmt) isStatement() {}
 
+// DescribeContractFromOpenAPIStmt represents: DESCRIBE CONTRACT OPERATIONS FROM OPENAPI '/path/to/spec.json'
+// No project connection required; outputs the MDL that would be generated from the spec.
+type DescribeContractFromOpenAPIStmt struct {
+	SpecPath string
+}
+
+func (s *DescribeContractFromOpenAPIStmt) isStatement() {}
+
 // ============================================================================
 // Published REST Service Statements
 // ============================================================================
@@ -93,13 +102,13 @@ func (s *DropRestClientStmt) isStatement() {}
 //
 //	CREATE PUBLISHED REST SERVICE Module.Name (Path: '...', Version: '...') { RESOURCE ... };
 type CreatePublishedRestServiceStmt struct {
-	Name            QualifiedName
-	Path            string
-	Version         string
-	ServiceName     string
-	Folder          string
-	Resources       []*PublishedRestResourceDef
-	CreateOrReplace bool
+	Name           QualifiedName
+	Path           string
+	Version        string
+	ServiceName    string
+	Folder         string
+	Resources      []*PublishedRestResourceDef
+	CreateOrModify bool
 }
 
 func (s *CreatePublishedRestServiceStmt) isStatement() {}

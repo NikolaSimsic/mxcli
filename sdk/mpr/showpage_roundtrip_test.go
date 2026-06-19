@@ -8,6 +8,7 @@ import (
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 // TestShowPageAction_Roundtrip verifies that a ShowPageAction with parameters
@@ -62,6 +63,59 @@ func TestShowPageAction_Roundtrip(t *testing.T) {
 	}
 }
 
+func TestShowPageAction_WritesValidPageParameterMapping(t *testing.T) {
+	action := &microflows.ShowPageAction{
+		BaseElement: model.BaseElement{ID: "test-action-id"},
+		PageName:    "Sales.Product_NewEdit",
+		PageParameterMappings: []*microflows.PageParameterMapping{
+			{
+				BaseElement: model.BaseElement{ID: "test-mapping-id"},
+				Parameter:   "Sales.Product_NewEdit.Product",
+				Argument:    "$Product",
+			},
+		},
+	}
+
+	doc := serializeMicroflowAction(action)
+	data, err := bson.Marshal(doc)
+	if err != nil {
+		t.Fatalf("failed to marshal BSON: %v", err)
+	}
+
+	var raw map[string]any
+	if err := bson.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("failed to unmarshal BSON: %v", err)
+	}
+
+	formSettings := toMap(raw["FormSettings"])
+	if formSettings == nil {
+		t.Fatal("FormSettings missing")
+	}
+
+	mappings, ok := formSettings["ParameterMappings"].(primitive.A)
+	if !ok {
+		t.Fatalf("ParameterMappings type = %T, want primitive.A", formSettings["ParameterMappings"])
+	}
+	if len(mappings) != 2 {
+		t.Fatalf("ParameterMappings length = %d, want marker plus one mapping", len(mappings))
+	}
+	if marker, ok := mappings[0].(int32); !ok || marker != 2 {
+		t.Fatalf("ParameterMappings marker = %#v, want int32(2)", mappings[0])
+	}
+
+	mapping := toMap(mappings[1])
+	if mapping == nil {
+		t.Fatal("PageParameterMapping missing")
+	}
+	variable := toMap(mapping["Variable"])
+	if variable == nil {
+		t.Fatal("Variable is nil; Studio Pro rejects null page parameter mapping variables")
+	}
+	if got := extractString(variable["$Type"]); got != "Forms$PageVariable" {
+		t.Fatalf("Variable $Type = %q, want Forms$PageVariable", got)
+	}
+}
+
 // TestShowPageAction_RoundtripNoParams verifies that a ShowPageAction without parameters
 // survives BSON serialization/deserialization.
 func TestShowPageAction_RoundtripNoParams(t *testing.T) {
@@ -88,6 +142,40 @@ func TestShowPageAction_RoundtripNoParams(t *testing.T) {
 	}
 	if len(parsed.PageParameterMappings) != 0 {
 		t.Errorf("PageParameterMappings count = %d, want 0", len(parsed.PageParameterMappings))
+	}
+}
+
+// TestShowPageAction_TitleOverride_NotNil verifies that FormSettings.TitleOverride is written as
+// an embedded Microflows$TextTemplate object, not nil.  Studio Pro rejects null embedded objects
+// on project load (same class of bug as FormSettings.ParameterMappings.Variable — issue #295).
+func TestShowPageAction_TitleOverride_NotNil(t *testing.T) {
+	action := &microflows.ShowPageAction{
+		BaseElement: model.BaseElement{ID: "test-action-id"},
+		PageName:    "Sales.Product_NewEdit",
+	}
+
+	doc := serializeMicroflowAction(action)
+	data, err := bson.Marshal(doc)
+	if err != nil {
+		t.Fatalf("failed to marshal BSON: %v", err)
+	}
+
+	var raw map[string]any
+	if err := bson.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("failed to unmarshal BSON: %v", err)
+	}
+
+	formSettings := toMap(raw["FormSettings"])
+	if formSettings == nil {
+		t.Fatal("FormSettings missing")
+	}
+
+	to := toMap(formSettings["TitleOverride"])
+	if to == nil {
+		t.Fatal("TitleOverride is nil; Studio Pro rejects null Microflows$TextTemplate objects (issue #468)")
+	}
+	if got := extractString(to["$Type"]); got != "Microflows$TextTemplate" {
+		t.Fatalf("TitleOverride.$Type = %q, want %q", got, "Microflows$TextTemplate")
 	}
 }
 

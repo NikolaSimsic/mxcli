@@ -67,6 +67,8 @@ func (w *Writer) UpdateEntity(domainModelID model.ID, entity *domainmodel.Entity
 
 // DeleteEntity deletes an entity from a domain model.
 // domainModelID is the ID of the domain model itself (not the module ID).
+// Cascade: any association in any module whose ParentID or ChildID matches
+// entityID is also removed, preventing dangling unit-pointer errors.
 func (w *Writer) DeleteEntity(domainModelID model.ID, entityID model.ID) error {
 	dm, err := w.reader.GetDomainModelByID(domainModelID)
 	if err != nil {
@@ -74,14 +76,58 @@ func (w *Writer) DeleteEntity(domainModelID model.ID, entityID model.ID) error {
 	}
 
 	// Find and remove the entity
+	found := false
 	for i, e := range dm.Entities {
 		if e.ID == entityID {
 			dm.Entities = append(dm.Entities[:i], dm.Entities[i+1:]...)
-			return w.updateDomainModel(dm)
+			found = true
+			break
+		}
+	}
+	if !found {
+		return fmt.Errorf("entity not found: %s", entityID)
+	}
+
+	// Remove associations referencing this entity from the same DM
+	var keptAssocs []*domainmodel.Association
+	for _, a := range dm.Associations {
+		if a.ParentID != entityID && a.ChildID != entityID {
+			keptAssocs = append(keptAssocs, a)
+		}
+	}
+	dm.Associations = keptAssocs
+
+	if err := w.updateDomainModel(dm); err != nil {
+		return err
+	}
+
+	// Cascade: remove associations referencing this entity from all other DMs
+	allDMs, err := w.reader.ListDomainModels()
+	if err != nil {
+		return fmt.Errorf("cascade cleanup: list domain models: %w", err)
+	}
+	for _, other := range allDMs {
+		if other.ID == domainModelID {
+			continue
+		}
+		changed := false
+		var kept []*domainmodel.Association
+		for _, a := range other.Associations {
+			if a.ParentID == entityID || a.ChildID == entityID {
+				changed = true
+			} else {
+				kept = append(kept, a)
+			}
+		}
+		if changed {
+			other.Associations = kept
+			if err := w.updateDomainModel(other); err != nil {
+				return fmt.Errorf("cascade cleanup: update domain model %s: %w", other.ID, err)
+			}
 		}
 	}
 
-	return fmt.Errorf("entity not found: %s", entityID)
+	return nil
 }
 
 // MoveEntity moves an entity from one domain model to another.
@@ -593,14 +639,15 @@ func (w *Writer) serializeDomainModel(dm *domainmodel.DomainModel) ([]byte, erro
 		crossAssociations = append(crossAssociations, serializeCrossAssociation(ca))
 	}
 
-	doc := bson.M{
-		"$ID":               idToBsonBinary(string(dm.ID)),
-		"$Type":             "DomainModels$DomainModel",
-		"Documentation":     "",
-		"Annotations":       bson.A{int32(3)}, // Empty with version prefix
-		"Entities":          entities,
-		"Associations":      associations,
-		"CrossAssociations": crossAssociations,
+	// Use bson.D (ordered) so $Type appears early — Mendix requires this for correct parsing
+	doc := bson.D{
+		{Key: "$ID", Value: idToBsonBinary(string(dm.ID))},
+		{Key: "$Type", Value: "DomainModels$DomainModel"},
+		{Key: "Documentation", Value: ""},
+		{Key: "Annotations", Value: bson.A{int32(3)}},
+		{Key: "Entities", Value: entities},
+		{Key: "Associations", Value: associations},
+		{Key: "CrossAssociations", Value: crossAssociations},
 	}
 	return bson.Marshal(doc)
 }
@@ -928,7 +975,6 @@ func serializeODataRemoteEntitySource(e *domainmodel.Entity) bson.D {
 		bson.E{Key: "SkipSupported", Value: e.SkipSupported},
 		bson.E{Key: "SourceDocument", Value: e.RemoteServiceName},
 		bson.E{Key: "TopSupported", Value: e.TopSupported},
-		bson.E{Key: "Updatable", Value: e.Updatable},
 	)
 	return doc
 }
@@ -1181,34 +1227,42 @@ func serializeDeleteBehavior(parentBehavior, childBehavior *domainmodel.DeleteBe
 	}
 }
 
+// zeroGUID is the all-zero UUID Studio Pro writes for an unset GUID reference.
+const zeroGUID = "00000000-0000-0000-0000-000000000000"
+
 func serializeIndex(idx *domainmodel.Index) bson.M {
-	// Index attributes array with version prefix 3
-	attrs := bson.A{int32(3)}
+	// IndexedAttribute lists use typed-array marker 2 (NOT the domain-model
+	// default of 3) — verified against real Studio-Pro 11.x BSON
+	// (mx-test-projects/test7-app: IdxProbe).
+	attrs := bson.A{int32(2)}
 	for _, ia := range idx.Attributes {
 		attrs = append(attrs, serializeIndexAttribute(ia))
 	}
 
 	return bson.M{
-		"$ID":        idToBsonBinary(string(idx.ID)),
-		"$Type":      "DomainModels$EntityIndex",
-		"Attributes": attrs,
+		"$ID":              idToBsonBinary(string(idx.ID)),
+		"$Type":            "DomainModels$EntityIndex",
+		"Attributes":       attrs,
+		"GUID":             idToBsonBinary(string(idx.ID)),
+		"IncludeInOffline": false,
 	}
 }
 
+// serializeIndexAttribute emits the Studio-Pro 11.x index-segment shape:
+// Ascending(bool)+Type("Normal")+AttributePointer, plus an all-zero
+// AssociationPointer for an attribute-based segment. This replaces the stale
+// "SortOrder" string the writer previously emitted — the legacy parser already
+// reads Ascending (with a SortOrder fallback), so writer and parser are now
+// aligned, and the output matches what Studio Pro produces.
 func serializeIndexAttribute(ia *domainmodel.IndexAttribute) bson.M {
 	return bson.M{
-		"$ID":              idToBsonBinary(string(ia.ID)),
-		"$Type":            "DomainModels$IndexedAttribute",
-		"AttributePointer": idToBsonBinary(string(ia.AttributeID)), // BSON Binary like $ID
-		"SortOrder":        getSortOrder(ia.Ascending),
+		"$ID":                idToBsonBinary(string(ia.ID)),
+		"$Type":              "DomainModels$IndexedAttribute",
+		"AttributePointer":   idToBsonBinary(string(ia.AttributeID)), // BSON Binary like $ID
+		"AssociationPointer": idToBsonBinary(zeroGUID),               // zero GUID: attribute-based segment
+		"Ascending":          ia.Ascending,
+		"Type":               "Normal",
 	}
-}
-
-func getSortOrder(ascending bool) string {
-	if ascending {
-		return "Ascending"
-	}
-	return "Descending"
 }
 
 func serializeValidationRule(vr *domainmodel.ValidationRule, moduleName string, entity *domainmodel.Entity) bson.D {

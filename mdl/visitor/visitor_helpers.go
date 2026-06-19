@@ -428,16 +428,62 @@ func buildDeleteBehavior(ctx parser.IDeleteBehaviorContext) ast.DeleteBehavior {
 	return ast.DeleteKeepReferences
 }
 
+// QuoteString escapes s for safe embedding inside an MDL single-quoted string
+// literal. It is the inverse of unquoteString: a backslash becomes `\\` and an
+// apostrophe becomes `”`. Use it whenever a runtime value (e.g. a filesystem
+// path) is interpolated into MDL source such as `CONNECT LOCAL '<path>'`, so a
+// Windows path like `C:\temp\App.mpr` round-trips unchanged instead of having
+// `\t`/`\n`/`\r` interpreted as escapes. See issue #644.
+func QuoteString(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `'`, `''`)
+	return s
+}
+
 func unquoteString(s string) string {
 	// Remove surrounding quotes and unescape
 	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
 		s = s[1 : len(s)-1]
 	}
-	// Handle escaped single quotes (both \' and '')
-	s = strings.ReplaceAll(s, "''", "'")
-	s = strings.ReplaceAll(s, "\\'", "'")
-	s = strings.ReplaceAll(s, "\\\\", "\\")
-	return s
+	var b strings.Builder
+	b.Grow(len(s))
+
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\'':
+			if i+1 < len(s) && s[i+1] == '\'' {
+				b.WriteByte('\'')
+				i++
+			} else {
+				b.WriteByte('\'')
+			}
+		case '\\':
+			if i+1 >= len(s) {
+				b.WriteByte('\\')
+				continue
+			}
+			i++
+			switch s[i] {
+			case 'n':
+				b.WriteByte('\n')
+			case 'r':
+				b.WriteByte('\r')
+			case 't':
+				b.WriteByte('\t')
+			case '\\':
+				b.WriteByte('\\')
+			case '\'':
+				b.WriteByte('\'')
+			default:
+				b.WriteByte('\\')
+				b.WriteByte(s[i])
+			}
+		default:
+			b.WriteByte(s[i])
+		}
+	}
+
+	return b.String()
 }
 
 func extractLiteralValue(ctx parser.ILiteralContext) any {

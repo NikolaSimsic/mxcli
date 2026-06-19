@@ -6,6 +6,7 @@ import (
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
 
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
@@ -66,6 +67,36 @@ func parseMicroflowCallAction(raw map[string]any) *microflows.MicroflowCallActio
 	return action
 }
 
+func parseNanoflowCallAction(raw map[string]any) *microflows.NanoflowCallAction {
+	action := &microflows.NanoflowCallAction{}
+	action.ID = model.ID(extractBsonID(raw["$ID"]))
+	action.ErrorHandlingType = microflows.ErrorHandlingType(extractString(raw["ErrorHandlingType"]))
+	action.OutputVariableName = extractString(raw["OutputVariableName"])
+	action.UseReturnVariable = extractBool(raw["UseReturnVariable"], false)
+
+	// Parse nested NanoflowCall structure
+	if nfCall, ok := raw["NanoflowCall"].(map[string]any); ok {
+		call := &microflows.NanoflowCall{}
+		call.ID = model.ID(extractBsonID(nfCall["$ID"]))
+		call.Nanoflow = extractString(nfCall["Nanoflow"])
+
+		if mappings := extractBsonArray(nfCall["ParameterMappings"]); len(mappings) > 0 {
+			for _, m := range mappings {
+				if mMap, ok := m.(map[string]any); ok {
+					mapping := &microflows.NanoflowCallParameterMapping{}
+					mapping.ID = model.ID(extractBsonID(mMap["$ID"]))
+					mapping.Parameter = extractString(mMap["Parameter"])
+					mapping.Argument = extractString(mMap["Argument"])
+					call.ParameterMappings = append(call.ParameterMappings, mapping)
+				}
+			}
+		}
+		action.NanoflowCall = call
+	}
+
+	return action
+}
+
 func parseJavaActionCallAction(raw map[string]any) *microflows.JavaActionCallAction {
 	action := &microflows.JavaActionCallAction{}
 	action.ID = model.ID(extractBsonID(raw["$ID"]))
@@ -83,6 +114,33 @@ func parseJavaActionCallAction(raw map[string]any) *microflows.JavaActionCallAct
 				mapping.Parameter = extractString(mMap["Parameter"])
 				// Parse Value - it can be various types
 				if value, ok := mMap["Value"].(map[string]any); ok {
+					mapping.Value = parseCodeActionParameterValue(value)
+				}
+				action.ParameterMappings = append(action.ParameterMappings, mapping)
+			}
+		}
+	}
+
+	return action
+}
+
+func parseJavaScriptActionCallAction(raw map[string]any) *microflows.JavaScriptActionCallAction {
+	action := &microflows.JavaScriptActionCallAction{}
+	action.ID = model.ID(extractBsonID(raw["$ID"]))
+	action.ErrorHandlingType = microflows.ErrorHandlingType(extractString(raw["ErrorHandlingType"]))
+	action.JavaScriptAction = extractString(raw["JavaScriptAction"])
+	action.OutputVariableName = extractString(raw["OutputVariableName"])
+	action.UseReturnVariable = extractBool(raw["UseReturnVariable"], false)
+
+	// Parse parameter mappings
+	if mappings := extractBsonArray(raw["ParameterMappings"]); len(mappings) > 0 {
+		for _, m := range mappings {
+			if mMap, ok := m.(map[string]any); ok {
+				mapping := &microflows.JavaScriptActionParameterMapping{}
+				mapping.ID = model.ID(extractBsonID(mMap["$ID"]))
+				mapping.Parameter = extractString(mMap["Parameter"])
+				// BSON key is "ParameterValue"; Go struct JSON tag is "value" — intentional asymmetry
+				if value, ok := mMap["ParameterValue"].(map[string]any); ok {
 					mapping.Value = parseCodeActionParameterValue(value)
 				}
 				action.ParameterMappings = append(action.ParameterMappings, mapping)
@@ -117,6 +175,11 @@ func parseCodeActionParameterValue(raw map[string]any) microflows.CodeActionPara
 		value := &microflows.BasicCodeActionParameterValue{}
 		value.ID = model.ID(extractBsonID(raw["$ID"]))
 		value.Argument = extractString(raw["Argument"])
+		return value
+	case "Microflows$MicroflowParameterValue":
+		value := &microflows.MicroflowParameterValue{}
+		value.ID = model.ID(extractBsonID(raw["$ID"]))
+		value.Microflow = extractString(raw["Microflow"])
 		return value
 	case "Microflows$EntityTypeCodeActionParameterValue":
 		value := &microflows.EntityTypeCodeActionParameterValue{}
@@ -229,10 +292,10 @@ func parseShowHomePageAction(raw map[string]any) *microflows.ShowHomePageAction 
 func parseClosePageAction(raw map[string]any) *microflows.ClosePageAction {
 	action := &microflows.ClosePageAction{}
 	action.ID = model.ID(extractBsonID(raw["$ID"]))
-	if numPages, ok := raw["NumberOfPagesToClose"].(int32); ok {
-		action.NumberOfPages = int(numPages)
-	} else if numPages, ok := raw["NumberOfPagesToClose"].(int64); ok {
-		action.NumberOfPages = int(numPages)
+	// Issue #585: collapse the int32/int64 dispatch to the shared extractInt
+	// helper. Default of 1 is preserved when the field is absent.
+	if _, ok := raw["NumberOfPagesToClose"]; ok {
+		action.NumberOfPages = extractInt(raw["NumberOfPagesToClose"])
 	} else {
 		action.NumberOfPages = 1
 	}
@@ -291,6 +354,10 @@ func parseValidationFeedbackAction(raw map[string]any) *microflows.ValidationFee
 func parseDownloadFileAction(raw map[string]any) *microflows.DownloadFileAction {
 	action := &microflows.DownloadFileAction{}
 	action.ID = model.ID(extractBsonID(raw["$ID"]))
+	action.ErrorHandlingType = microflows.ErrorHandlingType(extractString(raw["ErrorHandlingType"]))
+	if action.ErrorHandlingType == "" {
+		action.ErrorHandlingType = microflows.ErrorHandlingTypeRollback
+	}
 	action.FileDocument = extractString(raw["FileDocumentVariableName"])
 	action.ShowInBrowser = extractBool(raw["ShowInBrowser"], false)
 	return action
@@ -330,6 +397,9 @@ func parseCastAction(raw map[string]any) *microflows.CastAction {
 	action.ID = model.ID(extractBsonID(raw["$ID"]))
 	action.ObjectVariable = extractString(raw["ObjectVariableName"])
 	action.OutputVariable = extractString(raw["OutputVariableName"])
+	if action.OutputVariable == "" {
+		action.OutputVariable = extractString(raw["VariableName"])
+	}
 	return action
 }
 
@@ -363,6 +433,63 @@ func parseRestCallAction(raw map[string]any) *microflows.RestCallAction {
 		action.RequestHandling = parseRequestHandling(requestHandlingD.Map(), requestHandlingType)
 	}
 
+	return action
+}
+
+func parseWebServiceCallAction(raw map[string]any) *microflows.WebServiceCallAction {
+	action := &microflows.WebServiceCallAction{}
+	action.ID = model.ID(extractBsonID(raw["$ID"]))
+	action.ErrorHandlingType = microflows.ErrorHandlingType(extractString(raw["ErrorHandlingType"]))
+	action.ServiceID = model.ID(extractString(raw["ImportedService"]))
+	action.OperationName = extractString(raw["OperationName"])
+	action.TimeoutExpression = extractString(raw["TimeOutExpression"])
+
+	if resultHandling := extractBsonMap(raw["NewResultHandling"]); resultHandling != nil {
+		action.OutputVariable = extractString(resultHandling["ResultVariableName"])
+		action.UseReturnVariable = action.OutputVariable != ""
+		if call := extractBsonMap(resultHandling["ImportMappingCall"]); call != nil {
+			action.ReceiveMappingID = model.ID(extractString(call["ReturnValueMapping"]))
+		}
+	}
+	if requestHandling := extractBsonMap(raw["RequestHandling"]); requestHandling != nil {
+		if call := extractBsonMap(requestHandling["ExportMappingCall"]); call != nil {
+			action.SendMappingID = model.ID(extractString(call["Mapping"]))
+		}
+	}
+	if webServiceActionRequiresRawBSON(raw) {
+		if rawBSON, err := bson.Marshal(raw); err == nil {
+			action.RawBSON = rawBSON
+		}
+	}
+
+	return action
+}
+
+func webServiceActionRequiresRawBSON(raw map[string]any) bool {
+	supported := map[string]bool{
+		"$ID":               true,
+		"$Type":             true,
+		"ErrorHandlingType": true,
+		"ImportedService":   true,
+		"OperationName":     true,
+		"TimeOutExpression": true,
+		"UseRequestTimeOut": true,
+		"NewResultHandling": true,
+		"RequestHandling":   true,
+	}
+	for key := range raw {
+		if !supported[key] {
+			return true
+		}
+	}
+	return false
+}
+
+func parseWebServiceCallActionFromD(raw primitive.D) *microflows.WebServiceCallAction {
+	action := parseWebServiceCallAction(raw.Map())
+	if rawBSON, err := bson.Marshal(raw); err == nil {
+		action.RawBSON = rawBSON
+	}
 	return action
 }
 
@@ -501,9 +628,17 @@ func parseResultHandling(raw map[string]any, handlingType string) microflows.Res
 				mappingRef = extractString(call["ReturnValueMapping"])
 			}
 			result.MappingID = model.ID(mappingRef)
+			forceSingleOccurrence := extractBool(call["ForceSingleOccurrence"], false)
+			result.ForceSingleOccurrence = &forceSingleOccurrence
+			if rangeMap := toMap(call["Range"]); rangeMap != nil {
+				result.SingleObject = extractBool(rangeMap["SingleObject"], false)
+			}
 		}
 		if varType := toMap(raw["VariableType"]); varType != nil {
 			result.ResultEntityID = model.ID(extractString(varType["Entity"]))
+			if extractString(varType["$Type"]) == "DataTypes$ObjectType" {
+				result.SingleObject = true
+			}
 		}
 		return result
 	case "None":
@@ -605,7 +740,18 @@ func parseImportXmlAction(raw map[string]any) *microflows.ImportXmlAction {
 			if varType := toMap(call["VariableType"]); varType != nil {
 				handling.ResultEntityID = model.ID(extractString(varType["Entity"]))
 			}
-			handling.SingleObject = extractBool(call["ForceSingleOccurrence"], false)
+			forceSingleOccurrence := extractBool(call["ForceSingleOccurrence"], false)
+			handling.ForceSingleOccurrence = &forceSingleOccurrence
+			if rangeMap := toMap(call["Range"]); rangeMap != nil {
+				handling.SingleObject = extractBool(rangeMap["SingleObject"], false)
+			}
+			// Older XML import mappings may omit Range and encode single-object
+			// handling only through ForceSingleOccurrence. REST result handling
+			// stores Range consistently, so this compatibility fallback stays
+			// XML-specific.
+			if !handling.SingleObject {
+				handling.SingleObject = forceSingleOccurrence
+			}
 		}
 		action.ResultHandling = handling
 	}

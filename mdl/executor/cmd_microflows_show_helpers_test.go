@@ -3,8 +3,10 @@
 package executor
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
 )
 
@@ -129,6 +131,98 @@ func TestFindNormalFlows_AllErrors(t *testing.T) {
 	}
 }
 
+func TestEmitObjectAnnotations_EscapesMultilineText(t *testing.T) {
+	obj := &microflows.ActionActivity{
+		BaseActivity: microflows.BaseActivity{
+			BaseMicroflowObject: microflows.BaseMicroflowObject{
+				BaseElement: model.BaseElement{ID: mkID("act")},
+				Position:    model.Point{X: 100, Y: 200},
+			},
+			Caption:             "Caption\nLine",
+			AutoGenerateCaption: false,
+		},
+	}
+
+	annotationsByTarget := map[model.ID][]string{
+		mkID("act"): {"Note\nLine\tTabbed"},
+	}
+
+	var lines []string
+	// Pass nil flow maps — @anchor emission is intentionally suppressed here.
+	emitObjectAnnotations(obj, &lines, "", annotationsByTarget, nil, nil, nil)
+
+	got := strings.Join(lines, "\n")
+	if !strings.Contains(got, "@caption 'Caption\\nLine'") {
+		t.Fatalf("expected escaped caption, got:\n%s", got)
+	}
+	if !strings.Contains(got, "@annotation 'Note\\nLine\\tTabbed'") {
+		t.Fatalf("expected escaped annotation, got:\n%s", got)
+	}
+}
+
+func TestEmitObjectAnnotations_LoopCaption(t *testing.T) {
+	obj := &microflows.LoopedActivity{
+		BaseMicroflowObject: microflows.BaseMicroflowObject{
+			BaseElement: model.BaseElement{ID: mkID("loop")},
+			Position:    model.Point{X: 100, Y: 200},
+		},
+		Caption: "Loop owner's\ncaption",
+	}
+
+	var lines []string
+	// Pass nil flow maps — @anchor emission is intentionally suppressed here.
+	emitObjectAnnotations(obj, &lines, "", nil, nil, nil, nil)
+
+	got := strings.Join(lines, "\n")
+	if !strings.Contains(got, "@caption 'Loop owner''s\\ncaption'") {
+		t.Fatalf("expected escaped loop caption, got:\n%s", got)
+	}
+}
+
+func TestPrependFreeAnnotationLines_ModelAnnotationsStayFree(t *testing.T) {
+	oc := &microflows.MicroflowObjectCollection{
+		Objects: []microflows.MicroflowObject{
+			&microflows.Annotation{
+				BaseMicroflowObject: mkObj("free-note"),
+				Caption:             "free synthetic note",
+			},
+			&microflows.Annotation{
+				BaseMicroflowObject: mkObj("attached-note"),
+				Caption:             "attached synthetic note",
+			},
+		},
+		AnnotationFlows: []*microflows.AnnotationFlow{
+			{
+				BaseElement:   model.BaseElement{ID: mkID("annotation-flow")},
+				OriginID:      mkID("attached-note"),
+				DestinationID: mkID("activity"),
+			},
+		},
+	}
+
+	activityLines := []string{
+		"@position(100, 200)",
+		"@annotation 'attached synthetic note'",
+		"log info 'Synthetic' 'message';",
+	}
+
+	gotLines := prependFreeAnnotationLines(oc, activityLines)
+	got := strings.Join(gotLines, "\n")
+
+	want := strings.Join([]string{
+		"@annotation 'free synthetic note'",
+		"@position(100, 200)",
+		"@annotation 'attached synthetic note'",
+		"log info 'Synthetic' 'message';",
+	}, "\n")
+	if got != want {
+		t.Fatalf("free annotation describe output mismatch\nwant:\n%s\n\ngot:\n%s", want, got)
+	}
+	if strings.Count(got, "attached synthetic note") != 1 {
+		t.Fatalf("attached annotation was emitted as free too:\n%s", got)
+	}
+}
+
 // =============================================================================
 // formatErrorHandlingSuffix
 // =============================================================================
@@ -138,10 +232,10 @@ func TestFormatErrorHandlingSuffix(t *testing.T) {
 		errType microflows.ErrorHandlingType
 		want    string
 	}{
-		{microflows.ErrorHandlingTypeContinue, " ON ERROR CONTINUE"},
-		{microflows.ErrorHandlingTypeRollback, " ON ERROR ROLLBACK"},
-		{microflows.ErrorHandlingTypeCustom, " ON ERROR"},
-		{microflows.ErrorHandlingTypeCustomWithoutRollback, " ON ERROR WITHOUT ROLLBACK"},
+		{microflows.ErrorHandlingTypeContinue, " on error continue"},
+		{microflows.ErrorHandlingTypeRollback, " on error rollback"},
+		{microflows.ErrorHandlingTypeCustom, " on error"},
+		{microflows.ErrorHandlingTypeCustomWithoutRollback, " on error without rollback"},
 		{microflows.ErrorHandlingTypeAbort, ""},
 		{"", ""},
 		{"SomethingElse", ""},
@@ -287,12 +381,20 @@ func TestFormatActivity_StartEvent(t *testing.T) {
 	}
 }
 
-func TestFormatActivity_EndEvent_NoReturn(t *testing.T) {
+func TestFormatActivity_EndEvent_VoidOrUnknownContext(t *testing.T) {
 	e := newTestExecutor()
 	obj := &microflows.EndEvent{BaseMicroflowObject: mkObj("1")}
 	got := e.formatActivity(obj, nil, nil)
+	if got != "return;" {
+		t.Errorf("expected bare return for EndEvent without return, got %q", got)
+	}
+}
+
+func TestFormatActivity_EndEvent_NoReturnValueInReturningMicroflow(t *testing.T) {
+	obj := &microflows.EndEvent{BaseMicroflowObject: mkObj("1")}
+	got := formatActivity(&ExecContext{DescribingMicroflowHasReturnValue: true}, obj, nil, nil)
 	if got != "" {
-		t.Errorf("expected empty for EndEvent without return, got %q", got)
+		t.Errorf("expected empty EndEvent to be skipped in value-returning microflow, got %q", got)
 	}
 }
 
@@ -303,8 +405,8 @@ func TestFormatActivity_EndEvent_WithReturn(t *testing.T) {
 		ReturnValue:         "Result",
 	}
 	got := e.formatActivity(obj, nil, nil)
-	if got != "RETURN $Result;" {
-		t.Errorf("got %q, want %q", got, "RETURN $Result;")
+	if got != "return $Result;" {
+		t.Errorf("got %q, want %q", got, "return $Result;")
 	}
 }
 
@@ -315,8 +417,8 @@ func TestFormatActivity_EndEvent_WithDollarPrefix(t *testing.T) {
 		ReturnValue:         "$Result",
 	}
 	got := e.formatActivity(obj, nil, nil)
-	if got != "RETURN $Result;" {
-		t.Errorf("got %q, want %q (should not double the $)", got, "RETURN $Result;")
+	if got != "return $Result;" {
+		t.Errorf("got %q, want %q (should not double the $)", got, "return $Result;")
 	}
 }
 
@@ -327,8 +429,8 @@ func TestFormatActivity_ExclusiveSplit(t *testing.T) {
 		SplitCondition:      &microflows.ExpressionSplitCondition{Expression: "$Count > 5"},
 	}
 	got := e.formatActivity(obj, nil, nil)
-	if got != "IF $Count > 5 THEN" {
-		t.Errorf("got %q, want %q", got, "IF $Count > 5 THEN")
+	if got != "if $Count > 5 then" {
+		t.Errorf("got %q, want %q", got, "if $Count > 5 then")
 	}
 }
 
@@ -336,8 +438,8 @@ func TestFormatActivity_ExclusiveSplit_NilCondition(t *testing.T) {
 	e := newTestExecutor()
 	obj := &microflows.ExclusiveSplit{BaseMicroflowObject: mkObj("1")}
 	got := e.formatActivity(obj, nil, nil)
-	if got != "IF true THEN" {
-		t.Errorf("got %q, want %q", got, "IF true THEN")
+	if got != "if true then" {
+		t.Errorf("got %q, want %q", got, "if true then")
 	}
 }
 
@@ -345,8 +447,8 @@ func TestFormatActivity_ExclusiveMerge(t *testing.T) {
 	e := newTestExecutor()
 	obj := &microflows.ExclusiveMerge{BaseMicroflowObject: mkObj("1")}
 	got := e.formatActivity(obj, nil, nil)
-	if got != "END IF;" {
-		t.Errorf("got %q, want %q", got, "END IF;")
+	if got != "end if;" {
+		t.Errorf("got %q, want %q", got, "end if;")
 	}
 }
 
@@ -360,8 +462,8 @@ func TestFormatActivity_LoopedActivity(t *testing.T) {
 		},
 	}
 	got := e.formatActivity(obj, nil, nil)
-	if got != "LOOP $Order IN $OrderList" {
-		t.Errorf("got %q, want %q", got, "LOOP $Order IN $OrderList")
+	if got != "loop $Order in $OrderList" {
+		t.Errorf("got %q, want %q", got, "loop $Order in $OrderList")
 	}
 }
 
@@ -369,8 +471,8 @@ func TestFormatActivity_LoopedActivity_Defaults(t *testing.T) {
 	e := newTestExecutor()
 	obj := &microflows.LoopedActivity{BaseMicroflowObject: mkObj("1")}
 	got := e.formatActivity(obj, nil, nil)
-	if got != "LOOP $Item IN $List" {
-		t.Errorf("got %q, want %q", got, "LOOP $Item IN $List")
+	if got != "loop $Item in $List" {
+		t.Errorf("got %q, want %q", got, "loop $Item in $List")
 	}
 }
 
@@ -378,8 +480,8 @@ func TestFormatActivity_BreakEvent(t *testing.T) {
 	e := newTestExecutor()
 	obj := &microflows.BreakEvent{BaseMicroflowObject: mkObj("1")}
 	got := e.formatActivity(obj, nil, nil)
-	if got != "BREAK;" {
-		t.Errorf("got %q, want %q", got, "BREAK;")
+	if got != "break;" {
+		t.Errorf("got %q, want %q", got, "break;")
 	}
 }
 
@@ -387,8 +489,8 @@ func TestFormatActivity_ContinueEvent(t *testing.T) {
 	e := newTestExecutor()
 	obj := &microflows.ContinueEvent{BaseMicroflowObject: mkObj("1")}
 	got := e.formatActivity(obj, nil, nil)
-	if got != "CONTINUE;" {
-		t.Errorf("got %q, want %q", got, "CONTINUE;")
+	if got != "continue;" {
+		t.Errorf("got %q, want %q", got, "continue;")
 	}
 }
 
@@ -396,7 +498,7 @@ func TestFormatActivity_ErrorEvent(t *testing.T) {
 	e := newTestExecutor()
 	obj := &microflows.ErrorEvent{BaseMicroflowObject: mkObj("1")}
 	got := e.formatActivity(obj, nil, nil)
-	if got != "RAISE ERROR;" {
-		t.Errorf("got %q, want %q", got, "RAISE ERROR;")
+	if got != "raise error;" {
+		t.Errorf("got %q, want %q", got, "raise error;")
 	}
 }

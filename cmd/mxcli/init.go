@@ -488,7 +488,7 @@ Container Runtime:
 				fmt.Fprintf(os.Stderr, "  Error writing devcontainer.json: %v\n", err)
 			}
 			dockerfile := filepath.Join(devcontainerDir, "Dockerfile")
-			dcDockerfile := generateDockerfile(projectName, mprFile)
+			dcDockerfile := generateDockerfile(projectName, mprFile, initContainerRuntime)
 			if err := os.WriteFile(dockerfile, []byte(dcDockerfile), 0644); err != nil {
 				fmt.Fprintf(os.Stderr, "  Error writing Dockerfile: %v\n", err)
 			}
@@ -536,6 +536,15 @@ Container Runtime:
 			installVSCodeExtension(absDir)
 		}
 
+		// Extract pluggable widget definitions from the project's widgets/
+		// folder. Skip silently if there's no .mpr or no widgets/. Auto-
+		// refresh keeps definitions in sync when mxcli has been upgraded.
+		if mprPath := filepath.Join(absDir, mprFile); statExists(mprPath) {
+			if err := ExtractWidgetDefinitions(mprPath, false, false); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: widget definition extraction failed: %v\n", err)
+			}
+		}
+
 		fmt.Println("\n✓ Initialization complete!")
 		fmt.Println("\nWhat was created:")
 		fmt.Println("  • .gitignore - Mendix project ignore patterns")
@@ -571,6 +580,11 @@ func findMprFile(dir string) string {
 		}
 	}
 	return ""
+}
+
+func statExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func init() {

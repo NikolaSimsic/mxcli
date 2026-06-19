@@ -1,0 +1,112 @@
+-- ============================================================================
+-- Keyword-as-Identifier Regression Tests
+-- ============================================================================
+--
+-- Verifies that lexer keyword tokens can be used as identifiers (entity names,
+-- attribute names, enum values) via the parser's `keyword` rule.
+--
+-- Regression test for PR #186 (168 missing tokens) and PR #174 (OPEN fix).
+-- See: https://github.com/mendixlabs/mxcli/pull/186
+--
+-- Usage:
+--   mxcli check mdl-examples/doctype-tests/keyword-as-identifier.mdl
+--
+-- ============================================================================
+
+create module KeywordTest;
+
+-- MARK: Enum values that are lexer keywords
+
+create enumeration KeywordTest.IssueStatus (
+  open,
+  Closed,
+  data,
+  filter,
+  match,
+  empty,
+  container,
+  node
+);
+
+create enumeration KeywordTest.HttpMethod (
+  get,
+  post,
+  put,
+  delete,
+  patch
+);
+
+create enumeration KeywordTest.ActivityKind (
+  activity,
+  condition,
+  loop,
+  Start,
+  end,
+  split,
+  join,
+  Merge
+);
+
+create enumeration KeywordTest.LayoutKind (
+  layout,
+  header,
+  footer,
+  body,
+  content,
+  title,
+  text,
+  image
+);
+
+create enumeration KeywordTest.MiscKeywords (
+  action,
+  source,
+  Target,
+  Name,
+  value,
+  Result,
+  index,
+  Input,
+  Output,
+  sort,
+  Order,
+  commit,
+  close,
+  refresh,
+  rollback
+);
+
+-- MARK: Entity names and attributes that are keywords
+
+create entity KeywordTest.data (
+  filter     : string(200),
+  match      : string(200),
+  container  : string(200),
+  source     : string(200),
+  Target     : string(200),
+  action     : string(200),
+  value      : string(200),
+  status     : string(200)
+);
+
+create entity KeywordTest.activity (
+  Name       : string(200),
+  Result     : string(200)
+);
+
+-- MARK: Microflow using keyword-named enum values in CREATE
+
+create or replace microflow KeywordTest.TestKeywordEnumValues ()
+returns nothing
+begin
+  $Issue = create KeywordTest.data (
+    filter = 'test',
+    match  = 'test',
+    status = 'active'
+  );
+
+  $activity = create KeywordTest.activity (
+    Name   = 'test',
+    Result = 'ok'
+  );
+end;

@@ -5,6 +5,7 @@ package docker
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -64,16 +65,48 @@ func ExecuteOQL(opts OQLOptions, query string) (*OQLResult, error) {
 		"numberHandling": "asString",
 	}
 
-	resp, err := CallM2EE(m2eeOpts, "preview_execute_oql", params)
+	// Mendix 11.11+ serves OQL preview as a REST endpoint
+	// (POST /dev/preview_execute_oql with the params as the body, returning
+	// {"data":[...]} directly). Try it first; on older runtimes it 404s and we
+	// fall back to the legacy M2EE action (POST / with {"action","params"}).
+	raw, err := previewOQLDev(m2eeOpts, params)
+	if errors.Is(err, errDevEndpointNotFound) {
+		resp, lerr := CallM2EE(m2eeOpts, "preview_execute_oql", params)
+		if lerr != nil {
+			return nil, lerr
+		}
+		if errMsg := resp.M2EEError(); errMsg != "" {
+			return nil, fmt.Errorf("OQL error: %s", errMsg)
+		}
+		return parseOQLFeedback(resp.RawFeedback)
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	if errMsg := resp.M2EEError(); errMsg != "" {
+	// The dev endpoint reports query failures as HTTP 200 with an {"error":"..."}
+	// body (no "data"), so a bad query must be surfaced here rather than parsed
+	// as an empty result.
+	if errMsg := oqlDevError(raw); errMsg != "" {
 		return nil, fmt.Errorf("OQL error: %s", errMsg)
 	}
 
-	return parseOQLFeedback(resp.RawFeedback)
+	return parseOQLFeedback(raw)
+}
+
+// oqlDevError returns the message from a dev-endpoint error response
+// ({"error":"..."}), or "" when the body carries no error field.
+func oqlDevError(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var env struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return ""
+	}
+	return env.Error
 }
 
 // parseOQLFeedback extracts OQL results from the raw M2EE feedback JSON,

@@ -19,7 +19,7 @@ Go backend (mxcli)  →  Mermaid.js  →  SVG in WebviewPanel
 MPR file
   │  (modelsdk-go reads BSON)
   ▼
-Entity / Microflow / Page structs
+entity / microflow / page structs
   │  (cmd_mermaid.go formats)
   ▼
 Mermaid text + %% metadata comments
@@ -32,7 +32,7 @@ WebviewPanel loads HTML page
   │  (mermaid.run() in browser)
   ▼
 SVG elements in DOM
-  │  (postRender JavaScript)
+  │  (postRender javascript)
   ▼
 Colored, interactive, pannable diagram
 ```
@@ -47,6 +47,7 @@ The Go backend reads Mendix model data from the MPR file and outputs **Mermaid s
 |----------|-------------|-------------|
 | Domain Model | `erDiagram` | Entities, attributes, associations, generalizations |
 | Microflow | `flowchart LR` | Activities, splits, merge points, sequence flows |
+| Nanoflow | `flowchart LR` | Same as microflow (shares flow rendering) |
 | Page | `block-beta` | Widget tree structure |
 
 ### Domain Model Example
@@ -54,12 +55,12 @@ The Go backend reads Mendix model data from the MPR file and outputs **Mermaid s
 ```mermaid
 erDiagram
     Customer {
-        String Name
-        Boolean IsActive
+        string Name
+        boolean IsActive
     }
     Order {
-        Integer OrderNumber
-        DateTime OrderDate
+        integer OrderNumber
+        datetime OrderDate
     }
     Customer ||--o{ Order : "Customer_Order"
 ```
@@ -84,7 +85,7 @@ The Go backend appends metadata as Mermaid comments (`%%`) that Mermaid ignores 
 | `%% @type` | Diagram type identifier | `%% @type flowchart` |
 | `%% @direction` | Flow direction (LR or TD) | `%% @direction LR` |
 | `%% @colors` | Entity type classification for coloring | `%% @colors {"Customer":"persistent","OrderView":"view"}` |
-| `%% @nodeinfo` | Activity detail properties for expand/click | `%% @nodeinfo {"n_def":["Entity: Module.Customer","Output: $NewCustomer"]}` |
+| `%% @nodeinfo` | Activity detail properties for expand/click | `%% @nodeinfo {"n_def":["entity: Module.Customer","Output: $NewCustomer"]}` |
 
 ### Entry Point
 
@@ -167,7 +168,7 @@ SVG (Scalable Vector Graphics) is an XML-based vector graphics format that brows
   <g id="entity-Customer" class="er entity">
     <rect class="er entityBox" x="10" y="10" width="150" height="80" />
     <text class="er entityLabel" x="85" y="35">Customer</text>
-    <text x="85" y="55">String Name</text>
+    <text x="85" y="55">string Name</text>
   </g>
   <path d="M160,50 L300,50" class="er relationshipLine" />
   ...
@@ -232,9 +233,9 @@ VS Code's `WebviewPanel` is an embedded Chromium iframe. The `MdlPreviewProvider
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│ Toolbar: [title] [zoom%] [Fit] [+] [-] [↕LR] [Details] [Source] [Copy] │
+│ Toolbar: [title] [zoom%] [Fit] [+] [-] [↕LR] [Details] [source] [Copy] │
 ├──────────────────────────────────────────────────────┤
-│ Legend: ■ Persistent  ■ Non-Persistent  ■ External  ■ View              │
+│ Legend: ■ persistent  ■ non-persistent  ■ external  ■ view              │
 ├──────────────────────────────────────────────────────┤
 │                                                      │
 │  diagram-viewport (pan/zoom container)               │

@@ -6,7 +6,7 @@ import (
 	"database/sql"
 	"fmt"
 
-	"github.com/mendixlabs/mxcli/sdk/mpr"
+	"github.com/mendixlabs/mxcli/mdl/types"
 )
 
 func (b *Builder) buildNavigation() error {
@@ -19,12 +19,11 @@ func (b *Builder) buildNavigation() error {
 	}
 
 	profileStmt, err := b.tx.Prepare(`
-		INSERT INTO navigation_profiles (ProfileName, Kind, IsNative,
+		INSERT INTO navigation_profiles_data (ProfileName, Kind, IsNative,
 			HomePage, HomePageType, LoginPage, NotFoundPage,
 			MenuItemCount, RoleBasedHomeCount, OfflineEntityCount,
-			ProjectId, ProjectName, SnapshotId, SnapshotDate, SnapshotSource,
-			SourceId, SourceBranch, SourceRevision)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			ProjectId, SnapshotId)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -52,7 +51,7 @@ func (b *Builder) buildNavigation() error {
 	}
 	defer roleHomeStmt.Close()
 
-	projectID, projectName, snapshotID, snapshotDate, snapshotSource, sourceID, sourceBranch, sourceRevision := b.snapshotMeta()
+	projectID, snapshotID := b.snapshotMeta()
 
 	profileCount := 0
 	menuCount := 0
@@ -91,8 +90,7 @@ func (b *Builder) buildNavigation() error {
 			totalMenuItems,
 			len(profile.RoleBasedHomePages),
 			len(profile.OfflineEntities),
-			projectID, projectName, snapshotID, snapshotDate, snapshotSource,
-			sourceID, sourceBranch, sourceRevision,
+			projectID, snapshotID,
 		)
 		if err != nil {
 			return err
@@ -129,7 +127,7 @@ func (b *Builder) buildNavigation() error {
 }
 
 // countMenuItems recursively counts all menu items.
-func countMenuItems(items []*mpr.NavMenuItem) int {
+func countMenuItems(items []*types.NavMenuItem) int {
 	count := len(items)
 	for _, item := range items {
 		count += countMenuItems(item.Items)
@@ -138,7 +136,7 @@ func countMenuItems(items []*mpr.NavMenuItem) int {
 }
 
 // insertMenuItems recursively inserts menu items with hierarchical path encoding.
-func insertMenuItems(stmt *sql.Stmt, profileName string, items []*mpr.NavMenuItem, parentPath string, depth int, projectID, snapshotID string) int {
+func insertMenuItems(stmt *sql.Stmt, profileName string, items []*types.NavMenuItem, parentPath string, depth int, projectID, snapshotID string) int {
 	count := 0
 	for i, item := range items {
 		itemPath := fmt.Sprintf("%d", i)

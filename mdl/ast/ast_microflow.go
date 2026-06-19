@@ -65,6 +65,28 @@ type DropMicroflowStmt struct {
 
 func (s *DropMicroflowStmt) isStatement() {}
 
+// CreateNanoflowStmt represents: CREATE NANOFLOW Module.Name (params) RETURNS type BEGIN body END
+type CreateNanoflowStmt struct {
+	Name           QualifiedName
+	Parameters     []MicroflowParam
+	ReturnType     *MicroflowReturnType
+	Body           []MicroflowStatement
+	Documentation  string
+	Comment        string
+	Folder         string // Folder path within module
+	CreateOrModify bool
+	Excluded       bool // @excluded — document excluded from project
+}
+
+func (s *CreateNanoflowStmt) isStatement() {}
+
+// DropNanoflowStmt represents: DROP NANOFLOW Module.Name
+type DropNanoflowStmt struct {
+	Name QualifiedName
+}
+
+func (s *DropNanoflowStmt) isStatement() {}
+
 // ============================================================================
 // Microflow Body Statements
 // ============================================================================
@@ -78,6 +100,47 @@ type DeclareStmt struct {
 }
 
 func (s *DeclareStmt) isMicroflowStatement() {}
+
+// EnumSplitCase represents one enumeration branch in an EnumSplit.
+type EnumSplitCase struct {
+	Value  string // First enumeration value, or "(empty)" for Mendix's empty enum case.
+	Values []string
+	Body   []MicroflowStatement
+}
+
+// EnumSplitStmt represents: CASE $Var WHEN value THEN body ... END CASE
+type EnumSplitStmt struct {
+	Variable    string // Variable or attribute path without $ prefix (e.g. EventType or Event/EventType)
+	Cases       []EnumSplitCase
+	ElseBody    []MicroflowStatement
+	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+}
+
+// InheritanceSplitCase represents one typed branch in an inheritance split.
+type InheritanceSplitCase struct {
+	Entity QualifiedName
+	Body   []MicroflowStatement
+}
+
+// InheritanceSplitStmt represents: SPLIT TYPE $Var ... END SPLIT
+type InheritanceSplitStmt struct {
+	Variable    string // Variable name without $ prefix
+	Cases       []InheritanceSplitCase
+	ElseBody    []MicroflowStatement
+	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+}
+
+func (s *EnumSplitStmt) isMicroflowStatement()        {}
+func (s *InheritanceSplitStmt) isMicroflowStatement() {}
+
+// CastObjectStmt represents: $Output = CAST $Object
+type CastObjectStmt struct {
+	OutputVariable string               // Output variable name without $ prefix
+	ObjectVariable string               // Source object variable name without $ prefix
+	Annotations    *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+}
+
+func (s *CastObjectStmt) isMicroflowStatement() {}
 
 // MfSetStmt represents: SET $Var = expr or SET $Var/Attr = expr
 // (Named MfSetStmt to avoid conflict with existing SetStmt for SET key = value)
@@ -105,14 +168,49 @@ type RaiseErrorStmt struct {
 
 func (s *RaiseErrorStmt) isMicroflowStatement() {}
 
+// AnchorSide identifies one of the four sides of an activity's visual box
+// that a SequenceFlow attaches to.
+type AnchorSide int
+
+const (
+	AnchorSideUnset  AnchorSide = -1
+	AnchorSideTop    AnchorSide = 0
+	AnchorSideRight  AnchorSide = 1
+	AnchorSideBottom AnchorSide = 2
+	AnchorSideLeft   AnchorSide = 3
+)
+
+// FlowAnchors captures the origin/destination anchors for a single
+// SequenceFlow. Each side is independently optional: Unset means the builder
+// should derive the anchor from the visual direction.
+type FlowAnchors struct {
+	From AnchorSide // OriginConnectionIndex on the outgoing SequenceFlow
+	To   AnchorSide // DestinationConnectionIndex on the outgoing SequenceFlow
+}
+
 // ActivityAnnotations holds metadata annotations for microflow activities.
-// These are emitted as @position, @caption, @color, @annotation, @excluded lines in MDL.
+// These are emitted as @position, @caption, @color, @annotation, @excluded, @anchor lines in MDL.
 type ActivityAnnotations struct {
-	Position       *Position // @position(x, y)
-	Caption        string    // @caption 'text'
-	Color          string    // @color Green
-	AnnotationText string    // @annotation 'text'
-	Excluded       bool      // @excluded
+	Position        *Position    // @position(x, y)
+	Caption         string       // @caption 'text'
+	Color           string       // @color Green
+	AnnotationText  string       // @annotation 'text'
+	FreeAnnotations []string     // Multiple free-floating @annotation lines in source order
+	Excluded        bool         // @excluded
+	Anchor          *FlowAnchors // @anchor(from: X, to: Y) — anchors of the flow leaving this statement
+
+	// Split-specific anchors for IF statements. When the statement is not an
+	// IF these remain nil. The grammar accepts them on IfStmt only:
+	//   @anchor(true: (from: right, to: left), false: (from: bottom, to: left))
+	TrueBranchAnchor  *FlowAnchors
+	FalseBranchAnchor *FlowAnchors
+
+	// Loop body anchors for LOOP/WHILE. IteratorAnchor is the flow that
+	// enters the loop body from the iterator; BodyTailAnchor is the flow
+	// from the last body statement back to the loop boundary. Both are only
+	// populated on LoopStmt/WhileStmt.
+	IteratorAnchor *FlowAnchors
+	BodyTailAnchor *FlowAnchors
 }
 
 // ChangeItem represents a single assignment in CREATE/CHANGE: Attr = expr
@@ -134,9 +232,10 @@ func (s *CreateObjectStmt) isMicroflowStatement() {}
 
 // ChangeObjectStmt represents: CHANGE $Var (assignments)
 type ChangeObjectStmt struct {
-	Variable    string               // Variable name
-	Changes     []ChangeItem         // SET assignments
-	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	Variable        string               // Variable name
+	Changes         []ChangeItem         // SET assignments
+	RefreshInClient bool                 // Whether to refresh in client
+	Annotations     *ActivityAnnotations // Optional @position, @caption, @color, @annotation
 }
 
 func (s *ChangeObjectStmt) isMicroflowStatement() {}
@@ -191,6 +290,7 @@ type IfStmt struct {
 	Condition   Expression           // IF condition
 	ThenBody    []MicroflowStatement // THEN branch
 	ElseBody    []MicroflowStatement // ELSE branch (optional)
+	HasElse     bool                 // true when the source contained ELSE, even if the body is empty
 	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
 }
 
@@ -261,10 +361,10 @@ func (p *TemplateParam) IsDataSourceRef() bool {
 	return p.DataSourceName != ""
 }
 
-// LogStmt represents: LOG LEVEL NODE 'node' 'message' [WITH params]
+// LogStmt represents: LOG LEVEL [NODE expr] message [WITH params]
 type LogStmt struct {
 	Level       LogLevel             // Log level (INFO, WARNING, etc.)
-	Node        string               // Log node name
+	Node        Expression           // Optional log node expression
 	Message     Expression           // Message expression
 	Template    []TemplateParam      // Optional WITH template params
 	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
@@ -289,6 +389,17 @@ type CallMicroflowStmt struct {
 
 func (s *CallMicroflowStmt) isMicroflowStatement() {}
 
+// CallNanoflowStmt represents: [$Result =] CALL NANOFLOW Name (args) [ON ERROR ...]
+type CallNanoflowStmt struct {
+	OutputVariable string               // Optional output variable
+	NanoflowName   QualifiedName        // Nanoflow to call
+	Arguments      []CallArgument       // Arguments
+	ErrorHandling  *ErrorHandlingClause // Optional ON ERROR clause
+	Annotations    *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+}
+
+func (s *CallNanoflowStmt) isMicroflowStatement() {}
+
 // CallJavaActionStmt represents: CALL JAVA ACTION Name (args) [ON ERROR ...]
 type CallJavaActionStmt struct {
 	OutputVariable string               // Optional output variable
@@ -299,6 +410,32 @@ type CallJavaActionStmt struct {
 }
 
 func (s *CallJavaActionStmt) isMicroflowStatement() {}
+
+// CallJavaScriptActionStmt represents: CALL JAVASCRIPT ACTION Name (args) [ON ERROR ...]
+type CallJavaScriptActionStmt struct {
+	OutputVariable string               // Optional output variable
+	ActionName     QualifiedName        // JavaScript action name
+	Arguments      []CallArgument       // Arguments
+	ErrorHandling  *ErrorHandlingClause // Optional ON ERROR clause
+	Annotations    *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+}
+
+func (s *CallJavaScriptActionStmt) isMicroflowStatement() {}
+
+// CallWebServiceStmt represents a legacy SOAP web service call.
+type CallWebServiceStmt struct {
+	OutputVariable   string               // Optional output variable
+	RawBSONBase64    string               // Raw Microflows$CallWebServiceAction BSON for lossless roundtrip
+	ServiceID        string               // Consumed web service ID or qualified name
+	OperationName    string               // Operation name
+	SendMappingID    string               // Optional export mapping ID or qualified name
+	ReceiveMappingID string               // Optional import mapping ID or qualified name
+	Timeout          Expression           // Optional timeout expression
+	ErrorHandling    *ErrorHandlingClause // Optional ON ERROR clause
+	Annotations      *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+}
+
+func (s *CallWebServiceStmt) isMicroflowStatement() {}
 
 // ExecuteDatabaseQueryStmt represents: EXECUTE DATABASE QUERY Module.Connection.QueryName ...
 type ExecuteDatabaseQueryStmt struct {
@@ -357,6 +494,7 @@ const (
 	ListOpSubtract
 	ListOpContains
 	ListOpEquals
+	ListOpRange
 )
 
 func (t ListOperationType) String() string {
@@ -381,6 +519,8 @@ func (t ListOperationType) String() string {
 		return "CONTAINS"
 	case ListOpEquals:
 		return "EQUALS"
+	case ListOpRange:
+		return "RANGE"
 	default:
 		return "UNKNOWN"
 	}
@@ -404,6 +544,8 @@ type ListOperationStmt struct {
 	SecondVariable string               // Second operand for UNION, INTERSECT, SUBTRACT, CONTAINS, EQUALS
 	Condition      Expression           // Condition for FIND/FILTER
 	SortSpecs      []SortSpec           // Sort specifications for SORT
+	OffsetExpr     Expression           // Offset expression for RANGE
+	LimitExpr      Expression           // Limit expression for RANGE
 	Annotations    *ActivityAnnotations // Optional @position, @caption, @color, @annotation
 }
 
@@ -418,6 +560,7 @@ const (
 	AggregateAverage
 	AggregateMinimum
 	AggregateMaximum
+	AggregateReduce
 )
 
 func (t AggregateListOperationType) String() string {
@@ -432,6 +575,8 @@ func (t AggregateListOperationType) String() string {
 		return "MINIMUM"
 	case AggregateMaximum:
 		return "MAXIMUM"
+	case AggregateReduce:
+		return "REDUCE"
 	default:
 		return "UNKNOWN"
 	}
@@ -440,11 +585,14 @@ func (t AggregateListOperationType) String() string {
 // AggregateListStmt represents aggregate operations: COUNT, SUM, AVERAGE, etc.
 // $Count = COUNT($List)
 // $Sum = SUM($List/Attr)
+// $Sum = SUM($List, $currentObject/Price * 2)  // expression form
 type AggregateListStmt struct {
 	OutputVariable string                     // Output variable name
 	Operation      AggregateListOperationType // Operation type
 	InputVariable  string                     // Input list variable
-	Attribute      string                     // Attribute name for SUM/AVG/MIN/MAX (empty for COUNT)
+	Attribute      string                     // Attribute name for SUM/AVG/MIN/MAX (empty for COUNT or expression form)
+	IsExpression   bool                       // true when Expression is used instead of Attribute
+	Expression     Expression                 // Mendix expression (when IsExpression=true)
 	Annotations    *ActivityAnnotations       // Optional @position, @caption, @color, @annotation
 }
 
@@ -459,9 +607,10 @@ type CreateListStmt struct {
 
 func (s *CreateListStmt) isMicroflowStatement() {}
 
-// AddToListStmt represents: ADD $Item TO $List
+// AddToListStmt represents: ADD expr TO $List
 type AddToListStmt struct {
-	Item        string               // Item variable to add
+	Item        string               // Item variable to add, kept for simple $Var compatibility
+	Value       Expression           // Item expression to add
 	List        string               // Target list variable
 	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
 }
@@ -524,6 +673,16 @@ type ShowMessageStmt struct {
 }
 
 func (s *ShowMessageStmt) isMicroflowStatement() {}
+
+// DownloadFileStmt represents: DOWNLOAD FILE $FileDocument [SHOW IN BROWSER]
+type DownloadFileStmt struct {
+	FileDocument  string               // File document variable without $ prefix
+	ShowInBrowser bool                 // Whether the file opens in the browser
+	ErrorHandling *ErrorHandlingClause // Optional ON ERROR clause
+	Annotations   *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+}
+
+func (s *DownloadFileStmt) isMicroflowStatement() {}
 
 // ValidationFeedbackStmt represents: VALIDATION FEEDBACK $Var/Attr MESSAGE 'message' OBJECTS [$Var1, $Var2];
 type ValidationFeedbackStmt struct {
@@ -595,6 +754,13 @@ type RestResult struct {
 	Type         RestResultType // Result type
 	MappingName  QualifiedName  // Import mapping name (for Mapping type)
 	ResultEntity QualifiedName  // Result entity type (for Mapping type)
+	// IsList distinguishes `as Module.Entity` (single object) from
+	// `as list of Module.Entity` (list). Studio Pro stores this on the
+	// microflow's ImportMappingCall (Range.SingleObject /
+	// ForceSingleOccurrence), independently of whether the underlying
+	// import mapping is list-typed: the same mapping can yield either a
+	// single object or a list depending on this flag.
+	IsList bool
 }
 
 // RestCallStmt represents: $Var = REST CALL METHOD url [HEADER ...] [AUTH ...] [BODY ...] [TIMEOUT ...] RETURNS ...
@@ -657,11 +823,11 @@ func (s *ExportToMappingStmt) isMicroflowStatement() {}
 
 // TransformJsonStmt represents: $Result = TRANSFORM $Input WITH Module.Transformer
 type TransformJsonStmt struct {
-	OutputVariable  string               // Result string variable (without $)
-	InputVariable   string               // Source JSON string variable (without $)
-	Transformation  QualifiedName        // Data transformer qualified name
-	ErrorHandling   *ErrorHandlingClause // Optional ON ERROR clause
-	Annotations     *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	OutputVariable string               // Result string variable (without $)
+	InputVariable  string               // Source JSON string variable (without $)
+	Transformation QualifiedName        // Data transformer qualified name
+	ErrorHandling  *ErrorHandlingClause // Optional ON ERROR clause
+	Annotations    *ActivityAnnotations // Optional @position, @caption, @color, @annotation
 }
 
 func (s *TransformJsonStmt) isMicroflowStatement() {}

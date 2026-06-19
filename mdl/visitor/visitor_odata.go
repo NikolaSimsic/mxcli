@@ -49,7 +49,16 @@ func (b *Builder) ExitCreateODataClientStatement(ctx *parser.CreateODataClientSt
 			stmt.HttpPassword = value
 		case "clientcertificate":
 			stmt.ClientCertificate = value
-		case "configurationmicroflow":
+		case "configurationmicroflow", "headersmicroflow":
+			// Both MDL property names map to the same BSON field
+			// `ConfigurationMicroflow`. Studio Pro distinguishes the
+			// "Configuration microflow" and "Headers microflow"
+			// dropdown options by the microflow's return type:
+			//   - returns System.ConsumedODataConfiguration -> Config
+			//   - returns list of System.HttpHeader         -> Headers
+			// The `HeadersMicroflow` keyword stays for ergonomic MDL
+			// (so the example MDL can self-document which signature
+			// the referenced microflow is expected to have).
 			stmt.ConfigurationMicroflow = value
 		case "errorhandlingmicroflow":
 			stmt.ErrorHandlingMicroflow = value
@@ -164,19 +173,23 @@ func (b *Builder) ExitCreateExternalEntityStatement(ctx *parser.CreateExternalEn
 		name := identifierOrKeywordText(prop.IdentifierOrKeyword())
 		value := odataAssignmentValueText(prop)
 
+		boolVal := strings.EqualFold(value, "true") || strings.EqualFold(value, "yes")
+		strVal := value
 		switch strings.ToLower(name) {
 		case "entityset":
-			stmt.EntitySet = value
+			stmt.EntitySet = &strVal
 		case "remotename":
-			stmt.RemoteName = value
+			stmt.RemoteName = &strVal
 		case "countable":
-			stmt.Countable = strings.EqualFold(value, "true") || strings.EqualFold(value, "yes")
+			stmt.Countable = &boolVal
 		case "creatable":
-			stmt.Creatable = strings.EqualFold(value, "true") || strings.EqualFold(value, "yes")
+			stmt.Creatable = &boolVal
 		case "deletable":
-			stmt.Deletable = strings.EqualFold(value, "true") || strings.EqualFold(value, "yes")
+			stmt.Deletable = &boolVal
 		case "updatable":
-			stmt.Updatable = strings.EqualFold(value, "true") || strings.EqualFold(value, "yes")
+			stmt.Updatable = &boolVal
+		case "allowcreatechangelocally", "allowcreatingandchanginglocally", "createchangelocally":
+			stmt.AllowCreateChangeLocally = &boolVal
 		}
 	}
 
@@ -266,6 +279,11 @@ func odataValueText(val *parser.OdataPropertyValueContext) string {
 			return "MICROFLOW " + getQualifiedNameText(qn)
 		}
 		return "MICROFLOW"
+	}
+	if val.AT() != nil {
+		if qn := val.QualifiedName(); qn != nil {
+			return "@" + getQualifiedNameText(qn)
+		}
 	}
 	if qn := val.QualifiedName(); qn != nil {
 		return getQualifiedNameText(qn)
@@ -382,12 +400,12 @@ func parseExposeMembers(ctx parser.IExposeClauseContext) []*ast.PublishedMemberD
 		member := memberCtx.(*parser.ExposeMemberContext)
 
 		// Guard against incomplete parse (e.g., user typing in LSP)
-		if member.IDENTIFIER() == nil {
+		if member.IdentifierOrKeyword() == nil {
 			continue
 		}
 
 		m := &ast.PublishedMemberDef{
-			Name: member.IDENTIFIER().GetText(),
+			Name: member.IdentifierOrKeyword().GetText(),
 		}
 
 		// Optional AS 'ExposedName'
@@ -398,13 +416,13 @@ func parseExposeMembers(ctx parser.IExposeClauseContext) []*ast.PublishedMemberD
 		// Optional options (Filterable, Sortable, IsPartOfKey)
 		if opts := member.ExposeMemberOptions(); opts != nil {
 			optsCtx := opts.(*parser.ExposeMemberOptionsContext)
-			for _, id := range optsCtx.AllIDENTIFIER() {
+			for _, id := range optsCtx.AllIdentifierOrKeyword() {
 				switch strings.ToLower(id.GetText()) {
 				case "filterable":
 					m.Filterable = true
 				case "sortable":
 					m.Sortable = true
-				case "ispartofkey":
+				case "key", "ispartofkey":
 					m.IsPartOfKey = true
 				}
 			}

@@ -60,11 +60,12 @@ type WidgetV3 struct {
 
 // DataSourceV3 represents a V3 datasource expression.
 type DataSourceV3 struct {
-	Type      string          // "parameter", "database", "microflow", "nanoflow", "association", "selection"
-	Reference string          // Entity name, flow name, widget name, or parameter name
-	Args      []FlowArgV3     // Arguments for microflow/nanoflow calls
-	Where     string          // XPath constraint (for database source)
-	OrderBy   []OrderByItemV3 // Sort order (for database source)
+	Type            string          // "parameter", "database", "microflow", "nanoflow", "association", "selection"
+	Reference       string          // Entity name, flow name, widget name, or parameter name
+	ContextVariable string          // Context variable name (for association source: $currentObject → "currentObject")
+	Args            []FlowArgV3     // Arguments for microflow/nanoflow calls
+	Where           string          // XPath constraint (for database source)
+	OrderBy         []OrderByItemV3 // Sort order (for database source)
 }
 
 // FlowArgV3 represents an argument for microflow/nanoflow/page calls.
@@ -107,10 +108,13 @@ type ParamAssignmentV3 struct {
 	Value any // Expression value
 }
 
-// DesignPropertyEntryV3 represents a single design property key-value pair.
+// DesignPropertyEntryV3 represents a single design property entry. It is either
+// flat (Value set) or compound (Nested set) — a compound property's value is
+// itself a list of sub-properties, e.g. 'Spacing': ['margin-top': 'Large', …].
 type DesignPropertyEntryV3 struct {
-	Key   string // e.g., "Spacing top"
-	Value string // e.g., "Large", "ON", "OFF"
+	Key    string                  // e.g., "Spacing top" or "Spacing"
+	Value  string                  // flat value: "Large", "on", "off" (empty when Nested is set)
+	Nested []DesignPropertyEntryV3 // compound sub-properties (empty for a flat property)
 }
 
 // Helper functions to extract typed properties from WidgetV3
@@ -251,6 +255,20 @@ func (w *WidgetV3) GetAttr() string {
 // GetSnippet returns the Snippet property (qualified name) or empty string.
 func (w *WidgetV3) GetSnippet() string {
 	return w.GetStringProp("Snippet")
+}
+
+// SnippetCallParam represents one parameter mapping in a SNIPPETCALL Params: block.
+type SnippetCallParam struct {
+	ParamName string // Parameter name as written (may include leading $)
+	Variable  string // Variable being passed, always includes leading $
+}
+
+// GetSnippetParams returns the Params mappings for a SNIPPETCALL widget, or nil.
+func (w *WidgetV3) GetSnippetParams() []SnippetCallParam {
+	if v, ok := w.Properties["Params"].([]SnippetCallParam); ok {
+		return v
+	}
+	return nil
 }
 
 // GetSelection returns the Selection mode or empty string.

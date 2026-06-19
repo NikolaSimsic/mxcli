@@ -4,7 +4,9 @@ package mpr
 
 import (
 	"fmt"
+	"strings"
 
+	"github.com/mendixlabs/mxcli/mdl/bsonutil"
 	"github.com/mendixlabs/mxcli/model"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -170,20 +172,59 @@ func (w *Writer) RemoveFromAllowedRoles(unitID model.ID, roleName string) (bool,
 // ============================================================================
 
 // AddModuleRole adds a new module role to the module's Security$ModuleSecurity unit.
+// If a role with the same name (case-insensitive) already exists, the existing role's
+// Name is overwritten with the caller-supplied casing and Description is updated.
+// Mendix Studio Pro rejects case-insensitive duplicate role names with CE0123, so
+// merging into the existing entry matches runtime semantics — and preserves the
+// caller's casing for downstream case-sensitive lookups (e.g., GRANT ACCESS TO x.user).
 func (w *Writer) AddModuleRole(unitID model.ID, roleName, description string) error {
 	return w.readPatchWrite(unitID, func(doc bson.D) (bson.D, error) {
+		// Get existing ModuleRoles array
+		existing := getBsonArray(doc, "ModuleRoles")
+		if existing == nil {
+			existing = bson.A{int32(1)}
+		}
+
+		// If a case-insensitive duplicate already exists, overwrite its Name and
+		// Description with the caller's values. This keeps the ID stable (any
+		// references to it remain valid) while adopting the newly-requested casing.
+		for i, item := range existing {
+			role, ok := item.(bson.D)
+			if !ok {
+				continue
+			}
+			matched := false
+			for _, field := range role {
+				if field.Key == "Name" {
+					if name, ok := field.Value.(string); ok && strings.EqualFold(name, roleName) {
+						matched = true
+					}
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+			for j, field := range role {
+				switch field.Key {
+				case "Name":
+					role[j].Value = roleName
+				case "Description":
+					if description != "" {
+						role[j].Value = description
+					}
+				}
+			}
+			existing[i] = role
+			return setBsonField(doc, "ModuleRoles", existing), nil
+		}
+
 		// Build the new role BSON document
 		newRole := bson.D{
 			{Key: "$Type", Value: "Security$ModuleRole"},
 			{Key: "$ID", Value: idToBsonBinary(generateUUID())},
 			{Key: "Name", Value: roleName},
 			{Key: "Description", Value: description},
-		}
-
-		// Get existing ModuleRoles array
-		existing := getBsonArray(doc, "ModuleRoles")
-		if existing == nil {
-			existing = bson.A{int32(1)}
 		}
 
 		existing = append(existing, newRole)
@@ -211,7 +252,7 @@ func (w *Writer) RemoveModuleRole(unitID model.ID, roleName string) error {
 				name := ""
 				for _, f := range roleDoc {
 					if f.Key == "Name" {
-						name, _ = f.Value.(string)
+						name = bsonutil.String(f.Value, "Name")
 						break
 					}
 				}
@@ -285,7 +326,7 @@ func (w *Writer) AlterUserRoleModuleRoles(unitID model.ID, userRoleName string, 
 			name := ""
 			for _, f := range roleDoc {
 				if f.Key == "Name" {
-					name, _ = f.Value.(string)
+					name = bsonutil.String(f.Value, "Name")
 					break
 				}
 			}
@@ -436,7 +477,7 @@ func (w *Writer) RemoveUserRole(unitID model.ID, name string) error {
 				roleName := ""
 				for _, f := range roleDoc {
 					if f.Key == "Name" {
-						roleName, _ = f.Value.(string)
+						roleName = bsonutil.String(f.Value, "Name")
 						break
 					}
 				}
@@ -490,7 +531,7 @@ func (w *Writer) RemoveDemoUser(unitID model.ID, userName string) error {
 				name := ""
 				for _, f := range userDoc {
 					if f.Key == "UserName" {
-						name, _ = f.Value.(string)
+						name = bsonutil.String(f.Value, "UserName")
 						break
 					}
 				}
@@ -542,7 +583,7 @@ func (w *Writer) AddEntityAccessRule(unitID model.ID, entityName string, roleNam
 			name := ""
 			for _, f := range entityDoc {
 				if f.Key == "Name" {
-					name, _ = f.Value.(string)
+					name = bsonutil.String(f.Value, "Name")
 					break
 				}
 			}
@@ -727,11 +768,11 @@ func mergeAccessRule(existing, newRule bson.D) bson.D {
 			for _, mf := range maDoc {
 				switch mf.Key {
 				case "Attribute":
-					ref = mf.Value.(string)
+					ref = bsonutil.String(mf.Value, "Attribute")
 				case "Association":
-					ref = mf.Value.(string)
+					ref = bsonutil.String(mf.Value, "Association")
 				case "AccessRights":
-					rights, _ = mf.Value.(string)
+					rights = bsonutil.String(mf.Value, "AccessRights")
 				}
 			}
 			if ref != "" {
@@ -746,13 +787,13 @@ func mergeAccessRule(existing, newRule bson.D) bson.D {
 	for _, f := range existing {
 		switch f.Key {
 		case "AllowCreate":
-			existCreate, _ = f.Value.(bool)
+			existCreate = bsonutil.Bool(f.Value, "AllowCreate")
 		case "AllowDelete":
-			existDelete, _ = f.Value.(bool)
+			existDelete = bsonutil.Bool(f.Value, "AllowDelete")
 		case "DefaultMemberAccessRights":
-			existDefault, _ = f.Value.(string)
+			existDefault = bsonutil.String(f.Value, "DefaultMemberAccessRights")
 		case "XPathConstraint":
-			existXPath, _ = f.Value.(string)
+			existXPath = bsonutil.String(f.Value, "XPathConstraint")
 		}
 	}
 
@@ -760,18 +801,18 @@ func mergeAccessRule(existing, newRule bson.D) bson.D {
 	for i, f := range newRule {
 		switch f.Key {
 		case "AllowCreate":
-			newVal, _ := f.Value.(bool)
+			newVal := bsonutil.Bool(f.Value, "AllowCreate")
 			newRule[i].Value = newVal || existCreate
 		case "AllowDelete":
-			newVal, _ := f.Value.(bool)
+			newVal := bsonutil.Bool(f.Value, "AllowDelete")
 			newRule[i].Value = newVal || existDelete
 		case "DefaultMemberAccessRights":
-			newVal, _ := f.Value.(string)
+			newVal := bsonutil.String(f.Value, "DefaultMemberAccessRights")
 			if accessRightsLevel(existDefault) > accessRightsLevel(newVal) {
 				newRule[i].Value = existDefault
 			}
 		case "XPathConstraint":
-			newVal, _ := f.Value.(string)
+			newVal := bsonutil.String(f.Value, "XPathConstraint")
 			if newVal == "" && existXPath != "" {
 				newRule[i].Value = existXPath
 			}
@@ -789,11 +830,11 @@ func mergeAccessRule(existing, newRule bson.D) bson.D {
 				for _, mf := range maDoc {
 					switch mf.Key {
 					case "Attribute":
-						ref = mf.Value.(string)
+						ref = bsonutil.String(mf.Value, "Attribute")
 					case "Association":
-						ref = mf.Value.(string)
+						ref = bsonutil.String(mf.Value, "Association")
 					case "AccessRights":
-						newRights, _ = mf.Value.(string)
+						newRights = bsonutil.String(mf.Value, "AccessRights")
 					}
 				}
 				if ref == "" {
@@ -845,7 +886,7 @@ func (w *Writer) RemoveEntityAccessRule(unitID model.ID, entityName string, role
 			name := ""
 			for _, f := range entityDoc {
 				if f.Key == "Name" {
-					name, _ = f.Value.(string)
+					name = bsonutil.String(f.Value, "Name")
 					break
 				}
 			}
@@ -976,7 +1017,7 @@ func (w *Writer) RevokeEntityMemberAccess(unitID model.ID, entityName string, ro
 			name := ""
 			for _, f := range entityDoc {
 				if f.Key == "Name" {
-					name, _ = f.Value.(string)
+					name = bsonutil.String(f.Value, "Name")
 					break
 				}
 			}
@@ -1033,7 +1074,7 @@ func (w *Writer) RevokeEntityMemberAccess(unitID model.ID, entityName string, ro
 								ruleDoc[k].Value = "None"
 								ruleModified = true
 							} else if revocation.RevokeWriteAll {
-								cur, _ := rf.Value.(string)
+								cur := bsonutil.String(rf.Value, "DefaultMemberAccessRights")
 								if cur == "ReadWrite" {
 									ruleDoc[k].Value = "ReadOnly"
 									ruleModified = true
@@ -1053,11 +1094,11 @@ func (w *Writer) RevokeEntityMemberAccess(unitID model.ID, entityName string, ro
 								for _, mf := range maDoc {
 									switch mf.Key {
 									case "Attribute":
-										ref = mf.Value.(string)
+										ref = bsonutil.String(mf.Value, "Attribute")
 									case "Association":
-										ref = mf.Value.(string)
+										ref = bsonutil.String(mf.Value, "Association")
 									case "AccessRights":
-										rights, _ = mf.Value.(string)
+										rights = bsonutil.String(mf.Value, "AccessRights")
 									}
 								}
 								if ref == "" {
@@ -1227,7 +1268,7 @@ func (w *Writer) ReconcileMemberAccesses(unitID model.ID, moduleName string) (in
 			entityName := ""
 			for _, f := range entityDoc {
 				if f.Key == "Name" {
-					entityName, _ = f.Value.(string)
+					entityName = bsonutil.String(f.Value, "Name")
 					break
 				}
 			}
@@ -1248,7 +1289,7 @@ func (w *Writer) ReconcileMemberAccesses(unitID model.ID, moduleName string) (in
 				isCalculated := false
 				for _, f := range attrDoc {
 					if f.Key == "Name" {
-						attrName, _ = f.Value.(string)
+						attrName = bsonutil.String(f.Value, "Name")
 					}
 					if f.Key == "Value" {
 						if valueDoc, ok := f.Value.(bson.D); ok {
@@ -1323,7 +1364,7 @@ func (w *Writer) ReconcileMemberAccesses(unitID model.ID, moduleName string) (in
 					case "ParentPointer":
 						aParentID = extractBsonIDValue(f.Value)
 					case "Name":
-						aName, _ = f.Value.(string)
+						aName = bsonutil.String(f.Value, "Name")
 					}
 				}
 				if aParentID == entityID && aName != "" {
@@ -1342,7 +1383,7 @@ func (w *Writer) ReconcileMemberAccesses(unitID model.ID, moduleName string) (in
 						parentID = extractBsonIDValue(f.Value)
 					}
 					if f.Key == "Name" {
-						caName, _ = f.Value.(string)
+						caName = bsonutil.String(f.Value, "Name")
 					}
 				}
 				if parentID == entityID && caName != "" {
@@ -1421,10 +1462,10 @@ func (w *Writer) ReconcileMemberAccesses(unitID model.ID, moduleName string) (in
 							assocRef := ""
 							for _, mf := range maDoc {
 								if mf.Key == "Attribute" {
-									attrRef, _ = mf.Value.(string)
+									attrRef = bsonutil.String(mf.Value, "Attribute")
 								}
 								if mf.Key == "Association" {
-									assocRef, _ = mf.Value.(string)
+									assocRef = bsonutil.String(mf.Value, "Association")
 								}
 							}
 

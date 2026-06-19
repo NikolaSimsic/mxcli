@@ -36,9 +36,12 @@ reference/mdl-grammar/
 reference/mxbuild-11.6.0/
 /reference/
 mx-test-projects/*/
+mx-template-projects/
 tmp/
 
 # Generated files
+# ANTLR4 parser (regenerate with: make grammar)
+mdl/grammar/parser/
 *.pdf
 *.tar
 *.tgz
@@ -58,3 +61,5 @@ grammardoc
 
 # Snap tool binary (used for BSON fixture generation)
 snap-bson
+.playwright-cli/
+.claude/worktrees/

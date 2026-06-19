@@ -55,7 +55,7 @@ func (b *Builder) ExitCreateJavaActionStatement(ctx *parser.CreateJavaActionStat
 	// Get return type
 	if retType := ctx.JavaActionReturnType(); retType != nil {
 		if dt := retType.DataType(); dt != nil {
-			stmt.ReturnType = buildDataType(dt)
+			stmt.ReturnType = buildJavaActionReturnType(dt)
 		}
 	}
 
@@ -76,13 +76,19 @@ func (b *Builder) ExitCreateJavaActionStatement(ctx *parser.CreateJavaActionStat
 			code = code[2 : len(code)-2]
 		}
 		// Trim leading/trailing whitespace but preserve internal formatting
-		stmt.JavaCode = strings.TrimSpace(code)
+		code = strings.TrimSpace(code)
+		// Extract import lines so they go into the file-level import section,
+		// not into the executeAction() method body (a common AI agent mistake).
+		stmt.JavaCode, stmt.Imports = extractJavaImports(code)
 	}
 
-	// Check for documentation comment from parent createStatement
+	// Check for documentation comment and OR MODIFY/REPLACE from parent createStatement
 	if parent, ok := ctx.GetParent().(*parser.CreateStatementContext); ok {
 		if docComment := parent.DocComment(); docComment != nil {
 			stmt.Documentation = extractDocComment(docComment.GetText())
+		}
+		if parent.OR() != nil && (parent.MODIFY() != nil || parent.REPLACE() != nil) {
+			stmt.CreateOrModify = true
 		}
 	}
 
@@ -96,4 +102,51 @@ func (b *Builder) ExitCreateJavaActionStatement(ctx *parser.CreateJavaActionStat
 	}
 
 	b.statements = append(b.statements, stmt)
+}
+
+func buildJavaActionReturnType(ctx parser.IDataTypeContext) ast.DataType {
+	dt := buildDataType(ctx)
+	if isVoidReturnType(dt) {
+		return ast.DataType{Kind: ast.TypeVoid}
+	}
+	return dt
+}
+
+func isVoidReturnType(dt ast.DataType) bool {
+	var name ast.QualifiedName
+	switch dt.Kind {
+	case ast.TypeVoid:
+		return true
+	case ast.TypeEntity:
+		if dt.EntityRef == nil {
+			return false
+		}
+		name = *dt.EntityRef
+	case ast.TypeEnumeration:
+		if dt.EnumRef == nil {
+			return false
+		}
+		name = *dt.EnumRef
+	default:
+		return false
+	}
+	return name.Module == "" && strings.EqualFold(name.Name, "void")
+}
+
+// extractJavaImports separates `import ...;` lines from Java code.
+// Lines matching the Java import statement pattern are returned as imports;
+// the remaining lines form the method body. This handles the common case
+// where AI agents prepend import statements inside the $$ block, which
+// would otherwise end up as illegal Java inside executeAction().
+func extractJavaImports(code string) (body string, imports []string) {
+	var bodyLines []string
+	for _, line := range strings.Split(code, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "import ") && strings.HasSuffix(trimmed, ";") {
+			imports = append(imports, trimmed)
+		} else {
+			bodyLines = append(bodyLines, line)
+		}
+	}
+	return strings.TrimSpace(strings.Join(bodyLines, "\n")), imports
 }

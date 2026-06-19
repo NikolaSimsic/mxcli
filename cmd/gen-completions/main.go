@@ -133,10 +133,16 @@ func parseLexerGrammar(path string) ([]tokenEntry, error) {
 				continue
 			}
 
+			category := currentCategory
+			if tokenName == "RECEIVE" {
+				// RECEIVE is shared by REST and legacy SOAP call-web-service statements.
+				category = "Service keyword"
+			}
+
 			entries = append(entries, tokenEntry{
 				Name:     tokenName,
 				Text:     text,
-				Category: currentCategory,
+				Category: category,
 			})
 			continue
 		}
@@ -304,6 +310,8 @@ func normalizeCategoryName(raw string) string {
 		return "Connection keyword"
 	case strings.Contains(raw, "OQL"), strings.Contains(raw, "QUERY"):
 		return "Query keyword"
+	case strings.Contains(raw, "ANCHOR"):
+		return "Flow annotation keyword"
 	case strings.Contains(raw, "MICROFLOW"):
 		return "Microflow keyword"
 	case strings.Contains(raw, "PAGE"), strings.Contains(raw, "WIDGET"):

@@ -7,9 +7,9 @@ Custom lint rules are written in Starlark (a Python-like language) and placed in
 Every `.star` file must define metadata constants and a `check()` function:
 
 ```python
-RULE_ID = "CUSTOM001"          # Unique identifier
+RULE_ID = "CUSTOM001"          # unique identifier
 RULE_NAME = "MyRule"           # Short display name
-DESCRIPTION = "What it checks" # One-line description
+description = "What it checks" # One-line description
 CATEGORY = "security"          # Category: naming, quality, design, security, etc.
 SEVERITY = "warning"           # hint, info, warning, error
 
@@ -33,11 +33,60 @@ def check():
 | `activities_for(microflow_qualified_name)` | list of activity | Activities for a microflow (requires FULL catalog) |
 | `permissions()` | list of permission | All permissions across all element types |
 | `permissions_for(entity_qualified_name)` | list of permission | Access rules for a specific entity |
-| `refs_to(target_name)` | list of reference | Cross-references to a target |
+| `refs_to(target_name)` | list of reference | Cross-references *to* a target |
+| `refs_from(source_name)` | list of reference | Cross-references *from* a source (outbound) |
 | `user_roles()` | list of user_role | User roles from project security |
 | `module_roles()` | list of module_role | All module roles (deduplicated from role mappings) |
 | `role_mappings()` | list of role_mapping | User role to module role assignments |
 | `project_security()` | project_security or None | Project-level security settings (requires MPR reader) |
+
+### Graph-analysis functions (architecture rules)
+
+These expose the dependency-graph facts so you can enforce your **own**
+architecture policy (layering, allowed module dependencies, no cycles, coupling
+budgets). They require `refresh catalog communities` to have populated the graph
+tables; otherwise they return empty/None (the rule degrades gracefully — it does
+not fail). In a session, run `refresh catalog communities` before `lint`.
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `layer_of(asset)` | int or None | Topological layer sequence number (no opinion on ordering) |
+| `community_of(asset)` | struct{id, label} or None | The asset's detected community (bounded context) |
+| `cycles()` | list of struct{id, size, members} | Dependency cycles (SCCs > 1 node) |
+| `module_dependencies()` | list of struct{source_module, target_module, ref_kind, edges} | Directed module→module edges |
+| `centrality(asset)` | struct{in, out, total, pagerank, betweenness} or None | Centrality of an asset |
+| `god_nodes(metric="degree"\|"pagerank"\|"betweenness", min=N)` | list of struct{asset, object_type, module_name, degree, pagerank, betweenness} | High-centrality assets above a threshold |
+| `integration_surface()` | list of struct{source_community, target_community, ref_kind, edges, mechanism} | Cross-community contract edges (for app-splitting) |
+
+Example — a team enforcing *its own* strict layering (mxcli ships no such rule):
+
+```python
+RULE_ID = "ARCH900"
+RULE_NAME = "Layering"
+DESCRIPTION = "A module may only depend on lower or equal layers"
+CATEGORY = "architecture"
+SEVERITY = "error"
+
+def check():
+    out = []
+    for d in module_dependencies():
+        if d.ref_kind in ("layout", "show_page"):  # ignore UI navigation
+            continue
+        ls, lt = layer_of(d.source_module + ".x"), layer_of(d.target_module + ".x")
+        # (resolve a real asset per module in practice; shown simplified)
+        if ls != None and lt != None and ls < lt:
+            out.append(violation(message = "%s depends upward on %s" % (d.source_module, d.target_module)))
+    return out
+```
+
+Another team bans a specific dependency:
+
+```python
+def check():
+    return [violation(message = "Payments must not depend on Reporting")
+            for d in module_dependencies()
+            if d.source_module == "Payments" and d.target_module == "Reporting"]
+```
 
 ## Object Properties
 
@@ -49,7 +98,7 @@ def check():
 | `qualified_name` | string | `"Sales.Customer"` |
 | `module_name` | string | `"Sales"` |
 | `folder` | string | `"DomainModel"` — folder path within module |
-| `entity_type` | string | `"Persistent"`, `"NonPersistent"`, `"View"` |
+| `entity_type` | string | `"persistent"`, `"NonPersistent"`, `"view"` |
 | `description` | string | Documentation text |
 | `generalization` | string | Parent entity qualified name |
 | `attribute_count` | int | Number of attributes |
@@ -65,8 +114,8 @@ def check():
 | `name` | string | `"ACT_Customer_Create"` |
 | `qualified_name` | string | `"Sales.ACT_Customer_Create"` |
 | `module_name` | string | `"Sales"` |
-| `folder` | string | `"Microflows/Customer"` — folder path within module |
-| `microflow_type` | string | `"Microflow"` or `"Nanoflow"` |
+| `folder` | string | `"microflows/Customer"` — folder path within module |
+| `microflow_type` | string | `"microflow"` or `"nanoflow"` |
 | `description` | string | Documentation text |
 | `return_type` | string | Return type |
 | `parameter_count` | int | Number of parameters |
@@ -80,7 +129,7 @@ def check():
 | `name` | string | `"Customer_Overview"` |
 | `qualified_name` | string | `"Sales.Customer_Overview"` |
 | `module_name` | string | `"Sales"` |
-| `folder` | string | `"Pages/Customer"` — folder path within module |
+| `folder` | string | `"pages/Customer"` — folder path within module |
 | `title` | string | Page title |
 | `url` | string | Page URL |
 | `description` | string | Documentation text |
@@ -93,7 +142,7 @@ def check():
 | `name` | string | `"OrderStatus"` |
 | `qualified_name` | string | `"Sales.OrderStatus"` |
 | `module_name` | string | `"Sales"` |
-| `folder` | string | `"Enumerations"` — folder path within module |
+| `folder` | string | `"enumerations"` — folder path within module |
 | `description` | string | Documentation text |
 | `value_count` | int | Number of enum values |
 
@@ -102,10 +151,10 @@ def check():
 |----------|------|---------|
 | `id` | string | Widget UUID |
 | `name` | string | Widget name |
-| `widget_type` | string | `"DataView"`, `"ListView"`, etc. |
+| `widget_type` | string | `"dataview"`, `"listview"`, etc. |
 | `container_id` | string | Container UUID |
 | `container_qualified_name` | string | `"Sales.Customer_Overview"` |
-| `container_type` | string | `"Page"` or `"Snippet"` |
+| `container_type` | string | `"page"` or `"snippet"` |
 | `module_name` | string | `"Sales"` |
 | `entity_ref` | string | Referenced entity qualified name |
 | `attribute_ref` | string | Referenced attribute path |
@@ -117,7 +166,7 @@ def check():
 | `name` | string | `"SNIPPET_CustomerCard"` |
 | `qualified_name` | string | `"Sales.SNIPPET_CustomerCard"` |
 | `module_name` | string | `"Sales"` |
-| `folder` | string | `"Snippets"` — folder path within module |
+| `folder` | string | `"snippets"` — folder path within module |
 | `widget_count` | int | Number of widgets |
 
 ### attribute
@@ -128,7 +177,7 @@ def check():
 | `entity_id` | string | Parent entity UUID |
 | `entity_qualified_name` | string | `"Sales.Customer"` |
 | `module_name` | string | `"Sales"` |
-| `data_type` | string | `"String"`, `"Integer"`, `"DateTime"`, etc. |
+| `data_type` | string | `"string"`, `"integer"`, `"datetime"`, etc. |
 | `length` | int | Field length (for strings) |
 | `is_unique` | bool | Has unique constraint |
 | `is_required` | bool | Is required |
@@ -156,11 +205,11 @@ Returned by `permissions()` (all types) or `permissions_for()` (entity-specific)
 | Property | Type | Example |
 |----------|------|---------|
 | `module_role_name` | string | `"Admin"` |
-| `element_type` | string | `"ENTITY"`, `"MICROFLOW"`, `"PAGE"`, `"ODATA_SERVICE"` (from `permissions()` only) |
+| `element_type` | string | `"entity"`, `"microflow"`, `"page"`, `"ODATA_SERVICE"` (from `permissions()` only) |
 | `element_name` | string | `"Sales.Customer"` |
 | `module_name` | string | `"Sales"` |
 | `entity_name` | string | `"Sales.Customer"` (from `permissions_for()` only) |
-| `access_type` | string | `"CREATE"`, `"READ"`, `"WRITE"`, `"DELETE"`, `"EXECUTE"`, `"VIEW"`, `"ACCESS"`, `"MEMBER_READ"`, `"MEMBER_WRITE"` |
+| `access_type` | string | `"create"`, `"read"`, `"write"`, `"delete"`, `"execute"`, `"view"`, `"access"`, `"MEMBER_READ"`, `"MEMBER_WRITE"` |
 | `member_name` | string | Attribute name (for MEMBER_READ/MEMBER_WRITE) |
 | `xpath_constraint` | string | XPath constraint or empty |
 | `is_constrained` | bool | True if XPath constraint is set |
@@ -189,10 +238,10 @@ Returned by `permissions()` (all types) or `permissions_for()` (entity-specific)
 ### reference
 | Property | Type | Example |
 |----------|------|---------|
-| `source_type` | string | `"MICROFLOW"`, `"PAGE"`, etc. |
+| `source_type` | string | `"microflow"`, `"page"`, etc. |
 | `source_id` | string | Source UUID |
 | `source_name` | string | `"Sales.ACT_Customer_Create"` |
-| `target_type` | string | `"ENTITY"`, `"MICROFLOW"`, etc. |
+| `target_type` | string | `"entity"`, `"microflow"`, etc. |
 | `target_id` | string | Target UUID |
 | `target_name` | string | `"Sales.Customer"` |
 | `ref_kind` | string | Reference kind |
@@ -200,7 +249,7 @@ Returned by `permissions()` (all types) or `permissions_for()` (entity-specific)
 
 ### project_security
 
-Returned by `project_security()`. Returns `None` if no MPR reader is available.
+Returned by `project_security()`. Returns `none` if no MPR reader is available.
 
 | Property | Type | Description |
 |----------|------|-------------|
@@ -236,18 +285,18 @@ Returned by `project_security()`. Returns `None` if no MPR reader is available.
 ```python
 RULE_ID = "SEC001"
 RULE_NAME = "NoEntityAccessRules"
-DESCRIPTION = "Persistent entities should have access rules"
+description = "persistent entities should have access rules"
 CATEGORY = "security"
 SEVERITY = "warning"
 
 def check():
     violations = []
     for e in entities():
-        if e.entity_type == "Persistent" and not e.is_external and e.access_rule_count == 0:
+        if e.entity_type == "persistent" and not e.is_external and e.access_rule_count == 0:
             violations.append(violation(
-                message="Persistent entity '{}' has no access rules".format(e.qualified_name),
+                message="persistent entity '{}' has no access rules".format(e.qualified_name),
                 location=location(module=e.module_name, document_type="entity", document_name=e.name),
-                suggestion="GRANT <Role> ON {} (READ *)".format(e.qualified_name),
+                suggestion="grant <role> on {} (read *)".format(e.qualified_name),
             ))
     return violations
 ```
@@ -257,19 +306,19 @@ def check():
 ```python
 RULE_ID = "SEC002"
 RULE_NAME = "WeakPasswordPolicy"
-DESCRIPTION = "Password policy should require at least 8 characters"
+description = "password policy should require at least 8 characters"
 CATEGORY = "security"
 SEVERITY = "warning"
 
 def check():
     sec = project_security()
-    if sec == None:
+    if sec == none:
         return []
     if sec.password_policy.min_length < 8:
         return [violation(
-            message="Password minimum length is {} (recommended: 8+)".format(sec.password_policy.min_length),
+            message="password minimum length is {} (recommended: 8+)".format(sec.password_policy.min_length),
             location=location(module="", document_type="security", document_name="ProjectSecurity"),
-            suggestion="ALTER PROJECT SECURITY PASSWORD POLICY MINIMUM LENGTH 8",
+            suggestion="alter project security password POLICY minimum length 8",
         )]
     return []
 ```
@@ -279,7 +328,7 @@ def check():
 ```python
 RULE_ID = "CUSTOM003"
 RULE_NAME = "UnreferencedEntity"
-DESCRIPTION = "Entities should be referenced by at least one microflow or page"
+description = "entities should be referenced by at least one microflow or page"
 CATEGORY = "quality"
 SEVERITY = "info"
 
@@ -289,7 +338,7 @@ def check():
         refs = refs_to(e.qualified_name)
         if len(refs) == 0:
             violations.append(violation(
-                message="Entity '{}' is not referenced anywhere".format(e.qualified_name),
+                message="entity '{}' is not referenced anywhere".format(e.qualified_name),
                 location=location(module=e.module_name, document_type="entity", document_name=e.name),
             ))
     return violations
@@ -300,7 +349,7 @@ def check():
 ```python
 RULE_ID = "CUSTOM004"
 RULE_NAME = "RequiredStringLength"
-DESCRIPTION = "String attributes should have a length limit"
+description = "string attributes should have a length limit"
 CATEGORY = "design"
 SEVERITY = "warning"
 
@@ -308,9 +357,9 @@ def check():
     violations = []
     for e in entities():
         for attr in attributes_for(e.qualified_name):
-            if attr.data_type == "String" and attr.length == 0:
+            if attr.data_type == "string" and attr.length == 0:
                 violations.append(violation(
-                    message="String attribute '{}.{}' has unlimited length".format(e.name, attr.name),
+                    message="string attribute '{}.{}' has unlimited length".format(e.name, attr.name),
                     location=location(module=e.module_name, document_type="entity", document_name=e.name),
                 ))
     return violations
@@ -322,7 +371,7 @@ Test your rule by running the linter:
 
 ```bash
 mxcli lint -p app.mpr --list-rules   # Verify rule is loaded
-mxcli lint -p app.mpr                 # Run all rules including yours
+mxcli lint -p app.mpr                 # run all rules including yours
 ```
 
 If a `.star` file has syntax errors, a warning is printed and the rule is skipped.

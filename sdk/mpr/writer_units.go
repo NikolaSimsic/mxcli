@@ -9,19 +9,34 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 )
 
+// isContentsHashSchemaError returns true when the error looks like SQLite complaining
+// about the absence of the ContentsHash column (i.e. an old MPR v1 schema from pre-Mx
+// versions that predate ContentsHash). Anything else — a disk-full error, a missing
+// UnitID, a rolled-back transaction — must propagate so writes don't silently succeed
+// without updating Contents.
+func isContentsHashSchemaError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "ContentsHash")
+}
+
 // updateTransactionID updates the _Transaction table with a new UUID.
 // Studio Pro uses this to detect external changes during F4 sync.
 // Only applies to MPR v2 projects (Mendix >= 10.18).
-func (w *Writer) updateTransactionID() {
+func (w *Writer) updateTransactionID() error {
 	if w.reader.version != MPRVersionV2 {
-		return
+		return nil
 	}
 	newID := generateUUID()
-	_, _ = w.reader.db.Exec(`UPDATE _Transaction SET LastTransactionID = ?`, newID)
+	_, err := w.reader.db.Exec(`UPDATE _Transaction SET LastTransactionID = ?`, newID)
+	return err
 }
 
 // placeholderBinaryPrefix is the GUID-swapped byte pattern for placeholder IDs generated
@@ -43,6 +58,11 @@ func validateNoPlaceholderIDs(unitID string, contents []byte) error {
 		return fmt.Errorf("placeholder ID leak detected in unit %s: string aa000000-prefix ID found in BSON contents", unitID)
 	}
 	return nil
+}
+
+func contentHashBase64(contents []byte) string {
+	hash := sha256.Sum256(contents)
+	return base64.StdEncoding.EncodeToString(hash[:])
 }
 
 func (w *Writer) insertUnit(unitID, containerID, containmentName, unitType string, contents []byte) error {
@@ -70,9 +90,7 @@ func (w *Writer) insertUnit(unitID, containerID, containmentName, unitType strin
 			return fmt.Errorf("failed to write unit file: %w", err)
 		}
 
-		// Compute content hash (base64-encoded SHA256)
-		hash := sha256.Sum256(contents)
-		contentsHash := base64.StdEncoding.EncodeToString(hash[:])
+		contentsHash := contentHashBase64(contents)
 
 		// Insert reference to database
 		_, err := w.reader.db.Exec(`
@@ -85,16 +103,20 @@ func (w *Writer) insertUnit(unitID, containerID, containmentName, unitType strin
 			return err
 		}
 		w.reader.InvalidateCache()
-		w.updateTransactionID()
+		if err := w.updateTransactionID(); err != nil {
+			return fmt.Errorf("failed to update transaction ID: %w", err)
+		}
 		return nil
 	}
 
 	// MPR v1: Store directly in database
+	contentsHash := contentHashBase64(contents)
+
 	// Try new schema first (without Type column - Mendix 11.6.2+)
 	_, err := w.reader.db.Exec(`
 		INSERT INTO Unit (UnitID, ContainerID, ContainmentName, TreeConflict, ContentsHash, ContentsConflicts, Contents)
-		VALUES (?, ?, ?, 0, '', '', ?)
-	`, unitIDBlob, containerIDBlob, containmentName, contents)
+		VALUES (?, ?, ?, 0, ?, '', ?)
+	`, unitIDBlob, containerIDBlob, containmentName, contentsHash, contents)
 	if err != nil {
 		// Try old schema with Type column
 		_, err = w.reader.db.Exec(`
@@ -133,23 +155,31 @@ func (w *Writer) updateUnit(unitID string, contents []byte) error {
 			return fmt.Errorf("failed to write unit file: %w", err)
 		}
 
-		// Update ContentsHash in database
-		hash := sha256.Sum256(contents)
-		contentsHash := base64.StdEncoding.EncodeToString(hash[:])
+		contentsHash := contentHashBase64(contents)
 		_, err := w.reader.db.Exec(`
 			UPDATE Unit SET ContentsHash = ? WHERE UnitID = ?
 		`, contentsHash, unitIDBlob)
 		if err == nil {
 			w.reader.InvalidateCache()
-			w.updateTransactionID()
+			if txErr := w.updateTransactionID(); txErr != nil {
+				return fmt.Errorf("failed to update transaction ID: %w", txErr)
+			}
 		}
 		return err
 	}
 
 	// MPR v1: Update in database
+	contentsHash := contentHashBase64(contents)
 	_, err := w.reader.db.Exec(`
-		UPDATE Unit SET Contents = ? WHERE UnitID = ?
-	`, contents, unitIDBlob)
+		UPDATE Unit SET Contents = ?, ContentsHash = ? WHERE UnitID = ?
+	`, contents, contentsHash, unitIDBlob)
+	if err != nil && isContentsHashSchemaError(err) {
+		// Older v1 schemas do not have ContentsHash; retry without it.
+		// Any other error (disk full, invalid UnitID, rolled-back tx) propagates.
+		_, err = w.reader.db.Exec(`
+			UPDATE Unit SET Contents = ? WHERE UnitID = ?
+		`, contents, unitIDBlob)
+	}
 	return err
 }
 
@@ -198,7 +228,9 @@ func (w *Writer) deleteUnit(unitID string) error {
 	}
 
 	w.reader.InvalidateCache()
-	w.updateTransactionID()
+	if err := w.updateTransactionID(); err != nil {
+		return fmt.Errorf("failed to update transaction ID after deleting unit: %w", err)
+	}
 	return nil
 }
 

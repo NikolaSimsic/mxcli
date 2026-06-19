@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package widgetobj
+
+import (
+	"testing"
+
+	"go.mongodb.org/mongo-driver/bson"
+
+	"github.com/mendixlabs/mxcli/mdl/backend"
+	"github.com/mendixlabs/mxcli/sdk/pages"
+)
+
+// TestSetAttributeRefField locks in the BSON shape for the
+// pluggable-widget engine's `attribute` operation (object-list item
+// sub-properties — e.g. `column colName (Attribute: NId)` inside a
+// pluggablewidget 'com.mendix.widget.web.datagrid.Datagrid' block).
+//
+// Regression for #64: an earlier implementation wrote `$Type:
+// "CustomWidgets$AttributeRef"` and only the bare attribute name. Mendix's
+// type cache has no such type, so `mx update-widgets` / `mx check` failed
+// with TypeCacheUnknownTypeException and Studio Pro flagged CE0463.
+func TestSetAttributeRefField(t *testing.T) {
+	t.Run("fully-qualified path -> DomainModels$AttributeRef", func(t *testing.T) {
+		value := bson.D{
+			{Key: "AttributeRef", Value: nil},
+			{Key: "PrimitiveValue", Value: ""},
+		}
+		got := setAttributeRefField(value, "ReproUoM.UoM.NId")
+
+		ref := findField(t, got, "AttributeRef")
+		refDoc, ok := ref.(bson.D)
+		if !ok {
+			t.Fatalf("AttributeRef value is %T, want bson.D", ref)
+		}
+
+		gotType := findField(t, refDoc, "$Type")
+		if gotType != "DomainModels$AttributeRef" {
+			t.Errorf("$Type = %q, want DomainModels$AttributeRef (CustomWidgets$AttributeRef is not registered in Mendix's type cache)", gotType)
+		}
+
+		gotAttr := findField(t, refDoc, "Attribute")
+		if gotAttr != "ReproUoM.UoM.NId" {
+			t.Errorf("Attribute = %q, want fully-qualified ReproUoM.UoM.NId", gotAttr)
+		}
+
+		gotEntityRef := findField(t, refDoc, "EntityRef")
+		if gotEntityRef != nil {
+			t.Errorf("EntityRef = %v, want nil", gotEntityRef)
+		}
+	})
+
+	t.Run("unqualified path -> AttributeRef nil", func(t *testing.T) {
+		value := bson.D{{Key: "AttributeRef", Value: bson.D{{Key: "stale", Value: 1}}}}
+		got := setAttributeRefField(value, "NId")
+		if findField(t, got, "AttributeRef") != nil {
+			t.Errorf("AttributeRef must be nil for unqualified path; got %v", findField(t, got, "AttributeRef"))
+		}
+	})
+}
+
+func findField(t *testing.T, doc bson.D, key string) any {
+	t.Helper()
+	for _, e := range doc {
+		if e.Key == key {
+			return e.Value
+		}
+	}
+	t.Fatalf("field %q not found in BSON doc", key)
+	return nil
+}
+
+// TestDetectObjectListItemKind covers the heuristic used to classify an
+// object-list item as attribute-bound, custom-content, or default. Mirrors
+// the keyword path's hasCustomContent logic.
+func TestDetectObjectListItemKind(t *testing.T) {
+	tests := []struct {
+		name         string
+		spec         map[string]backend.ObjectListItemProperty
+		childWidgets map[string][]pages.Widget
+		want         objectListItemKind
+	}{
+		{
+			name: "attribute set, no children → attribute kind",
+			spec: map[string]backend.ObjectListItemProperty{
+				"attribute": {AttributePath: "Mod.Ent.Attr"},
+			},
+			childWidgets: nil,
+			want:         itemKindAttribute,
+		},
+		{
+			name:         "content slot widgets present → customcontent kind",
+			spec:         nil,
+			childWidgets: map[string][]pages.Widget{"content": {nil}},
+			want:         itemKindCustomContent,
+		},
+		{
+			name: "filter widget present + attribute set → still attribute kind",
+			// Filter widgets are sidecars to attribute columns; they don't
+			// make the column custom-content.
+			spec: map[string]backend.ObjectListItemProperty{
+				"attribute": {AttributePath: "Mod.Ent.Attr"},
+			},
+			childWidgets: map[string][]pages.Widget{"filter": {nil}},
+			want:         itemKindAttribute,
+		},
+		{
+			name:         "neither → default",
+			spec:         nil,
+			childWidgets: nil,
+			want:         itemKindDefault,
+		},
+		{
+			name: "empty AttributePath → default",
+			spec: map[string]backend.ObjectListItemProperty{
+				"attribute": {AttributePath: ""},
+			},
+			want: itemKindDefault,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := detectObjectListItemKind(tc.spec, tc.childWidgets)
+			if got != tc.want {
+				t.Errorf("detectObjectListItemKind() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestShouldEmitEmptyClientTemplate locks in the per-widget Studio Pro
+// convention for unset TextTemplate properties on DataGrid columns
+// (verified against Cars_Overview in c3d61af1).
+func TestShouldEmitEmptyClientTemplate(t *testing.T) {
+	const datagrid = "com.mendix.widget.web.datagrid.Datagrid"
+	tests := []struct {
+		name     string
+		widgetID string
+		listKey  string
+		propKey  string
+		kind     objectListItemKind
+		want     bool
+	}{
+		{"DataGrid attribute col tooltip → empty", datagrid, "columns", "tooltip", itemKindAttribute, true},
+		{"DataGrid attribute col exportValue → null", datagrid, "columns", "exportValue", itemKindAttribute, false},
+		{"DataGrid attribute col dynamicText → null", datagrid, "columns", "dynamicText", itemKindAttribute, false},
+		{"DataGrid custom-content col tooltip → null", datagrid, "columns", "tooltip", itemKindCustomContent, false},
+		{"DataGrid custom-content col exportValue → empty", datagrid, "columns", "exportValue", itemKindCustomContent, true},
+		{"DataGrid custom-content col dynamicText → null", datagrid, "columns", "dynamicText", itemKindCustomContent, false},
+		{"Unknown widget → null", "com.example.Other", "columns", "tooltip", itemKindAttribute, false},
+		{"Unknown list → null", datagrid, "rows", "tooltip", itemKindAttribute, false},
+		{"Unknown kind → null", datagrid, "columns", "tooltip", itemKindDefault, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shouldEmitEmptyClientTemplate(tc.widgetID, tc.listKey, tc.propKey, tc.kind)
+			if got != tc.want {
+				t.Errorf("shouldEmitEmptyClientTemplate(%q, %q, %q, %q) = %v, want %v",
+					tc.widgetID, tc.listKey, tc.propKey, tc.kind, got, tc.want)
+			}
+		})
+	}
+}
+
+// (TestApplyColumnHeaderFallback covers the helper in widget_engine.go; the
+// unit test lives in the executor package — see widget_defs_test.go.)

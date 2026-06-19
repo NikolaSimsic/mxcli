@@ -9,6 +9,7 @@ import (
 	"sort"
 
 	"github.com/mendixlabs/mxcli/mdl/executor"
+	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/mpr"
 	"github.com/spf13/cobra"
@@ -400,6 +401,58 @@ func buildProjectTree(projectPath string) ([]*TreeNode, error) {
 		}
 		children := buildDatabaseConnectionChildren(dbc)
 		md.documents = append(md.documents, treeElement{Name: dbc.Name, ContainerID: dbc.ContainerID, Type: "databaseconnection", Children: children})
+	}
+
+	// Collect data transformers
+	dts, _ := reader.ListDataTransformers()
+	for _, dt := range dts {
+		modID := h.FindModuleID(dt.ContainerID)
+		md, ok := modData[modID]
+		if !ok {
+			continue
+		}
+		md.documents = append(md.documents, treeElement{Name: dt.Name, ContainerID: dt.ContainerID, Type: "datatransformer"})
+	}
+
+	// Collect agent-editor documents (Mendix 11.9+; empty on older projects)
+	agentModels, _ := reader.ListAgentEditorModels()
+	for _, m := range agentModels {
+		modID := h.FindModuleID(m.ContainerID)
+		md, ok := modData[modID]
+		if !ok {
+			continue
+		}
+		md.documents = append(md.documents, treeElement{Name: m.Name, ContainerID: m.ContainerID, Type: "aimodel"})
+	}
+
+	kbs, _ := reader.ListAgentEditorKnowledgeBases()
+	for _, kb := range kbs {
+		modID := h.FindModuleID(kb.ContainerID)
+		md, ok := modData[modID]
+		if !ok {
+			continue
+		}
+		md.documents = append(md.documents, treeElement{Name: kb.Name, ContainerID: kb.ContainerID, Type: "knowledgebase"})
+	}
+
+	mcpServices, _ := reader.ListAgentEditorConsumedMCPServices()
+	for _, svc := range mcpServices {
+		modID := h.FindModuleID(svc.ContainerID)
+		md, ok := modData[modID]
+		if !ok {
+			continue
+		}
+		md.documents = append(md.documents, treeElement{Name: svc.Name, ContainerID: svc.ContainerID, Type: "consumedmcpservice"})
+	}
+
+	agents, _ := reader.ListAgentEditorAgents()
+	for _, a := range agents {
+		modID := h.FindModuleID(a.ContainerID)
+		md, ok := modData[modID]
+		if !ok {
+			continue
+		}
+		md.documents = append(md.documents, treeElement{Name: a.Name, ContainerID: a.ContainerID, Type: "agent"})
 	}
 
 	// Mark external entities in domain model
@@ -951,7 +1004,7 @@ func buildDatabaseConnectionChildren(dbc *model.DatabaseConnection) []*TreeNode 
 }
 
 // buildMenuTreeNodes recursively builds tree nodes from navigation menu items.
-func buildMenuTreeNodes(parent *TreeNode, items []*mpr.NavMenuItem) {
+func buildMenuTreeNodes(parent *TreeNode, items []*types.NavMenuItem) {
 	for _, item := range items {
 		label := item.Caption
 		if label == "" {

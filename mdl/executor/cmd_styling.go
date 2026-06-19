@@ -5,11 +5,12 @@ package executor
 import (
 	"fmt"
 	"path/filepath"
-	"reflect"
 	"sort"
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/backend"
+	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/pages"
 )
@@ -18,19 +19,23 @@ import (
 // SHOW DESIGN PROPERTIES
 // ============================================================================
 
-func (e *Executor) execShowDesignProperties(s *ast.ShowDesignPropertiesStmt) error {
-	if e.reader == nil {
-		return fmt.Errorf("not connected to a project")
+func execShowDesignProperties(ctx *ExecContext, s *ast.ShowDesignPropertiesStmt) error {
+
+	if !ctx.Connected() {
+		return mdlerrors.NewNotConnected()
+	}
+	if ctx.MprPath == "" {
+		return mdlerrors.NewValidationf("project path unavailable — connected via mock backend without MprPath")
 	}
 
-	projectDir := filepath.Dir(e.mprPath)
+	projectDir := filepath.Dir(ctx.MprPath)
 	registry, err := loadThemeRegistry(projectDir)
 	if err != nil {
-		return fmt.Errorf("failed to load theme registry: %w", err)
+		return mdlerrors.NewBackend("load theme registry", err)
 	}
 
 	if len(registry.WidgetProperties) == 0 {
-		fmt.Fprintln(e.output, "No design properties found. Check that themesource/*/web/design-properties.json exists in the project directory.")
+		fmt.Fprintln(ctx.Output, "No design properties found. Check that themesource/*/web/design-properties.json exists in the project directory.")
 		return nil
 	}
 
@@ -39,11 +44,11 @@ func (e *Executor) execShowDesignProperties(s *ast.ShowDesignPropertiesStmt) err
 		dpKey := resolveDesignPropsKey(s.WidgetType)
 		props := registry.GetPropertiesForWidget(dpKey)
 		if len(props) == 0 {
-			fmt.Fprintf(e.output, "No design properties found for widget type %s (%s)\n", s.WidgetType, dpKey)
+			fmt.Fprintf(ctx.Output, "No design properties found for widget type %s (%s)\n", s.WidgetType, dpKey)
 			return nil
 		}
-		fmt.Fprintf(e.output, "Design Properties for %s:\n\n", s.WidgetType)
-		e.printDesignProperties(registry, dpKey)
+		fmt.Fprintf(ctx.Output, "Design Properties for %s:\n\n", s.WidgetType)
+		printDesignProperties(ctx, registry, dpKey)
 	} else {
 		// Show all widget types and their properties
 		keys := make([]string, 0, len(registry.WidgetProperties))
@@ -57,11 +62,11 @@ func (e *Executor) execShowDesignProperties(s *ast.ShowDesignPropertiesStmt) err
 			if len(props) == 0 {
 				continue
 			}
-			fmt.Fprintf(e.output, "=== %s ===\n", key)
+			fmt.Fprintf(ctx.Output, "=== %s ===\n", key)
 			for _, p := range props {
-				e.printOneProperty(p)
+				printOneProperty(ctx, p)
 			}
-			fmt.Fprintln(e.output)
+			fmt.Fprintln(ctx.Output)
 		}
 	}
 
@@ -69,39 +74,39 @@ func (e *Executor) execShowDesignProperties(s *ast.ShowDesignPropertiesStmt) err
 }
 
 // printDesignProperties prints properties for a widget type, showing inherited "Widget" props separately.
-func (e *Executor) printDesignProperties(registry *ThemeRegistry, dpKey string) {
+func printDesignProperties(ctx *ExecContext, registry *ThemeRegistry, dpKey string) {
 	// Print inherited Widget properties
 	if widgetProps, ok := registry.WidgetProperties["Widget"]; ok && len(widgetProps) > 0 {
-		fmt.Fprintf(e.output, "From: Widget (inherited)\n")
+		fmt.Fprintf(ctx.Output, "From: Widget (inherited)\n")
 		for _, p := range widgetProps {
-			e.printOneProperty(p)
+			printOneProperty(ctx, p)
 		}
 	}
 
 	// Print type-specific properties
 	if dpKey != "Widget" {
 		if typeProps, ok := registry.WidgetProperties[dpKey]; ok && len(typeProps) > 0 {
-			fmt.Fprintf(e.output, "From: %s\n", dpKey)
+			fmt.Fprintf(ctx.Output, "From: %s\n", dpKey)
 			for _, p := range typeProps {
-				e.printOneProperty(p)
+				printOneProperty(ctx, p)
 			}
 		}
 	}
 }
 
 // printOneProperty prints a single design property in a readable format.
-func (e *Executor) printOneProperty(p ThemeProperty) {
+func printOneProperty(ctx *ExecContext, p ThemeProperty) {
 	switch p.Type {
 	case "Toggle":
-		fmt.Fprintf(e.output, "  %-24s Toggle      class: %s\n", p.Name, p.Class)
+		fmt.Fprintf(ctx.Output, "  %-24s Toggle      class: %s\n", p.Name, p.Class)
 	case "Dropdown", "ColorPicker", "ToggleButtonGroup":
 		options := make([]string, 0, len(p.Options))
 		for _, o := range p.Options {
 			options = append(options, o.Name)
 		}
-		fmt.Fprintf(e.output, "  %-24s %-11s [%s]\n", p.Name, p.Type, strings.Join(options, ", "))
+		fmt.Fprintf(ctx.Output, "  %-24s %-11s [%s]\n", p.Name, p.Type, strings.Join(options, ", "))
 	default:
-		fmt.Fprintf(e.output, "  %-24s %s\n", p.Name, p.Type)
+		fmt.Fprintf(ctx.Output, "  %-24s %s\n", p.Name, p.Type)
 	}
 }
 
@@ -109,23 +114,28 @@ func (e *Executor) printOneProperty(p ThemeProperty) {
 // DESCRIBE STYLING
 // ============================================================================
 
-func (e *Executor) execDescribeStyling(s *ast.DescribeStylingStmt) error {
-	if e.reader == nil {
-		return fmt.Errorf("not connected to a project")
+func execDescribeStyling(ctx *ExecContext, s *ast.DescribeStylingStmt) error {
+
+	if !ctx.Connected() {
+		return mdlerrors.NewNotConnected()
 	}
 
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	var rawWidgets []rawWidget
 
-	if s.ContainerType == "PAGE" {
+	// ContainerType is stored uppercase ("PAGE"/"SNIPPET") by the visitor;
+	// normalize so comparisons are case-insensitive.
+	containerType := strings.ToLower(s.ContainerType)
+
+	if containerType == "page" {
 		// Find page
-		allPages, err := e.reader.ListPages()
+		allPages, err := ctx.Backend.ListPages()
 		if err != nil {
-			return fmt.Errorf("failed to list pages: %w", err)
+			return mdlerrors.NewBackend("list pages", err)
 		}
 
 		var foundPage *pages.Page
@@ -138,14 +148,14 @@ func (e *Executor) execDescribeStyling(s *ast.DescribeStylingStmt) error {
 			}
 		}
 		if foundPage == nil {
-			return fmt.Errorf("page %s not found", s.ContainerName.String())
+			return mdlerrors.NewNotFound("page", s.ContainerName.String())
 		}
-		rawWidgets = e.getPageWidgetsFromRaw(foundPage.ID)
-	} else if s.ContainerType == "SNIPPET" {
+		rawWidgets = getPageWidgetsFromRaw(ctx, foundPage.ID)
+	} else if containerType == "snippet" {
 		// Find snippet
-		allSnippets, err := e.reader.ListSnippets()
+		allSnippets, err := ctx.Backend.ListSnippets()
 		if err != nil {
-			return fmt.Errorf("failed to list snippets: %w", err)
+			return mdlerrors.NewBackend("list snippets", err)
 		}
 
 		var foundSnippet *pages.Snippet
@@ -158,13 +168,13 @@ func (e *Executor) execDescribeStyling(s *ast.DescribeStylingStmt) error {
 			}
 		}
 		if foundSnippet == nil {
-			return fmt.Errorf("snippet %s not found", s.ContainerName.String())
+			return mdlerrors.NewNotFound("snippet", s.ContainerName.String())
 		}
-		rawWidgets = e.getSnippetWidgetsFromRaw(foundSnippet.ID)
+		rawWidgets = getSnippetWidgetsFromRaw(ctx, foundSnippet.ID)
 	}
 
 	if len(rawWidgets) == 0 {
-		fmt.Fprintf(e.output, "No widgets found in %s %s\n", s.ContainerType, s.ContainerName.String())
+		fmt.Fprintf(ctx.Output, "No widgets found in %s %s\n", containerType, s.ContainerName.String())
 		return nil
 	}
 
@@ -173,38 +183,38 @@ func (e *Executor) execDescribeStyling(s *ast.DescribeStylingStmt) error {
 
 	if len(styledWidgets) == 0 {
 		if s.WidgetName != "" {
-			return fmt.Errorf("widget %q not found in %s %s", s.WidgetName, s.ContainerType, s.ContainerName.String())
+			return mdlerrors.NewNotFoundMsg("widget", s.WidgetName, fmt.Sprintf("widget %q not found in %s %s", s.WidgetName, containerType, s.ContainerName.String()))
 		}
-		fmt.Fprintf(e.output, "No styled widgets found in %s %s\n", s.ContainerType, s.ContainerName.String())
+		fmt.Fprintf(ctx.Output, "No styled widgets found in %s %s\n", containerType, s.ContainerName.String())
 		return nil
 	}
 
 	// Output
 	for i, w := range styledWidgets {
 		if i > 0 {
-			fmt.Fprintln(e.output)
+			fmt.Fprintln(ctx.Output)
 		}
 		displayName := getWidgetDisplayName(w.Type)
-		fmt.Fprintf(e.output, "WIDGET %s (%s)\n", w.Name, displayName)
+		fmt.Fprintf(ctx.Output, "widget %s (%s)\n", w.Name, displayName)
 		if w.Class != "" {
-			fmt.Fprintf(e.output, "  Class: '%s'\n", w.Class)
+			fmt.Fprintf(ctx.Output, "  Class: '%s'\n", w.Class)
 		}
 		if w.Style != "" {
-			fmt.Fprintf(e.output, "  Style: '%s'\n", w.Style)
+			fmt.Fprintf(ctx.Output, "  Style: '%s'\n", w.Style)
 		}
 		if len(w.DesignProperties) > 0 {
-			fmt.Fprintf(e.output, "  DesignProperties: [")
+			fmt.Fprintf(ctx.Output, "  DesignProperties: [")
 			for j, dp := range w.DesignProperties {
 				if j > 0 {
-					fmt.Fprint(e.output, ", ")
+					fmt.Fprint(ctx.Output, ", ")
 				}
 				if dp.ValueType == "toggle" {
-					fmt.Fprintf(e.output, "'%s': ON", dp.Key)
+					fmt.Fprintf(ctx.Output, "'%s': on", dp.Key)
 				} else {
-					fmt.Fprintf(e.output, "'%s': '%s'", dp.Key, dp.Option)
+					fmt.Fprintf(ctx.Output, "'%s': '%s'", dp.Key, dp.Option)
 				}
 			}
-			fmt.Fprintln(e.output, "]")
+			fmt.Fprintln(ctx.Output, "]")
 		}
 	}
 
@@ -251,196 +261,100 @@ func collectStyledWidgets(widgets []rawWidget, widgetName string) []rawWidget {
 // ALTER STYLING
 // ============================================================================
 
-func (e *Executor) execAlterStyling(s *ast.AlterStylingStmt) error {
-	if e.reader == nil {
-		return fmt.Errorf("not connected to a project")
+func execAlterStyling(ctx *ExecContext, s *ast.AlterStylingStmt) error {
+
+	if !ctx.Connected() {
+		return mdlerrors.NewNotConnected()
 	}
-	if e.writer == nil {
-		return fmt.Errorf("project not opened for writing")
+	if !ctx.ConnectedForWrite() {
+		return mdlerrors.NewNotConnectedWrite()
 	}
 
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
-	if s.ContainerType == "PAGE" {
-		return e.alterStylingOnPage(s, h)
-	} else if s.ContainerType == "SNIPPET" {
-		return e.alterStylingOnSnippet(s, h)
-	}
+	// ContainerType is stored uppercase ("PAGE"/"SNIPPET") by the visitor;
+	// normalize so comparisons are case-insensitive.
+	containerType := strings.ToLower(s.ContainerType)
 
-	return fmt.Errorf("unsupported container type: %s", s.ContainerType)
-}
-
-func (e *Executor) alterStylingOnPage(s *ast.AlterStylingStmt, h *ContainerHierarchy) error {
-	// Find page
-	allPages, err := e.reader.ListPages()
-	if err != nil {
-		return fmt.Errorf("failed to list pages: %w", err)
-	}
-
-	var page *pages.Page
-	for _, p := range allPages {
-		modID := h.FindModuleID(p.ContainerID)
-		modName := h.GetModuleName(modID)
-		if p.Name == s.ContainerName.Name && (s.ContainerName.Module == "" || modName == s.ContainerName.Module) {
-			page = p
-			break
+	var unitID model.ID
+	switch containerType {
+	case "page":
+		page, err := findPageByName(ctx, s.ContainerName, h)
+		if err != nil {
+			return err
 		}
-	}
-	if page == nil {
-		return fmt.Errorf("page %s not found", s.ContainerName.String())
-	}
-
-	// Walk the page to find the widget by name
-	found := false
-	err = walkPageWidgets(page, func(widget any) error {
-		name := getWidgetName(widget)
-		if name != s.WidgetName {
-			return nil
+		unitID = page.ID
+	case "snippet":
+		snippet, _, err := findSnippetByName(ctx, s.ContainerName, h)
+		if err != nil {
+			return err
 		}
-		found = true
-		return applyStylingAssignments(widget, s.Assignments, s.ClearDesignProps)
-	})
+		unitID = snippet.ID
+	default:
+		return mdlerrors.NewUnsupported("unsupported container type: " + s.ContainerType)
+	}
+
+	// Open the unit for mutation via the backend (mutator pattern). This works
+	// uniformly on pages/snippets created in Studio Pro and by the MDL builder.
+	mutator, err := ctx.Backend.OpenPageForMutation(unitID)
 	if err != nil {
-		return err
+		return mdlerrors.NewBackend("open "+containerType+" for mutation", err)
 	}
 
-	if !found {
-		return fmt.Errorf("widget %q not found in page %s", s.WidgetName, s.ContainerName.String())
+	if !mutator.FindWidget(s.WidgetName) {
+		return mdlerrors.NewNotFoundMsg("widget", s.WidgetName,
+			fmt.Sprintf("widget %q not found in %s %s", s.WidgetName, containerType, s.ContainerName.String()))
 	}
 
-	// Save the page
-	if err := e.writer.UpdatePage(page); err != nil {
-		return fmt.Errorf("failed to save page: %w", err)
+	if err := applyStylingMutator(mutator, s); err != nil {
+		return mdlerrors.NewBackend("alter styling", err)
 	}
 
-	fmt.Fprintf(e.output, "Updated styling on widget %q in page %s\n", s.WidgetName, s.ContainerName.String())
+	if err := mutator.Save(); err != nil {
+		return mdlerrors.NewBackend("save "+containerType, err)
+	}
+
+	fmt.Fprintf(ctx.Output, "Updated styling on widget %q in %s %s\n", s.WidgetName, containerType, s.ContainerName.String())
 	return nil
 }
 
-func (e *Executor) alterStylingOnSnippet(s *ast.AlterStylingStmt, h *ContainerHierarchy) error {
-	// Find snippet
-	allSnippets, err := e.reader.ListSnippets()
-	if err != nil {
-		return fmt.Errorf("failed to list snippets: %w", err)
-	}
-
-	var snippet *pages.Snippet
-	for _, sn := range allSnippets {
-		modID := h.FindModuleID(sn.ContainerID)
-		modName := h.GetModuleName(modID)
-		if sn.Name == s.ContainerName.Name && (s.ContainerName.Module == "" || modName == s.ContainerName.Module) {
-			snippet = sn
-			break
-		}
-	}
-	if snippet == nil {
-		return fmt.Errorf("snippet %s not found", s.ContainerName.String())
-	}
-
-	// Walk the snippet to find the widget by name
-	found := false
-	err = walkSnippetWidgets(snippet, func(widget any) error {
-		name := getWidgetName(widget)
-		if name != s.WidgetName {
-			return nil
-		}
-		found = true
-		return applyStylingAssignments(widget, s.Assignments, s.ClearDesignProps)
-	})
-	if err != nil {
-		return err
-	}
-
-	if !found {
-		return fmt.Errorf("widget %q not found in snippet %s", s.WidgetName, s.ContainerName.String())
-	}
-
-	// Save the snippet
-	if err := e.writer.UpdateSnippet(snippet); err != nil {
-		return fmt.Errorf("failed to save snippet: %w", err)
-	}
-
-	fmt.Fprintf(e.output, "Updated styling on widget %q in snippet %s\n", s.WidgetName, s.ContainerName.String())
-	return nil
-}
-
-// getWidgetName extracts the Name from a widget using reflection.
-func getWidgetName(widget any) string {
-	if widget == nil {
-		return ""
-	}
-
-	// Try Widget interface first
-	if w, ok := widget.(pages.Widget); ok {
-		return w.GetName()
-	}
-
-	// Fall back to reflection
-	v := reflect.ValueOf(widget)
-	if v.Kind() == reflect.Pointer {
-		v = v.Elem()
-	}
-	if v.Kind() != reflect.Struct {
-		return ""
-	}
-
-	// Try BaseWidget.Name
-	if baseWidget := v.FieldByName("BaseWidget"); baseWidget.IsValid() {
-		if nameField := baseWidget.FieldByName("Name"); nameField.IsValid() {
-			return nameField.String()
+// applyStylingMutator applies the ALTER STYLING assignments through the page
+// mutator. CLEAR DESIGN PROPERTIES is applied first, then each assignment in order.
+func applyStylingMutator(mutator backend.PageMutator, s *ast.AlterStylingStmt) error {
+	if s.ClearDesignProps {
+		if err := mutator.ClearDesignProperties(s.WidgetName); err != nil {
+			return err
 		}
 	}
 
-	// Direct Name field
-	if nameField := v.FieldByName("Name"); nameField.IsValid() {
-		return nameField.String()
-	}
-
-	return ""
-}
-
-// applyStylingAssignments applies styling changes to a widget.
-func applyStylingAssignments(widget any, assignments []ast.StylingAssignment, clearDesignProps bool) error {
-	v := reflect.ValueOf(widget)
-	if v.Kind() == reflect.Pointer {
-		v = v.Elem()
-	}
-	if v.Kind() != reflect.Struct {
-		return fmt.Errorf("widget is not a struct")
-	}
-
-	// Get BaseWidget
-	baseWidget := v.FieldByName("BaseWidget")
-	if !baseWidget.IsValid() {
-		return fmt.Errorf("widget has no BaseWidget field")
-	}
-
-	// Clear design properties if requested
-	if clearDesignProps {
-		dpField := baseWidget.FieldByName("DesignProperties")
-		if dpField.IsValid() && dpField.CanSet() {
-			dpField.Set(reflect.Zero(dpField.Type()))
-		}
-	}
-
-	for _, a := range assignments {
-		switch a.Property {
-		case "Class":
-			classField := baseWidget.FieldByName("Class")
-			if classField.IsValid() && classField.CanSet() {
-				classField.SetString(a.Value)
+	for _, a := range s.Assignments {
+		// CLASS/STYLE keywords set the widget's CSS appearance — not a design
+		// property (a quoted key named 'Class'/'Style' is a design property).
+		if a.IsCSS {
+			if err := mutator.SetWidgetProperty(s.WidgetName, a.Property, a.Value); err != nil {
+				return err
 			}
-		case "Style":
-			styleField := baseWidget.FieldByName("Style")
-			if styleField.IsValid() && styleField.CanSet() {
-				styleField.SetString(a.Value)
+			continue
+		}
+
+		switch {
+		case a.IsToggle && a.ToggleOn:
+			if err := mutator.SetDesignProperty(s.WidgetName, a.Property, "toggle", ""); err != nil {
+				return err
+			}
+		case a.IsToggle && !a.ToggleOn:
+			if err := mutator.RemoveDesignProperty(s.WidgetName, a.Property); err != nil {
+				return err
 			}
 		default:
-			// Design property assignment
-			if err := setDesignProperty(baseWidget, a); err != nil {
+			// A single-selection design property (Dropdown or ToggleButtonGroup)
+			// is stored as Forms$OptionDesignPropertyValue — verified against
+			// Studio Pro-authored widgets. (The SDK's "custom" classification for
+			// ToggleButtonGroup is incorrect and triggers CE6084.)
+			if err := mutator.SetDesignProperty(s.WidgetName, a.Property, "option", a.Value); err != nil {
 				return err
 			}
 		}
@@ -449,69 +363,12 @@ func applyStylingAssignments(widget any, assignments []ast.StylingAssignment, cl
 	return nil
 }
 
-// setDesignProperty sets or updates a design property on the widget's BaseWidget.
-func setDesignProperty(baseWidget reflect.Value, a ast.StylingAssignment) error {
-	dpField := baseWidget.FieldByName("DesignProperties")
-	if !dpField.IsValid() || !dpField.CanSet() {
-		return fmt.Errorf("widget does not support design properties")
-	}
-
-	// Get existing design properties
-	var existing []pages.DesignPropertyValue
-	if !dpField.IsNil() {
-		existing = dpField.Interface().([]pages.DesignPropertyValue)
-	}
-
-	if a.IsToggle && !a.ToggleOn {
-		// OFF: remove the design property
-		var updated []pages.DesignPropertyValue
-		for _, dp := range existing {
-			if dp.Key != a.Property {
-				updated = append(updated, dp)
-			}
-		}
-		dpField.Set(reflect.ValueOf(updated))
-		return nil
-	}
-
-	// Update existing or append new
-	found := false
-	for i, dp := range existing {
-		if dp.Key == a.Property {
-			if a.IsToggle {
-				existing[i].ValueType = "toggle"
-				existing[i].Option = ""
-			} else {
-				existing[i].ValueType = "option"
-				existing[i].Option = a.Value
-			}
-			found = true
-			break
-		}
-	}
-
-	if !found {
-		newProp := pages.DesignPropertyValue{
-			Key: a.Property,
-		}
-		if a.IsToggle {
-			newProp.ValueType = "toggle"
-		} else {
-			newProp.ValueType = "option"
-			newProp.Option = a.Value
-		}
-		existing = append(existing, newProp)
-	}
-
-	dpField.Set(reflect.ValueOf(existing))
-	return nil
-}
-
 // findPageByName looks up a page by qualified name.
-func (e *Executor) findPageByName(name ast.QualifiedName, h *ContainerHierarchy) (*pages.Page, error) {
-	allPages, err := e.reader.ListPages()
+func findPageByName(ctx *ExecContext, name ast.QualifiedName, h *ContainerHierarchy) (*pages.Page, error) {
+
+	allPages, err := ctx.Backend.ListPages()
 	if err != nil {
-		return nil, fmt.Errorf("failed to list pages: %w", err)
+		return nil, mdlerrors.NewBackend("list pages", err)
 	}
 	for _, p := range allPages {
 		modID := h.FindModuleID(p.ContainerID)
@@ -520,14 +377,15 @@ func (e *Executor) findPageByName(name ast.QualifiedName, h *ContainerHierarchy)
 			return p, nil
 		}
 	}
-	return nil, fmt.Errorf("page %s not found", name.String())
+	return nil, mdlerrors.NewNotFound("page", name.String())
 }
 
 // findSnippetByName looks up a snippet by qualified name.
-func (e *Executor) findSnippetByName(name ast.QualifiedName, h *ContainerHierarchy) (*pages.Snippet, model.ID, error) {
-	allSnippets, err := e.reader.ListSnippets()
+func findSnippetByName(ctx *ExecContext, name ast.QualifiedName, h *ContainerHierarchy) (*pages.Snippet, model.ID, error) {
+
+	allSnippets, err := ctx.Backend.ListSnippets()
 	if err != nil {
-		return nil, "", fmt.Errorf("failed to list snippets: %w", err)
+		return nil, "", mdlerrors.NewBackend("list snippets", err)
 	}
 	for _, s := range allSnippets {
 		modID := h.FindModuleID(s.ContainerID)
@@ -536,5 +394,5 @@ func (e *Executor) findSnippetByName(name ast.QualifiedName, h *ContainerHierarc
 			return s, modID, nil
 		}
 	}
-	return nil, "", fmt.Errorf("snippet %s not found", name.String())
+	return nil, "", mdlerrors.NewNotFound("snippet", name.String())
 }

@@ -3,6 +3,8 @@
 package mpr
 
 import (
+	"strings"
+
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/pages"
 
@@ -11,12 +13,31 @@ import (
 
 // serializeSnippetCall serializes a SnippetCallWidget.
 func serializeSnippetCall(s *pages.SnippetCallWidget) bson.D {
+	// Build parameter mappings array.
+	// Format: [count, mapping1, mapping2, ...] where count is the Mendix array version marker.
+	// Type is Forms$SnippetParameterMapping (not Forms$PageParameterMapping).
+	// The variable reference goes in Variable.PageParameter; Argument is always empty.
+	paramMappings := bson.A{int32(len(s.ParameterMappings))}
+	for _, pm := range s.ParameterMappings {
+		// Parameter is BY_NAME_REFERENCE: SnippetQualifiedName.ParameterName
+		paramRef := s.SnippetName + "." + pm.ParamName
+		// Strip leading $ from the variable name for PageParameter sub-field
+		varName := strings.TrimPrefix(pm.Argument, "$")
+		paramMappings = append(paramMappings, bson.D{
+			{Key: "$ID", Value: idToBsonBinary(generateUUID())},
+			{Key: "$Type", Value: "Forms$SnippetParameterMapping"},
+			{Key: "Argument", Value: ""},
+			{Key: "Parameter", Value: paramRef},
+			{Key: "Variable", Value: buildFormPageVariable(varName)},
+		})
+	}
+
 	// Build the inner SnippetCall object
 	snippetCallID := generateUUID()
 	snippetCall := bson.D{
 		{Key: "$ID", Value: idToBsonBinary(snippetCallID)},
 		{Key: "$Type", Value: "Forms$SnippetCall"},
-		{Key: "ParameterMappings", Value: bson.A{int32(3)}},
+		{Key: "ParameterMappings", Value: paramMappings},
 	}
 
 	// Add snippet reference - prefer qualified name (BY_NAME_REFERENCE) over binary ID
@@ -397,6 +418,19 @@ func serializeTitle(t *pages.Title) bson.D {
 	return doc
 }
 
+// dataViewLabelWidth resolves the LabelWidth to write to BSON. LabelWidth wins
+// if explicitly set; otherwise FormOrientation is the source (Vertical -> 0,
+// Horizontal/unset -> Mendix's metamodel default of 3).
+func dataViewLabelWidth(dv *pages.DataView) int64 {
+	if dv.LabelWidth != nil {
+		return int64(*dv.LabelWidth)
+	}
+	if dv.FormOrientation == pages.FormOrientationVertical {
+		return 0
+	}
+	return 3
+}
+
 // serializeDataView serializes a DataView widget with all required properties.
 func serializeDataView(dv *pages.DataView) bson.D {
 	// Build NoEntityMessage as Texts$Text
@@ -443,7 +477,7 @@ func serializeDataView(dv *pages.DataView) bson.D {
 		{Key: "DataSource", Value: dataSource},
 		{Key: "Editability", Value: editability},
 		{Key: "FooterWidgets", Value: footerWidgets},
-		{Key: "LabelWidth", Value: int64(3)},
+		{Key: "LabelWidth", Value: dataViewLabelWidth(dv)},
 		{Key: "Name", Value: dv.Name},
 		{Key: "NoEntityMessage", Value: noEntityMessage},
 		{Key: "ReadOnlyStyle", Value: "Control"},
@@ -515,6 +549,7 @@ func serializeDataViewDataSource(ds pages.DataSource) any {
 		return bson.D{
 			{Key: "$ID", Value: idToBsonBinary(string(d.ID))},
 			{Key: "$Type", Value: "Forms$ListenTargetSource"},
+			{Key: "ForceFullObjects", Value: false},
 			{Key: "ListenTarget", Value: d.WidgetName},
 		}
 	case *pages.AssociationSource:

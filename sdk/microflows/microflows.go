@@ -48,11 +48,12 @@ func (m *Microflow) GetContainerID() model.ID {
 // Nanoflows run on the client side and have restrictions on which activities can be used.
 type Nanoflow struct {
 	model.BaseElement
-	ContainerID   model.ID `json:"containerId"`
-	Name          string   `json:"name"`
-	Documentation string   `json:"documentation,omitempty"`
-	MarkAsUsed    bool     `json:"markAsUsed"`
-	Excluded      bool     `json:"excluded"`
+	ContainerID        model.ID   `json:"containerId"`
+	Name               string     `json:"name"`
+	Documentation      string     `json:"documentation,omitempty"`
+	MarkAsUsed         bool       `json:"markAsUsed"`
+	Excluded           bool       `json:"excluded"`
+	AllowedModuleRoles []model.ID `json:"allowedModuleRoles,omitempty"`
 
 	// Return type
 	ReturnType DataType `json:"returnType,omitempty"`
@@ -189,7 +190,8 @@ func (EnumerationCase) isCaseValue() {}
 // InheritanceCase represents an inheritance/type case value.
 type InheritanceCase struct {
 	model.BaseElement
-	EntityID model.ID `json:"entityId"`
+	EntityID            model.ID `json:"entityId"`
+	EntityQualifiedName string   `json:"entityQualifiedName,omitempty"`
 }
 
 func (InheritanceCase) isCaseValue() {}
@@ -290,19 +292,24 @@ type ExpressionSplitCondition struct {
 func (ExpressionSplitCondition) isSplitCondition() {}
 
 // RuleSplitCondition represents a rule-based split condition.
+// In Mendix BSON the rule is referenced by qualified name under the
+// "RuleCall.Microflow" field (rules and microflows share a namespace).
 type RuleSplitCondition struct {
 	model.BaseElement
-	RuleID            model.ID                    `json:"ruleId"`
+	RuleQualifiedName string                      `json:"ruleQualifiedName,omitempty"`
 	ParameterMappings []*RuleCallParameterMapping `json:"parameterMappings,omitempty"`
 }
 
 func (RuleSplitCondition) isSplitCondition() {}
 
 // RuleCallParameterMapping maps a parameter to a value.
+// ParameterName is the fully qualified parameter name (e.g. "Module.Rule.ParamName")
+// as stored in BSON; used when the describer renders the rule call.
 type RuleCallParameterMapping struct {
 	model.BaseElement
-	ParameterID model.ID `json:"parameterId"`
-	Argument    string   `json:"argument"`
+	ParameterID   model.ID `json:"parameterId"`
+	ParameterName string   `json:"parameterName,omitempty"`
+	Argument      string   `json:"argument"`
 }
 
 // LoopSource is the source for a LoopedActivity. Either IterableList (FOR EACH) or WhileLoopCondition (WHILE).

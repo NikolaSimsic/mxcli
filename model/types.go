@@ -319,9 +319,16 @@ type ConsumedODataService struct {
 	// HTTP configuration (nested Microflows$HttpConfiguration part)
 	HttpConfiguration *HttpConfiguration `json:"httpConfiguration,omitempty"`
 
-	// Microflow references (BY_NAME)
-	ConfigurationMicroflow string `json:"configurationMicroflow,omitempty"` // Microflow for configuring requests
-	ErrorHandlingMicroflow string `json:"errorHandlingMicroflow,omitempty"` // Microflow for handling errors
+	// Microflow reference (BY_NAME). Studio Pro's "Configuration source"
+	// dropdown has three options: Constants only, Configuration microflow,
+	// Headers microflow. Both microflow options write to the same BSON
+	// field `ConfigurationMicroflow`; Studio Pro picks the dropdown label
+	// based on the microflow's return type
+	// (System.ConsumedODataConfiguration vs list of System.HttpHeader).
+	// The MDL `HeadersMicroflow` keyword is an alias that writes to this
+	// same field.
+	ConfigurationMicroflow string `json:"configurationMicroflow,omitempty"` // BSON: ConfigurationMicroflow
+	ErrorHandlingMicroflow string `json:"errorHandlingMicroflow,omitempty"` // BSON: ErrorHandlingMicroflow
 
 	// Proxy constant references (BY_NAME to Constants$Constant)
 	ProxyHost     string `json:"proxyHost,omitempty"`
@@ -435,6 +442,13 @@ type PublishedMember struct {
 	Filterable  bool   `json:"filterable,omitempty"`
 	Sortable    bool   `json:"sortable,omitempty"`
 	IsPartOfKey bool   `json:"isPartOfKey,omitempty"`
+
+	// Association-specific fields (Kind == "association"). Studio Pro's
+	// ODataPublish$PublishedAssociationEnd records both the association
+	// target entity (qualified name) and the bare association name
+	// alongside ExposedName (the navigation property name).
+	AssociationTargetEntity string `json:"associationTargetEntity,omitempty"`
+	ExposedAssociationName  string `json:"exposedAssociationName,omitempty"`
 }
 
 // ============================================================================
@@ -573,11 +587,11 @@ type ServiceOperation struct {
 // PublishedRestService represents a Rest$PublishedRestService document.
 type PublishedRestService struct {
 	BaseElement
-	ContainerID ID                       `json:"containerId"`
-	Name        string                   `json:"name"`
-	Path        string                   `json:"path,omitempty"`
-	Version     string                   `json:"version,omitempty"`
-	ServiceName string                   `json:"serviceName,omitempty"`
+	ContainerID  ID                       `json:"containerId"`
+	Name         string                   `json:"name"`
+	Path         string                   `json:"path,omitempty"`
+	Version      string                   `json:"version,omitempty"`
+	ServiceName  string                   `json:"serviceName,omitempty"`
 	Excluded     bool                     `json:"excluded,omitempty"`
 	AllowedRoles []string                 `json:"allowedRoles,omitempty"`
 	Resources    []*PublishedRestResource `json:"resources,omitempty"`
@@ -625,6 +639,7 @@ type ConsumedRestService struct {
 	BaseUrl        string                 `json:"baseUrl"`
 	Authentication *RestAuthentication    `json:"authentication,omitempty"`
 	Operations     []*RestClientOperation `json:"operations,omitempty"`
+	OpenApiContent string                 `json:"openApiContent,omitempty"` // raw spec text (stored in OpenApiFile.Content BSON field)
 }
 
 // GetName returns the service's name.
@@ -650,6 +665,7 @@ type RestClientOperation struct {
 	Documentation    string                 `json:"documentation,omitempty"`
 	HttpMethod       string                 `json:"httpMethod"`                // "GET", "POST", etc.
 	Path             string                 `json:"path"`                      // e.g. "/pet/{petId}"
+	Tags             []string               `json:"tags,omitempty"`            // resource group labels (from OpenAPI tags[0])
 	Parameters       []*RestClientParameter `json:"parameters,omitempty"`      // path parameters
 	QueryParameters  []*RestClientParameter `json:"queryParameters,omitempty"` // query parameters
 	Headers          []*RestClientHeader    `json:"headers,omitempty"`
@@ -658,9 +674,9 @@ type RestClientOperation struct {
 	BodyMappings     []*RestResponseMapping `json:"bodyMappings,omitempty"` // export mapping tree (Entity → JSON) for EXPORT_MAPPING bodies
 	ResponseType     string                 `json:"responseType"`           // "JSON", "STRING", "FILE", "STATUS", "NONE", "MAPPING"
 	ResponseVariable string                 `json:"responseVariable,omitempty"`
-	ResponseEntity   string                 `json:"responseEntity,omitempty"`              // target entity for implicit mapping response
-	ResponseMappings []*RestResponseMapping `json:"responseMappings,omitempty"`            // JSON field → entity attribute
-	Timeout          int                    `json:"timeout,omitempty"`                     // 0 = default (300s)
+	ResponseEntity   string                 `json:"responseEntity,omitempty"`   // target entity for implicit mapping response
+	ResponseMappings []*RestResponseMapping `json:"responseMappings,omitempty"` // JSON field → entity attribute
+	Timeout          int                    `json:"timeout,omitempty"`          // 0 = default (300s)
 }
 
 // RestResponseMapping represents one element in a response mapping tree.
@@ -668,9 +684,9 @@ type RestClientOperation struct {
 // (Entity set, with its own Children).
 type RestResponseMapping struct {
 	// Value mapping: maps a JSON field to an entity attribute
-	Attribute   string `json:"attribute,omitempty"`   // entity attribute short name
-	ExposedName string `json:"exposedName"`           // JSON field name
-	JsonPath    string `json:"jsonPath,omitempty"`     // e.g. "(Object)|args|queryparam_1"
+	Attribute   string `json:"attribute,omitempty"` // entity attribute short name
+	ExposedName string `json:"exposedName"`         // JSON field name
+	JsonPath    string `json:"jsonPath,omitempty"`  // e.g. "(Object)|args|queryparam_1"
 
 	// Object mapping: nested entity linked by association
 	Entity      string                 `json:"entity,omitempty"`      // child entity (e.g. "RestDemo.Args")
@@ -813,7 +829,19 @@ type ConventionSettings struct {
 // LanguageSettings represents Settings$LanguageSettings.
 type LanguageSettings struct {
 	BaseElement
-	DefaultLanguageCode string `json:"defaultLanguageCode,omitempty"`
+	DefaultLanguageCode string     `json:"defaultLanguageCode,omitempty"`
+	Languages           []Language `json:"languages,omitempty"`
+}
+
+// Language represents a Texts$Language entry in the project language settings.
+// The Languages slice is populated by parseLanguageSettings and is available
+// for use by settings describers and future language-aware commands.
+type Language struct {
+	Code                 string `json:"code"`
+	CheckCompleteness    bool   `json:"checkCompleteness,omitempty"`
+	CustomDateFormat     string `json:"customDateFormat,omitempty"`
+	CustomDateTimeFormat string `json:"customDateTimeFormat,omitempty"`
+	CustomTimeFormat     string `json:"customTimeFormat,omitempty"`
 }
 
 // CertificateSettings represents Settings$CertificateSettings.

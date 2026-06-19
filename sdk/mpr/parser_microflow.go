@@ -19,16 +19,27 @@ func (r *Reader) parseMicroflow(unitID, containerID string, contents []byte) (*m
 	if err != nil {
 		return nil, err
 	}
+	return ParseMicroflowBSON(contents, model.ID(unitID), model.ID(containerID))
+}
 
+// ParseMicroflowBSON parses raw microflow BSON bytes into a Microflow.
+// Unlike (*Reader).parseMicroflow it does not require a Reader, so it can
+// parse arbitrary blobs (e.g. historical versions read via `git show`).
+func ParseMicroflowBSON(contents []byte, unitID, containerID model.ID) (*microflows.Microflow, error) {
 	var raw map[string]any
 	if err := bson.Unmarshal(contents, &raw); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal BSON: %w", err)
 	}
+	return ParseMicroflowFromRaw(raw, unitID, containerID), nil
+}
 
+// ParseMicroflowFromRaw builds a Microflow from an already-unmarshalled BSON map.
+// Useful when the caller already has the decoded map (e.g. diff-local).
+func ParseMicroflowFromRaw(raw map[string]any, unitID, containerID model.ID) *microflows.Microflow {
 	mf := &microflows.Microflow{}
-	mf.ID = model.ID(unitID)
+	mf.ID = unitID
 	mf.TypeName = "Microflows$Microflow"
-	mf.ContainerID = model.ID(containerID)
+	mf.ContainerID = containerID
 
 	if name, ok := raw["Name"].(string); ok {
 		mf.Name = name
@@ -128,7 +139,7 @@ func (r *Reader) parseMicroflow(unitID, containerID string, contents []byte) (*m
 		}
 	}
 
-	return mf, nil
+	return mf
 }
 
 // parseSequenceFlow parses a SequenceFlow from raw BSON data.
@@ -140,19 +151,19 @@ func parseSequenceFlow(raw map[string]any) *microflows.SequenceFlow {
 	flow.OriginID = model.ID(extractBsonID(raw["OriginPointer"]))
 	flow.DestinationID = model.ID(extractBsonID(raw["DestinationPointer"]))
 
-	if originIdx, ok := raw["OriginConnectionIndex"].(int32); ok {
-		flow.OriginConnectionIndex = int(originIdx)
-	}
-	if destIdx, ok := raw["DestinationConnectionIndex"].(int32); ok {
-		flow.DestinationConnectionIndex = int(destIdx)
-	}
+	flow.OriginConnectionIndex = extractInt(raw["OriginConnectionIndex"])
+	flow.DestinationConnectionIndex = extractInt(raw["DestinationConnectionIndex"])
 	if isErr, ok := raw["IsErrorHandler"].(bool); ok {
 		flow.IsErrorHandler = isErr
 	}
 
-	// Parse CaseValues if present (note: plural, stored as array [count, case_object, ...])
+	// Parse decision branch values. Newer Mendix versions store branch data
+	// in CaseValues ([marker, case]), while older projects use a single
+	// inline NewCaseValue document.
 	if caseVals := raw["CaseValues"]; caseVals != nil {
 		flow.CaseValue = parseCaseValues(caseVals)
+	} else if caseVal := raw["NewCaseValue"]; caseVal != nil {
+		flow.CaseValue = parseCaseValue(caseVal)
 	}
 
 	// Parse BezierCurve control vectors from Line
@@ -211,6 +222,16 @@ func parseCaseValue(raw any) microflows.CaseValue {
 				BaseElement: model.BaseElement{ID: id},
 				Value:       val,
 			}
+		}
+	case "Microflows$InheritanceCase":
+		entityName := extractString(caseMap["Value"])
+		if entityName == "" {
+			entityName = extractString(caseMap["Entity"])
+		}
+		return &microflows.InheritanceCase{
+			BaseElement:         model.BaseElement{ID: id},
+			EntityID:            model.ID(extractBsonID(caseMap["Entity"])),
+			EntityQualifiedName: entityName,
 		}
 	}
 	return nil
@@ -449,20 +470,26 @@ func parseSplitCondition(raw map[string]any) microflows.SplitCondition {
 			Expression: extractString(raw["Expression"]),
 		}
 	case "Microflows$RuleSplitCondition":
-		cond := &microflows.RuleSplitCondition{
-			RuleID: model.ID(extractBsonID(raw["Rule"])),
+		cond := &microflows.RuleSplitCondition{}
+		// Mendix nests the rule reference under a RuleCall sub-document whose
+		// "Microflow" field holds the rule's qualified name (rules share the
+		// microflow namespace). Parameter mappings are scoped inside RuleCall too.
+		rcSource := raw
+		if rc := extractBsonMap(raw["RuleCall"]); rc != nil {
+			cond.RuleQualifiedName = extractString(rc["Microflow"])
+			rcSource = rc
 		}
-		// Parse parameter mappings if present
-		if mappings, ok := raw["ParameterMappings"].([]any); ok {
-			for _, m := range mappings {
-				if mMap, ok := m.(map[string]any); ok {
-					mapping := &microflows.RuleCallParameterMapping{
-						ParameterID: model.ID(extractBsonID(mMap["Parameter"])),
-						Argument:    extractString(mMap["Argument"]),
-					}
-					cond.ParameterMappings = append(cond.ParameterMappings, mapping)
-				}
+		for _, m := range extractBsonArray(rcSource["ParameterMappings"]) {
+			mMap := extractBsonMap(m)
+			if mMap == nil {
+				continue
 			}
+			mapping := &microflows.RuleCallParameterMapping{
+				ParameterID:   model.ID(extractBsonID(mMap["Parameter"])),
+				ParameterName: extractString(mMap["Parameter"]),
+				Argument:      extractString(mMap["Argument"]),
+			}
+			cond.ParameterMappings = append(cond.ParameterMappings, mapping)
 		}
 		return cond
 	default:
@@ -485,9 +512,9 @@ func parseActionActivity(raw map[string]any) *microflows.ActionActivity {
 		activity.ErrorHandlingType = microflows.ErrorHandlingType(errorHandling)
 	}
 
-	// Parse the action
-	if action, ok := raw["Action"].(map[string]any); ok {
-		activity.Action = parseMicroflowAction(action)
+	// Parse the action.
+	if action := parseMicroflowActionValue(raw["Action"]); action != nil {
+		activity.Action = action
 	}
 
 	return activity
@@ -522,9 +549,12 @@ var microflowActionParsers = map[string]func(map[string]any) microflows.Microflo
 	"Microflows$ListOperationsAction": func(r map[string]any) microflows.MicroflowAction { return parseListOperationAction(r) },
 
 	// Integration actions
-	"Microflows$MicroflowCallAction":  func(r map[string]any) microflows.MicroflowAction { return parseMicroflowCallAction(r) },
-	"Microflows$JavaActionCallAction": func(r map[string]any) microflows.MicroflowAction { return parseJavaActionCallAction(r) },
-	"Microflows$CallExternalAction":   func(r map[string]any) microflows.MicroflowAction { return parseCallExternalAction(r) },
+	"Microflows$MicroflowCallAction":        func(r map[string]any) microflows.MicroflowAction { return parseMicroflowCallAction(r) },
+	"Microflows$NanoflowCallAction":         func(r map[string]any) microflows.MicroflowAction { return parseNanoflowCallAction(r) },
+	"Microflows$JavaActionCallAction":       func(r map[string]any) microflows.MicroflowAction { return parseJavaActionCallAction(r) },
+	"Microflows$JavaScriptActionCallAction": func(r map[string]any) microflows.MicroflowAction { return parseJavaScriptActionCallAction(r) },
+	"Microflows$CallExternalAction":         func(r map[string]any) microflows.MicroflowAction { return parseCallExternalAction(r) },
+	"Microflows$CallWebServiceAction":       func(r map[string]any) microflows.MicroflowAction { return parseWebServiceCallAction(r) },
 
 	// Client actions (ShowFormAction is storageName for ShowPageAction)
 	"Microflows$ShowFormAction":           func(r map[string]any) microflows.MicroflowAction { return parseShowPageAction(r) },
@@ -580,6 +610,27 @@ func parseMicroflowAction(raw map[string]any) microflows.MicroflowAction {
 		return fn(raw)
 	}
 	return &microflows.UnknownAction{TypeName: typeName}
+}
+
+func parseMicroflowActionValue(raw any) microflows.MicroflowAction {
+	switch action := raw.(type) {
+	case primitive.D:
+		actionMap := action.Map()
+		typeName, _ := actionMap["$Type"].(string)
+		if typeName == "Microflows$CallWebServiceAction" {
+			return parseWebServiceCallActionFromD(action)
+		}
+		return parseMicroflowAction(actionMap)
+	case map[string]any:
+		return parseMicroflowAction(action)
+	case primitive.M:
+		return parseMicroflowAction(map[string]any(action))
+	default:
+		if actionMap := extractBsonMap(raw); actionMap != nil {
+			return parseMicroflowAction(actionMap)
+		}
+		return nil
+	}
 }
 
 func parseCreateVariableAction(raw map[string]any) *microflows.CreateVariableAction {
@@ -697,8 +748,9 @@ func parseCommitAction(raw map[string]any) *microflows.CommitObjectsAction {
 	action.CommitVariable = extractString(raw["CommitVariableName"])
 	action.WithEvents = extractBool(raw["WithEvents"], false)
 	action.RefreshInClient = extractBool(raw["RefreshInClient"], false)
-	if errType, ok := raw["ErrorHandlingType"].(string); ok {
-		action.ErrorHandlingType = microflows.ErrorHandlingType(errType)
+	action.ErrorHandlingType = microflows.ErrorHandlingType(extractString(raw["ErrorHandlingType"]))
+	if action.ErrorHandlingType == "" {
+		action.ErrorHandlingType = microflows.ErrorHandlingTypeRollback
 	}
 	return action
 }
@@ -765,6 +817,7 @@ func parseSortItems(raw map[string]any) []*microflows.SortItem {
 			} else {
 				sortItem.AttributeID = model.ID(extractBsonID(attrRefMap["Attribute"]))
 			}
+			sortItem.EntityRefSteps = parseEntityRefSteps(attrRefMap["EntityRef"])
 		}
 
 		// Fall back to AttributePath (legacy)
@@ -782,6 +835,32 @@ func parseSortItems(raw map[string]any) []*microflows.SortItem {
 		result = append(result, sortItem)
 	}
 	return result
+}
+
+func parseEntityRefSteps(raw any) []microflows.EntityRefStep {
+	entityRefMap := extractBsonMap(raw)
+	if entityRefMap == nil {
+		return nil
+	}
+	items := extractBsonSlice(entityRefMap["Steps"])
+	if len(items) == 0 {
+		return nil
+	}
+	var steps []microflows.EntityRefStep
+	for _, item := range items {
+		itemMap := extractBsonMap(item)
+		if itemMap == nil {
+			continue
+		}
+		step := microflows.EntityRefStep{
+			Association:       extractString(itemMap["Association"]),
+			DestinationEntity: extractString(itemMap["DestinationEntity"]),
+		}
+		if step.Association != "" || step.DestinationEntity != "" {
+			steps = append(steps, step)
+		}
+	}
+	return steps
 }
 
 func parseRetrieveSource(raw map[string]any) microflows.RetrieveSource {
@@ -881,6 +960,13 @@ func parseAggregateListAction(raw map[string]any) *microflows.AggregateListActio
 		action.Function = microflows.AggregateFunction(fn)
 	}
 
+	if useExpr, ok := raw["UseExpression"].(bool); ok {
+		action.UseExpression = useExpr
+	}
+	if action.UseExpression {
+		action.Expression = extractString(raw["Expression"])
+	}
+
 	return action
 }
 
@@ -937,10 +1023,26 @@ func parseListOperation(raw map[string]any) microflows.ListOperation {
 			BaseElement:  model.BaseElement{ID: id},
 			ListVariable: listVar,
 		}
+	case "Microflows$Find":
+		return &microflows.FindByAttributeOperation{
+			BaseElement:  model.BaseElement{ID: id},
+			ListVariable: listVar,
+			Attribute:    extractString(raw["Attribute"]),
+			Association:  extractString(raw["Association"]),
+			Expression:   extractString(raw["Expression"]),
+		}
 	case "Microflows$FindByExpression":
 		return &microflows.FindOperation{
 			BaseElement:  model.BaseElement{ID: id},
 			ListVariable: listVar,
+			Expression:   extractString(raw["Expression"]),
+		}
+	case "Microflows$Filter":
+		return &microflows.FilterByAttributeOperation{
+			BaseElement:  model.BaseElement{ID: id},
+			ListVariable: listVar,
+			Attribute:    extractString(raw["Attribute"]),
+			Association:  extractString(raw["Association"]),
 			Expression:   extractString(raw["Expression"]),
 		}
 	case "Microflows$FilterByExpression":
@@ -986,6 +1088,16 @@ func parseListOperation(raw map[string]any) microflows.ListOperation {
 			ListVariable1: listVar,
 			ListVariable2: extractString(raw["SecondListOrObjectName"]),
 		}
+	case "Microflows$ListRange":
+		rangeOp := &microflows.ListRangeOperation{
+			BaseElement:  model.BaseElement{ID: id},
+			ListVariable: listVar,
+		}
+		if cr := extractBsonMap(raw["CustomRange"]); cr != nil {
+			rangeOp.LimitExpression = extractString(cr["LimitExpression"])
+			rangeOp.OffsetExpression = extractString(cr["OffsetExpression"])
+		}
+		return rangeOp
 	default:
 		return nil
 	}

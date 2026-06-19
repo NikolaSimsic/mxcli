@@ -4,6 +4,7 @@
 #   make build     - Build mxcli for current platform
 #   make release   - Build mxcli for all platforms (macOS, Windows, Linux)
 #   make test      - Run unit tests
+#   make check-mdl - Check MDL syntax for all doctype example scripts
 #   make test-integration - Run integration tests (requires mx/mxbuild)
 #   make test-mdl  - Run MDL integration tests (requires Docker)
 #   make lint      - Lint all code (Go + TypeScript)
@@ -28,7 +29,7 @@ LDFLAGS = -ldflags "-X main.Version=$(VERSION) -X main.BuildTime=$(BUILD_TIME)"
 # Clean version for VS Code extension (must be valid semver: major.minor.patch)
 VSCE_VERSION = $(shell echo "$(VERSION)" | sed 's/^v//; s/-.*//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$$' || echo "0.0.0")
 
-.PHONY: build build-debug release clean test test-mdl grammar completions sync-skills sync-commands sync-lint-rules sync-changelog sync-all docs documentation docs-site docs-serve vscode-ext vscode-install source-tree sbom sbom-report lint lint-go lint-ts fmt vet
+.PHONY: build build-debug release clean test engine-diff test-mdl check-widget-versions grammar completions sync-skills sync-commands sync-lint-rules sync-changelog sync-all docs documentation docs-site docs-serve vscode-ext vscode-install source-tree sbom sbom-report lint lint-go lint-ts fmt vet
 
 # Helper: copy file only if content differs (avoids mtime updates that invalidate go build cache)
 # Usage: $(call copy-if-changed,src,dst)
@@ -100,7 +101,7 @@ completions:
 	fi
 
 # Build for current platform (auto-syncs skills and commands)
-build: sync-all completions
+build: grammar sync-all completions
 	@mkdir -p $(BUILD_DIR)
 	CGO_ENABLED=0 go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) $(CMD_PATH)
 	CGO_ENABLED=0 go build -o $(BUILD_DIR)/source_tree ./cmd/source_tree
@@ -113,7 +114,7 @@ build-debug: sync-all completions
 	@echo "Built $(BUILD_DIR)/$(BINARY_NAME)-debug (debug build with bson tools)"
 
 # Build for all platforms (CGO_ENABLED=0 for cross-compilation)
-release: clean vscode-ext sync-all
+release: clean grammar vscode-ext sync-all
 	@mkdir -p $(BUILD_DIR)
 	@echo "Building release binaries..."
 
@@ -140,8 +141,66 @@ release: clean vscode-ext sync-all
 	@ls -lh $(BUILD_DIR)/
 
 # Run tests
-test:
+test: grammar
 	CGO_ENABLED=0 go test ./...
+
+# Dual-engine read-parity harness: run read queries through the legacy (sdk/mpr)
+# and modelsdk engines and diff the rendered output. The read-side of the
+# engine-adoption comparison gate (docs/plans/2026-06-05-adopt-modelsdk-engine.md).
+engine-diff: grammar
+	CGO_ENABLED=0 go test ./mdl/enginecompare/ -run TestReadParity -v
+
+# Check MDL syntax for all example scripts.
+#
+# Covers both doctype-tests/ (broad doctype demos) and bug-tests/ (per-PR
+# regression fixtures). Skips files ending in .test.mdl — those are
+# mxcli-test inputs, not mxcli-check inputs.
+#
+# Nine bug-test fixtures are pre-existing failures (varied causes: some
+# demonstrate intentionally-broken syntax, others need project context).
+# Tracked separately (issue #571); the SKIP list keeps CI green until each
+# is triaged.
+#
+# Files ending in .fail.mdl are explicit negative tests — they MUST fail
+# `mxcli check` (the script reproduces a symptom that a new validation
+# rule rejects). The runner inverts the exit code for these: an unexpected
+# pass is treated as a regression of the rule.
+check-mdl: build
+	@FAILED=0; \
+	for f in mdl-examples/doctype-tests/*.mdl mdl-examples/bug-tests/*.mdl; do \
+		case "$$f" in *.test.mdl) continue ;; esac; \
+		case "$$f" in \
+			*/116-datagrid2-column-name-mismatch.mdl|\
+			*/343-list-attribute-find-filter.mdl|\
+			*/352-java-action-return-type-inference.mdl|\
+			*/352-retrieve-compact-reverse-association.mdl|\
+			*/360-import-mapping-result-type.mdl|\
+			*/367-retrieve-sort-indirect-entity-ref.mdl|\
+			*/369-rest-mapping-result-cardinality.mdl|\
+			*/373-change-action-items-storage-list.mdl|\
+			*/552-npe-reserved-words.mdl) \
+				echo "SKIP: $$(basename "$$f") (pre-existing — tracked separately)"; \
+				continue ;; \
+		esac; \
+		NAME=$$(basename "$$f"); \
+		case "$$f" in *.fail.mdl) \
+			if ./$(BUILD_DIR)/$(BINARY_NAME) check "$$f" > /dev/null 2>&1; then \
+				echo "FAIL (negative test unexpectedly passed): $$NAME"; \
+				FAILED=1; \
+			else \
+				echo "PASS (negative test, expected error): $$NAME"; \
+			fi; \
+			continue ;; \
+		esac; \
+		if ./$(BUILD_DIR)/$(BINARY_NAME) check "$$f" > /dev/null 2>&1; then \
+			echo "PASS: $$NAME"; \
+		else \
+			echo "FAIL: $$NAME"; \
+			./$(BUILD_DIR)/$(BINARY_NAME) check "$$f" 2>&1 | grep -v "^WARNING"; \
+			FAILED=1; \
+		fi; \
+	done; \
+	exit $$FAILED
 
 # Run integration tests (requires mx binary / mxbuild)
 test-integration:
@@ -151,7 +210,21 @@ test-integration:
 # Usage: make test-mdl MPR=path/to/app.mpr
 MPR ?= app.mpr
 test-mdl: build
-	$(BUILD_DIR)/$(BINARY_NAME) test mdl-examples/doctype-tests/microflow-spec.test.mdl -p $(MPR)
+	./scripts/run-mdl-tests.sh "$(abspath $(MPR))" "$(abspath $(BUILD_DIR)/$(BINARY_NAME))"
+
+# Cross-version widget-envelope drift gate (v0.12.0 Stream A / A3).
+# Runs the v0.10 widget fixtures through exec + mx check on multiple Mendix
+# versions and fails if the CE0463 set differs between them (envelope drift).
+# Requires the matching mxbuilds (~/.mxcli/mxbuild/<ver>/) and reference
+# projects with the fixtures' widgets installed (override the vars below).
+MX_PROJECT_119 ?= ../ModelSDKGo/mx-test-projects/test5-app/test5.mpr
+MX_PROJECT_1110 ?= ../ModelSDKGo/mx-test-projects/test6-app/test6.mpr
+check-widget-versions: build
+	@for fix in 03-page-examples 30-pluggable-widget-examples 31-pluggable-datagrid-gallery-v010-examples 32-pluggable-widget-object-lists-v010; do \
+		echo "== $$fix =="; \
+		./scripts/check-widget-versions.sh "mdl-examples/doctype-tests/$$fix.mdl" \
+			"11.9.0:$(MX_PROJECT_119)" "11.10.0:$(MX_PROJECT_1110)" || exit 1; \
+	done
 
 # Lint all code (Go + TypeScript)
 lint: lint-go lint-ts

@@ -214,6 +214,9 @@ func buildSnippetParameterListAsPage(ctx parser.ISnippetParameterListContext) []
 		} else if v := spCtx.VARIABLE(); v != nil {
 			// VARIABLE token is $name, strip the $ prefix
 			param.Name = strings.TrimPrefix(v.GetText(), "$")
+		} else if qid := spCtx.QUOTED_IDENTIFIER(); qid != nil {
+			// Quoted name for reserved-keyword params, e.g. "List". See issue #114.
+			param.Name = unquoteIdentifier(qid.GetText())
 		}
 
 		if dt := spCtx.DataType(); dt != nil {
@@ -319,18 +322,21 @@ func buildWidgetV3(ctx parser.IWidgetV3Context, b *Builder) *ast.WidgetV3 {
 
 	// Get widget type
 	if wCtx.PLUGGABLEWIDGET() != nil {
-		widget.Type = "PLUGGABLEWIDGET"
+		widget.Type = "pluggablewidget"
 		widget.Properties["WidgetType"] = unquoteString(wCtx.STRING_LITERAL().GetText())
 	} else if wCtx.CUSTOMWIDGET() != nil {
-		widget.Type = "CUSTOMWIDGET"
+		widget.Type = "customwidget"
 		widget.Properties["WidgetType"] = unquoteString(wCtx.STRING_LITERAL().GetText())
 	} else if typeCtx := wCtx.WidgetTypeV3(); typeCtx != nil {
-		widget.Type = strings.ToUpper(typeCtx.GetText())
+		widget.Type = strings.ToLower(typeCtx.GetText())
 	}
 
-	// Get required identifier
+	// Get required identifier. The name may be quoted (QUOTED_IDENTIFIER) when it
+	// collides with a reserved keyword, e.g. a widget named "List". See issue #619.
 	if id := wCtx.IDENTIFIER(); id != nil {
 		widget.Name = id.GetText()
+	} else if qid := wCtx.QUOTED_IDENTIFIER(); qid != nil {
+		widget.Name = unquoteIdentifier(qid.GetText())
 	}
 
 	// Parse properties
@@ -517,6 +523,14 @@ func parseWidgetPropertyV3(ctx parser.IWidgetPropertyV3Context, widget *ast.Widg
 		return
 	}
 
+	// Params: {$Asset: $var} — snippet call parameter mappings
+	if propCtx.PARAMS() != nil {
+		if plCtx := propCtx.SnippetCallParamListV3(); plCtx != nil {
+			widget.Properties["Params"] = buildSnippetCallParamListV3(plCtx)
+		}
+		return
+	}
+
 	// Attributes: [...] (for filter widgets)
 	if propCtx.ATTRIBUTES() != nil {
 		if attrListCtx := propCtx.AttributeListV3(); attrListCtx != nil {
@@ -615,7 +629,14 @@ func buildDataSourceV3(ctx parser.IDataSourceExprV3Context) *ast.DataSourceV3 {
 	dsCtx := ctx.(*parser.DataSourceExprV3Context)
 	ds := &ast.DataSourceV3{}
 
-	if v := dsCtx.VARIABLE(); v != nil {
+	if v := dsCtx.VARIABLE(); v != nil && dsCtx.SLASH() != nil {
+		// $currentObject/Module.Assoc — ByAssociation data source (sugar for ASSOCIATION Path)
+		ds.Type = "association"
+		ds.ContextVariable = strings.TrimPrefix(v.GetText(), "$")
+		if pathCtx := dsCtx.AssociationPathV3(); pathCtx != nil {
+			ds.Reference = buildAssociationPathV3(pathCtx)
+		}
+	} else if v := dsCtx.VARIABLE(); v != nil {
 		// $ParamName
 		ds.Type = "parameter"
 		ds.Reference = v.GetText()
@@ -663,8 +684,8 @@ func buildDataSourceV3(ctx parser.IDataSourceExprV3Context) *ast.DataSourceV3 {
 	} else if dsCtx.ASSOCIATION() != nil {
 		// ASSOCIATION Path
 		ds.Type = "association"
-		if pathCtx := dsCtx.AttributePathV3(); pathCtx != nil {
-			ds.Reference = buildAttributePathV3(pathCtx)
+		if pathCtx := dsCtx.AssociationPathV3(); pathCtx != nil {
+			ds.Reference = buildAssociationPathV3(pathCtx)
 		}
 	} else if dsCtx.SELECTION() != nil {
 		// SELECTION widgetName
@@ -796,6 +817,20 @@ func buildAttributeListV3(ctx parser.IAttributeListV3Context) []string {
 	}
 
 	return attrs
+}
+
+// buildAssociationPathV3 builds an association path string from a parser context.
+// Format: "Module.Assoc" or "Module.Assoc/Module.Entity" — qualified names separated by /.
+func buildAssociationPathV3(ctx parser.IAssociationPathV3Context) string {
+	if ctx == nil {
+		return ""
+	}
+	apc := ctx.(*parser.AssociationPathV3Context)
+	var parts []string
+	for _, qn := range apc.AllQualifiedName() {
+		parts = append(parts, getQualifiedNameText(qn))
+	}
+	return strings.Join(parts, "/")
 }
 
 // buildAttributePathV3 builds an attribute path string.
@@ -1065,12 +1100,17 @@ func buildDesignPropertyEntryV3(ctx parser.IDesignPropertyEntryV3Context) *ast.D
 
 	key := unquoteString(allStrings[0].GetText())
 
+	// Compound (nested): 'Spacing': ['margin-top': 'Large', 'margin-bottom': 'Medium']
+	if listCtx := entryCtx.DesignPropertyListV3(); listCtx != nil {
+		return &ast.DesignPropertyEntryV3{Key: key, Nested: buildDesignPropertyListV3(listCtx)}
+	}
+
 	// Value: second STRING_LITERAL, ON, or OFF
 	if entryCtx.ON() != nil {
-		return &ast.DesignPropertyEntryV3{Key: key, Value: "ON"}
+		return &ast.DesignPropertyEntryV3{Key: key, Value: "on"}
 	}
 	if entryCtx.OFF() != nil {
-		return &ast.DesignPropertyEntryV3{Key: key, Value: "OFF"}
+		return &ast.DesignPropertyEntryV3{Key: key, Value: "off"}
 	}
 	if len(allStrings) >= 2 {
 		return &ast.DesignPropertyEntryV3{Key: key, Value: unquoteString(allStrings[1].GetText())}
@@ -1163,11 +1203,10 @@ func xpathExprToString(expr ast.Expression) string {
 	case *ast.IdentifierExpr:
 		return e.Name
 	case *ast.QualifiedNameExpr:
-		// For enum value references (3-part: Module.EnumName.Value), XPath requires
-		// just the value name in quotes: 'Value'.
+		// XPath constraints run at the database level; enum values must be string literals.
+		// 3-part names (Module.EnumName.Value) → 'Value'; 2-part names pass through.
 		if dotIdx := strings.LastIndex(e.QualifiedName.Name, "."); dotIdx >= 0 {
-			valueName := e.QualifiedName.Name[dotIdx+1:]
-			return "'" + valueName + "'"
+			return "'" + e.QualifiedName.Name[dotIdx+1:] + "'"
 		}
 		return e.QualifiedName.String()
 	default:
@@ -1187,4 +1226,31 @@ func xpathPathToString(path *ast.XPathPathExpr) string {
 		parts = append(parts, s)
 	}
 	return strings.Join(parts, "/")
+}
+
+// buildSnippetCallParamListV3 converts a parsed snippetCallParamListV3 context
+// into a slice of SnippetCallParam AST nodes.
+func buildSnippetCallParamListV3(ctx parser.ISnippetCallParamListV3Context) []ast.SnippetCallParam {
+	var params []ast.SnippetCallParam
+	for _, mappingCtx := range ctx.AllSnippetCallParamMappingV3() {
+		param := ast.SnippetCallParam{}
+		if iok := mappingCtx.IdentifierOrKeyword(); iok != nil {
+			// Param name written without $: Agent: $someVar or Asset: $someVar
+			param.ParamName = iok.GetText()
+			if vars := mappingCtx.AllVARIABLE(); len(vars) > 0 {
+				param.Variable = vars[0].GetText()
+			}
+		} else {
+			// Param name written with $: $Asset: $someVar
+			vars := mappingCtx.AllVARIABLE()
+			if len(vars) >= 2 {
+				param.ParamName = vars[0].GetText()
+				param.Variable = vars[1].GetText()
+			}
+		}
+		if param.ParamName != "" && param.Variable != "" {
+			params = append(params, param)
+		}
+	}
+	return params
 }

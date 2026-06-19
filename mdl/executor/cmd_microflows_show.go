@@ -9,22 +9,30 @@ import (
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
 )
 
-// showMicroflows handles SHOW MICROFLOWS command.
-func (e *Executor) showMicroflows(moduleName string) error {
+// listMicroflows handles SHOW MICROFLOWS command.
+func listMicroflows(ctx *ExecContext, moduleName string) error {
 	// Get hierarchy for module/folder resolution
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
+	}
+
+	// Validate module exists if specified
+	if moduleName != "" {
+		if _, err := findModule(ctx, moduleName); err != nil {
+			return err
+		}
 	}
 
 	// Get all microflows
-	microflows, err := e.reader.ListMicroflows()
+	microflows, err := ctx.Backend.ListMicroflows()
 	if err != nil {
-		return fmt.Errorf("failed to list microflows: %w", err)
+		return mdlerrors.NewBackend("list microflows", err)
 	}
 
 	// Collect rows and calculate column widths
@@ -74,21 +82,28 @@ func (e *Executor) showMicroflows(moduleName string) error {
 	for _, r := range rows {
 		result.Rows = append(result.Rows, []any{r.qualifiedName, r.module, r.name, r.excluded, r.folderPath, r.params, r.activities, r.complexity, r.returnType})
 	}
-	return e.writeResult(result)
+	return writeResult(ctx, result)
 }
 
-// showNanoflows handles SHOW NANOFLOWS command.
-func (e *Executor) showNanoflows(moduleName string) error {
+// listNanoflows handles SHOW NANOFLOWS command.
+func listNanoflows(ctx *ExecContext, moduleName string) error {
 	// Get hierarchy for module/folder resolution
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
+	}
+
+	// Validate module exists if specified
+	if moduleName != "" {
+		if _, err := findModule(ctx, moduleName); err != nil {
+			return err
+		}
 	}
 
 	// Get all nanoflows
-	nanoflows, err := e.reader.ListNanoflows()
+	nanoflows, err := ctx.Backend.ListNanoflows()
 	if err != nil {
-		return fmt.Errorf("failed to list nanoflows: %w", err)
+		return mdlerrors.NewBackend("list nanoflows", err)
 	}
 
 	// Collect rows and calculate column widths
@@ -138,7 +153,7 @@ func (e *Executor) showNanoflows(moduleName string) error {
 	for _, r := range rows {
 		result.Rows = append(result.Rows, []any{r.qualifiedName, r.module, r.name, r.excluded, r.folderPath, r.params, r.activities, r.complexity, r.returnType})
 	}
-	return e.writeResult(result)
+	return writeResult(ctx, result)
 }
 
 // countNanoflowActivities counts meaningful activities in a nanoflow.
@@ -176,21 +191,21 @@ func calculateNanoflowComplexity(nf *microflows.Nanoflow) int {
 }
 
 // describeMicroflow handles DESCRIBE MICROFLOW command - outputs MDL source code.
-func (e *Executor) describeMicroflow(name ast.QualifiedName) error {
+func describeMicroflow(ctx *ExecContext, name ast.QualifiedName) error {
 	// Get hierarchy for module/folder resolution
-	h, err := e.getHierarchy()
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	// Use pre-warmed cache if available (from PreWarmCache), otherwise build on demand
-	entityNames := e.getEntityNames(h)
-	microflowNames := e.getMicroflowNames(h)
+	entityNames := getEntityNames(ctx, h)
+	microflowNames := getMicroflowNames(ctx, h)
 
 	// Find the microflow
-	allMicroflows, err := e.reader.ListMicroflows()
+	allMicroflows, err := ctx.Backend.ListMicroflows()
 	if err != nil {
-		return fmt.Errorf("failed to list microflows: %w", err)
+		return mdlerrors.NewBackend("list microflows", err)
 	}
 
 	// Supplement microflow name lookup if not pre-warmed
@@ -211,7 +226,7 @@ func (e *Executor) describeMicroflow(name ast.QualifiedName) error {
 	}
 
 	if targetMf == nil {
-		return fmt.Errorf("microflow not found: %s", name)
+		return mdlerrors.NewNotFound("microflow", name.String())
 	}
 
 	// Generate MDL output
@@ -234,11 +249,11 @@ func (e *Executor) describeMicroflow(name ast.QualifiedName) error {
 	// CREATE MICROFLOW header
 	qualifiedName := name.Module + "." + name.Name
 	if len(targetMf.Parameters) > 0 {
-		lines = append(lines, fmt.Sprintf("CREATE OR MODIFY MICROFLOW %s (", qualifiedName))
+		lines = append(lines, fmt.Sprintf("create or modify microflow %s (", qualifiedName))
 		for i, param := range targetMf.Parameters {
 			paramType := "Object"
 			if param.Type != nil {
-				paramType = e.formatMicroflowDataType(param.Type, entityNames)
+				paramType = formatMicroflowDataType(ctx, param.Type, entityNames)
 			}
 			comma := ","
 			if i == len(targetMf.Parameters)-1 {
@@ -248,17 +263,17 @@ func (e *Executor) describeMicroflow(name ast.QualifiedName) error {
 		}
 		lines = append(lines, ")")
 	} else {
-		lines = append(lines, fmt.Sprintf("CREATE OR MODIFY MICROFLOW %s ()", qualifiedName))
+		lines = append(lines, fmt.Sprintf("create or modify microflow %s ()", qualifiedName))
 	}
 
 	// Return type
 	if targetMf.ReturnType != nil {
-		returnType := e.formatMicroflowDataType(targetMf.ReturnType, entityNames)
+		returnType := formatMicroflowDataType(ctx, targetMf.ReturnType, entityNames)
 		if returnType != "Void" && returnType != "" {
-			returnLine := fmt.Sprintf("RETURNS %s", returnType)
+			returnLine := fmt.Sprintf("returns %s", returnType)
 			// Add variable name if specified (AS $VarName)
 			if targetMf.ReturnVariableName != "" && targetMf.ReturnVariableName != "Variable" {
-				returnLine += fmt.Sprintf(" AS $%s", targetMf.ReturnVariableName)
+				returnLine += fmt.Sprintf(" as $%s", targetMf.ReturnVariableName)
 			}
 			lines = append(lines, returnLine)
 		}
@@ -266,15 +281,22 @@ func (e *Executor) describeMicroflow(name ast.QualifiedName) error {
 
 	// Folder
 	if folderPath := h.BuildFolderPath(targetMf.ContainerID); folderPath != "" {
-		lines = append(lines, fmt.Sprintf("FOLDER '%s'", folderPath))
+		lines = append(lines, fmt.Sprintf("folder %s", mdlQuote(folderPath)))
 	}
 
 	// BEGIN block
-	lines = append(lines, "BEGIN")
+	lines = append(lines, "begin")
+
+	prevDescribingReturnValue := ctx.DescribingMicroflowHasReturnValue
+	ctx.DescribingMicroflowHasReturnValue = microflowHasReturnValue(targetMf)
+	defer func() {
+		ctx.DescribingMicroflowHasReturnValue = prevDescribingReturnValue
+	}()
 
 	// Generate activities
 	if targetMf.ObjectCollection != nil && len(targetMf.ObjectCollection.Objects) > 0 {
-		activityLines := e.formatMicroflowActivities(targetMf, entityNames, microflowNames)
+		activityLines := formatMicroflowActivities(ctx, targetMf, entityNames, microflowNames)
+		activityLines = prependFreeAnnotationLines(targetMf.ObjectCollection, activityLines)
 		for _, line := range activityLines {
 			lines = append(lines, "  "+line)
 		}
@@ -282,7 +304,7 @@ func (e *Executor) describeMicroflow(name ast.QualifiedName) error {
 		lines = append(lines, "  -- No activities")
 	}
 
-	lines = append(lines, "END;")
+	lines = append(lines, "end;")
 
 	// Add GRANT EXECUTE if roles are assigned
 	if len(targetMf.AllowedModuleRoles) > 0 {
@@ -291,28 +313,31 @@ func (e *Executor) describeMicroflow(name ast.QualifiedName) error {
 			roles[i] = string(r)
 		}
 		lines = append(lines, "")
-		lines = append(lines, fmt.Sprintf("GRANT EXECUTE ON MICROFLOW %s.%s TO %s;",
+		lines = append(lines, fmt.Sprintf("grant execute on microflow %s.%s to %s;",
 			name.Module, name.Name, strings.Join(roles, ", ")))
 	}
 
 	lines = append(lines, "/")
 
 	// Output
-	fmt.Fprintln(e.output, strings.Join(lines, "\n"))
+	fmt.Fprintln(ctx.Output, strings.Join(lines, "\n"))
 	return nil
 }
 
 // describeNanoflow generates re-executable CREATE OR MODIFY NANOFLOW MDL output
 // with activities and control flows listed as comments.
-func (e *Executor) describeNanoflow(name ast.QualifiedName) error {
-	h, err := e.getHierarchy()
+func describeNanoflow(ctx *ExecContext, name ast.QualifiedName) error {
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to build hierarchy: %w", err)
+		return mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	// Build entity name lookup
 	entityNames := make(map[model.ID]string)
-	domainModels, _ := e.reader.ListDomainModels()
+	domainModels, err := ctx.Backend.ListDomainModels()
+	if err != nil {
+		return mdlerrors.NewBackend("list domain models", err)
+	}
 	for _, dm := range domainModels {
 		modName := h.GetModuleName(dm.ContainerID)
 		for _, entity := range dm.Entities {
@@ -322,15 +347,18 @@ func (e *Executor) describeNanoflow(name ast.QualifiedName) error {
 
 	// Build microflow/nanoflow name lookup (used for call actions)
 	microflowNames := make(map[model.ID]string)
-	allMicroflows, _ := e.reader.ListMicroflows()
+	allMicroflows, err := ctx.Backend.ListMicroflows()
+	if err != nil {
+		return mdlerrors.NewBackend("list microflows", err)
+	}
 	for _, mf := range allMicroflows {
 		microflowNames[mf.ID] = h.GetQualifiedName(mf.ContainerID, mf.Name)
 	}
 
 	// Find the nanoflow
-	allNanoflows, err := e.reader.ListNanoflows()
+	allNanoflows, err := ctx.Backend.ListNanoflows()
 	if err != nil {
-		return fmt.Errorf("failed to list nanoflows: %w", err)
+		return mdlerrors.NewBackend("list nanoflows", err)
 	}
 
 	for _, nf := range allNanoflows {
@@ -348,7 +376,7 @@ func (e *Executor) describeNanoflow(name ast.QualifiedName) error {
 	}
 
 	if targetNf == nil {
-		return fmt.Errorf("nanoflow not found: %s", name)
+		return mdlerrors.NewNotFound("nanoflow", name.String())
 	}
 
 	var lines []string
@@ -362,14 +390,19 @@ func (e *Executor) describeNanoflow(name ast.QualifiedName) error {
 		lines = append(lines, " */")
 	}
 
+	// @excluded annotation
+	if targetNf.Excluded {
+		lines = append(lines, "@excluded")
+	}
+
 	// CREATE NANOFLOW header
 	qualifiedName := name.Module + "." + name.Name
 	if len(targetNf.Parameters) > 0 {
-		lines = append(lines, fmt.Sprintf("CREATE OR MODIFY NANOFLOW %s (", qualifiedName))
+		lines = append(lines, fmt.Sprintf("create or modify nanoflow %s (", qualifiedName))
 		for i, param := range targetNf.Parameters {
 			paramType := "Object"
 			if param.Type != nil {
-				paramType = e.formatMicroflowDataType(param.Type, entityNames)
+				paramType = formatMicroflowDataType(ctx, param.Type, entityNames)
 			}
 			comma := ","
 			if i == len(targetNf.Parameters)-1 {
@@ -379,31 +412,38 @@ func (e *Executor) describeNanoflow(name ast.QualifiedName) error {
 		}
 		lines = append(lines, ")")
 	} else {
-		lines = append(lines, fmt.Sprintf("CREATE OR MODIFY NANOFLOW %s ()", qualifiedName))
+		lines = append(lines, fmt.Sprintf("create or modify nanoflow %s ()", qualifiedName))
 	}
 
 	// Return type
 	if targetNf.ReturnType != nil {
-		returnType := e.formatMicroflowDataType(targetNf.ReturnType, entityNames)
+		returnType := formatMicroflowDataType(ctx, targetNf.ReturnType, entityNames)
 		if returnType != "Void" && returnType != "" {
-			lines = append(lines, fmt.Sprintf("RETURNS %s", returnType))
+			lines = append(lines, fmt.Sprintf("returns %s", returnType))
 		}
 	}
 
 	// Folder
 	if folderPath := h.BuildFolderPath(targetNf.ContainerID); folderPath != "" {
-		lines = append(lines, fmt.Sprintf("FOLDER '%s'", folderPath))
+		lines = append(lines, fmt.Sprintf("folder %s", mdlQuote(folderPath)))
 	}
 
 	// BEGIN block with activities
-	lines = append(lines, "BEGIN")
+	lines = append(lines, "begin")
 
 	// Wrap nanoflow in a Microflow to reuse formatMicroflowActivities
+	wrapperMf := &microflows.Microflow{
+		ReturnType:       targetNf.ReturnType,
+		ObjectCollection: targetNf.ObjectCollection,
+	}
+	prevDescribingReturnValue := ctx.DescribingMicroflowHasReturnValue
+	ctx.DescribingMicroflowHasReturnValue = microflowHasReturnValue(wrapperMf)
+	defer func() {
+		ctx.DescribingMicroflowHasReturnValue = prevDescribingReturnValue
+	}()
+
 	if targetNf.ObjectCollection != nil && len(targetNf.ObjectCollection.Objects) > 0 {
-		wrapperMf := &microflows.Microflow{
-			ObjectCollection: targetNf.ObjectCollection,
-		}
-		activityLines := e.formatMicroflowActivities(wrapperMf, entityNames, microflowNames)
+		activityLines := formatMicroflowActivities(ctx, wrapperMf, entityNames, microflowNames)
 		for _, line := range activityLines {
 			lines = append(lines, "  "+line)
 		}
@@ -411,23 +451,23 @@ func (e *Executor) describeNanoflow(name ast.QualifiedName) error {
 		lines = append(lines, "  -- No activities")
 	}
 
-	lines = append(lines, "END;")
+	lines = append(lines, "end;")
 	lines = append(lines, "/")
 
-	fmt.Fprintln(e.output, strings.Join(lines, "\n"))
+	fmt.Fprintln(ctx.Output, strings.Join(lines, "\n"))
 	return nil
 }
 
 // describeMicroflowToString generates MDL source for a microflow and returns it as a string
 // along with a source map mapping node IDs to line ranges.
-func (e *Executor) describeMicroflowToString(name ast.QualifiedName) (string, map[string]elkSourceRange, error) {
-	h, err := e.getHierarchy()
+func describeMicroflowToString(ctx *ExecContext, name ast.QualifiedName) (string, map[string]elkSourceRange, error) {
+	h, err := getHierarchy(ctx)
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to build hierarchy: %w", err)
+		return "", nil, mdlerrors.NewBackend("build hierarchy", err)
 	}
 
 	entityNames := make(map[model.ID]string)
-	domainModels, _ := e.reader.ListDomainModels()
+	domainModels, _ := ctx.Backend.ListDomainModels()
 	for _, dm := range domainModels {
 		modName := h.GetModuleName(dm.ContainerID)
 		for _, entity := range dm.Entities {
@@ -436,9 +476,9 @@ func (e *Executor) describeMicroflowToString(name ast.QualifiedName) (string, ma
 	}
 
 	microflowNames := make(map[model.ID]string)
-	allMicroflows, err := e.reader.ListMicroflows()
+	allMicroflows, err := ctx.Backend.ListMicroflows()
 	if err != nil {
-		return "", nil, fmt.Errorf("failed to list microflows: %w", err)
+		return "", nil, mdlerrors.NewBackend("list microflows", err)
 	}
 	for _, mf := range allMicroflows {
 		microflowNames[mf.ID] = h.GetQualifiedName(mf.ContainerID, mf.Name)
@@ -455,56 +495,157 @@ func (e *Executor) describeMicroflowToString(name ast.QualifiedName) (string, ma
 	}
 
 	if targetMf == nil {
-		return "", nil, fmt.Errorf("microflow not found: %s", name)
+		return "", nil, mdlerrors.NewNotFound("microflow", name.String())
 	}
+
+	sourceMap := make(map[string]elkSourceRange)
+	mdl := renderMicroflowMDL(ctx, "microflow", targetMf, name, entityNames, microflowNames, sourceMap)
+	return mdl, sourceMap, nil
+}
+
+// describeNanoflowToString generates MDL source for a nanoflow and returns it as a string
+// along with a source map mapping node IDs to line ranges.
+func describeNanoflowToString(ctx *ExecContext, name ast.QualifiedName) (string, map[string]elkSourceRange, error) {
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return "", nil, mdlerrors.NewBackend("build hierarchy", err)
+	}
+
+	entityNames := make(map[model.ID]string)
+	domainModels, err := ctx.Backend.ListDomainModels()
+	if err != nil {
+		return "", nil, mdlerrors.NewBackend("list domain models", err)
+	}
+	for _, dm := range domainModels {
+		modName := h.GetModuleName(dm.ContainerID)
+		for _, entity := range dm.Entities {
+			entityNames[entity.ID] = modName + "." + entity.Name
+		}
+	}
+
+	microflowNames := make(map[model.ID]string)
+	allMicroflows, err := ctx.Backend.ListMicroflows()
+	if err != nil {
+		return "", nil, mdlerrors.NewBackend("list microflows", err)
+	}
+	for _, mf := range allMicroflows {
+		microflowNames[mf.ID] = h.GetQualifiedName(mf.ContainerID, mf.Name)
+	}
+
+	allNanoflows, err := ctx.Backend.ListNanoflows()
+	if err != nil {
+		return "", nil, mdlerrors.NewBackend("list nanoflows", err)
+	}
+	for _, nf := range allNanoflows {
+		microflowNames[nf.ID] = h.GetQualifiedName(nf.ContainerID, nf.Name)
+	}
+
+	var targetNf *microflows.Nanoflow
+	for _, nf := range allNanoflows {
+		modID := h.FindModuleID(nf.ContainerID)
+		modName := h.GetModuleName(modID)
+		if modName == name.Module && nf.Name == name.Name {
+			targetNf = nf
+			break
+		}
+	}
+
+	if targetNf == nil {
+		return "", nil, mdlerrors.NewNotFound("nanoflow", name.String())
+	}
+
+	// Wrap nanoflow as a Microflow so renderMicroflowMDL can handle it
+	wrapperMf := &microflows.Microflow{
+		Documentation:      targetNf.Documentation,
+		Excluded:           targetNf.Excluded,
+		Parameters:         targetNf.Parameters,
+		ReturnType:         targetNf.ReturnType,
+		ObjectCollection:   targetNf.ObjectCollection,
+		AllowedModuleRoles: targetNf.AllowedModuleRoles,
+	}
+
+	sourceMap := make(map[string]elkSourceRange)
+	mdl := renderMicroflowMDL(ctx, "nanoflow", wrapperMf, name, entityNames, microflowNames, sourceMap)
+	return mdl, sourceMap, nil
+}
+
+// renderMicroflowMDL formats a parsed Microflow as MDL text.
+//
+// Shared by DESCRIBE MICROFLOW and `diff-local`, so both paths produce the
+// same output. entityNames/microflowNames provide ID → qualified-name
+// resolution; pass empty maps if unavailable (types will fall back to
+// "Object"/"List" stubs). If sourceMap is non-nil it will be populated with
+// ELK node IDs → line ranges for visualization; pass nil when not needed.
+func renderMicroflowMDL(
+	ctx *ExecContext,
+	flowType string,
+	mf *microflows.Microflow,
+	name ast.QualifiedName,
+	entityNames map[model.ID]string,
+	microflowNames map[model.ID]string,
+	sourceMap map[string]elkSourceRange,
+) string {
+	prevDescribingReturnValue := ctx.DescribingMicroflowHasReturnValue
+	ctx.DescribingMicroflowHasReturnValue = microflowHasReturnValue(mf)
+	defer func() {
+		ctx.DescribingMicroflowHasReturnValue = prevDescribingReturnValue
+	}()
 
 	var lines []string
 
-	if targetMf.Documentation != "" {
+	if mf.Documentation != "" {
 		lines = append(lines, "/**")
-		for docLine := range strings.SplitSeq(targetMf.Documentation, "\n") {
+		for docLine := range strings.SplitSeq(mf.Documentation, "\n") {
 			lines = append(lines, " * "+docLine)
 		}
 		lines = append(lines, " */")
 	}
 
+	if mf.Excluded {
+		lines = append(lines, "@excluded")
+	}
+
 	qualifiedName := name.Module + "." + name.Name
-	if len(targetMf.Parameters) > 0 {
-		lines = append(lines, fmt.Sprintf("CREATE OR MODIFY MICROFLOW %s (", qualifiedName))
-		for i, param := range targetMf.Parameters {
+	if len(mf.Parameters) > 0 {
+		lines = append(lines, fmt.Sprintf("create or modify %s %s (", flowType, qualifiedName))
+		for i, param := range mf.Parameters {
 			paramType := "Object"
 			if param.Type != nil {
-				paramType = e.formatMicroflowDataType(param.Type, entityNames)
+				paramType = formatMicroflowDataType(ctx, param.Type, entityNames)
 			}
 			comma := ","
-			if i == len(targetMf.Parameters)-1 {
+			if i == len(mf.Parameters)-1 {
 				comma = ""
 			}
 			lines = append(lines, fmt.Sprintf("  $%s: %s%s", param.Name, paramType, comma))
 		}
 		lines = append(lines, ")")
 	} else {
-		lines = append(lines, fmt.Sprintf("CREATE OR MODIFY MICROFLOW %s ()", qualifiedName))
+		lines = append(lines, fmt.Sprintf("create or modify %s %s ()", flowType, qualifiedName))
 	}
 
-	if targetMf.ReturnType != nil {
-		returnType := e.formatMicroflowDataType(targetMf.ReturnType, entityNames)
+	if mf.ReturnType != nil {
+		returnType := formatMicroflowDataType(ctx, mf.ReturnType, entityNames)
 		if returnType != "Void" && returnType != "" {
-			returnLine := fmt.Sprintf("RETURNS %s", returnType)
-			if targetMf.ReturnVariableName != "" && targetMf.ReturnVariableName != "Variable" {
-				returnLine += fmt.Sprintf(" AS $%s", targetMf.ReturnVariableName)
+			returnLine := fmt.Sprintf("returns %s", returnType)
+			if mf.ReturnVariableName != "" && mf.ReturnVariableName != "Variable" {
+				returnLine += fmt.Sprintf(" as $%s", mf.ReturnVariableName)
 			}
 			lines = append(lines, returnLine)
 		}
 	}
 
-	lines = append(lines, "BEGIN")
-	headerLineCount := len(lines) // lines before activity body
+	lines = append(lines, "begin")
+	headerLineCount := len(lines)
 
-	sourceMap := make(map[string]elkSourceRange)
-
-	if targetMf.ObjectCollection != nil && len(targetMf.ObjectCollection.Objects) > 0 {
-		activityLines := e.formatMicroflowActivitiesWithSourceMap(targetMf, entityNames, microflowNames, sourceMap, headerLineCount)
+	if mf.ObjectCollection != nil && len(mf.ObjectCollection.Objects) > 0 {
+		var activityLines []string
+		if sourceMap != nil {
+			activityLines = formatMicroflowActivitiesWithSourceMap(ctx, mf, entityNames, microflowNames, sourceMap, headerLineCount)
+		} else {
+			activityLines = formatMicroflowActivities(ctx, mf, entityNames, microflowNames)
+		}
+		activityLines = prependFreeAnnotationLines(mf.ObjectCollection, activityLines)
 		for _, line := range activityLines {
 			lines = append(lines, "  "+line)
 		}
@@ -512,25 +653,33 @@ func (e *Executor) describeMicroflowToString(name ast.QualifiedName) (string, ma
 		lines = append(lines, "  -- No activities")
 	}
 
-	lines = append(lines, "END;")
+	lines = append(lines, "end;")
 
-	if len(targetMf.AllowedModuleRoles) > 0 {
-		roles := make([]string, len(targetMf.AllowedModuleRoles))
-		for i, r := range targetMf.AllowedModuleRoles {
+	if len(mf.AllowedModuleRoles) > 0 {
+		roles := make([]string, len(mf.AllowedModuleRoles))
+		for i, r := range mf.AllowedModuleRoles {
 			roles[i] = string(r)
 		}
 		lines = append(lines, "")
-		lines = append(lines, fmt.Sprintf("GRANT EXECUTE ON MICROFLOW %s.%s TO %s;",
-			name.Module, name.Name, strings.Join(roles, ", ")))
+		lines = append(lines, fmt.Sprintf("grant execute on %s %s.%s to %s;",
+			flowType, name.Module, name.Name, strings.Join(roles, ", ")))
 	}
 
 	lines = append(lines, "/")
 
-	return strings.Join(lines, "\n"), sourceMap, nil
+	return strings.Join(lines, "\n")
+}
+
+func microflowHasReturnValue(mf *microflows.Microflow) bool {
+	if mf == nil || mf.ReturnType == nil {
+		return false
+	}
+	_, isVoid := mf.ReturnType.(*microflows.VoidType)
+	return !isVoid
 }
 
 // formatMicroflowDataType formats a microflow data type for MDL output.
-func (e *Executor) formatMicroflowDataType(dt microflows.DataType, entityNames map[model.ID]string) string {
+func formatMicroflowDataType(ctx *ExecContext, dt microflows.DataType, entityNames map[model.ID]string) string {
 	if dt == nil {
 		return "Unknown"
 	}
@@ -574,7 +723,7 @@ func (e *Executor) formatMicroflowDataType(dt microflows.DataType, entityNames m
 		return "List"
 	case *microflows.EnumerationType:
 		if t.EnumerationQualifiedName != "" {
-			return "ENUM " + t.EnumerationQualifiedName
+			return "enum " + t.EnumerationQualifiedName
 		}
 		return "Enumeration"
 	default:
@@ -583,13 +732,14 @@ func (e *Executor) formatMicroflowDataType(dt microflows.DataType, entityNames m
 }
 
 // formatMicroflowActivities generates MDL statements for microflow activities.
-func (e *Executor) formatMicroflowActivities(
+func formatMicroflowActivities(
+	ctx *ExecContext,
 	mf *microflows.Microflow,
 	entityNames map[model.ID]string,
 	microflowNames map[model.ID]string,
 ) []string {
 	if mf.ObjectCollection == nil {
-		return []string{"-- DEBUG: ObjectCollection is nil"}
+		return []string{"-- debug: ObjectCollection is nil"}
 	}
 
 	// Build activity map by ID for flow traversal
@@ -603,13 +753,17 @@ func (e *Executor) formatMicroflowActivities(
 		}
 	}
 
-	// Build flow graph: map from origin ID to flows (sorted by OriginConnectionIndex)
+	// Build flow graph: map from origin ID to flows (sorted by OriginConnectionIndex).
+	// Build the inverse destination→flows map for @anchor emission.
 	flowsByOrigin := make(map[model.ID][]*microflows.SequenceFlow)
+	flowsByDest := make(map[model.ID][]*microflows.SequenceFlow)
 	for _, flow := range mf.ObjectCollection.Flows {
 		flowsByOrigin[flow.OriginID] = append(flowsByOrigin[flow.OriginID], flow)
+		flowsByDest[flow.DestinationID] = append(flowsByDest[flow.DestinationID], flow)
 	}
 
 	var lines []string
+	lines = append(lines, duplicateOutputVariableWarnings(mf.ObjectCollection)...)
 
 	// Sort flows by OriginConnectionIndex for each origin
 	for originID := range flowsByOrigin {
@@ -625,7 +779,7 @@ func (e *Executor) formatMicroflowActivities(
 	}
 
 	// Find the merge point for each split (where branches converge)
-	splitMergeMap := e.findSplitMergePoints(mf.ObjectCollection, activityMap)
+	splitMergeMap := findSplitMergePoints(ctx, mf.ObjectCollection, activityMap)
 
 	// Traverse the flow graph recursively
 	visited := make(map[model.ID]bool)
@@ -633,15 +787,163 @@ func (e *Executor) formatMicroflowActivities(
 	// Build annotation map for @annotation emission
 	annotationsByTarget := buildAnnotationsByTarget(mf.ObjectCollection)
 
-	e.traverseFlow(startID, activityMap, flowsByOrigin, splitMergeMap, visited, entityNames, microflowNames, &lines, 0, nil, 0, annotationsByTarget)
+	// flowsByOrigin / flowsByDest are threaded into traverseFlow so @anchor
+	// emission is per-call — no package-level globals, safe under concurrent
+	// describe (e.g. captureDescribeParallel).
+	traverseFlow(ctx, startID, activityMap, flowsByOrigin, flowsByDest, splitMergeMap, visited, entityNames, microflowNames, &lines, 0, nil, 0, annotationsByTarget)
 
 	return lines
+}
+
+type outputVariableSeen struct {
+	pos model.Point
+}
+
+func duplicateOutputVariableWarnings(oc *microflows.MicroflowObjectCollection) []string {
+	warningPositions := make(map[string]model.Point)
+
+	var walkCollection func(*microflows.MicroflowObjectCollection, map[string]outputVariableSeen)
+	walkCollection = func(collection *microflows.MicroflowObjectCollection, inherited map[string]outputVariableSeen) {
+		if collection == nil {
+			return
+		}
+		activityMap := make(map[model.ID]microflows.MicroflowObject)
+		flowsByOrigin := make(map[model.ID][]*microflows.SequenceFlow)
+		var starts []model.ID
+		for _, obj := range collection.Objects {
+			activityMap[obj.GetID()] = obj
+			if _, ok := obj.(*microflows.StartEvent); ok {
+				starts = append(starts, obj.GetID())
+			}
+		}
+		for _, flow := range collection.Flows {
+			flowsByOrigin[flow.OriginID] = append(flowsByOrigin[flow.OriginID], flow)
+		}
+		if len(starts) == 0 {
+			for _, obj := range collection.Objects {
+				starts = append(starts, obj.GetID())
+			}
+		}
+
+		var walkNode func(model.ID, map[string]outputVariableSeen, map[model.ID]bool)
+		walkNode = func(currentID model.ID, seen map[string]outputVariableSeen, path map[model.ID]bool) {
+			if currentID == "" || path[currentID] {
+				return
+			}
+			obj := activityMap[currentID]
+			if obj == nil {
+				return
+			}
+			path = cloneIDBoolMap(path)
+			path[currentID] = true
+			seen = cloneSeenOutputs(seen)
+
+			if activity, ok := obj.(*microflows.ActionActivity); ok {
+				if name := actionOutputVariableName(activity.Action); name != "" {
+					if first, ok := seen[name]; ok {
+						if _, recorded := warningPositions[name]; !recorded {
+							warningPositions[name] = first.pos
+						}
+					} else {
+						seen[name] = outputVariableSeen{pos: obj.GetPosition()}
+					}
+				}
+			}
+			if loop, ok := obj.(*microflows.LoopedActivity); ok {
+				walkCollection(loop.ObjectCollection, seen)
+			}
+			for _, flow := range findNormalFlows(flowsByOrigin[currentID]) {
+				walkNode(flow.DestinationID, seen, path)
+			}
+		}
+
+		for _, startID := range starts {
+			walkNode(startID, cloneSeenOutputs(inherited), nil)
+		}
+	}
+	walkCollection(oc, nil)
+
+	var names []string
+	for name := range warningPositions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	warnings := make([]string, 0, len(names))
+	for _, name := range names {
+		pos := warningPositions[name]
+		warnings = append(warnings, fmt.Sprintf("-- WARNING: duplicate output variable $%s at position (%d, %d) - model is invalid; open in Studio Pro to fix", name, pos.X, pos.Y))
+	}
+	return warnings
+}
+
+func cloneSeenOutputs(src map[string]outputVariableSeen) map[string]outputVariableSeen {
+	if src == nil {
+		return make(map[string]outputVariableSeen)
+	}
+	dst := make(map[string]outputVariableSeen, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func cloneIDBoolMap(src map[model.ID]bool) map[model.ID]bool {
+	if src == nil {
+		return make(map[model.ID]bool)
+	}
+	dst := make(map[model.ID]bool, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func actionOutputVariableName(action any) string {
+	switch a := action.(type) {
+	case *microflows.CreateObjectAction:
+		return a.OutputVariable
+	case *microflows.RetrieveAction:
+		return a.OutputVariable
+	case *microflows.JavaActionCallAction:
+		if a.UseReturnVariable {
+			return a.ResultVariableName
+		}
+	case *microflows.MicroflowCallAction:
+		if a.UseReturnVariable {
+			return a.ResultVariableName
+		}
+	case *microflows.NanoflowCallAction:
+		if a.UseReturnVariable {
+			return a.OutputVariableName
+		}
+	case *microflows.JavaScriptActionCallAction:
+		if a.UseReturnVariable {
+			return a.OutputVariableName
+		}
+	case *microflows.AggregateListAction:
+		return a.OutputVariable
+	case *microflows.ListOperationAction:
+		return a.OutputVariable
+	case *microflows.RestCallAction:
+		return a.OutputVariable
+	case *microflows.ImportMappingCallAction:
+		return a.OutputVariable
+	case *microflows.ExportMappingCallAction:
+		return a.OutputVariable
+	case *microflows.CallExternalAction:
+		if a.UseReturnVariable {
+			return a.ResultVariableName
+		}
+	}
+	return ""
 }
 
 // formatMicroflowActivitiesWithSourceMap generates MDL statements and populates a source map
 // mapping ELK node IDs ("node-<objectID>") to line ranges (0-indexed) in the full MDL output.
 // headerLineCount is the number of lines before the BEGIN body (to compute absolute line numbers).
-func (e *Executor) formatMicroflowActivitiesWithSourceMap(
+func formatMicroflowActivitiesWithSourceMap(
+	ctx *ExecContext,
 	mf *microflows.Microflow,
 	entityNames map[model.ID]string,
 	microflowNames map[model.ID]string,
@@ -649,7 +951,7 @@ func (e *Executor) formatMicroflowActivitiesWithSourceMap(
 	headerLineCount int,
 ) []string {
 	if mf.ObjectCollection == nil {
-		return []string{"-- DEBUG: ObjectCollection is nil"}
+		return []string{"-- debug: ObjectCollection is nil"}
 	}
 
 	activityMap := make(map[model.ID]microflows.MicroflowObject)
@@ -663,11 +965,14 @@ func (e *Executor) formatMicroflowActivitiesWithSourceMap(
 	}
 
 	flowsByOrigin := make(map[model.ID][]*microflows.SequenceFlow)
+	flowsByDest := make(map[model.ID][]*microflows.SequenceFlow)
 	for _, flow := range mf.ObjectCollection.Flows {
 		flowsByOrigin[flow.OriginID] = append(flowsByOrigin[flow.OriginID], flow)
+		flowsByDest[flow.DestinationID] = append(flowsByDest[flow.DestinationID], flow)
 	}
 
 	var lines []string
+	lines = append(lines, duplicateOutputVariableWarnings(mf.ObjectCollection)...)
 
 	for originID := range flowsByOrigin {
 		flows := flowsByOrigin[originID]
@@ -680,36 +985,47 @@ func (e *Executor) formatMicroflowActivitiesWithSourceMap(
 		}
 	}
 
-	splitMergeMap := e.findSplitMergePoints(mf.ObjectCollection, activityMap)
+	splitMergeMap := findSplitMergePoints(ctx, mf.ObjectCollection, activityMap)
 	visited := make(map[model.ID]bool)
 
 	// Build annotation map for @annotation emission
 	annotationsByTarget := buildAnnotationsByTarget(mf.ObjectCollection)
 
-	e.traverseFlow(startID, activityMap, flowsByOrigin, splitMergeMap, visited, entityNames, microflowNames, &lines, 0, sourceMap, headerLineCount, annotationsByTarget)
+	traverseFlow(ctx, startID, activityMap, flowsByOrigin, flowsByDest, splitMergeMap, visited, entityNames, microflowNames, &lines, 0, sourceMap, headerLineCount, annotationsByTarget)
 
 	return lines
 }
 
 // findSplitMergePoints finds the corresponding merge point for each exclusive split.
-func (e *Executor) findSplitMergePoints(
+func findSplitMergePoints(
+	ctx *ExecContext,
 	oc *microflows.MicroflowObjectCollection,
 	activityMap map[model.ID]microflows.MicroflowObject,
 ) map[model.ID]model.ID {
-	result := make(map[model.ID]model.ID)
-
 	// Build flow graph for forward traversal
 	flowsByOrigin := make(map[model.ID][]*microflows.SequenceFlow)
 	for _, flow := range oc.Flows {
 		flowsByOrigin[flow.OriginID] = append(flowsByOrigin[flow.OriginID], flow)
 	}
 
-	// For each ExclusiveSplit, find its merge point
-	for _, obj := range oc.Objects {
-		if _, ok := obj.(*microflows.ExclusiveSplit); ok {
+	return findSplitMergePointsForGraph(ctx, activityMap, flowsByOrigin)
+}
+
+// findSplitMergePointsForGraph finds the corresponding merge point for each
+// split in an already materialized flow graph. Nested traversals such as loop
+// bodies use this because they do not have a top-level object collection.
+func findSplitMergePointsForGraph(
+	ctx *ExecContext,
+	activityMap map[model.ID]microflows.MicroflowObject,
+	flowsByOrigin map[model.ID][]*microflows.SequenceFlow,
+) map[model.ID]model.ID {
+	result := make(map[model.ID]model.ID)
+	for _, obj := range activityMap {
+		switch obj.(type) {
+		case *microflows.ExclusiveSplit, *microflows.InheritanceSplit:
 			splitID := obj.GetID()
-			// Find merge by following both branches until they converge
-			mergeID := e.findMergeForSplit(splitID, flowsByOrigin, activityMap)
+			// Find merge by following both branches until they converge.
+			mergeID := findMergeForSplit(ctx, splitID, flowsByOrigin, activityMap)
 			if mergeID != "" {
 				result[splitID] = mergeID
 			}
@@ -719,56 +1035,255 @@ func (e *Executor) findSplitMergePoints(
 	return result
 }
 
-// findMergeForSplit finds the ExclusiveMerge where branches from a split converge.
-func (e *Executor) findMergeForSplit(
+// findMergeForSplit finds the nearest node where branches from a split converge.
+// Studio Pro models often converge directly on the next activity instead of an
+// explicit ExclusiveMerge, so the join can be any executable microflow object.
+func findMergeForSplit(
+	ctx *ExecContext,
 	splitID model.ID,
 	flowsByOrigin map[model.ID][]*microflows.SequenceFlow,
 	activityMap map[model.ID]microflows.MicroflowObject,
 ) model.ID {
-	flows := flowsByOrigin[splitID]
+	flows := findNormalFlows(flowsByOrigin[splitID])
 	if len(flows) < 2 {
 		return ""
 	}
 
-	// Follow each branch and collect all reachable nodes
-	branch0Nodes := e.collectReachableNodes(flows[0].DestinationID, flowsByOrigin, activityMap, make(map[model.ID]bool))
-	branch1Nodes := e.collectReachableNodes(flows[1].DestinationID, flowsByOrigin, activityMap, make(map[model.ID]bool))
+	branchDistances := make([]map[model.ID]int, 0, len(flows))
+	branchStarts := make([]model.ID, 0, len(flows))
+	for _, flow := range flows {
+		branchStarts = append(branchStarts, flow.DestinationID)
+		branchDistances = append(branchDistances, collectReachableDistances(flow.DestinationID, flowsByOrigin))
+	}
 
-	// Find the first common node that is an ExclusiveMerge
-	// This is a simplification - we look for the first merge point reachable from both branches
-	for nodeID := range branch0Nodes {
-		if branch1Nodes[nodeID] {
-			if _, ok := activityMap[nodeID].(*microflows.ExclusiveMerge); ok {
-				return nodeID
+	return selectNearestCommonJoin(activityMap, flowsByOrigin, branchStarts, branchDistances)
+}
+
+// collectReachableDistances collects the shortest normal-flow distance from a
+// branch start to every reachable node. Error handler flows are excluded because
+// they do not participate in split/merge structural pairing.
+func collectReachableDistances(
+	startID model.ID,
+	flowsByOrigin map[model.ID][]*microflows.SequenceFlow,
+) map[model.ID]int {
+	distances := map[model.ID]int{}
+	type queueItem struct {
+		id       model.ID
+		distance int
+	}
+	queue := []queueItem{{id: startID}}
+
+	for len(queue) > 0 {
+		item := queue[0]
+		queue = queue[1:]
+
+		if previous, ok := distances[item.id]; ok && previous <= item.distance {
+			continue
+		}
+		distances[item.id] = item.distance
+
+		for _, flow := range findNormalFlows(flowsByOrigin[item.id]) {
+			queue = append(queue, queueItem{
+				id:       flow.DestinationID,
+				distance: item.distance + 1,
+			})
+		}
+	}
+
+	return distances
+}
+
+func selectNearestCommonJoin(
+	activityMap map[model.ID]microflows.MicroflowObject,
+	flowsByOrigin map[model.ID][]*microflows.SequenceFlow,
+	branchStarts []model.ID,
+	branchDistances []map[model.ID]int,
+) model.ID {
+	if len(branchDistances) < 2 {
+		return ""
+	}
+
+	type candidate struct {
+		id          model.ID
+		reachCount  int
+		maxDistance int
+		sumDistance int
+	}
+	candidates := []candidate{}
+
+	for nodeID, firstDistance := range branchDistances[0] {
+		if !isSplitJoinCandidate(activityMap[nodeID]) {
+			continue
+		}
+
+		maxDistance := firstDistance
+		sumDistance := firstDistance
+		common := true
+		for _, distances := range branchDistances[1:] {
+			distance, ok := distances[nodeID]
+			if !ok {
+				common = false
+				break
+			}
+			if distance > maxDistance {
+				maxDistance = distance
+			}
+			sumDistance += distance
+		}
+		if common {
+			candidates = append(candidates, candidate{
+				id:          nodeID,
+				reachCount:  len(branchDistances),
+				maxDistance: maxDistance,
+				sumDistance: sumDistance,
+			})
+		}
+	}
+
+	if len(candidates) == 0 {
+		byNode := map[model.ID]candidate{}
+		for _, distances := range branchDistances {
+			for nodeID, distance := range distances {
+				if !isSplitJoinCandidate(activityMap[nodeID]) {
+					continue
+				}
+				c := byNode[nodeID]
+				c.id = nodeID
+				c.reachCount++
+				if distance > c.maxDistance {
+					c.maxDistance = distance
+				}
+				c.sumDistance += distance
+				byNode[nodeID] = c
+			}
+		}
+		for _, c := range byNode {
+			if c.reachCount >= 2 {
+				candidates = append(candidates, c)
 			}
 		}
 	}
 
-	return ""
-}
-
-// collectReachableNodes collects all nodes reachable from a starting node.
-func (e *Executor) collectReachableNodes(
-	startID model.ID,
-	flowsByOrigin map[model.ID][]*microflows.SequenceFlow,
-	activityMap map[model.ID]microflows.MicroflowObject,
-	visited map[model.ID]bool,
-) map[model.ID]bool {
-	result := make(map[model.ID]bool)
-
-	var traverse func(id model.ID)
-	traverse = func(id model.ID) {
-		if visited[id] {
-			return
-		}
-		visited[id] = true
-		result[id] = true
-
-		for _, flow := range flowsByOrigin[id] {
-			traverse(flow.DestinationID)
-		}
+	if len(candidates) == 0 {
+		return ""
 	}
 
-	traverse(startID)
+	filtered := candidates[:0]
+	for _, candidate := range candidates {
+		if splitJoinCandidateDoesNotHaveDownstreamBypass(candidate.id, activityMap, flowsByOrigin, branchStarts) {
+			filtered = append(filtered, candidate)
+		}
+	}
+	candidates = filtered
+	if len(candidates) == 0 {
+		return ""
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].reachCount != candidates[j].reachCount {
+			return candidates[i].reachCount > candidates[j].reachCount
+		}
+		if candidates[i].maxDistance != candidates[j].maxDistance {
+			return candidates[i].maxDistance < candidates[j].maxDistance
+		}
+		if candidates[i].sumDistance != candidates[j].sumDistance {
+			return candidates[i].sumDistance < candidates[j].sumDistance
+		}
+		return string(candidates[i].id) < string(candidates[j].id)
+	})
+
+	return candidates[0].id
+}
+
+func splitJoinCandidateDoesNotHaveDownstreamBypass(
+	candidateID model.ID,
+	activityMap map[model.ID]microflows.MicroflowObject,
+	flowsByOrigin map[model.ID][]*microflows.SequenceFlow,
+	branchStarts []model.ID,
+) bool {
+	downstream := collectReachableNonTerminalObjects(candidateID, activityMap, flowsByOrigin)
+	if len(downstream) == 0 {
+		return true
+	}
+	for _, startID := range branchStarts {
+		if startID == candidateID {
+			continue
+		}
+		if reachesAnyObjectAvoiding(startID, downstream, candidateID, activityMap, flowsByOrigin, map[model.ID]bool{}) {
+			return false
+		}
+	}
+	return true
+}
+
+func collectReachableNonTerminalObjects(
+	startID model.ID,
+	activityMap map[model.ID]microflows.MicroflowObject,
+	flowsByOrigin map[model.ID][]*microflows.SequenceFlow,
+) map[model.ID]bool {
+	result := map[model.ID]bool{}
+	var walk func(model.ID)
+	visited := map[model.ID]bool{startID: true}
+	walk = func(currentID model.ID) {
+		if visited[currentID] {
+			return
+		}
+		visited[currentID] = true
+		if isNonTerminalMicroflowObject(activityMap[currentID]) {
+			result[currentID] = true
+		}
+		for _, flow := range findNormalFlows(flowsByOrigin[currentID]) {
+			walk(flow.DestinationID)
+		}
+	}
+	for _, flow := range findNormalFlows(flowsByOrigin[startID]) {
+		walk(flow.DestinationID)
+	}
 	return result
 }
+
+func reachesAnyObjectAvoiding(
+	currentID model.ID,
+	targets map[model.ID]bool,
+	avoidID model.ID,
+	activityMap map[model.ID]microflows.MicroflowObject,
+	flowsByOrigin map[model.ID][]*microflows.SequenceFlow,
+	visited map[model.ID]bool,
+) bool {
+	if currentID == "" || currentID == avoidID || visited[currentID] {
+		return false
+	}
+	if targets[currentID] {
+		return true
+	}
+	if !isNonTerminalMicroflowObject(activityMap[currentID]) {
+		return false
+	}
+	visited[currentID] = true
+	for _, flow := range findNormalFlows(flowsByOrigin[currentID]) {
+		if reachesAnyObjectAvoiding(flow.DestinationID, targets, avoidID, activityMap, flowsByOrigin, visited) {
+			return true
+		}
+	}
+	return false
+}
+
+func isNonTerminalMicroflowObject(obj microflows.MicroflowObject) bool {
+	switch obj.(type) {
+	case nil, *microflows.StartEvent, *microflows.EndEvent, *microflows.ErrorEvent:
+		return false
+	default:
+		return true
+	}
+}
+
+func isSplitJoinCandidate(obj microflows.MicroflowObject) bool {
+	switch obj.(type) {
+	case nil, *microflows.StartEvent, *microflows.EndEvent:
+		return false
+	default:
+		return true
+	}
+}
+
+// --- Executor method wrappers for callers in unmigrated code ---

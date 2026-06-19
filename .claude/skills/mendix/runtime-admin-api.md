@@ -17,11 +17,11 @@ The Mendix runtime exposes an HTTP admin API on port **8090** (configurable via 
 **Default credentials** (from `.docker/.env`):
 - **Port**: 8090
 - **Password**: `AdminPassword1!`
-- **Auth method**: `X-M2EE-Authentication` header with the password **base64-encoded**
+- **Auth method**: `X-M2EE-authentication` header with the password **base64-encoded**
 
 ## Authentication
 
-All requests require the `X-M2EE-Authentication` header containing the base64-encoded admin password:
+All requests require the `X-M2EE-authentication` header containing the base64-encoded admin password:
 
 ```bash
 # Encode the password
@@ -35,10 +35,35 @@ The header value is `base64(password)` — NOT `base64(user:password)` (this is 
 
 ### OQL Query (Read-Only Preview)
 
+> **Mendix 11.11 changed the wire protocol.** OQL preview moved off the M2EE
+> action dispatch onto a dedicated REST endpoint `POST /dev/preview_execute_oql`,
+> where the request body is the params object **directly** and the response is
+> `{"data":[...]}` (no `action`/`params` wrapper, no `feedback` envelope). The
+> auth header is unchanged. `mxcli oql` tries this endpoint first and falls back
+> to the legacy action below on a 404 (older runtimes), so it works on both.
+
+**11.11+ (new endpoint):**
 ```bash
-curl -sf -X POST http://localhost:8090/ \
+curl -sf -X post http://localhost:8090/dev/preview_execute_oql \
   -H 'Content-Type: application/json' \
-  -H "X-M2EE-Authentication: $(echo -n 'AdminPassword1!' | base64)" \
+  -H "X-M2EE-authentication: $(echo -n 'AdminPassword1!' | base64)" \
+  -d '{"oql":"SELECT Name FROM System.User","numberHandling":"asString"}'
+# -> {"data":[{"Name":"MxAdmin"}, ...]}
+```
+
+A **failed query** on the dev endpoint returns **HTTP 200** (not 4xx/5xx) with an
+`{"error":"..."}` body and no `data` field, e.g.:
+```json
+{"error":"An exception has occurred for the following request(s):\n\tInternalOqlTextGetRequest (depth = -1): SELECT ..."}
+```
+So an error must be detected by the presence of the `error` field, not by the
+HTTP status. `mxcli oql` surfaces this message instead of returning empty.
+
+**Pre-11.11 (legacy action):**
+```bash
+curl -sf -X post http://localhost:8090/ \
+  -H 'Content-Type: application/json' \
+  -H "X-M2EE-authentication: $(echo -n 'AdminPassword1!' | base64)" \
   -d '{"action":"preview_execute_oql","params":{"oql":"SELECT Name FROM System.User","numberHandling":"asString"}}'
 ```
 
@@ -62,25 +87,25 @@ curl -sf -X POST http://localhost:8090/ \
 ### More OQL Examples
 
 ```bash
-# Count entities
-curl -sf -X POST http://localhost:8090/ \
+# count entities
+curl -sf -X post http://localhost:8090/ \
   -H 'Content-Type: application/json' \
-  -H "X-M2EE-Authentication: $(echo -n 'AdminPassword1!' | base64)" \
+  -H "X-M2EE-authentication: $(echo -n 'AdminPassword1!' | base64)" \
   -d '{"action":"preview_execute_oql","params":{"oql":"SELECT count(*) AS Total FROM MyModule.Customer","numberHandling":"asString"}}'
 
-# Join query
-curl -sf -X POST http://localhost:8090/ \
+# join query
+curl -sf -X post http://localhost:8090/ \
   -H 'Content-Type: application/json' \
-  -H "X-M2EE-Authentication: $(echo -n 'AdminPassword1!' | base64)" \
+  -H "X-M2EE-authentication: $(echo -n 'AdminPassword1!' | base64)" \
   -d '{"action":"preview_execute_oql","params":{"oql":"SELECT o.OrderNumber, c.Name FROM MyModule.Order o JOIN o/MyModule.Order_Customer/MyModule.Customer c","numberHandling":"asString"}}'
 ```
 
 ### Runtime Info
 
 ```bash
-curl -sf -X POST http://localhost:8090/ \
+curl -sf -X post http://localhost:8090/ \
   -H 'Content-Type: application/json' \
-  -H "X-M2EE-Authentication: $(echo -n 'AdminPassword1!' | base64)" \
+  -H "X-M2EE-authentication: $(echo -n 'AdminPassword1!' | base64)" \
   -d '{"action":"runtime_status"}'
 ```
 
@@ -89,10 +114,10 @@ curl -sf -X POST http://localhost:8090/ \
 `mxcli oql` wraps the admin API with automatic credential resolution and output formatting:
 
 ```bash
-# Table output (default)
-./mxcli oql -p app.mpr "SELECT Name FROM System.User"
+# table output (default)
+./mxcli oql -p app.mpr "select Name from System.User"
 
-# JSON output for piping
+# json output for piping
 ./mxcli oql -p app.mpr --json "SELECT Name FROM System.User" | jq '.[].Name'
 
 # Explicit connection (no project needed)
@@ -108,7 +133,7 @@ In a devcontainer with Docker-in-Docker, port 8090 on the Mendix container may b
 ```bash
 # What mxcli does internally (docker exec mode):
 docker compose -f .docker/docker-compose.yml exec -T mendix sh -c \
-  "curl -sf -X POST http://localhost:8090/ \
+  "curl -sf -X post http://localhost:8090/ \
    -H 'Content-Type: application/json' \
    -H 'X-M2EE-Authentication: QWRtaW5QYXNzd29yZDEh' \
    -d '{\"action\":\"preview_execute_oql\",\"params\":{\"oql\":\"SELECT 1\",\"numberHandling\":\"asString\"}}'"
@@ -128,7 +153,7 @@ The `preview_execute_oql` action requires a JVM flag on the runtime:
 -Dmendix.live-preview=enabled
 ```
 
-This is included in the default docker-compose template generated by `mxcli docker init`. If you get `"Action not found: preview_execute_oql"`, re-initialize:
+This is included in the default docker-compose template generated by `mxcli docker init`. If you get `"action not found: preview_execute_oql"`, re-initialize:
 
 ```bash
 ./mxcli docker init -p app.mpr --force

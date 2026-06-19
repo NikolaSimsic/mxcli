@@ -1,3 +1,8 @@
+---
+title: SHOW/DESCRIBE Queues (Task Queues)
+status: proposed
+---
+
 # Proposal: SHOW/DESCRIBE Queues (Task Queues)
 
 ## Overview
@@ -22,7 +27,7 @@ Task Queues define asynchronous processing configurations for microflows. They c
 ```
 Queues$Queue:
   Name: string
-  Documentation: string
+  documentation: string
   Excluded: bool
   ExportLevel: string
   Config: Queues$BasicQueueConfig
@@ -35,7 +40,7 @@ Queues$Queue:
 ### SHOW QUEUES
 
 ```
-SHOW QUEUES [IN Module]
+show QUEUES [in module]
 ```
 
 | Qualified Name | Module | Name | Cluster Wide | Parallelism |
@@ -44,7 +49,7 @@ SHOW QUEUES [IN Module]
 ### DESCRIBE QUEUE
 
 ```
-DESCRIBE QUEUE Module.Name
+describe QUEUE Module.Name
 ```
 
 Output format:
@@ -75,7 +80,7 @@ QUEUE MyModule.EmailSending
 type Queue struct {
     ContainerID  model.ID
     Name         string
-    Documentation string
+    documentation string
     Excluded     bool
     ExportLevel  string
     ClusterWide  bool

@@ -43,15 +43,22 @@ The version is detected from the project file (--project) or specified
 explicitly (--version). The binary is cached at ~/.mxcli/mxbuild/{version}/
 and automatically found by 'mxcli docker build' and 'mxcli docker check'.
 
+The Mendix CDN only publishes Linux MxBuild. On Windows and macOS that binary
+cannot run natively, so this command prefers Studio Pro's bundled MxBuild and
+refuses to download the Linux binary unless --force is given (useful for
+pre-caching a Linux binary for a Docker/devcontainer build).
+
 Examples:
   mxcli setup mxbuild -p app.mpr
   mxcli setup mxbuild --version 11.6.3
   mxcli setup mxbuild -p app.mpr --dry-run
+  mxcli setup mxbuild --version 11.6.3 --force   # download Linux binary on Windows/macOS
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		projectPath, _ := cmd.Flags().GetString("project")
 		versionStr, _ := cmd.Flags().GetString("version")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
+		force, _ := cmd.Flags().GetBool("force")
 
 		// Determine version
 		if versionStr == "" && projectPath == "" {
@@ -70,6 +77,23 @@ Examples:
 			reader.Close()
 			versionStr = pv.ProductVersion
 			fmt.Fprintf(os.Stdout, "Detected Mendix version: %s\n", versionStr)
+		}
+
+		// The Mendix CDN only publishes Linux mxbuild. On Windows/macOS a CDN
+		// download cannot run natively (dotnet reports "Exec format error"), so
+		// prefer Studio Pro's bundled mxbuild and otherwise refuse with guidance.
+		// --force overrides this to pre-cache the Linux binary (e.g. for Docker).
+		if !force {
+			nativePath, guidance, err := docker.NativeMxBuildForSetup(runtime.GOOS, versionStr)
+			if nativePath != "" {
+				fmt.Fprintf(os.Stdout, "Using Studio Pro mxbuild for %s: %s\n", versionStr, nativePath)
+				fmt.Fprintf(os.Stdout, "(No download needed. Re-run with --force to download the Linux CDN binary instead.)\n")
+				return
+			}
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n\n  %s\n", err, guidance)
+				os.Exit(1)
+			}
 		}
 
 		if dryRun {
@@ -199,15 +223,21 @@ func downloadMxcliBinary(repo, tag, targetOS, targetArch, outputPath string, w i
 	url := mxcliBinaryURL(repo, tag, targetOS, targetArch)
 	fmt.Fprintf(w, "Downloading mxcli %s (%s/%s)...\n", tag, targetOS, targetArch)
 	fmt.Fprintf(w, "  URL: %s\n", url)
+	return downloadMxcliBinaryFromURL(url, outputPath, w)
+}
 
-	resp, err := http.Get(url)
+// downloadMxcliBinaryFromURL fetches a binary from rawURL and writes it to
+// outputPath with executable permissions (0755). Used by downloadMxcliBinary
+// and directly by tests via an httptest.Server URL.
+func downloadMxcliBinaryFromURL(rawURL, outputPath string, w io.Writer) error {
+	resp, err := http.Get(rawURL)
 	if err != nil {
 		return fmt.Errorf("downloading mxcli: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("downloading mxcli: HTTP %d from %s", resp.StatusCode, url)
+		return fmt.Errorf("downloading mxcli: HTTP %d from %s", resp.StatusCode, rawURL)
 	}
 
 	if resp.ContentLength > 0 {
@@ -279,6 +309,7 @@ Examples:
 func init() {
 	setupMxBuildCmd.Flags().String("version", "", "Mendix version to download (e.g., 11.6.3)")
 	setupMxBuildCmd.Flags().Bool("dry-run", false, "Show what would be downloaded without downloading")
+	setupMxBuildCmd.Flags().Bool("force", false, "Download the Linux CDN binary even on Windows/macOS (e.g. to pre-cache for Docker)")
 
 	setupMxRuntimeCmd.Flags().String("version", "", "Mendix version to download (e.g., 11.6.3)")
 	setupMxRuntimeCmd.Flags().Bool("dry-run", false, "Show what would be downloaded without downloading")
