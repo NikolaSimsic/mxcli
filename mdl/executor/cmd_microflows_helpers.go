@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/mendixexpr"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
@@ -69,282 +70,48 @@ func convertASTToMicroflowDataType(dt ast.DataType, entityResolver func(ast.Qual
 	}
 }
 
-// mendixBuiltinFunctions is the canonical spelling of every built-in Mendix
-// expression function. The expression runtime is case-sensitive: it only
-// recognises these names as spelt here (lower-case with camelCase for
-// compound words). Emitting an alternative spelling causes CE0117
-// ("Error(s) in expression.") on Studio Pro validation.
+// bareEnumerationType resolves the entity/enumeration ambiguity of a declared
+// type. The parser cannot tell an entity from an enumeration for a bare
+// `Module.Name` and always records an entity reference, so a caller that has
+// found no entity of that name asks here whether an enumeration has it. It
+// returns dt retyped as that enumeration, or false when none does.
 //
-// Source: https://docs.mendix.com/refguide/expressions/ and the linked
-// function-specific pages (string, math, date arithmetic, parse/format,
-// trim-to-date, list operations, aggregates, type conversions).
-//
-// The map key is the upper-case spelling for case-insensitive lookup; the
-// value is the runtime-accepted canonical spelling. Custom user-defined
-// java actions, sub-microflows, and unknown function names pass through
-// unchanged so user case is preserved.
-var mendixBuiltinFunctions = func() map[string]string {
-	canonical := []string{
-		// List operations
-		"head", "tail", "find", "filter", "sort", "union",
-		"intersect", "subtract", "contains", "equals", "range",
-		// List aggregates
-		"count", "sum", "average", "minimum", "maximum",
-		"allTrue", "anyTrue",
-		// String functions (docs.mendix.com/refguide/string-function-calls)
-		"toUpperCase", "toLowerCase", "trim", "length", "substring",
-		"findLast", "replaceAll", "replaceFirst", "startsWith", "endsWith",
-		"isMatch", "isInvariantMatch", "stringFromRegex", "stringListFromRegex",
-		"urlEncode", "urlDecode", "reverse", "indexOf",
-		// Math functions (docs.mendix.com/refguide/mathematical-function-calls)
-		"abs", "ceil", "floor", "round", "max", "min", "pow",
-		"sqrt", "ln", "log10", "random", "rand",
-		// Date creation (docs.mendix.com/refguide/date-creation)
-		"dateTime", "dateTimeUTC",
-		// Begin-of-date / end-of-date / trim-to-date
-		"trimToDays", "trimToHours", "trimToMinutes", "trimToSeconds",
-		"trimToDaysUTC", "trimToHoursUTC", "trimToMinutesUTC", "trimToSecondsUTC",
-		"beginOfDay", "beginOfWeek", "beginOfMonth", "beginOfYear",
-		"beginOfDayUTC", "beginOfWeekUTC", "beginOfMonthUTC", "beginOfYearUTC",
-		"endOfDay", "endOfWeek", "endOfMonth", "endOfYear",
-		"endOfDayUTC", "endOfWeekUTC", "endOfMonthUTC", "endOfYearUTC",
-		// Between-date functions
-		"millisecondsBetween", "secondsBetween", "minutesBetween",
-		"hoursBetween", "daysBetween", "weeksBetween", "monthsBetween",
-		"yearsBetween", "calendarDaysBetween", "calendarMonthsBetween",
-		"calendarYearsBetween",
-		// Add-date functions
-		"addMilliseconds", "addSeconds", "addMinutes", "addHours",
-		"addDays", "addWeeks", "addMonths", "addYears",
-		"addDaysUTC", "addWeeksUTC", "addMonthsUTC", "addYearsUTC",
-		// Subtract-date functions
-		"subtractMilliseconds", "subtractSeconds", "subtractMinutes",
-		"subtractHours", "subtractDays", "subtractWeeks", "subtractMonths",
-		"subtractYears", "subtractDaysUTC", "subtractWeeksUTC",
-		"subtractMonthsUTC", "subtractYearsUTC",
-		// Day-of / timestamp conversion helpers
-		"dayOfWeek", "dayOfWeekFromDateTime", "weekOfYearFromDateTime",
-		"dayOfYearFromDateTime", "daysInMonth", "daysInYear",
-		"dateTimeToEpoch", "epochToDateTime",
-		// Parse / format (parse-and-format-date, parse-and-format-decimal)
-		"formatDateTime", "formatDateTimeUTC", "parseDateTime", "parseDateTimeUTC",
-		"parseInteger", "parseLong", "parseDecimal", "formatDecimal",
-		// To-string / length  (to-string, length refguide pages)
-		"toString", "toBoolean", "toFloat",
-		// Enumeration helpers
-		"getCaption", "getKey",
-		// Miscellaneous
-		"if", "empty", "isNew", "isAnonymous",
-		// Boolean operators expressed as functions (true(), false())
-		"true", "false",
-		// Not / and / or appear as operators, not function calls — omitted.
+// Parameters and return types of microflows, nanoflows and rules all resolve
+// through this, so the three kinds accept the same spellings; `check` makes the
+// same decision for a project that is not yet written in declaredTypeResolver.
+func bareEnumerationType(ctx *ExecContext, dt ast.DataType) (ast.DataType, bool) {
+	if dt.EntityRef == nil || findEnumeration(ctx, dt.EntityRef.Module, dt.EntityRef.Name) == nil {
+		return dt, false
 	}
-	m := make(map[string]string, len(canonical))
-	for _, c := range canonical {
-		m[strings.ToUpper(c)] = c
-	}
-	return m
-}()
-
-// mendixFunctionName normalises the case of built-in Mendix expression
-// functions. The visitor canonicalises list / aggregate operations in
-// UPPERCASE for AST dispatch; the expression runtime only recognises the
-// documented camelCase spelling. For every built-in Mendix function we
-// always emit the canonical spelling so that:
-//
-//   - round-tripping a pristine microflow never mutates `find(...)` into
-//     `FIND(...)` (which Studio Pro rejects with CE0117).
-//   - LLM-generated MDL with accidental capitalisation (`LENGTH(...)`,
-//     `ToString(...)`) still validates when executed.
-//
-// Custom (user-defined) java actions, sub-microflows and entity member
-// references pass through unchanged so user case is preserved.
-func mendixFunctionName(name string) string {
-	if canonical, ok := mendixBuiltinFunctions[strings.ToUpper(name)]; ok {
-		return canonical
-	}
-	return name
+	return ast.DataType{Kind: ast.TypeEnumeration, EnumRef: dt.EntityRef}, true
 }
 
-// quoteExpressionLiteral wraps a Mendix expression string literal in single
-// quotes and applies the narrowest possible escaping needed for MDL roundtrip:
-//
-//   - ASCII control characters that STRING_LITERAL does not accept raw — 0x0A
-//     (newline), 0x0D (carriage return), 0x09 (tab) — are written as `\n`, `\r`,
-//     `\t`. The MDL lexer rejects raw newlines inside single-quoted literals,
-//     so emitting them verbatim produces parse errors on re-execute.
-//   - Apostrophes are doubled (MDL's own delimiter-escape convention).
-//   - Backslashes followed by one of the recognised escape letters (n/r/t/\/')
-//     are doubled so the visitor's unquoteString preserves them — without this,
-//     the source literal `\\n` would come back as a real newline on reparse.
-//   - For any other backslash-prefixed byte (e.g. `\d`, `\w`, `\p{...}` inside
-//     regexes) the backslash is emitted as-is and the follower is written by the
-//     next loop iteration via the default arm, so the two bytes end up in the
-//     output unchanged. This keeps Mendix regular-expression escape sequences
-//     bit-exact across describe→exec roundtrips; the output is byte-identical
-//     to passthrough even though the implementation walks the bytes separately.
-//
-// This is narrower than mdlQuote (used for @annotation / @caption text where
-// the AST value is a plain string): mdlQuote unconditionally doubles every
-// backslash, which would break expression literals containing regex escape
-// sequences that the Mendix engine consumes literally.
-func quoteExpressionLiteral(s string) string {
-	var b strings.Builder
-	b.Grow(len(s) + 2)
-	b.WriteByte('\'')
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch c {
-		case '\n':
-			b.WriteString(`\n`)
-		case '\r':
-			b.WriteString(`\r`)
-		case '\t':
-			b.WriteString(`\t`)
-		case '\'':
-			b.WriteString(`''`)
-		case '\\':
-			// Double the backslash only when the next byte would otherwise be
-			// interpreted as an escape by unquoteString — that is, n/r/t/\/'.
-			// For any other follower (letters like d/w, punctuation) the
-			// backslash can pass through verbatim so regex escape characters
-			// roundtrip without mutation.
-			if i+1 < len(s) {
-				switch s[i+1] {
-				case 'n', 'r', 't':
-					b.WriteString(`\\`)
-					b.WriteByte(s[i+1])
-					i++
-					continue
-				case '\\':
-					// Literal backslash-backslash in AST. To survive roundtrip
-					// it must be written as four backslashes: unquoteString
-					// decodes `\\` twice, producing two backslashes again.
-					b.WriteString(`\\\\`)
-					i++
-					continue
-				case '\'':
-					// Literal backslash-apostrophe: double the backslash and
-					// double the apostrophe, so the reparsed value stays
-					// [\, '].
-					b.WriteString(`\\`)
-					b.WriteString(`''`)
-					i++
-					continue
-				}
-				b.WriteByte('\\')
-				continue
-			}
-			// Trailing backslash at end-of-string: the lexer's `'\\' .` escape
-			// rule requires a following character, so emitting a bare `\'`
-			// terminator would be reinterpreted as an escape pair and never
-			// close the literal. Double the backslash — unquoteString decodes
-			// `\\` back to a single backslash.
-			b.WriteString(`\\`)
-		default:
-			b.WriteByte(c)
-		}
-	}
-	b.WriteByte('\'')
-	return b.String()
-}
+// The Mendix expression renderer lives in mdl/mendixexpr, where the visitor
+// can reach it too (fmt --upgrade, ako/mxcli#804). These names are the
+// executor's handles on it.
 
-// expressionToString converts an AST Expression to a Mendix expression string.
-// Note: string literals are quoted via mdlQuote, which escapes backslashes,
-// newlines, tabs, and carriage returns for MDL round-trip safety. Mendix's
-// expression engine does not treat `\n` etc. as escapes, so a string literal
-// with an embedded raw newline round-trips as `\n` in the MDL source (parseable)
-// but is re-serialised into BSON as a two-character `\n` sequence rather than a
-// real newline. This is the correct trade-off for describe→re-execute flows;
-// the alternative (emitting raw control chars in MDL) would break the parser.
-func expressionToString(expr ast.Expression) string {
-	// Check for nil interface
-	if expr == nil {
-		return ""
-	}
-
-	// Use reflection to check for nil pointer inside interface
-	// This handles the Go interface gotcha where the type is set but pointer is nil
-	if reflect.ValueOf(expr).IsNil() {
-		return ""
-	}
-
-	switch e := expr.(type) {
-	case *ast.LiteralExpr:
-		switch e.Kind {
-		case ast.LiteralString:
-			return quoteExpressionLiteral(fmt.Sprintf("%v", e.Value))
-		case ast.LiteralBoolean:
-			if e.Value.(bool) {
-				return "true"
-			}
-			return "false"
-		case ast.LiteralNull:
-			return "empty"
-		default:
-			return fmt.Sprintf("%v", e.Value)
-		}
-	case *ast.VariableExpr:
-		return "$" + e.Name
-	case *ast.AttributePathExpr:
-		return "$" + e.Variable + "/" + strings.Join(e.Path, "/")
-	case *ast.BinaryExpr:
-		left := expressionToString(e.Left)
-		right := expressionToString(e.Right)
-		// Mendix expressions use lowercase operators (and, or, div, mod)
-		op := strings.ToLower(e.Operator)
-		return left + " " + op + " " + right
-	case *ast.UnaryExpr:
-		// Mendix expressions use lowercase operators (not)
-		op := strings.ToLower(e.Operator)
-		// not(expr) — always emit parens; Mendix CE0117 rejects bare "not expr"
-		if op == "not" {
-			inner := e.Operand
-			if paren, ok := inner.(*ast.ParenExpr); ok {
-				// Unwrap double-parens: not((expr)) → not(expr)
-				return "not(" + expressionToString(paren.Inner) + ")"
-			}
-			return "not(" + expressionToString(inner) + ")"
-		}
-		operand := expressionToString(e.Operand)
-		return op + " " + operand
-	case *ast.FunctionCallExpr:
-		var args []string
-		for _, arg := range e.Arguments {
-			args = append(args, expressionToString(arg))
-		}
-		return mendixFunctionName(e.Name) + "(" + strings.Join(args, ", ") + ")"
-	case *ast.TokenExpr:
-		return "[%" + e.Token + "%]"
-	case *ast.ParenExpr:
-		return "(" + expressionToString(e.Inner) + ")"
-	case *ast.IdentifierExpr:
-		// Unquoted identifier (attribute name in XPath)
-		return e.Name
-	case *ast.QualifiedNameExpr:
-		// Qualified name (association name, entity reference) - unquoted
-		return e.QualifiedName.String()
-	case *ast.ConstantRefExpr:
-		return "@" + e.QualifiedName.String()
-	case *ast.IfThenElseExpr:
-		cond := expressionToString(e.Condition)
-		thenStr := expressionToString(e.ThenExpr)
-		elseStr := expressionToString(e.ElseExpr)
-		return "if " + cond + " then " + thenStr + " else " + elseStr
-	case *ast.SourceExpr:
-		if e.Source != "" {
-			return e.Source
-		}
-		return expressionToString(e.Expression)
-	default:
-		return ""
-	}
-}
+func mendixFunctionName(name string) string         { return mendixexpr.FunctionName(name) }
+func quoteExpressionLiteral(s string) string        { return mendixexpr.QuoteLiteral(s) }
+func expressionToString(expr ast.Expression) string { return mendixexpr.String(expr) }
+func normalizeMendixOperatorCase(src string) string { return mendixexpr.NormalizeOperatorCase(src) }
+func isWordByte(c byte) bool                        { return mendixexpr.IsWordByte(c) }
 
 // expressionToXPath converts an AST Expression to an XPath constraint string.
 // Unlike expressionToString (for Mendix expressions), XPath requires Mendix
 // tokens like [%CurrentDateTime%] to be quoted: '[%CurrentDateTime%]'.
 func expressionToXPath(expr ast.Expression) string {
+	return xpathOf(expr, false)
+}
+
+// expressionToXPathNames is expressionToXPath with every qualified name left as
+// written, for a writer that decides what a three-part name is itself — an
+// attribute of the constrained entity or an enumeration value — with
+// storedXPathConstraint (ako/mxcli#874).
+func expressionToXPathNames(expr ast.Expression) string {
+	return xpathOf(expr, true)
+}
+
+func xpathOf(expr ast.Expression, keepNames bool) string {
 	if expr == nil {
 		return ""
 	}
@@ -356,29 +123,29 @@ func expressionToXPath(expr ast.Expression) string {
 	case *ast.TokenExpr:
 		return "'[%" + e.Token + "%]'"
 	case *ast.BinaryExpr:
-		left := expressionToXPath(e.Left)
-		right := expressionToXPath(e.Right)
+		left := xpathOf(e.Left, keepNames)
+		right := xpathOf(e.Right, keepNames)
 		op := strings.ToLower(e.Operator)
 		return left + " " + op + " " + right
 	case *ast.UnaryExpr:
-		operand := expressionToXPath(e.Operand)
+		operand := xpathOf(e.Operand, keepNames)
 		op := strings.ToLower(e.Operator)
 		// For 'not' with parenthesized operand, output as not(expr)
 		if op == "not" {
 			if p, ok := e.Operand.(*ast.ParenExpr); ok {
-				return "not(" + expressionToXPath(p.Inner) + ")"
+				return "not(" + xpathOf(p.Inner, keepNames) + ")"
 			}
 			return "not(" + operand + ")"
 		}
 		return op + " " + operand
 	case *ast.ParenExpr:
-		return "(" + expressionToXPath(e.Inner) + ")"
+		return "(" + xpathOf(e.Inner, keepNames) + ")"
 	case *ast.XPathPathExpr:
-		return xpathPathExprToString(e)
+		return xpathPathOf(e, keepNames)
 	case *ast.FunctionCallExpr:
 		var args []string
 		for _, arg := range e.Arguments {
-			args = append(args, expressionToXPath(arg))
+			args = append(args, xpathOf(arg, keepNames))
 		}
 		return mendixFunctionName(e.Name) + "(" + strings.Join(args, ", ") + ")"
 	case *ast.LiteralExpr:
@@ -387,12 +154,15 @@ func expressionToXPath(expr ast.Expression) string {
 		}
 		return expressionToString(expr)
 	case *ast.QualifiedNameExpr:
+		if keepNames {
+			return e.QualifiedName.String()
+		}
 		return qualifiedNameToXPath(e)
 	case *ast.SourceExpr:
 		if e.Source != "" {
 			return e.Source
 		}
-		return expressionToXPath(e.Expression)
+		return xpathOf(e.Expression, keepNames)
 	default:
 		// For all other expression types, the standard serialization is correct
 		return expressionToString(expr)
@@ -412,17 +182,78 @@ func qualifiedNameToXPath(e *ast.QualifiedNameExpr) string {
 
 // xpathEnumRefRe matches 3-part qualified enum value references like Module.EnumName.Value
 // in a raw XPath string. These must be replaced with string literals for database queries.
-var xpathEnumRefRe = regexp.MustCompile(`[A-Za-z][A-Za-z0-9_]*\.[A-Za-z][A-Za-z0-9_]*\.[A-Za-z][A-Za-z0-9_]*`)
+//
+// The value may start with an underscore: Studio Pro names a True/False
+// enumeration's values `_True` and `_False`. Requiring a letter there wrote
+// `[A = M.E._True]` verbatim, which mxbuild rejects with CE0161.
+var xpathEnumRefRe = regexp.MustCompile(`[A-Za-z][A-Za-z0-9_]*\.[A-Za-z][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*`)
 
 // normalizeXPathEnumRefs converts 3-part qualified enum value references in a raw XPath
 // string to the string literal format that Mendix database queries require.
 // Example: "[Status = XpathTest.OrderStatus.Open]" → "[Status = 'Open']".
 // This handles the SourceExpr (bracketed) path where qualifiedNameToXPath is bypassed.
+//
+// INSIDE A STRING LITERAL the letters are data and are left alone, the same rule
+// NormalizeXPathOperators follows. Running the regex over the whole constraint
+// rewrote a ref the author had already quoted into a DOUBLED quote:
+//
+//	'Mod.Enum.Value'  ->  ''Value''
+//
+// which every downstream reader lexes as
+// an empty string literal followed by a stray bare word. The stored constraint
+// then read `Status = Mod.Enum.` with the value, the closing quote and the ENTIRE
+// following clause gone, `mxcli check` passing, and mxbuild reporting only a
+// generic CE0161 that does not say which clause (ako/CapTrackV3 FINDINGS §29).
+//
+// A quoted ref is left exactly as written rather than repaired. Consuming the
+// author's quotes would make `Name = 'a.b.c'` — an ordinary literal that happens
+// to have two dots — silently match something else, and telling those two apart
+// needs the project's enumerations, which this string-level pass does not have.
+// MDL-XPATH01 reports the quoted spelling at check time, where the enum can
+// actually be resolved.
 func normalizeXPathEnumRefs(xpath string) string {
-	return xpathEnumRefRe.ReplaceAllStringFunc(xpath, func(match string) string {
-		lastDot := strings.LastIndex(match, ".")
-		return "'" + match[lastDot+1:] + "'"
-	})
+	var b strings.Builder
+	b.Grow(len(xpath))
+	for i := 0; i < len(xpath); {
+		if xpath[i] != '\'' {
+			j := strings.IndexByte(xpath[i:], '\'')
+			if j < 0 {
+				b.WriteString(xpathEnumRefRe.ReplaceAllStringFunc(xpath[i:], enumRefToLiteral))
+				break
+			}
+			b.WriteString(xpathEnumRefRe.ReplaceAllStringFunc(xpath[i:i+j], enumRefToLiteral))
+			i += j
+			continue
+		}
+		b.WriteString(xpath[i:xpathLiteralEnd(xpath, i)])
+		i = xpathLiteralEnd(xpath, i)
+	}
+	return b.String()
+}
+
+// enumRefToLiteral turns `Module.Enum.Value` into the `'Value'` a database query
+// compares against.
+func enumRefToLiteral(match string) string {
+	return "'" + match[strings.LastIndex(match, ".")+1:] + "'"
+}
+
+// xpathLiteralEnd returns the index just past the string literal starting at
+// start. A doubled quote inside one is an escaped quote, not the end — the same
+// rule the MDL expression scanner and NormalizeXPathOperators use. An unclosed
+// literal runs to the end of the constraint, which keeps the caller's loop
+// terminating on malformed input instead of stalling.
+func xpathLiteralEnd(s string, start int) int {
+	for j := start + 1; j < len(s); j++ {
+		if s[j] != '\'' {
+			continue
+		}
+		if j+1 < len(s) && s[j+1] == '\'' {
+			j++
+			continue
+		}
+		return j + 1
+	}
+	return len(s)
 }
 
 // memberExpressionToString converts an AST Expression to a Mendix expression string,
@@ -543,7 +374,17 @@ func xpathBareAttrName(expr ast.Expression) string {
 
 // enumStringToQN builds a QualifiedNameExpr for an enum value reference.
 // enumRef = "Module.EnumName", valueKey = "Open" → Module: "Module", Name: "EnumName.Open"
+//
+// A value that is ALREADY the qualified name is returned as it stands. Mendix
+// stores an enum comparison as the bare value, so a stored `'Module.Enum.Value'`
+// is a constraint the author quoted by mistake (ako/CapTrackV3 FINDINGS §29) —
+// prefixing it again rendered `Xp.Status.Xp.Status.Confirmed`, which a
+// describe → exec round-trip would then write back into the model. Describing an
+// invalid constraint should show what is stored, not compound it.
 func enumStringToQN(enumRef, valueKey string) *ast.QualifiedNameExpr {
+	if strings.HasPrefix(valueKey, enumRef+".") {
+		valueKey = strings.TrimPrefix(valueKey, enumRef+".")
+	}
 	parts := strings.SplitN(enumRef, ".", 2)
 	if len(parts) != 2 {
 		return &ast.QualifiedNameExpr{QualifiedName: ast.QualifiedName{Module: enumRef, Name: valueKey}}
@@ -591,8 +432,8 @@ func xpathExprToMDLString(expr ast.Expression) string {
 		var parts []string
 		for _, step := range e.Steps {
 			s := xpathExprToMDLString(step.Expr)
-			if step.Predicate != nil {
-				s += "[" + xpathExprToMDLString(step.Predicate) + "]"
+			for _, pred := range step.Predicates {
+				s += "[" + xpathExprToMDLString(pred) + "]"
 			}
 			parts = append(parts, s)
 		}
@@ -606,11 +447,15 @@ func xpathExprToMDLString(expr ast.Expression) string {
 
 // xpathPathExprToString serializes an XPathPathExpr to an XPath path string.
 func xpathPathExprToString(path *ast.XPathPathExpr) string {
+	return xpathPathOf(path, false)
+}
+
+func xpathPathOf(path *ast.XPathPathExpr, keepNames bool) string {
 	var parts []string
 	for _, step := range path.Steps {
-		s := expressionToXPath(step.Expr)
-		if step.Predicate != nil {
-			s += "[" + expressionToXPath(step.Predicate) + "]"
+		s := xpathOf(step.Expr, keepNames)
+		for _, pred := range step.Predicates {
+			s += "[" + xpathOf(pred, keepNames) + "]"
 		}
 		parts = append(parts, s)
 	}

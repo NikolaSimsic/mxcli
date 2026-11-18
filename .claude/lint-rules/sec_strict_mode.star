@@ -27,5 +27,5 @@ def check():
     return [violation(
         message="Strict mode is disabled. This weakens XPath constraint enforcement and is relevant to CVE-2023-23835.",
         location=location(module="", document_type="security", document_name="ProjectSecurity"),
-        suggestion="ALTER PROJECT SECURITY STRICT MODE ON",
+        suggestion="Enable it with: ALTER PROJECT SECURITY STRICT MODE ON; (or in Studio Pro under Project Security).",
     )]

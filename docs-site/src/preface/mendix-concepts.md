@@ -21,7 +21,7 @@ A **module** is the top-level organizational unit, like a package in Go or a nam
 A typical project has a few custom modules (`Sales`, `Admin`, `Integration`) plus system modules provided by the platform (`System`, `Administration`).
 
 ```sql
-SHOW MODULES;
+LIST MODULES;
 ```
 
 ## Domain Model
@@ -126,15 +126,17 @@ Widgets are nested in a tree. Common widget types:
 
 ```sql
 CREATE PAGE Sales.CustomerOverview
-    LAYOUT Atlas_Core.Atlas_Default
-    TITLE 'Customers'
 (
-    DATAGRID SOURCE DATABASE Sales.Customer (
-        COLUMN Name,
-        COLUMN Email,
-        COLUMN IsActive
-    )
-);
+    Title: 'Customers',
+    Layout: Atlas_Core.Atlas_Default
+)
+{
+    DATAGRID dgCustomers (DataSource: DATABASE Sales.Customer) {
+        COLUMN (Attribute: Name, Caption: 'Name')
+        COLUMN (Attribute: Email, Caption: 'Email')
+        COLUMN (Attribute: IsActive, Caption: 'Active')
+    }
+};
 ```
 
 ### Snippets
@@ -203,7 +205,7 @@ Project
 In mxcli, you can explore this structure with:
 
 ```sql
-SHOW STRUCTURE DEPTH 2;
+DESCRIBE STRUCTURE DEPTH 2;
 ```
 
 ## What's Next

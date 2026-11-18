@@ -8,7 +8,10 @@ import (
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/backend/wfnames"
+	"github.com/mendixlabs/mxcli/mdl/catalog"
 	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
+	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 	"github.com/mendixlabs/mxcli/sdk/javaactions"
@@ -64,25 +67,31 @@ func execShowStructure(ctx *ExecContext, s *ast.ShowStmt) error {
 // structureDepth1JSON emits structure as a JSON table with one row per module
 // and columns for each element type count.
 func structureDepth1JSON(ctx *ExecContext, modules []structureModule) error {
-	entityCounts := queryCountByModule(ctx, "entities")
-	mfCounts := queryCountByModule(ctx, "microflows where MicroflowType = 'microflow'")
-	nfCounts := queryCountByModule(ctx, "microflows where MicroflowType = 'nanoflow'")
-	pageCounts := queryCountByModule(ctx, "pages")
-	enumCounts := queryCountByModule(ctx, "enumerations")
-	snippetCounts := queryCountByModule(ctx, "snippets")
-	jaCounts := queryCountByModule(ctx, "java_actions")
-	wfCounts := queryCountByModule(ctx, "workflows")
-	odataClientCounts := queryCountByModule(ctx, "odata_clients")
-	odataServiceCounts := queryCountByModule(ctx, "odata_services")
-	beServiceCounts := queryCountByModule(ctx, "business_event_services")
+	var qerr error
+	entityCounts := queryCountByModule(ctx, "entities", &qerr)
+	mfCounts := queryCountByModule(ctx, flowTypeFilter(catalog.MicroflowTypeMicroflow), &qerr)
+	nfCounts := queryCountByModule(ctx, flowTypeFilter(catalog.MicroflowTypeNanoflow), &qerr)
+	pageCounts := queryCountByModule(ctx, "pages", &qerr)
+	enumCounts := queryCountByModule(ctx, "enumerations", &qerr)
+	snippetCounts := queryCountByModule(ctx, "snippets", &qerr)
+	jaCounts := queryCountByModule(ctx, "java_actions", &qerr)
+	wfCounts := queryCountByModule(ctx, "workflows", &qerr)
+	odataClientCounts := queryCountByModule(ctx, "odata_clients", &qerr)
+	odataServiceCounts := queryCountByModule(ctx, "odata_services", &qerr)
+	beServiceCounts := queryCountByModule(ctx, "business_event_services", &qerr)
+	if qerr != nil {
+		return qerr
+	}
 	constantCounts := countByModuleFromBackend(ctx, "constants")
 	scheduledEventCounts := countByModuleFromBackend(ctx, "scheduled_events")
+	queueCounts := countByModuleFromBackend(ctx, "queues")
+	regexCounts := countByModuleFromBackend(ctx, "regular_expressions")
 
 	tr := &TableResult{
 		Columns: []string{
 			"Module", "Entities", "Enumerations", "Microflows", "Nanoflows",
 			"Workflows", "Pages", "Snippets", "JavaActions", "Constants",
-			"ScheduledEvents", "ODataClients", "ODataServices", "BusinessEventServices",
+			"ScheduledEvents", "Queues", "RegularExpressions", "ODataClients", "ODataServices", "BusinessEventServices",
 		},
 	}
 	for _, m := range modules {
@@ -98,6 +107,8 @@ func structureDepth1JSON(ctx *ExecContext, modules []structureModule) error {
 			jaCounts[m.Name],
 			constantCounts[m.Name],
 			scheduledEventCounts[m.Name],
+			queueCounts[m.Name],
+			regexCounts[m.Name],
 			odataClientCounts[m.Name],
 			odataServiceCounts[m.Name],
 			beServiceCounts[m.Name],
@@ -182,22 +193,28 @@ func asString(v any) string {
 // ============================================================================
 
 func structureDepth1(ctx *ExecContext, modules []structureModule) error {
+	var qerr error
 	// Query counts per module from catalog
-	entityCounts := queryCountByModule(ctx, "entities")
-	mfCounts := queryCountByModule(ctx, "microflows where MicroflowType = 'microflow'")
-	nfCounts := queryCountByModule(ctx, "microflows where MicroflowType = 'nanoflow'")
-	pageCounts := queryCountByModule(ctx, "pages")
-	enumCounts := queryCountByModule(ctx, "enumerations")
-	snippetCounts := queryCountByModule(ctx, "snippets")
-	jaCounts := queryCountByModule(ctx, "java_actions")
-	wfCounts := queryCountByModule(ctx, "workflows")
-	odataClientCounts := queryCountByModule(ctx, "odata_clients")
-	odataServiceCounts := queryCountByModule(ctx, "odata_services")
-	beServiceCounts := queryCountByModule(ctx, "business_event_services")
+	entityCounts := queryCountByModule(ctx, "entities", &qerr)
+	mfCounts := queryCountByModule(ctx, flowTypeFilter(catalog.MicroflowTypeMicroflow), &qerr)
+	nfCounts := queryCountByModule(ctx, flowTypeFilter(catalog.MicroflowTypeNanoflow), &qerr)
+	pageCounts := queryCountByModule(ctx, "pages", &qerr)
+	enumCounts := queryCountByModule(ctx, "enumerations", &qerr)
+	snippetCounts := queryCountByModule(ctx, "snippets", &qerr)
+	jaCounts := queryCountByModule(ctx, "java_actions", &qerr)
+	wfCounts := queryCountByModule(ctx, "workflows", &qerr)
+	odataClientCounts := queryCountByModule(ctx, "odata_clients", &qerr)
+	odataServiceCounts := queryCountByModule(ctx, "odata_services", &qerr)
+	beServiceCounts := queryCountByModule(ctx, "business_event_services", &qerr)
+	if qerr != nil {
+		return qerr
+	}
 
 	// Get constants and scheduled events from backend (no catalog tables)
 	constantCounts := countByModuleFromBackend(ctx, "constants")
 	scheduledEventCounts := countByModuleFromBackend(ctx, "scheduled_events")
+	queueCounts := countByModuleFromBackend(ctx, "queues")
+	regexCounts := countByModuleFromBackend(ctx, "regular_expressions")
 
 	// Calculate name column width for alignment
 	nameWidth := 0
@@ -240,6 +257,12 @@ func structureDepth1(ctx *ExecContext, modules []structureModule) error {
 		if c := scheduledEventCounts[m.Name]; c > 0 {
 			parts = append(parts, pluralize(c, "scheduled event", "scheduled events"))
 		}
+		if c := queueCounts[m.Name]; c > 0 {
+			parts = append(parts, pluralize(c, "queue", "queues"))
+		}
+		if c := regexCounts[m.Name]; c > 0 {
+			parts = append(parts, pluralize(c, "regular expression", "regular expressions"))
+		}
 		if c := odataClientCounts[m.Name]; c > 0 {
 			parts = append(parts, pluralize(c, "odata client", "odata clients"))
 		}
@@ -257,12 +280,31 @@ func structureDepth1(ctx *ExecContext, modules []structureModule) error {
 	return nil
 }
 
-// queryCountByModule queries a catalog table and returns a map of module name → count.
-func queryCountByModule(ctx *ExecContext, tableAndWhere string) map[string]int {
-	counts := make(map[string]int)
-	sql := fmt.Sprintf("select ModuleName, count(*) from %s GROUP by ModuleName", tableAndWhere)
+// structureQuery runs one of the structure overview's catalog queries. They are
+// fixed SQL against tables the catalog builder owns, so a failure is a column
+// or table drift inside mxcli, never a property of the user's project. They
+// used to discard the error, which is how depth 2 and 3 queried a ParentWidget
+// column widgets_data has never had and printed every page without its data
+// widgets, from the initial commit on.
+func structureQuery(ctx *ExecContext, sql string) (*catalog.QueryResult, error) {
 	result, err := ctx.Catalog.Query(sql)
 	if err != nil {
+		return nil, mdlerrors.NewBackend("run structure query "+sql, err)
+	}
+	return result, nil
+}
+
+// queryCountByModule queries a catalog table and returns a map of module name →
+// count. A failing query sets *errp (if not already set) and yields no counts,
+// so a caller can issue its whole batch and check once.
+func queryCountByModule(ctx *ExecContext, tableAndWhere string, errp *error) map[string]int {
+	counts := make(map[string]int)
+	sql := fmt.Sprintf("select ModuleName, count(*) from %s GROUP by ModuleName", tableAndWhere)
+	result, err := structureQuery(ctx, sql)
+	if err != nil {
+		if *errp == nil {
+			*errp = err
+		}
 		return counts
 	}
 	for _, row := range result.Rows {
@@ -270,6 +312,13 @@ func queryCountByModule(ctx *ExecContext, tableAndWhere string) map[string]int {
 		counts[name] = toInt(row[1])
 	}
 	return counts
+}
+
+// flowTypeFilter selects one flow flavour from the microflows table, spelled
+// with the catalog builder's own constant: a hand-typed lower-case literal here
+// matched no row and hid every microflow and nanoflow count.
+func flowTypeFilter(flowType string) string {
+	return fmt.Sprintf("microflows where MicroflowType = '%s'", flowType)
 }
 
 // countByModuleFromBackend counts elements per module using the backend (for types without catalog tables).
@@ -293,6 +342,22 @@ func countByModuleFromBackend(ctx *ExecContext, kind string) map[string]int {
 		if events, err := ctx.Backend.ListScheduledEvents(); err == nil {
 			for _, ev := range events {
 				modID := h.FindModuleID(ev.ContainerID)
+				modName := h.GetModuleName(modID)
+				counts[modName]++
+			}
+		}
+	case "queues":
+		if queues, err := ctx.Backend.ListQueues(); err == nil {
+			for _, q := range queues {
+				modID := h.FindModuleID(q.ContainerID)
+				modName := h.GetModuleName(modID)
+				counts[modName]++
+			}
+		}
+	case "regular_expressions":
+		if res, err := ctx.Backend.ListRegularExpressions(); err == nil {
+			for _, re := range res {
+				modID := h.FindModuleID(re.ContainerID)
 				modName := h.GetModuleName(modID)
 				counts[modName]++
 			}
@@ -374,6 +439,14 @@ func structureDepth2(ctx *ExecContext, modules []structureModule) error {
 		eventsByModule[modName] = append(eventsByModule[modName], ev)
 	}
 
+	allQueues, _ := ctx.Backend.ListQueues()
+	queuesByModule := make(map[string][]*types.Queue)
+	for _, q := range allQueues {
+		modID := h.FindModuleID(q.ContainerID)
+		modName := h.GetModuleName(modID)
+		queuesByModule[modName] = append(queuesByModule[modName], q)
+	}
+
 	// Load java actions for parameter types
 	allJavaActions, _ := ctx.Backend.ListJavaActionsFull()
 	jaByModule := make(map[string][]*javaactions.JavaAction)
@@ -397,74 +470,97 @@ func structureDepth2(ctx *ExecContext, modules []structureModule) error {
 			fmt.Fprintln(ctx.Output)
 		}
 		fmt.Fprintln(ctx.Output, m.Name)
+		if err := writeStructureModuleNested(ctx, m.Name, func() error {
 
-		// Entities
-		structureEntities(ctx, m.Name, dmByModule[m.Name], false)
+			// Entities
+			structureEntities(ctx, m.Name, dmByModule[m.Name], false)
 
-		// Enumerations
-		if enums, ok := enumsByModule[m.Name]; ok {
-			sortEnumerations(enums)
-			for _, enum := range enums {
-				values := make([]string, len(enum.Values))
-				for i, v := range enum.Values {
-					values[i] = v.Name
+			// Enumerations
+			if enums, ok := enumsByModule[m.Name]; ok {
+				sortEnumerations(enums)
+				for _, enum := range enums {
+					values := make([]string, len(enum.Values))
+					for i, v := range enum.Values {
+						values[i] = v.Name
+					}
+					fmt.Fprintf(ctx.Output, "  Enumeration %s.%s [%s]\n", m.Name, enum.Name, strings.Join(values, ", "))
 				}
-				fmt.Fprintf(ctx.Output, "  Enumeration %s.%s [%s]\n", m.Name, enum.Name, strings.Join(values, ", "))
 			}
-		}
 
-		// Microflows
-		if mfs, ok := mfByModule[m.Name]; ok {
-			sortMicroflows(mfs)
-			for _, mf := range mfs {
-				fmt.Fprintf(ctx.Output, "  Microflow %s.%s%s\n", m.Name, mf.Name, formatMicroflowSignature(mf.Parameters, mf.ReturnType, false))
+			// Microflows
+			if mfs, ok := mfByModule[m.Name]; ok {
+				sortMicroflows(mfs)
+				for _, mf := range mfs {
+					fmt.Fprintf(ctx.Output, "  Microflow %s.%s%s\n", m.Name, mf.Name, formatMicroflowSignature(mf.Parameters, mf.ReturnType, false))
+				}
 			}
-		}
 
-		// Nanoflows
-		if nfs, ok := nfByModule[m.Name]; ok {
-			sortNanoflows(nfs)
-			for _, nf := range nfs {
-				fmt.Fprintf(ctx.Output, "  Nanoflow %s.%s%s\n", m.Name, nf.Name, formatMicroflowSignature(nf.Parameters, nf.ReturnType, false))
+			// Nanoflows
+			if nfs, ok := nfByModule[m.Name]; ok {
+				sortNanoflows(nfs)
+				for _, nf := range nfs {
+					fmt.Fprintf(ctx.Output, "  Nanoflow %s.%s%s\n", m.Name, nf.Name, formatMicroflowSignature(nf.Parameters, nf.ReturnType, false))
+				}
 			}
-		}
 
-		// Workflows
-		structureWorkflows(ctx, m.Name, wfByModule[m.Name], false)
+			// Workflows
+			structureWorkflows(ctx, m.Name, wfByModule[m.Name], false)
 
-		// Pages (from catalog)
-		structurePages(ctx, m.Name)
-
-		// Snippets (from catalog)
-		structureSnippets(ctx, m.Name)
-
-		// Java Actions
-		outputJavaActions(ctx, m.Name, jaByModule[m.Name], false)
-
-		// Constants
-		if consts, ok := constByModule[m.Name]; ok {
-			sortConstants(consts)
-			for _, c := range consts {
-				fmt.Fprintf(ctx.Output, "  Constant %s.%s: %s\n", m.Name, c.Name, formatConstantTypeBrief(c.Type))
+			// Pages (from catalog)
+			if err := structurePages(ctx, m.Name); err != nil {
+				return err
 			}
-		}
 
-		// Scheduled Events
-		if events, ok := eventsByModule[m.Name]; ok {
-			sortScheduledEvents(events)
-			for _, ev := range events {
-				fmt.Fprintf(ctx.Output, "  ScheduledEvent %s.%s\n", m.Name, ev.Name)
+			// Snippets (from catalog)
+			if err := structureSnippets(ctx, m.Name); err != nil {
+				return err
 			}
+
+			// Java Actions
+			outputJavaActions(ctx, m.Name, jaByModule[m.Name], false)
+
+			// Constants
+			if consts, ok := constByModule[m.Name]; ok {
+				sortConstants(consts)
+				for _, c := range consts {
+					fmt.Fprintf(ctx.Output, "  Constant %s.%s: %s\n", m.Name, c.Name, formatConstantTypeBrief(c.Type))
+				}
+			}
+
+			// Scheduled Events
+			if events, ok := eventsByModule[m.Name]; ok {
+				sortScheduledEvents(events)
+				for _, ev := range events {
+					fmt.Fprintf(ctx.Output, "  ScheduledEvent %s.%s\n", m.Name, ev.Name)
+				}
+			}
+
+			// Task Queues
+			if queues, ok := queuesByModule[m.Name]; ok {
+				sort.Slice(queues, func(i, j int) bool { return queues[i].Name < queues[j].Name })
+				for _, q := range queues {
+					fmt.Fprintf(ctx.Output, "  Queue %s.%s\n", m.Name, q.Name)
+				}
+			}
+
+			// OData Clients
+			if err := structureODataClients(ctx, m.Name); err != nil {
+				return err
+			}
+
+			// OData Services
+			if err := structureODataServices(ctx, m.Name); err != nil {
+				return err
+			}
+
+			// Business Event Services
+			if err := structureBusinessEventServices(ctx, m.Name); err != nil {
+				return err
+			}
+			return nil
+		}); err != nil {
+			return err
 		}
-
-		// OData Clients
-		structureODataClients(ctx, m.Name)
-
-		// OData Services
-		structureODataServices(ctx, m.Name)
-
-		// Business Event Services
-		structureBusinessEventServices(ctx, m.Name)
 	}
 
 	return nil
@@ -529,6 +625,14 @@ func structureDepth3(ctx *ExecContext, modules []structureModule) error {
 		eventsByModule[modName] = append(eventsByModule[modName], ev)
 	}
 
+	allQueues, _ := ctx.Backend.ListQueues()
+	queuesByModule := make(map[string][]*types.Queue)
+	for _, q := range allQueues {
+		modID := h.FindModuleID(q.ContainerID)
+		modName := h.GetModuleName(modID)
+		queuesByModule[modName] = append(queuesByModule[modName], q)
+	}
+
 	allJavaActions, _ := ctx.Backend.ListJavaActionsFull()
 	jaByModule := make(map[string][]*javaactions.JavaAction)
 	for _, ja := range allJavaActions {
@@ -551,76 +655,99 @@ func structureDepth3(ctx *ExecContext, modules []structureModule) error {
 			fmt.Fprintln(ctx.Output)
 		}
 		fmt.Fprintln(ctx.Output, m.Name)
+		if err := writeStructureModuleNested(ctx, m.Name, func() error {
 
-		// Entities (with types)
-		structureEntities(ctx, m.Name, dmByModule[m.Name], true)
+			// Entities (with types)
+			structureEntities(ctx, m.Name, dmByModule[m.Name], true)
 
-		// Enumerations
-		if enums, ok := enumsByModule[m.Name]; ok {
-			sortEnumerations(enums)
-			for _, enum := range enums {
-				values := make([]string, len(enum.Values))
-				for i, v := range enum.Values {
-					values[i] = v.Name
+			// Enumerations
+			if enums, ok := enumsByModule[m.Name]; ok {
+				sortEnumerations(enums)
+				for _, enum := range enums {
+					values := make([]string, len(enum.Values))
+					for i, v := range enum.Values {
+						values[i] = v.Name
+					}
+					fmt.Fprintf(ctx.Output, "  Enumeration %s.%s [%s]\n", m.Name, enum.Name, strings.Join(values, ", "))
 				}
-				fmt.Fprintf(ctx.Output, "  Enumeration %s.%s [%s]\n", m.Name, enum.Name, strings.Join(values, ", "))
 			}
-		}
 
-		// Microflows (with param names)
-		if mfs, ok := mfByModule[m.Name]; ok {
-			sortMicroflows(mfs)
-			for _, mf := range mfs {
-				fmt.Fprintf(ctx.Output, "  Microflow %s.%s%s\n", m.Name, mf.Name, formatMicroflowSignature(mf.Parameters, mf.ReturnType, true))
-			}
-		}
-
-		// Nanoflows (with param names)
-		if nfs, ok := nfByModule[m.Name]; ok {
-			sortNanoflows(nfs)
-			for _, nf := range nfs {
-				fmt.Fprintf(ctx.Output, "  Nanoflow %s.%s%s\n", m.Name, nf.Name, formatMicroflowSignature(nf.Parameters, nf.ReturnType, true))
-			}
-		}
-
-		// Workflows (with details)
-		structureWorkflows(ctx, m.Name, wfByModule[m.Name], true)
-
-		// Pages
-		structurePages(ctx, m.Name)
-
-		// Snippets
-		structureSnippets(ctx, m.Name)
-
-		// Java Actions (with param names)
-		outputJavaActions(ctx, m.Name, jaByModule[m.Name], true)
-
-		// Constants (with default value)
-		if consts, ok := constByModule[m.Name]; ok {
-			sortConstants(consts)
-			for _, c := range consts {
-				s := fmt.Sprintf("  Constant %s.%s: %s", m.Name, c.Name, formatConstantTypeBrief(c.Type))
-				if c.DefaultValue != "" {
-					s += " = " + c.DefaultValue
+			// Microflows (with param names)
+			if mfs, ok := mfByModule[m.Name]; ok {
+				sortMicroflows(mfs)
+				for _, mf := range mfs {
+					fmt.Fprintf(ctx.Output, "  Microflow %s.%s%s\n", m.Name, mf.Name, formatMicroflowSignature(mf.Parameters, mf.ReturnType, true))
 				}
-				fmt.Fprintln(ctx.Output, s)
 			}
-		}
 
-		// Scheduled Events
-		if events, ok := eventsByModule[m.Name]; ok {
-			sortScheduledEvents(events)
-			for _, ev := range events {
-				fmt.Fprintf(ctx.Output, "  ScheduledEvent %s.%s\n", m.Name, ev.Name)
+			// Nanoflows (with param names)
+			if nfs, ok := nfByModule[m.Name]; ok {
+				sortNanoflows(nfs)
+				for _, nf := range nfs {
+					fmt.Fprintf(ctx.Output, "  Nanoflow %s.%s%s\n", m.Name, nf.Name, formatMicroflowSignature(nf.Parameters, nf.ReturnType, true))
+				}
 			}
+
+			// Workflows (with details)
+			structureWorkflows(ctx, m.Name, wfByModule[m.Name], true)
+
+			// Pages
+			if err := structurePages(ctx, m.Name); err != nil {
+				return err
+			}
+
+			// Snippets
+			if err := structureSnippets(ctx, m.Name); err != nil {
+				return err
+			}
+
+			// Java Actions (with param names)
+			outputJavaActions(ctx, m.Name, jaByModule[m.Name], true)
+
+			// Constants (with default value)
+			if consts, ok := constByModule[m.Name]; ok {
+				sortConstants(consts)
+				for _, c := range consts {
+					s := fmt.Sprintf("  Constant %s.%s: %s", m.Name, c.Name, formatConstantTypeBrief(c.Type))
+					if c.DefaultValue != "" {
+						s += " = " + c.DefaultValue
+					}
+					fmt.Fprintln(ctx.Output, s)
+				}
+			}
+
+			// Scheduled Events
+			if events, ok := eventsByModule[m.Name]; ok {
+				sortScheduledEvents(events)
+				for _, ev := range events {
+					fmt.Fprintf(ctx.Output, "  ScheduledEvent %s.%s\n", m.Name, ev.Name)
+				}
+			}
+
+			// Task Queues
+			if queues, ok := queuesByModule[m.Name]; ok {
+				sort.Slice(queues, func(i, j int) bool { return queues[i].Name < queues[j].Name })
+				for _, q := range queues {
+					fmt.Fprintf(ctx.Output, "  Queue %s.%s\n", m.Name, q.Name)
+				}
+			}
+
+			// OData
+			if err := structureODataClients(ctx, m.Name); err != nil {
+				return err
+			}
+			if err := structureODataServices(ctx, m.Name); err != nil {
+				return err
+			}
+
+			// Business Event Services
+			if err := structureBusinessEventServices(ctx, m.Name); err != nil {
+				return err
+			}
+			return nil
+		}); err != nil {
+			return err
 		}
-
-		// OData
-		structureODataClients(ctx, m.Name)
-		structureODataServices(ctx, m.Name)
-
-		// Business Event Services
-		structureBusinessEventServices(ctx, m.Name)
 	}
 
 	return nil
@@ -702,68 +829,97 @@ func structureEntities(ctx *ExecContext, moduleName string, dm *domainmodel.Doma
 	}
 }
 
-// structurePages outputs pages for a module from the catalog.
-func structurePages(ctx *ExecContext, moduleName string) {
-	// Query pages from catalog
-	result, err := ctx.Catalog.Query(fmt.Sprintf(
+// structurePages outputs pages for a module from the catalog, each annotated
+// with its outermost data widgets — `Page M.P [DataView<Customer>, Datagrid<Order>]`.
+//
+// "Outermost" means no data widget above it in the page's widget tree: those are
+// the widgets that establish a data context. A data widget inside a layout grid
+// or container still counts (they are not data contexts), and one nested inside
+// another data widget does not (it is a detail of its parent). Filtering on the
+// page root instead would drop nearly everything, since real pages wrap their
+// content in a layout grid.
+//
+// widgets_data is only filled by a full catalog build, so on a fast-mode catalog
+// every page prints bare.
+func structurePages(ctx *ExecContext, moduleName string) error {
+	result, err := structureQuery(ctx, fmt.Sprintf(
 		"select Name from pages where ModuleName = '%s' ORDER by Name",
 		escapeSQLString(moduleName)))
-	if err != nil || len(result.Rows) == 0 {
-		return
+	if err != nil {
+		return err
+	}
+	if len(result.Rows) == 0 {
+		return nil
 	}
 
-	// Try to get top-level data widgets from widgets table
-	widgetsByPage := make(map[string][]string)
-	widgetResult, err := ctx.Catalog.Query(fmt.Sprintf(
-		"select ContainerQualifiedName, WidgetType, EntityRef from widgets where ModuleName = '%s' and ParentWidget = '' ORDER by ContainerQualifiedName, WidgetType",
+	widgetResult, err := structureQuery(ctx, fmt.Sprintf(
+		"select Id, ParentWidgetId, ContainerQualifiedName, WidgetType, EntityRef from widgets "+
+			"where ModuleName = '%s' and ContainerType = 'PAGE' ORDER by ContainerQualifiedName, WidgetType, Id",
 		escapeSQLString(moduleName)))
-	if err == nil {
-		for _, row := range widgetResult.Rows {
-			pageName := asString(row[0])
-			widgetType := asString(row[1])
-			entityRef := asString(row[2])
-
-			// Only include data-bound widgets
-			if !isDataWidget(widgetType) {
-				continue
-			}
-
-			// Extract short widget type name
-			shortType := shortWidgetType(widgetType)
-			if entityRef != "" {
-				// Extract entity name from qualified name
-				shortEntity := shortName(entityRef)
-				widgetsByPage[pageName] = append(widgetsByPage[pageName], fmt.Sprintf("%s<%s>", shortType, shortEntity))
-			} else {
-				widgetsByPage[pageName] = append(widgetsByPage[pageName], shortType)
+	if err != nil {
+		return err
+	}
+	type pageWidget struct {
+		parent, page, widgetType, entity string
+	}
+	byID := make(map[string]pageWidget, len(widgetResult.Rows))
+	var order []string
+	for _, row := range widgetResult.Rows {
+		id := asString(row[0])
+		byID[id] = pageWidget{parent: asString(row[1]), page: asString(row[2]), widgetType: asString(row[3]), entity: asString(row[4])}
+		order = append(order, id)
+	}
+	hasDataAncestor := func(w pageWidget) bool {
+		// ParentWidgetId chains end at the page root (""); the visited set only
+		// guards against a malformed cycle.
+		seen := map[string]bool{}
+		for p := w.parent; p != "" && !seen[p]; p = byID[p].parent {
+			seen[p] = true
+			if isDataWidget(byID[p].widgetType) {
+				return true
 			}
 		}
+		return false
+	}
+
+	widgetsByPage := make(map[string][]string)
+	for _, id := range order {
+		w := byID[id]
+		if !isDataWidget(w.widgetType) || hasDataAncestor(w) {
+			continue
+		}
+		label := shortWidgetType(w.widgetType)
+		if w.entity != "" {
+			label += "<" + shortName(w.entity) + ">"
+		}
+		widgetsByPage[w.page] = append(widgetsByPage[w.page], label)
 	}
 
 	for _, row := range result.Rows {
-		name := asString(row[0])
-		qualName := moduleName + "." + name
-		if widgets, ok := widgetsByPage[qualName]; ok && len(widgets) > 0 {
+		qualName := moduleName + "." + asString(row[0])
+		if widgets := widgetsByPage[qualName]; len(widgets) > 0 {
 			fmt.Fprintf(ctx.Output, "  Page %s [%s]\n", qualName, strings.Join(widgets, ", "))
 		} else {
 			fmt.Fprintf(ctx.Output, "  Page %s\n", qualName)
 		}
 	}
+	return nil
 }
 
 // structureSnippets outputs snippets for a module from the catalog.
-func structureSnippets(ctx *ExecContext, moduleName string) {
-	result, err := ctx.Catalog.Query(fmt.Sprintf(
+func structureSnippets(ctx *ExecContext, moduleName string) error {
+	result, err := structureQuery(ctx, fmt.Sprintf(
 		"select Name from snippets where ModuleName = '%s' ORDER by Name",
 		escapeSQLString(moduleName)))
-	if err != nil || len(result.Rows) == 0 {
-		return
+	if err != nil {
+		return err
 	}
 
 	for _, row := range result.Rows {
 		name := asString(row[0])
 		fmt.Fprintf(ctx.Output, "  Snippet %s.%s\n", moduleName, name)
 	}
+	return nil
 }
 
 // outputJavaActions outputs java actions for a module.
@@ -828,12 +984,12 @@ func formatJATypeDisplay(typeStr string) string {
 }
 
 // structureODataClients outputs OData clients for a module.
-func structureODataClients(ctx *ExecContext, moduleName string) {
-	result, err := ctx.Catalog.Query(fmt.Sprintf(
-		"select Name, ODataVersion from odata_clients where ModuleName = '%s' ORDER by Name",
+func structureODataClients(ctx *ExecContext, moduleName string) error {
+	result, err := structureQuery(ctx, fmt.Sprintf(
+		"select Name, ODataVersion from consumed_odata_services where ModuleName = '%s' ORDER by Name",
 		escapeSQLString(moduleName)))
-	if err != nil || len(result.Rows) == 0 {
-		return
+	if err != nil {
+		return err
 	}
 
 	for _, row := range result.Rows {
@@ -846,15 +1002,16 @@ func structureODataClients(ctx *ExecContext, moduleName string) {
 			fmt.Fprintf(ctx.Output, "  ODataClient %s\n", qualName)
 		}
 	}
+	return nil
 }
 
 // structureODataServices outputs OData services for a module.
-func structureODataServices(ctx *ExecContext, moduleName string) {
-	result, err := ctx.Catalog.Query(fmt.Sprintf(
-		"select Name, Path, EntitySetCount from odata_services where ModuleName = '%s' ORDER by Name",
+func structureODataServices(ctx *ExecContext, moduleName string) error {
+	result, err := structureQuery(ctx, fmt.Sprintf(
+		"select Name, Path, EntitySetCount from published_odata_services where ModuleName = '%s' ORDER by Name",
 		escapeSQLString(moduleName)))
-	if err != nil || len(result.Rows) == 0 {
-		return
+	if err != nil {
+		return err
 	}
 
 	for _, row := range result.Rows {
@@ -868,15 +1025,16 @@ func structureODataServices(ctx *ExecContext, moduleName string) {
 			fmt.Fprintf(ctx.Output, "  ODataService %s\n", qualName)
 		}
 	}
+	return nil
 }
 
 // structureBusinessEventServices outputs business event services for a module.
-func structureBusinessEventServices(ctx *ExecContext, moduleName string) {
-	result, err := ctx.Catalog.Query(fmt.Sprintf(
+func structureBusinessEventServices(ctx *ExecContext, moduleName string) error {
+	result, err := structureQuery(ctx, fmt.Sprintf(
 		"select Name, MessageCount, PublishCount, SubscribeCount from business_event_services where ModuleName = '%s' ORDER by Name",
 		escapeSQLString(moduleName)))
-	if err != nil || len(result.Rows) == 0 {
-		return
+	if err != nil {
+		return err
 	}
 
 	for _, row := range result.Rows {
@@ -903,6 +1061,7 @@ func structureBusinessEventServices(ctx *ExecContext, moduleName string) {
 			fmt.Fprintf(ctx.Output, "  BusinessEventService %s\n", qualName)
 		}
 	}
+	return nil
 }
 
 // structureWorkflows outputs workflows for a module.
@@ -947,55 +1106,11 @@ func structureWorkflows(ctx *ExecContext, moduleName string, wfs []*workflows.Wo
 	}
 }
 
-// countStructureWorkflowActivities counts activity types in a workflow for structure output.
+// countStructureWorkflowActivities counts activity types in a workflow for
+// structure output, over every flow it holds — the catalog's walk (wfnames).
 func countStructureWorkflowActivities(wf *workflows.Workflow) (total, userTasks, microflowCalls, decisions int) {
-	if wf.Flow == nil {
-		return
-	}
-	countStructureFlowActivities(wf.Flow, &total, &userTasks, &microflowCalls, &decisions)
-	return
-}
-
-// countStructureFlowActivities recursively counts activity types in a flow.
-func countStructureFlowActivities(flow *workflows.Flow, total, userTasks, microflowCalls, decisions *int) {
-	if flow == nil {
-		return
-	}
-	for _, act := range flow.Activities {
-		*total++
-		switch a := act.(type) {
-		case *workflows.UserTask:
-			*userTasks++
-			for _, outcome := range a.Outcomes {
-				countStructureFlowActivities(outcome.Flow, total, userTasks, microflowCalls, decisions)
-			}
-		case *workflows.CallMicroflowTask:
-			*microflowCalls++
-			for _, outcome := range a.Outcomes {
-				if outcome != nil {
-					countStructureFlowActivities(outcome.GetFlow(), total, userTasks, microflowCalls, decisions)
-				}
-			}
-		case *workflows.SystemTask:
-			*microflowCalls++
-			for _, outcome := range a.Outcomes {
-				if outcome != nil {
-					countStructureFlowActivities(outcome.GetFlow(), total, userTasks, microflowCalls, decisions)
-				}
-			}
-		case *workflows.ExclusiveSplitActivity:
-			*decisions++
-			for _, outcome := range a.Outcomes {
-				if outcome != nil {
-					countStructureFlowActivities(outcome.GetFlow(), total, userTasks, microflowCalls, decisions)
-				}
-			}
-		case *workflows.ParallelSplitActivity:
-			for _, outcome := range a.Outcomes {
-				countStructureFlowActivities(outcome.Flow, total, userTasks, microflowCalls, decisions)
-			}
-		}
-	}
+	c := wfnames.CountActivities(wf)
+	return c.Total, c.UserTasks, c.MicroflowCalls, c.Decisions
 }
 
 // ============================================================================
@@ -1105,7 +1220,8 @@ func shortName(qualifiedName string) string {
 func shortWidgetType(widgetType string) string {
 	// Widget types may look like "DataGrid", "DataView", "ListView", etc.
 	// Or pluggable widgets like "com.mendix.widget.web.datagrid2.DataGrid2"
-	if idx := strings.LastIndex(widgetType, "."); idx >= 0 {
+	// Built-in widgets are stored as "Forms$DataView", "Forms$ListView", …
+	if idx := strings.LastIndexAny(widgetType, ".$"); idx >= 0 {
 		return widgetType[idx+1:]
 	}
 	return widgetType

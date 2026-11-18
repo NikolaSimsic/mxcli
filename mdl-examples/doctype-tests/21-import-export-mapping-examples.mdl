@@ -1,3 +1,4 @@
+mdl 1;
 -- ============================================================================
 -- Import & Export Mapping Examples
 -- ============================================================================
@@ -30,10 +31,10 @@ create module MapTest;
 -- ============================================================================
 
 create json structure MapTest.JSON_Pet
-snippet '{"id": 1, "name": "Fido", "status": "available"}';
+sample '{"id": 1, "name": "Fido", "status": "available"}';
 
 create json structure MapTest.JSON_Order
-snippet '{"orderId": 100, "customer": {"name": "Alice", "email": "alice@example.com"}, "items": [{"sku": "A1", "quantity": 2, "price": 9.99}]}';
+sample '{"orderId": 100, "customer": {"name": "Alice", "email": "alice@example.com"}, "items": [{"sku": "A1", "quantity": 2, "price": 9.99}]}';
 
 -- ############################################################################
 -- PART 1: SIMPLE MAPPINGS (flat JSON, shared domain model)
@@ -48,7 +49,19 @@ create non-persistent entity MapTest.PetResponse (
   Name: string,
   status: string
 );
-/
+
+-- The upsert example below needs a PERSISTENT entity. `find` and `find or
+-- create` search the database, which a non-persistent entity does not have —
+-- Mendix rejects the mapping with CE0251, and mxcli now refuses it at check
+-- time as MDL-MAP03 (ako/mxcli#253). This example used to search PetResponse
+-- and got away with it only because PART 5 drops the mapping again before
+-- anything builds the project.
+
+create entity MapTest.PetRecord (
+  PetId: integer,
+  Name: string,
+  status: string
+);
 
 -- ============================================================================
 -- Level 1.1: Simple Import Mapping
@@ -88,11 +101,14 @@ describe export mapping MapTest.EMM_Pet;
 --
 -- FIND OR CREATE looks up an existing object by KEY attributes.
 -- If not found, creates a new one. Useful for idempotent imports.
+--
+-- Two requirements, both enforced by mxcli check (MDL-MAP02 / MDL-MAP03):
+-- at least one member must be marked `key`, and the entity must be persistent.
 
 create import mapping MapTest.IMM_UpsertPet
   with json structure MapTest.JSON_Pet
 {
-  find or create MapTest.PetResponse {
+  find or create MapTest.PetRecord {
     PetId = id key,
     Name = name,
     status = status
@@ -140,31 +156,26 @@ describe export mapping MapTest.EMM_PetNullable;
 create non-persistent entity MapTest.OrderResponse (
   OrderId: integer
 );
-/
 
 create non-persistent entity MapTest.CustomerInfo (
   Name: string,
   Email: string
 );
-/
 
 create non-persistent entity MapTest.OrderItem (
   Sku: string,
   Quantity: integer,
   Price: decimal
 );
-/
 
 -- Associations: child entity FROM, parent entity TO
 create association MapTest.CustomerInfo_OrderResponse
   from MapTest.CustomerInfo
   to MapTest.OrderResponse;
-/
 
 create association MapTest.OrderItem_OrderResponse
   from MapTest.OrderItem
   to MapTest.OrderResponse;
-/
 
 -- ============================================================================
 -- Level 2.1: Nested Import Mapping
@@ -210,17 +221,14 @@ describe import mapping MapTest.IMM_Order;
 create non-persistent entity MapTest.ExRoot (
   OrderId: integer
 );
-/
 
 create non-persistent entity MapTest.ExCustomer (
   Name: string,
   Email: string
 );
-/
 
 -- Container entity for the "items" array (no attributes)
 create non-persistent entity MapTest.ExItems;
-/
 
 -- Item entity for each element in the "items" array
 create non-persistent entity MapTest.ExItemsItem (
@@ -228,23 +236,19 @@ create non-persistent entity MapTest.ExItemsItem (
   Quantity: integer,
   Price: decimal
 );
-/
 
 create association MapTest.ExCustomer_ExRoot
   from MapTest.ExCustomer
   to MapTest.ExRoot
   owner both;
-/
 
 create association MapTest.ExItems_ExRoot
   from MapTest.ExItems
   to MapTest.ExRoot;
-/
 
 create association MapTest.ExItemsItem_ExItems
   from MapTest.ExItemsItem
   to MapTest.ExItems;
-/
 
 -- ============================================================================
 -- Level 3.1: Nested Export Mapping
@@ -275,10 +279,10 @@ describe export mapping MapTest.EMM_Order;
 -- PART 4: SHOW AND LIST COMMANDS
 -- ############################################################################
 
-show import mappings;
-show import mappings in MapTest;
-show export mappings;
-show export mappings in MapTest;
+list import mappings;
+list import mappings in MapTest;
+list export mappings;
+list export mappings in MapTest;
 
 -- ############################################################################
 -- PART 5: DROP COMMANDS
@@ -287,8 +291,8 @@ show export mappings in MapTest;
 drop import mapping MapTest.IMM_UpsertPet;
 drop export mapping MapTest.EMM_PetNullable;
 
-show import mappings in MapTest;
-show export mappings in MapTest;
+list import mappings in MapTest;
+list export mappings in MapTest;
 
 -- ############################################################################
 -- PART 6: MICROFLOW ACTIONS (IMPORT FROM / EXPORT TO MAPPING)
@@ -313,7 +317,6 @@ begin
 
   return $success;
 end;
-/
 
 -- ============================================================================
 -- Level 6.2: Export to mapping (entity → JSON string)
@@ -326,7 +329,6 @@ begin
   log info node 'MapTest' 'Exported: ' + $JsonOutput;
   return $JsonOutput;
 end;
-/
 
 -- ============================================================================
 -- Level 6.3: Import → Process → Export pipeline
@@ -339,7 +341,6 @@ begin
   $Output = export to mapping MapTest.EMM_Pet($Pet);
   log info node 'MapTest' 'Round-trip result: ' + $Output;
 end;
-/
 
 -- ############################################################################
 -- PART 7: CREATE OR MODIFY (idempotent upsert)

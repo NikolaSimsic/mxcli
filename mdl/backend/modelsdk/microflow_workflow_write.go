@@ -61,8 +61,19 @@ func workflowMicroflowActionToGen(act microflows.MicroflowAction) element.Elemen
 		addStr(g, "UserTaskVariable", a.UserTaskVariable)
 		return g
 	case *microflows.NotifyWorkflowAction:
+		// Key order as ako/TestApp (Studio Pro 11.14) stores it: ErrorHandlingType,
+		// NotifyTarget, OutputVariableName, WorkflowVariable. Before 11.7 the target
+		// was the Activity string instead; the executor sets whichever applies.
 		g := newElem("Microflows$NotifyWorkflowAction", string(a.ID))
+		if a.Activity != "" {
+			addStr(g, "Activity", a.Activity)
+		}
 		addStr(g, "ErrorHandlingType", orDefault(string(a.ErrorHandlingType), "Rollback"))
+		if t := a.Target; t != nil {
+			target := newElem(t.TypeName, "")
+			addStr(target, t.Key(), t.Name)
+			addPart(g, "NotifyTarget", target)
+		}
 		addStr(g, "OutputVariableName", a.OutputVariableName)
 		addStr(g, "WorkflowVariable", a.WorkflowVariable)
 		return g
@@ -75,7 +86,11 @@ func workflowMicroflowActionToGen(act microflows.MicroflowAction) element.Elemen
 		g := newElem("Microflows$LockWorkflowAction", string(a.ID))
 		addStr(g, "ErrorHandlingType", orDefault(string(a.ErrorHandlingType), "Rollback"))
 		addBool(g, "PauseAllWorkflows", a.PauseAllWorkflows)
-		if !a.PauseAllWorkflows {
+		// The flag is "Pause instances" on the selected workflow, not "all
+		// workflows": Studio Pro stores it WITH the selection, and leaving the
+		// selection out for it was CE1825 (mendixlabs/mxcli#870). Only a lock
+		// naming nothing — refused by check and exec — has none to write.
+		if a.Workflow != "" || a.WorkflowVariable != "" {
 			addPart(g, "WorkflowSelection", workflowSelectionToGen(a.Workflow, a.WorkflowVariable))
 		}
 		return g
@@ -83,7 +98,7 @@ func workflowMicroflowActionToGen(act microflows.MicroflowAction) element.Elemen
 		g := newElem("Microflows$UnlockWorkflowAction", string(a.ID))
 		addStr(g, "ErrorHandlingType", orDefault(string(a.ErrorHandlingType), "Rollback"))
 		addBool(g, "ResumeAllPausedWorkflows", a.ResumeAllPausedWorkflows)
-		if !a.ResumeAllPausedWorkflows {
+		if a.Workflow != "" || a.WorkflowVariable != "" {
 			addPart(g, "WorkflowSelection", workflowSelectionToGen(a.Workflow, a.WorkflowVariable))
 		}
 		return g

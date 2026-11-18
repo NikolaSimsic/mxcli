@@ -14,6 +14,7 @@ package mprread
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/mendixlabs/mxcli/modelsdk/bsoncompat"
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/types"
@@ -56,6 +57,7 @@ func decodeOne[T element.Element](r *mmpr.Reader, unitID string) (T, error) {
 		return zero, fmt.Errorf("read unit %s: %w", unitID, err)
 	}
 	dec := codec.NewDecoder(codec.DefaultRegistry)
+	unitsDecoded.Add(1)
 	elem, err := dec.Decode(bson.Raw(raw))
 	if err != nil {
 		return zero, fmt.Errorf("decode unit %s: %w", unitID, err)
@@ -381,7 +383,7 @@ type customBlobWrapper struct {
 // parseCustomBlobWrapper decodes the outer CustomBlobDocument BSON.
 func parseCustomBlobWrapper(contents []byte) (*customBlobWrapper, error) {
 	var raw map[string]any
-	if err := bson.Unmarshal(contents, &raw); err != nil {
+	if err := bsoncompat.UnmarshalDocMap(contents, &raw); err != nil {
 		return nil, fmt.Errorf("unmarshal CustomBlobDocument BSON: %w", err)
 	}
 	out := &customBlobWrapper{}
@@ -516,6 +518,7 @@ func decodeAgentEditorKnowledgeBase(unitID, containerID string, wrap *customBlob
 	if err := json.Unmarshal([]byte(wrap.Contents), &payload); err != nil {
 		return nil, fmt.Errorf("unmarshal KnowledgeBase Contents JSON: %w", err)
 	}
+	k.InnerName = payload.Name
 	k.Provider = payload.Provider
 	k.Environment = payload.ProviderFields.Environment
 	k.DeepLinkURL = payload.ProviderFields.DeepLinkURL
@@ -547,14 +550,18 @@ func decodeAgentEditorConsumedMCPService(unitID, containerID string, wrap *custo
 		return c, nil
 	}
 	var payload struct {
-		ProtocolVersion          string `json:"protocolVersion"`
-		Documentation            string `json:"documentation"`
-		Version                  string `json:"version"`
-		ConnectionTimeoutSeconds int    `json:"connectionTimeoutSeconds"`
+		ProtocolVersion          string        `json:"protocolVersion"`
+		Documentation            string        `json:"documentation"`
+		Version                  string        `json:"version"`
+		ConnectionTimeoutSeconds int           `json:"connectionTimeoutSeconds"`
+		Endpoint                 *types.DocRef `json:"endpoint"`
+		AuthenticationMicroflow  *types.DocRef `json:"authenticationMicroflow"`
 	}
 	if err := json.Unmarshal([]byte(wrap.Contents), &payload); err != nil {
 		return nil, fmt.Errorf("unmarshal ConsumedMCPService Contents JSON: %w", err)
 	}
+	c.Endpoint = payload.Endpoint
+	c.AuthenticationMicroflow = payload.AuthenticationMicroflow
 	c.ProtocolVersion = payload.ProtocolVersion
 	c.InnerDocumentation = payload.Documentation
 	c.Version = payload.Version
@@ -582,19 +589,22 @@ func decodeAgentEditorAgent(unitID, containerID string, wrap *customBlobWrapper)
 		return a, nil
 	}
 	var payload struct {
-		Description        string              `json:"description"`
-		SystemPrompt       string              `json:"systemPrompt"`
-		UserPrompt         string              `json:"userPrompt"`
-		UsageType          string              `json:"usageType"`
-		Variables          []types.AgentVar    `json:"variables"`
-		Tools              []types.AgentTool   `json:"tools"`
-		KnowledgebaseTools []types.AgentKBTool `json:"knowledgebaseTools"`
-		Model              *types.DocRef       `json:"model"`
-		Entity             *types.DocRef       `json:"entity"`
-		MaxTokens          *int                `json:"maxTokens"`
-		ToolChoice         string              `json:"toolChoice"`
-		Temperature        *float64            `json:"temperature"`
-		TopP               *float64            `json:"topP"`
+		Description        string                    `json:"description"`
+		SystemPrompt       string                    `json:"systemPrompt"`
+		UserPrompt         string                    `json:"userPrompt"`
+		UsageType          string                    `json:"usageType"`
+		Variables          []types.AgentVar          `json:"variables"`
+		Tools              []types.AgentTool         `json:"tools"`
+		KnowledgebaseTools []types.AgentKBTool       `json:"knowledgebaseTools"`
+		Model              *types.DocRef             `json:"model"`
+		Entity             *types.DocRef             `json:"entity"`
+		MaxTokens          *int                      `json:"maxTokens"`
+		ToolChoice         string                    `json:"toolChoice"`
+		Temperature        *float64                  `json:"temperature"`
+		TopP               *float64                  `json:"topP"`
+		EnableBackend      *bool                     `json:"enableBackendStreaming"`
+		EnableUI           *bool                     `json:"enableUIStreaming"`
+		SelectedModel      *types.AgentSelectedModel `json:"selectedModel"`
 	}
 	if err := json.Unmarshal([]byte(wrap.Contents), &payload); err != nil {
 		return nil, fmt.Errorf("unmarshal Agent Contents JSON: %w", err)
@@ -612,7 +622,51 @@ func decodeAgentEditorAgent(unitID, containerID string, wrap *customBlobWrapper)
 	a.ToolChoice = payload.ToolChoice
 	a.Temperature = payload.Temperature
 	a.TopP = payload.TopP
+	a.EnableBackendStreaming = payload.EnableBackend
+	a.EnableUIStreaming = payload.EnableUI
+	a.SelectedModel = payload.SelectedModel
 	return a, nil
+}
+
+func decodeAgentEditorPublishedMCPService(unitID, containerID string, wrap *customBlobWrapper) (*types.PublishedMCPService, error) {
+	p := &types.PublishedMCPService{}
+	p.ID = model.ID(unitID)
+	p.TypeName = customBlobDocBsonType
+	p.ContainerID = model.ID(containerID)
+	p.Name = wrap.Name
+	p.Documentation = wrap.Documentation
+	p.Excluded = wrap.Excluded
+	p.ExportLevel = wrap.ExportLevel
+
+	if wrap.Contents == "" {
+		return p, nil
+	}
+	var payload struct {
+		ServerName              string                   `json:"serverName"`
+		EndpointPath            string                   `json:"endpointPath"`
+		Version                 string                   `json:"version"`
+		ProtocolVersion         string                   `json:"protocolVersion"`
+		AuthenticationEnabled   bool                     `json:"authenticationEnabled"`
+		AuthenticationMicroflow *types.DocRef            `json:"authenticationMicroflow"`
+		AuthorizationServerURL  string                   `json:"authorizationServerUrl"`
+		Scopes                  string                   `json:"scopes"`
+		Tools                   []types.PublishedMCPTool `json:"tools"`
+		Documentation           string                   `json:"documentation"`
+	}
+	if err := json.Unmarshal([]byte(wrap.Contents), &payload); err != nil {
+		return nil, fmt.Errorf("unmarshal PublishedMCPService Contents JSON: %w", err)
+	}
+	p.ServerName = payload.ServerName
+	p.EndpointPath = payload.EndpointPath
+	p.Version = payload.Version
+	p.ProtocolVersion = payload.ProtocolVersion
+	p.AuthenticationEnabled = payload.AuthenticationEnabled
+	p.AuthenticationMicroflow = payload.AuthenticationMicroflow
+	p.AuthorizationServerURL = payload.AuthorizationServerURL
+	p.Scopes = payload.Scopes
+	p.Tools = payload.Tools
+	p.InnerDocumentation = payload.Documentation
+	return p, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -702,6 +756,7 @@ func ListModules(r *mmpr.Reader) ([]Unit[*genProj.Module], error) {
 		if ref.Type != typeName {
 			continue
 		}
+		unitsDecoded.Add(1)
 		elem, err := dec.Decode(bson.Raw(ref.Contents))
 		if err != nil {
 			return nil, fmt.Errorf("decode module %s: %w", ref.ID, err)
@@ -721,4 +776,29 @@ func ListModules(r *mmpr.Reader) ([]Unit[*genProj.Module], error) {
 // parent Folder.
 func ListFolders(r *mmpr.Reader) ([]Unit[*genProj.Folder], error) {
 	return ListUnitsWithContainer[*genProj.Folder](r)
+}
+
+// DecodeAgentEditorUnit decodes one agent-editor CustomBlobDocument from its
+// stored bytes into a *types.Agent, *types.Model, *types.KnowledgeBase or
+// *types.ConsumedMCPService, chosen by its CustomDocumentType. It returns nil
+// for any other custom document type. The catalog reads the raw units, and
+// uses this to see what an agent document references (ako/mxcli#2074).
+func DecodeAgentEditorUnit(unitID, containerID string, contents []byte) (any, error) {
+	wrap, err := parseCustomBlobWrapper(contents)
+	if err != nil {
+		return nil, err
+	}
+	switch wrap.CustomDocumentType {
+	case types.CustomTypeAgent:
+		return decodeAgentEditorAgent(unitID, containerID, wrap)
+	case types.CustomTypeModel:
+		return decodeAgentEditorModel(unitID, containerID, wrap)
+	case types.CustomTypeKnowledgeBase:
+		return decodeAgentEditorKnowledgeBase(unitID, containerID, wrap)
+	case types.CustomTypeConsumedMCPService:
+		return decodeAgentEditorConsumedMCPService(unitID, containerID, wrap)
+	case types.CustomTypePublishedMCPService:
+		return decodeAgentEditorPublishedMCPService(unitID, containerID, wrap)
+	}
+	return nil, nil
 }

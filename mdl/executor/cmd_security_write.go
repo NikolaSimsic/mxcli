@@ -5,13 +5,16 @@ package executor
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
 	"github.com/mendixlabs/mxcli/mdl/backend"
 	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
 	"github.com/mendixlabs/mxcli/mdl/types"
+	"github.com/mendixlabs/mxcli/mdl/visitor"
 	"github.com/mendixlabs/mxcli/model"
+	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 	"github.com/mendixlabs/mxcli/sdk/security"
 )
 
@@ -42,7 +45,9 @@ func execCreateModuleRole(ctx *ExecContext, s *ast.CreateModuleRoleStmt) error {
 		if mr.Description == autoDocumentRoleDescription {
 			oldQualified := s.Name.Module + "." + mr.Name
 			newQualified := s.Name.Module + "." + s.Name.Name
-			if err := ctx.Backend.AddModuleRole(ms.ID, s.Name.Name, s.Description); err != nil {
+			// Adopting the role takes it over: the marker description is not
+			// the author's documentation, so an unstated description clears it.
+			if err := ctx.Backend.AddModuleRole(ms.ID, s.Name.Name, s.DescriptionText()); err != nil {
 				return mdlerrors.NewBackend("create module role", err)
 			}
 			// If the casing actually changed, propagate the rename across every
@@ -59,10 +64,28 @@ func execCreateModuleRole(ctx *ExecContext, s *ast.CreateModuleRoleStmt) error {
 			}
 			return nil
 		}
+		if s.CreateOrModify {
+			// Re-running a security script must not fail on a role that is
+			// already there. AddModuleRole overwrites, so this also adopts a new
+			// description and the caller's casing. A statement without a
+			// description clause keeps the stored one: passing "" erased it,
+			// reported only as "Modified" (ako/mxcli#1218).
+			description := mr.Description
+			if s.Description != nil {
+				description = *s.Description
+			}
+			if err := ctx.Backend.AddModuleRole(ms.ID, s.Name.Name, description); err != nil {
+				return mdlerrors.NewBackend("modify module role", err)
+			}
+			if !ctx.Quiet {
+				ctx.ReportMutation("Modified", "module role: %s.%s", s.Name.Module, s.Name.Name)
+			}
+			return nil
+		}
 		return mdlerrors.NewAlreadyExists("module role", s.Name.Module+"."+s.Name.Name)
 	}
 
-	if err := ctx.Backend.AddModuleRole(ms.ID, s.Name.Name, s.Description); err != nil {
+	if err := ctx.Backend.AddModuleRole(ms.ID, s.Name.Name, s.DescriptionText()); err != nil {
 		return mdlerrors.NewBackend("create module role", err)
 	}
 
@@ -97,6 +120,10 @@ func execDropModuleRole(ctx *ExecContext, s *ast.DropModuleRoleStmt) error {
 		}
 	}
 	if !found {
+		if s.IfExists {
+			fmt.Fprintf(ctx.Output, "Module role '%s' does not exist, skipping\n", s.Name)
+			return nil
+		}
 		return mdlerrors.NewNotFound("module role", s.Name.Module+"."+s.Name.Name)
 	}
 
@@ -199,23 +226,40 @@ func execCreateUserRole(ctx *ExecContext, s *ast.CreateUserRoleStmt) error {
 	}
 
 	// Build qualified module role names
-	var moduleRoleNames []string
-	for _, mr := range s.ModuleRoles {
-		qn := mr.Module + "." + mr.Name
-		moduleRoleNames = append(moduleRoleNames, qn)
+	moduleRoleNames, err := qualifiedModuleRoleNames(s.ModuleRoles)
+	if err != nil {
+		return err
 	}
 
 	// Check if role already exists
 	for _, ur := range ps.UserRoles {
 		if ur.Name == s.Name {
 			if !s.CreateOrModify {
-				return mdlerrors.NewAlreadyExists("user role", s.Name)
+				// Name the re-runnable form. A blank Mendix app already ships an
+				// `Administrator` user role, so this fires on the first realistic
+				// security script — and because exec halts on the first error, every
+				// statement after it is skipped. ako/mxcli-maintenance-2 concluded
+				// from the bare message that CREATE OR MODIFY USER ROLE did not
+				// exist and filed it as missing MDL surface; it exists, and its
+				// module-role list is required.
+				return mdlerrors.NewAlreadyExistsMsg("user role", s.Name, fmt.Sprintf(
+					"user role already exists: %s — use 'create or modify user role %s ( ModuleRoles: (Module.Role, ...) )' "+
+						"to add module roles to it and keep the script re-runnable", s.Name, s.Name))
 			}
 			// Additive: ensure specified module roles are present
-			if err := ctx.Backend.AlterUserRoleModuleRoles(ps.ID, s.Name, true, moduleRoleNames); err != nil {
-				return mdlerrors.NewBackend("update user role", err)
+			if len(moduleRoleNames) > 0 {
+				if err := ctx.Backend.AlterUserRoleModuleRoles(ps.ID, s.Name, true, moduleRoleNames); err != nil {
+					return mdlerrors.NewBackend("update user role", err)
+				}
 			}
-			fmt.Fprintf(ctx.Output, "Modified user role: %s\n", s.Name)
+			// The properties the statement states; the rest keep their stored
+			// values, as a module role's missing description does.
+			if props := userRoleProperties(s); !props.IsZero() {
+				if err := ctx.Backend.SetUserRoleProperties(ps.ID, s.Name, props); err != nil {
+					return mdlerrors.NewBackend("update user role", err)
+				}
+			}
+			ctx.ReportMutation("Modified", "user role: %s", s.Name)
 			return nil
 		}
 	}
@@ -223,9 +267,36 @@ func execCreateUserRole(ctx *ExecContext, s *ast.CreateUserRoleStmt) error {
 	if err := ctx.Backend.AddUserRole(ps.ID, s.Name, moduleRoleNames, s.ManageAllRoles); err != nil {
 		return mdlerrors.NewBackend("create user role", err)
 	}
+	// Description, CheckSecurity and the manageable roles: a positional role
+	// list had no slot for them, so describe → exec lost them (ako/mxcli#707).
+	props := userRoleProperties(s)
+	props.ManageAllRoles = nil // AddUserRole set it
+	if !props.IsZero() {
+		if err := ctx.Backend.SetUserRoleProperties(ps.ID, s.Name, props); err != nil {
+			return mdlerrors.NewBackend("create user role", err)
+		}
+	}
 
 	fmt.Fprintf(ctx.Output, "Created user role: %s\n", s.Name)
 	return nil
+}
+
+// userRoleProperties is what a create user role statement states beyond the
+// name and the module roles.
+func userRoleProperties(s *ast.CreateUserRoleStmt) backend.UserRoleProperties {
+	p := backend.UserRoleProperties{
+		Description:             s.Description,
+		CheckSecurity:           s.CheckSecurity,
+		ManageUsersWithoutRoles: s.ManageUsersWithoutRoles,
+	}
+	if s.ManageAllRolesSet {
+		v := s.ManageAllRoles
+		p.ManageAllRoles = &v
+	}
+	if s.ManageableSet {
+		p.ManageableRoles = append([]string{}, s.ManageableRoles...)
+	}
+	return p
 }
 
 // execAlterUserRole handles ALTER USER ROLE Name ADD/REMOVE MODULE ROLES (...).
@@ -252,9 +323,9 @@ func execAlterUserRole(ctx *ExecContext, s *ast.AlterUserRoleStmt) error {
 	}
 
 	// Build qualified module role names
-	var moduleRoleNames []string
-	for _, mr := range s.ModuleRoles {
-		moduleRoleNames = append(moduleRoleNames, mr.Module+"."+mr.Name)
+	moduleRoleNames, err := qualifiedModuleRoleNames(s.ModuleRoles)
+	if err != nil {
+		return err
 	}
 
 	if err := ctx.Backend.AlterUserRoleModuleRoles(ps.ID, s.Name, s.Add, moduleRoleNames); err != nil {
@@ -267,11 +338,14 @@ func execAlterUserRole(ctx *ExecContext, s *ast.AlterUserRoleStmt) error {
 		action = "Removed"
 		prep = "from"
 	}
-	fmt.Fprintf(ctx.Output, "%s module roles %s %s user role %s\n", action, strings.Join(moduleRoleNames, ", "), prep, s.Name)
+	ctx.reportWrite(fmt.Sprintf("user role: %s (module roles %s)", s.Name, strings.Join(moduleRoleNames, ", ")),
+		"%s module roles %s %s user role %s", action, strings.Join(moduleRoleNames, ", "), prep, s.Name)
 	return nil
 }
 
-// execDropUserRole handles DROP USER ROLE Name.
+// execDropUserRole handles DROP USER ROLE Name. It refuses a role the
+// administrator or a demo user still holds, which would leave a dangling name
+// (adminUserRoleDropRefusal, demoUserRoleDropRefusal).
 func execDropUserRole(ctx *ExecContext, s *ast.DropUserRoleStmt) error {
 	if !ctx.ConnectedForWrite() {
 		return mdlerrors.NewNotConnectedWrite()
@@ -291,7 +365,23 @@ func execDropUserRole(ctx *ExecContext, s *ast.DropUserRoleStmt) error {
 		}
 	}
 	if !found {
+		if s.IfExists {
+			fmt.Fprintf(ctx.Output, "User role '%s' does not exist, skipping\n", s.Name)
+			return nil
+		}
 		return mdlerrors.NewNotFound("user role", s.Name)
+	}
+	if ps.AdminUserRole == s.Name {
+		return mdlerrors.NewValidation(adminUserRoleDropRefusal(s.Name))
+	}
+	var holders []string
+	for _, du := range ps.DemoUsers {
+		if slices.Contains(du.UserRoles, s.Name) {
+			holders = append(holders, du.UserName)
+		}
+	}
+	if len(holders) > 0 {
+		return mdlerrors.NewValidation(demoUserRoleDropRefusal(s.Name, holders))
 	}
 
 	if err := ctx.Backend.RemoveUserRole(ps.ID, s.Name); err != nil {
@@ -302,6 +392,53 @@ func execDropUserRole(ctx *ExecContext, s *ast.DropUserRoleStmt) error {
 	return nil
 }
 
+// adminUserRoleDropRefusal is why `drop user role` refuses the administrator's
+// role (ako/mxcli#2015, mendixlabs/mxcli#1775). Security$ProjectSecurity names
+// it by name, and the drop left that name dangling: `mx check` reports nothing
+// (an empty one is CE0130, a name that does not resolve is not checked), and
+// every build then fails with a NullReferenceException in mxbuild's metadata
+// writer — measured on 11.12.6, where moving AdminUserRole first builds.
+func adminUserRoleDropRefusal(role string) string {
+	return fmt.Sprintf("user role '%s' is the administrator's user role (App Security > Administrator > User role): "+
+		"dropping it leaves the administrator a role that does not exist, which mx check does not report and every "+
+		"build then crashes on. Give the administrator another role first: alter app security ( AdminUserRole: <UserRole> );", role)
+}
+
+// demoUserRoleDropRefusal is why `drop user role` refuses a role demo users
+// still hold: each would name a role that does not exist, which `mx check`
+// reports as CE1613 "The selected user role 'X' no longer exists." at the demo
+// user (measured on 11.12.6). A demo user's roles only grow — `create or
+// modify demo user` adds — so the demo user has to go first.
+func demoUserRoleDropRefusal(role string, demoUsers []string) string {
+	quoted := make([]string, len(demoUsers))
+	drops := make([]string, len(demoUsers))
+	for i, u := range demoUsers {
+		quoted[i] = "'" + u + "'"
+		drops[i] = "drop demo user '" + u + "';"
+	}
+	what := "demo user " + quoted[0]
+	if len(quoted) > 1 {
+		what = "demo users " + strings.Join(quoted, ", ")
+	}
+	return fmt.Sprintf("user role '%s' is held by %s: dropping it leaves a demo user with a role that no longer "+
+		"exists (CE1613). Drop the demo user first, and re-create it with other roles if it is still needed: %s",
+		role, what, strings.Join(drops, " "))
+}
+
+// resolveUserRole returns the project user role named role, in its declared
+// casing, or an error naming the roles there are.
+func resolveUserRole(ps *security.ProjectSecurity, role, why string) (string, error) {
+	known := make([]string, 0, len(ps.UserRoles))
+	for _, ur := range ps.UserRoles {
+		known = append(known, ur.Name)
+		if strings.EqualFold(ur.Name, role) {
+			return ur.Name, nil
+		}
+	}
+	return "", mdlerrors.NewNotFoundMsg("user role", role, fmt.Sprintf(
+		"user role not found: %s (project user roles: %s). %s", role, strings.Join(known, ", "), why))
+}
+
 // execGrantEntityAccess handles GRANT roles ON Module.Entity (rights) [WHERE '...'].
 func execGrantEntityAccess(ctx *ExecContext, s *ast.GrantEntityAccessStmt) error {
 	if !ctx.ConnectedForWrite() {
@@ -310,6 +447,9 @@ func execGrantEntityAccess(ctx *ExecContext, s *ast.GrantEntityAccessStmt) error
 
 	module, err := findModule(ctx, s.Entity.Module)
 	if err != nil {
+		return err
+	}
+	if err := refuseSystemEntityGrant(module.Name, s.Entity.Name); err != nil {
 		return err
 	}
 
@@ -377,72 +517,117 @@ func execGrantEntityAccess(ctx *ExecContext, s *ast.GrantEntityAccessStmt) error
 		readMemberSet[m] = true
 	}
 
-	// Create entries for all entity attributes
-	for _, attr := range entity.Attributes {
+	// Create entries for every attribute of the entity's access surface — its own
+	// AND those inherited through the generalization chain. Enumerating only
+	// entity.Attributes meant a GRANT naming an inherited member produced no entry
+	// at all while still reporting success, and left the rule incomplete so Mendix
+	// reported CE0066 (mendixlabs/mxcli#758). Each reference is qualified against
+	// the entity that DECLARES the member; qualifying an inherited one against this
+	// entity is CE1613 "The selected attribute no longer exists".
+	entityQN := module.Name + "." + s.Entity.Name
+	members := EntityMembers(ctx, entityQN)
+	grantedMembers := map[string]bool{}
+	for _, mem := range members {
 		rights := defaultMemberAccess
-		if writeMemberSet[attr.Name] {
+		if writeMemberSet[mem.Name] {
 			rights = "ReadWrite"
-		} else if readMemberSet[attr.Name] {
+		} else if readMemberSet[mem.Name] {
 			rights = "ReadOnly"
 		}
-		// Calculated attributes cannot have write rights (CE6592)
-		isCalculated := attr.Value != nil && attr.Value.Type == "CalculatedValue"
-		if isCalculated && (rights == "ReadWrite" || rights == "WriteOnly") {
+		// Neither a calculated attribute nor an autonumber may carry write
+		// rights — both are CE6592. The autonumber half was missing, so
+		// `grant write *` on an entity with one wrote ReadWrite and failed the
+		// build (ako/mxcli#524).
+		if types.WriteRightsForbidden(mem.IsCalculated, mem.IsAutoNumber, mem.IsSystemReadOnly) &&
+			(rights == "ReadWrite" || rights == "WriteOnly") {
 			rights = "ReadOnly"
 		}
+		grantedMembers[mem.Name] = true
 		memberAccesses = append(memberAccesses, types.EntityMemberAccess{
-			AttributeRef: module.Name + "." + s.Entity.Name + "." + attr.Name,
+			AttributeRef: mem.Ref,
 			AccessRights: rights,
 		})
 	}
 
-	// Create entries for associations where this entity is the FROM entity.
-	// In Mendix, ParentID = FROM entity (FK owner). MemberAccess for associations
-	// is only required on the FROM side; adding it to the TO side triggers CE0066.
-	for _, assoc := range dm.Associations {
-		if assoc.ParentID == entity.ID {
-			rights := defaultMemberAccess
-			if writeMemberSet[assoc.Name] {
-				rights = "ReadWrite"
-			} else if readMemberSet[assoc.Name] {
-				rights = "ReadOnly"
-			}
-			memberAccesses = append(memberAccesses, types.EntityMemberAccess{
-				AssociationRef: module.Name + "." + assoc.Name,
-				AccessRights:   rights,
-			})
+	// Audit members are stored as flags on the entity, not as entries in
+	// entity.Attributes, so the member walk above never yields them — naming
+	// `createdDate` in a GRANT was rejected as "entity has no member(s)", which
+	// is simply wrong: Mendix does consider them members (issuetracker #20).
+	//
+	// What Mendix does NOT have is a MemberAccess for them. An entity storing
+	// audit members checks clean with no entry, and mxbuild rejects a rule that
+	// carries one with CE0066 (verified on 11.12.1). Their access therefore comes
+	// from the rule's default and cannot be set per member — so naming one is
+	// accepted (it is a real member), but asking for rights that differ from the
+	// default is refused rather than silently dropped.
+	for _, sys := range storedAuditMembers(entity) {
+		grantedMembers[sys] = true
+		rights, clause := "", ""
+		if writeMemberSet[sys] {
+			rights, clause = "ReadWrite", "write"
+		} else if readMemberSet[sys] {
+			rights, clause = "ReadOnly", "read"
 		}
-	}
-	for _, ca := range dm.CrossAssociations {
-		if ca.ParentID == entity.ID {
-			rights := defaultMemberAccess
-			if writeMemberSet[ca.Name] {
-				rights = "ReadWrite"
-			} else if readMemberSet[ca.Name] {
-				rights = "ReadOnly"
-			}
-			memberAccesses = append(memberAccesses, types.EntityMemberAccess{
-				AssociationRef: module.Name + "." + ca.Name,
-				AccessRights:   rights,
-			})
+		if rights != "" && rights != defaultMemberAccess {
+			return mdlerrors.NewValidationf(
+				"%s.%s is a Mendix audit member: its access follows the rule's default and cannot be set per member "+
+					"(Mendix stores no member access for it, and a rule that carries one fails the build with CE0066). "+
+					"Drop it from the %s (...) list and let `read *` / `write *` cover it, or change the rule's default.",
+				entityQN, sys, clause)
 		}
 	}
 
-	// Add MemberAccess entries for system associations (owner, changedBy).
-	// When an entity has HasOwner/HasChangedBy, Mendix implicitly adds
-	// System.owner/System.changedBy associations that require MemberAccess.
-	if entity.HasOwner {
+	// Create entries for the associations this entity's rule carries — which
+	// side owns one, and how it is referenced, is accessRuleAssociations'.
+	addAssociationAccess := func(name, ref string) {
+		rights := defaultMemberAccess
+		if writeMemberSet[name] {
+			rights = "ReadWrite"
+		} else if readMemberSet[name] {
+			rights = "ReadOnly"
+		}
+		grantedMembers[name] = true
 		memberAccesses = append(memberAccesses, types.EntityMemberAccess{
-			AssociationRef: "System.owner",
-			AccessRights:   defaultMemberAccess,
+			AssociationRef: ref,
+			AccessRights:   rights,
 		})
 	}
-	if entity.HasChangedBy {
-		memberAccesses = append(memberAccesses, types.EntityMemberAccess{
-			AssociationRef: "System.changedBy",
-			AccessRights:   defaultMemberAccess,
-		})
+	// The enumeration lives in accessRuleAssociations so REVOKE resolves member
+	// names against exactly the set GRANT writes (mendixlabs/mxcli#1225).
+	for _, a := range accessRuleAssociations(ctx, module.Name, dm, entity, entityQN) {
+		if a.inherited && grantedMembers[a.Name] {
+			continue // an association of this entity's own shadows it
+		}
+		addAssociationAccess(a.Name, a.Ref)
 	}
+
+	// A member named in the GRANT that matched nothing used to be dropped in
+	// silence — the command reported success and the access simply was not there,
+	// which is why REVOKE + GRANT could not repair a damaged rule (#758). Name it
+	// instead. Inherited members now resolve, so anything still unmatched is a typo
+	// or a member of another entity.
+	if unknown := unmatchedGrantMembers(readMembers, writeMembers, grantedMembers); len(unknown) > 0 {
+		return mdlerrors.NewValidationf(
+			"entity %s has no member(s) %s; grant only names members of the entity or of an entity it inherits from",
+			entityQN, strings.Join(unknown, ", "))
+	}
+
+	// No MemberAccess is written for System.owner / System.changedBy. They are
+	// implicit associations Mendix maintains from the entity's own flags, and
+	// naming one in a rule makes the rule out of date: mxbuild 11.14.0 reports
+	// CE0066 with the entry and 0 errors without it, measured one member at a
+	// time (ako/mxcli#554). The audit DATE members were already handled this way;
+	// these two were assumed to be the other case because they are associations.
+	// Both writers have to agree, so the same rule lives in
+	// ReconcileMemberAccesses — a GRANT that added the entry would be undone by
+	// the next reconcile, and vice versa.
+
+	// A constraint too long to read on one line is broken at its boolean joints;
+	// one that already fits comes back unchanged (upstream #979). It is formatted
+	// ONCE, here, because the stored text is also what identifies the rule: a rule
+	// is keyed by role plus constraint (#936), so echoing the result back with the
+	// unformatted spelling would look for a rule that is not there.
+	xpathConstraint := accessRuleXPathConstraint(ctx, s.XPathConstraint, s.Entity.String())
 
 	if err := ctx.Backend.AddEntityAccessRule(backend.EntityAccessRuleParams{
 		UnitID:              dm.ID,
@@ -451,28 +636,79 @@ func execGrantEntityAccess(ctx *ExecContext, s *ast.GrantEntityAccessStmt) error
 		AllowCreate:         allowCreate,
 		AllowDelete:         allowDelete,
 		DefaultMemberAccess: defaultMemberAccess,
-		XPathConstraint:     s.XPathConstraint,
+		XPathConstraint:     xpathConstraint,
 		MemberAccesses:      memberAccesses,
 	}); err != nil {
 		return mdlerrors.NewBackend("grant entity access", err)
 	}
 
 	// Reconcile MemberAccesses on pre-existing rules for this entity's domain model
+	var reconciled string
 	if count, err := ctx.Backend.ReconcileMemberAccesses(dm.ID, module.Name); err != nil {
 		return mdlerrors.NewBackend("reconcile member accesses", err)
 	} else if count > 0 && !ctx.Quiet {
-		fmt.Fprintf(ctx.Output, "Reconciled %d access rule(s) in module %s\n", count, module.Name)
+		reconciled = fmt.Sprintf("Reconciled %d access rule(s) in module %s\n", count, module.Name)
 	}
 
 	ctx.trackModifiedDomainModel(module.ID, module.Name)
-	fmt.Fprintf(ctx.Output, "Granted access on %s.%s to %s\n", s.Entity.Module, s.Entity.Name, strings.Join(roleNames, ", "))
+	text := reconciled + fmt.Sprintf("Granted access on %s.%s to %s\n", s.Entity.Module, s.Entity.Name, strings.Join(roleNames, ", "))
 	if !ctx.Quiet {
-		fmt.Fprint(ctx.Output, formatAccessRuleResult(ctx, s.Entity.Module, s.Entity.Name, roleNames))
+		text += formatAccessRuleResult(ctx, s.Entity.Module, s.Entity.Name, roleNames, xpathConstraint, false)
+	}
+	ctx.reportAccessRule(heldReport{
+		text:      text,
+		unchanged: fmt.Sprintf("entity access: %s.%s (%s)", s.Entity.Module, s.Entity.Name, strings.Join(roleNames, ", ")),
+	})
+	// Printed on a re-run too: an unchanged write leaves the overlap in place.
+	if w := grantOverlapWarning(entityQN, entity.AccessRules, roleNames, xpathConstraint); w != "" {
+		ctx.reportAccessRule(heldReport{notice: true, text: w})
 	}
 	return nil
 }
 
+// grantOverlapWarning is MDL-GRANT03 at exec (ako/mxcli#2320): the roles of a
+// grant that, beside the rule it writes, hold a rule on the entity of the other
+// kind — one with no constraint beside a constrained grant, or a constrained one
+// beside an unconstrained grant. Access rules add up, so the constraint limits
+// nothing. rules are the entity's rules as they were before the grant.
+func grantOverlapWarning(entityQN string, rules []*domainmodel.AccessRule, roleNames []string, xpath string) string {
+	constrained := strings.TrimSpace(xpath) != ""
+	want := map[string]bool{}
+	for _, r := range roleNames {
+		want[r] = true
+	}
+	hit := map[string]bool{}
+	for _, rule := range rules {
+		if (strings.TrimSpace(rule.XPathConstraint) != "") == constrained {
+			continue
+		}
+		for _, role := range rule.ModuleRoleNames {
+			if want[role] {
+				hit[role] = true
+			}
+		}
+	}
+	if len(hit) == 0 {
+		return ""
+	}
+	roles := make([]string, 0, len(hit))
+	for r := range hit {
+		roles = append(roles, r)
+	}
+	v := accessRuleOverlapViolation(0, entityQN, roles, constrained)
+	msg := strings.TrimPrefix(v.Message, "statement 0: ")
+	return fmt.Sprintf("Warning (%s): %s.\n  %s\n", v.RuleID, msg, v.Suggestion)
+}
+
 // execRevokeEntityAccess handles REVOKE roles ON Module.Entity [(rights...)].
+// nothingToRevoke is a revoke's report when the roles already lack the rights:
+// the idempotent re-run of a script, worded as the state it found rather than
+// as a lookup that failed ("No access rules found matching …").
+func nothingToRevoke(entity ast.QualifiedName, roleNames []string) string {
+	return fmt.Sprintf("Unchanged entity access: %s.%s (%s) — nothing to revoke\n",
+		entity.Module, entity.Name, strings.Join(roleNames, ", "))
+}
+
 func execRevokeEntityAccess(ctx *ExecContext, s *ast.RevokeEntityAccessStmt) error {
 	if !ctx.ConnectedForWrite() {
 		return mdlerrors.NewNotConnectedWrite()
@@ -480,6 +716,9 @@ func execRevokeEntityAccess(ctx *ExecContext, s *ast.RevokeEntityAccessStmt) err
 
 	module, err := findModule(ctx, s.Entity.Module)
 	if err != nil {
+		return err
+	}
+	if err := refuseSystemEntityGrant(module.Name, s.Entity.Name); err != nil {
 		return err
 	}
 
@@ -510,6 +749,54 @@ func execRevokeEntityAccess(ctx *ExecContext, s *ast.RevokeEntityAccessStmt) err
 	if len(s.Rights) > 0 {
 		// Partial revoke — downgrade specific rights
 		revocation := types.EntityAccessRevocation{}
+		// A member access is stored against the entity that DECLARES the
+		// member, so an inherited one is `System.FileDocument.HasContents`,
+		// not `Mod.Doc.HasContents`. Qualifying every name with this entity
+		// matched no stored entry for an inherited member, and the revoke
+		// answered "No access rules found" while the rule held ReadWrite.
+		//
+		// An association is stored by its module-qualified name and only on the
+		// rule of the entity that owns it, so it resolves through the same
+		// enumeration GRANT writes from (mendixlabs/mxcli#1225).
+		entityQN := module.Name + "." + s.Entity.Name
+		memberRef := map[string]string{}
+		for _, mem := range EntityMembers(ctx, entityQN) {
+			memberRef[mem.Name] = mem.Ref
+		}
+		for _, a := range accessRuleAssociations(ctx, module.Name, dm, entity, entityQN) {
+			if _, shadowed := memberRef[a.Name]; !shadowed {
+				memberRef[a.Name] = a.Ref
+			}
+		}
+		// An audit member is a real member with no MemberAccess of its own —
+		// naming one is accepted, and there is simply nothing to narrow.
+		known := map[string]bool{}
+		for name := range memberRef {
+			known[name] = true
+		}
+		for _, sys := range storedAuditMembers(entity) {
+			known[sys] = true
+		}
+		// A member the rule cannot carry is a mistake in the script, not an
+		// already-revoked right: answering "nothing to revoke" for it, exit 0,
+		// was the silent no-op of #1225. Refuse it as GRANT does (#758); a known
+		// member whose right is already gone stays the idempotent notice.
+		var readNamed, writeNamed []string
+		for _, right := range s.Rights {
+			switch right.Type {
+			case ast.EntityAccessReadMembers:
+				readNamed = append(readNamed, right.Members...)
+			case ast.EntityAccessWriteMembers:
+				writeNamed = append(writeNamed, right.Members...)
+			}
+		}
+		if unknown := unmatchedGrantMembers(readNamed, writeNamed, known); len(unknown) > 0 {
+			return mdlerrors.NewValidationf(
+				"entity %s has no member(s) %s; revoke only names members of the entity or of an entity it inherits from "+
+					"(an association is a member of the entity it goes FROM, unless it is owned by both)",
+				entityQN, strings.Join(unknown, ", "))
+		}
+		qualify := func(m string) string { return memberRef[m] }
 		for _, right := range s.Rights {
 			switch right.Type {
 			case ast.EntityAccessCreate:
@@ -523,12 +810,12 @@ func execRevokeEntityAccess(ctx *ExecContext, s *ast.RevokeEntityAccessStmt) err
 			case ast.EntityAccessReadMembers:
 				for _, m := range right.Members {
 					revocation.RevokeReadMembers = append(revocation.RevokeReadMembers,
-						module.Name+"."+s.Entity.Name+"."+m)
+						qualify(m))
 				}
 			case ast.EntityAccessWriteMembers:
 				for _, m := range right.Members {
 					revocation.RevokeWriteMembers = append(revocation.RevokeWriteMembers,
-						module.Name+"."+s.Entity.Name+"."+m)
+						qualify(m))
 				}
 			}
 		}
@@ -539,12 +826,14 @@ func execRevokeEntityAccess(ctx *ExecContext, s *ast.RevokeEntityAccessStmt) err
 		}
 
 		if modified == 0 {
-			fmt.Fprintf(ctx.Output, "No access rules found matching %s on %s.%s\n", strings.Join(roleNames, ", "), s.Entity.Module, s.Entity.Name)
+			ctx.reportAccessRule(heldReport{notice: true, text: nothingToRevoke(s.Entity, roleNames)})
 		} else {
-			fmt.Fprintf(ctx.Output, "Revoked partial access on %s.%s from %s\n", s.Entity.Module, s.Entity.Name, strings.Join(roleNames, ", "))
+			text := fmt.Sprintf("Revoked partial access on %s.%s from %s\n", s.Entity.Module, s.Entity.Name, strings.Join(roleNames, ", "))
 			if !ctx.Quiet {
-				fmt.Fprint(ctx.Output, formatAccessRuleResult(ctx, s.Entity.Module, s.Entity.Name, roleNames))
+				text += formatAccessRuleResult(ctx, s.Entity.Module, s.Entity.Name, roleNames, "", true)
 			}
+			ctx.reportAccessRule(heldReport{text: text,
+				unchanged: fmt.Sprintf("entity access: %s.%s (%s)", s.Entity.Module, s.Entity.Name, strings.Join(roleNames, ", "))})
 		}
 	} else {
 		// Full revoke — remove entire access rule
@@ -554,12 +843,14 @@ func execRevokeEntityAccess(ctx *ExecContext, s *ast.RevokeEntityAccessStmt) err
 		}
 
 		if modified == 0 {
-			fmt.Fprintf(ctx.Output, "No access rules found matching %s on %s.%s\n", strings.Join(roleNames, ", "), s.Entity.Module, s.Entity.Name)
+			ctx.reportAccessRule(heldReport{notice: true, text: nothingToRevoke(s.Entity, roleNames)})
 		} else {
-			fmt.Fprintf(ctx.Output, "Revoked access on %s.%s from %s\n", s.Entity.Module, s.Entity.Name, strings.Join(roleNames, ", "))
+			text := fmt.Sprintf("Revoked access on %s.%s from %s\n", s.Entity.Module, s.Entity.Name, strings.Join(roleNames, ", "))
 			if !ctx.Quiet {
-				fmt.Fprint(ctx.Output, "  Result: (no access)\n")
+				text += "  Result: (no access)\n"
 			}
+			ctx.reportAccessRule(heldReport{text: text,
+				unchanged: fmt.Sprintf("entity access: %s.%s (%s)", s.Entity.Module, s.Entity.Name, strings.Join(roleNames, ", "))})
 		}
 	}
 	ctx.trackModifiedDomainModel(module.ID, module.Name)
@@ -583,11 +874,16 @@ func execGrantMicroflowAccess(ctx *ExecContext, s *ast.GrantMicroflowAccessStmt)
 		return mdlerrors.NewBackend("list microflows", err)
 	}
 
-	for _, mf := range mfs {
+	for _, mf := range liveFirst(mfs, microflowExcluded) {
 		modID := h.FindModuleID(mf.ContainerID)
 		modName := h.GetModuleName(modID)
 		if modName != s.Microflow.Module || mf.Name != s.Microflow.Name {
 			continue
+		}
+
+		// Reject cross-module role grants before they reach the model (CE0148 guard).
+		if err := checkDocumentAccessRolesSameModule("microflow", modName, mf.Name, s.Roles); err != nil {
+			return err
 		}
 
 		// Validate all roles exist
@@ -645,7 +941,7 @@ func execRevokeMicroflowAccess(ctx *ExecContext, s *ast.RevokeMicroflowAccessStm
 		return mdlerrors.NewBackend("list microflows", err)
 	}
 
-	for _, mf := range mfs {
+	for _, mf := range liveFirst(mfs, microflowExcluded) {
 		modID := h.FindModuleID(mf.ContainerID)
 		modName := h.GetModuleName(modID)
 		if modName != s.Microflow.Module || mf.Name != s.Microflow.Name {
@@ -700,11 +996,16 @@ func execGrantNanoflowAccess(ctx *ExecContext, s *ast.GrantNanoflowAccessStmt) e
 		return mdlerrors.NewBackend("list nanoflows", err)
 	}
 
-	for _, nf := range nfs {
+	for _, nf := range liveFirst(nfs, nanoflowExcluded) {
 		modID := h.FindModuleID(nf.ContainerID)
 		modName := h.GetModuleName(modID)
 		if modName != s.Nanoflow.Module || nf.Name != s.Nanoflow.Name {
 			continue
+		}
+
+		// Reject cross-module role grants before they reach the model (CE0148 guard).
+		if err := checkDocumentAccessRolesSameModule("nanoflow", modName, nf.Name, s.Roles); err != nil {
+			return err
 		}
 
 		for _, role := range s.Roles {
@@ -759,7 +1060,7 @@ func execRevokeNanoflowAccess(ctx *ExecContext, s *ast.RevokeNanoflowAccessStmt)
 		return mdlerrors.NewBackend("list nanoflows", err)
 	}
 
-	for _, nf := range nfs {
+	for _, nf := range liveFirst(nfs, nanoflowExcluded) {
 		modID := h.FindModuleID(nf.ContainerID)
 		modName := h.GetModuleName(modID)
 		if modName != s.Nanoflow.Module || nf.Name != s.Nanoflow.Name {
@@ -813,11 +1114,16 @@ func execGrantPageAccess(ctx *ExecContext, s *ast.GrantPageAccessStmt) error {
 		return mdlerrors.NewBackend("list pages", err)
 	}
 
-	for _, pg := range pages {
+	for _, pg := range liveFirst(pages, pageExcluded) {
 		modID := h.FindModuleID(pg.ContainerID)
 		modName := h.GetModuleName(modID)
 		if modName != s.Page.Module || pg.Name != s.Page.Name {
 			continue
+		}
+
+		// Reject cross-module role grants before they reach the model (CE0148 guard).
+		if err := checkDocumentAccessRolesSameModule("page", modName, pg.Name, s.Roles); err != nil {
+			return err
 		}
 
 		// Validate all roles exist
@@ -875,7 +1181,7 @@ func execRevokePageAccess(ctx *ExecContext, s *ast.RevokePageAccessStmt) error {
 		return mdlerrors.NewBackend("list pages", err)
 	}
 
-	for _, pg := range pages {
+	for _, pg := range liveFirst(pages, pageExcluded) {
 		modID := h.FindModuleID(pg.ContainerID)
 		modName := h.GetModuleName(modID)
 		if modName != s.Page.Module || pg.Name != s.Page.Name {
@@ -914,25 +1220,48 @@ func execRevokePageAccess(ctx *ExecContext, s *ast.RevokePageAccessStmt) error {
 	return mdlerrors.NewNotFound("page", s.Page.Module+"."+s.Page.Name)
 }
 
-// execGrantWorkflowAccess handles GRANT EXECUTE ON WORKFLOW Module.WF TO roles.
-// Mendix workflows do not have a document-level AllowedModuleRoles field (unlike
-// microflows and pages), so this operation is not supported.
-func execGrantWorkflowAccess(ctx *ExecContext, s *ast.GrantWorkflowAccessStmt) error {
-	return mdlerrors.NewUnsupported("grant execute on workflow is not supported: Mendix workflows do not have document-level AllowedModuleRoles (unlike microflows and pages). Workflow access is controlled through the microflow that triggers the workflow and UserTask targeting")
-}
-
-// execRevokeWorkflowAccess handles REVOKE EXECUTE ON WORKFLOW Module.WF FROM roles.
-// Mendix workflows do not have a document-level AllowedModuleRoles field (unlike
-// microflows and pages), so this operation is not supported.
-func execRevokeWorkflowAccess(ctx *ExecContext, s *ast.RevokeWorkflowAccessStmt) error {
-	return mdlerrors.NewUnsupported("revoke execute on workflow is not supported: Mendix workflows do not have document-level AllowedModuleRoles (unlike microflows and pages). Workflow access is controlled through the microflow that triggers the workflow and UserTask targeting")
-}
-
 // validateModuleRole checks that a module role exists in the project.
+// qualifiedModuleRoleNames renders a statement's module-role list as
+// "Module.Role" strings, refusing any entry that has no module.
+//
+// The refusal is the point. A user-role statement does not resolve its module
+// roles against the project — it stores the names it is given — so an
+// unqualified `Wide` used to be concatenated into ".Wide" and written out with a
+// success message. Nothing in mxcli complained; mxbuild refused the project with
+// CE1613 "The selected module role '.Wide' no longer exists"
+// (mendixlabs/mxcli#1067). Reported as MDL-GRANT02 at check time.
+func qualifiedModuleRoleNames(roles []ast.QualifiedName) ([]string, error) {
+	out := make([]string, 0, len(roles))
+	for _, r := range roles {
+		if r.Module == "" {
+			return nil, mdlerrors.NewValidationf(
+				"module role %q is not module-qualified — write <Module>.%s "+
+					"(run `show module roles` to list the roles this project has)",
+				r.Name, r.Name)
+		}
+		out = append(out, r.String())
+	}
+	return out, nil
+}
+
 func validateModuleRole(ctx *ExecContext, role ast.QualifiedName) error {
+	// An unqualified role reaches here with an empty Module, because the grammar
+	// spells a module role as `qualifiedName` and its module part is optional.
+	// Reported as MDL-GRANT02 at check time; this is the exec-side guard, and it
+	// has to name the real problem — the old message ran the empty module through
+	// `NewBackend`, which prefixes "failed to ", and printed
+	// "failed to module not found for role .Wide" (mendixlabs/mxcli#1067).
+	if role.Module == "" {
+		return mdlerrors.NewValidationf(
+			"module role %q is not module-qualified — write <Module>.%s "+
+				"(run `show module roles` to list the roles this project has)",
+			role.Name, role.Name)
+	}
 	module, err := findModule(ctx, role.Module)
 	if err != nil {
-		return mdlerrors.NewBackend(fmt.Sprintf("module not found for role %s.%s", role.Module, role.Name), err)
+		return mdlerrors.NewValidationf(
+			"module %q not found, so the module role %s cannot be resolved: %v",
+			role.Module, role.String(), err)
 	}
 
 	ms, err := ctx.Backend.GetModuleSecurity(module.ID)
@@ -951,7 +1280,7 @@ func validateModuleRole(ctx *ExecContext, role ast.QualifiedName) error {
 	return mdlerrors.NewNotFound("module role", role.Module+"."+role.Name)
 }
 
-// execAlterProjectSecurity handles ALTER PROJECT SECURITY LEVEL/DEMO USERS.
+// execAlterProjectSecurity handles ALTER PROJECT SECURITY LEVEL/DEMO USERS/GUEST ACCESS.
 func execAlterProjectSecurity(ctx *ExecContext, s *ast.AlterProjectSecurityStmt) error {
 	if !ctx.ConnectedForWrite() {
 		return mdlerrors.NewNotConnectedWrite()
@@ -979,7 +1308,7 @@ func execAlterProjectSecurity(ctx *ExecContext, s *ast.AlterProjectSecurityStmt)
 		if err := ctx.Backend.SetProjectSecurityLevel(ps.ID, bsonLevel); err != nil {
 			return mdlerrors.NewBackend("set security level", err)
 		}
-		fmt.Fprintf(ctx.Output, "Set project security level to %s\n", s.SecurityLevel)
+		ctx.reportWrite("project security level: "+s.SecurityLevel, "Set project security level to %s", s.SecurityLevel)
 	}
 
 	if s.DemoUsersEnabled != nil {
@@ -990,13 +1319,134 @@ func execAlterProjectSecurity(ctx *ExecContext, s *ast.AlterProjectSecurityStmt)
 		if *s.DemoUsersEnabled {
 			state = "enabled"
 		}
-		fmt.Fprintf(ctx.Output, "Demo users %s\n", state)
+		ctx.reportWrite("demo users: "+state, "Demo users %s", state)
+	}
+
+	if s.GuestAccessEnabled != nil || s.GuestUserRole != "" {
+		if err := applyGuestAccess(ctx, ps, s); err != nil {
+			return err
+		}
+	}
+
+	if s.AdminUserName != "" {
+		if err := ctx.Backend.SetProjectAdminUserName(ps.ID, s.AdminUserName); err != nil {
+			return mdlerrors.NewBackend("set admin user name", err)
+		}
+		ctx.reportWrite("admin user name: "+s.AdminUserName, "Admin user name set to %s", s.AdminUserName)
+	}
+
+	if s.AdminUserRole != "" {
+		role, err := resolveUserRole(ps, s.AdminUserRole,
+			"mxbuild does not report an administrator role that does not resolve; every build crashes on it")
+		if err != nil {
+			return err
+		}
+		if err := ctx.Backend.SetProjectAdminUserRole(ps.ID, role); err != nil {
+			return mdlerrors.NewBackend("set admin user role", err)
+		}
+		ctx.reportWrite("admin user role: "+role, "Admin user role set to %s", role)
+	}
+
+	if s.AdminPassword != "" {
+		if err := ctx.Backend.SetProjectAdminPassword(ps.ID, s.AdminPassword); err != nil {
+			return mdlerrors.NewBackend("set admin password", err)
+		}
+		// Never echo the value: exec output ends up in logs and transcripts.
+		ctx.reportWrite("admin password", "Admin password set")
+	}
+
+	if s.StrictModeEnabled != nil {
+		if err := ctx.Backend.SetProjectStrictMode(ps.ID, *s.StrictModeEnabled); err != nil {
+			return mdlerrors.NewBackend("set strict mode", err)
+		}
+		state := "disabled"
+		if *s.StrictModeEnabled {
+			state = "enabled"
+		}
+		ctx.reportWrite("strict mode: "+state, "Strict mode %s", state)
 	}
 
 	return nil
 }
 
-// execCreateDemoUser handles CREATE [OR MODIFY] DEMO USER 'name' PASSWORD 'pw' [ENTITY Module.Entity] (Roles).
+// applyGuestAccess handles ALTER PROJECT SECURITY GUEST ACCESS ON|OFF [ROLE r].
+//
+// Two things Mendix does not do for us, and one it does:
+//
+//   - mxbuild raises CE0133 ("No user role for anonymous users selected even
+//     though the feature anonymous users is enabled") when access is on with no
+//     role, so ON is refused here rather than producing a project that will not
+//     build. A stored role satisfies it, which is why ROLE is optional.
+//   - mxbuild does NOT check that the role exists — a nonexistent one builds
+//     with the same error count as a valid one — so a typo would otherwise be a
+//     silently broken anonymous configuration. Validate it here.
+//   - OFF leaves the stored role in place. Guest access off with a role set is
+//     valid, and dropping it would lose the operator's choice on a toggle.
+func applyGuestAccess(ctx *ExecContext, ps *security.ProjectSecurity, s *ast.AlterProjectSecurityStmt) error {
+	// `( GuestUserRole: R )` alone changes the role and keeps the stored state.
+	enabled := ps.EnableGuestAccess
+	if s.GuestAccessEnabled != nil {
+		enabled = *s.GuestAccessEnabled
+	}
+	role := s.GuestUserRole
+
+	if role != "" {
+		known := make([]string, 0, len(ps.UserRoles))
+		var match string
+		for _, ur := range ps.UserRoles {
+			known = append(known, ur.Name)
+			if strings.EqualFold(ur.Name, role) {
+				match = ur.Name
+			}
+		}
+		if match == "" {
+			return mdlerrors.NewNotFoundMsg("user role", role, fmt.Sprintf(
+				"user role not found: %s (project user roles: %s). Mendix does not validate "+
+					"this reference, so an unknown role would build cleanly and leave anonymous "+
+					"visitors with no access",
+				role, strings.Join(known, ", ")))
+		}
+		// Store the role under its declared casing, not the caller's.
+		role = match
+	} else if enabled && ps.GuestUserRole == "" {
+		return mdlerrors.NewValidation(
+			"EnableGuestAccess: true requires a role: no anonymous user role is configured, and Mendix " +
+				"rejects anonymous access without one (CE0133). Use alter app security " +
+				"( EnableGuestAccess: true, GuestUserRole: <UserRole> )")
+	}
+
+	if err := ctx.Backend.SetProjectGuestAccess(ps.ID, enabled, role); err != nil {
+		return mdlerrors.NewBackend("set guest access", err)
+	}
+
+	if s.GuestAccessEnabled == nil {
+		// The role alone: report the role, not a state the statement never set.
+		state := "off"
+		if enabled {
+			state = "on"
+		}
+		ctx.reportWrite("guest user role: "+role, "Guest user role set to %s (guest access stays %s)", role, state)
+		return nil
+	}
+	if !enabled {
+		ctx.reportWrite("guest access: disabled", "Guest access disabled")
+		return nil
+	}
+	if role == "" {
+		role = ps.GuestUserRole
+	}
+	ctx.reportWrite("guest access: enabled for user role "+role, "Guest access enabled for user role %s", role)
+	return nil
+}
+
+// demoUserPasswordPlaceholder is what DESCRIBE DEMO USER prints in place of the
+// password. Executing it keeps the stored password of an existing user and is
+// refused for a new one, so a described script can neither leak a password nor
+// silently set one (ako/mxcli#707). It is the string describe always printed,
+// so scripts described before the fix get the safe meaning too.
+const demoUserPasswordPlaceholder = "***"
+
+// execCreateDemoUser handles CREATE [OR MODIFY] DEMO USER 'name' ( Password: 'pw', Entity: Module.Entity, UserRoles: (Roles) ).
 func execCreateDemoUser(ctx *ExecContext, s *ast.CreateDemoUserStmt) error {
 	if !ctx.ConnectedForWrite() {
 		return mdlerrors.NewNotConnectedWrite()
@@ -1007,8 +1457,29 @@ func execCreateDemoUser(ctx *ExecContext, s *ast.CreateDemoUserStmt) error {
 		return mdlerrors.NewBackend("read project security", err)
 	}
 
-	// Validate password against project password policy
-	if err := ps.PasswordPolicy.ValidatePassword(s.Password); err != nil {
+	// The placeholder DESCRIBE prints instead of the password. It means "keep
+	// the stored password", which exists only for a user that already exists.
+	password := s.Password
+	keepPassword := password == demoUserPasswordPlaceholder
+	if keepPassword {
+		var existing *security.DemoUser
+		for _, du := range ps.DemoUsers {
+			if du.UserName == s.UserName {
+				existing = du
+			}
+		}
+		if existing == nil {
+			return mdlerrors.NewValidationf("demo user '%s': password %s is the placeholder describe prints "+
+				"in place of the stored password, and there is no stored password to keep here\n"+
+				"hint: replace it with the real password", s.UserName, mdlQuoted(demoUserPasswordPlaceholder))
+		}
+		password = existing.Password
+	}
+
+	// Validate password against project password policy. A kept password was
+	// accepted when it was set; re-checking it against today's policy would make
+	// replaying a describe fail for a reason the script does not mention.
+	if err := ps.PasswordPolicy.ValidatePassword(password); err != nil && !keepPassword {
 		return mdlerrors.NewValidationf("password policy violation for demo user '%s': %v\nhint: check your project's password policy with show project security", s.UserName, err)
 	}
 
@@ -1018,7 +1489,7 @@ func execCreateDemoUser(ctx *ExecContext, s *ast.CreateDemoUserStmt) error {
 			if !s.CreateOrModify {
 				return mdlerrors.NewAlreadyExists("demo user", s.UserName)
 			}
-			// Additive: merge roles, update password. Drop and re-create with merged roles.
+			// Additive: merge roles, update password, in place.
 			mergedRoles := du.UserRoles
 			existingSet := make(map[string]bool)
 			for _, r := range mergedRoles {
@@ -1033,13 +1504,21 @@ func execCreateDemoUser(ctx *ExecContext, s *ast.CreateDemoUserStmt) error {
 			if s.Entity != "" {
 				entity = s.Entity
 			}
-			if err := ctx.Backend.RemoveDemoUser(ps.ID, s.UserName); err != nil {
+			// A demo user that already holds what the statement states is
+			// left alone. Removing and re-adding it gave the element a new
+			// $ID, so project security was written on every re-run of the
+			// script (ako/mxcli#859, rehearsal W2).
+			if password == du.Password && entity == du.Entity && len(mergedRoles) == len(du.UserRoles) {
+				reportUnchanged(ctx, "demo user: "+s.UserName)
+				return nil
+			}
+			// AddDemoUser updates an existing user in place. Removing it first
+			// moved it to the end of the list, so every user after it shifted
+			// an index and showed up in the diff (mendixlabs/mxcli#1701).
+			if err := ctx.Backend.AddDemoUser(ps.ID, s.UserName, password, entity, mergedRoles); err != nil {
 				return mdlerrors.NewBackend("update demo user", err)
 			}
-			if err := ctx.Backend.AddDemoUser(ps.ID, s.UserName, s.Password, entity, mergedRoles); err != nil {
-				return mdlerrors.NewBackend("update demo user", err)
-			}
-			fmt.Fprintf(ctx.Output, "Modified demo user: %s\n", s.UserName)
+			ctx.ReportMutation("Modified", "demo user: %s", s.UserName)
 			return nil
 		}
 	}
@@ -1054,15 +1533,148 @@ func execCreateDemoUser(ctx *ExecContext, s *ast.CreateDemoUserStmt) error {
 		entity = detected
 	}
 
-	if err := ctx.Backend.AddDemoUser(ps.ID, s.UserName, s.Password, entity, s.UserRoles); err != nil {
+	if err := ctx.Backend.AddDemoUser(ps.ID, s.UserName, password, entity, s.UserRoles); err != nil {
 		return mdlerrors.NewBackend("create demo user", err)
 	}
 
 	fmt.Fprintf(ctx.Output, "Created demo user: %s (entity: %s)\n", s.UserName, entity)
+	warnDemoUsersInert(ctx, ps.SecurityLevel)
 	return nil
 }
 
+// warnDemoUsersInert says so when demo users cannot materialise.
+//
+// With Security Level Off — the level a blank mxcli template ships with — the
+// runtime creates no accounts, serves no login page and enforces none of the
+// row-level rules, so the demo users sit in the model and never appear. Nothing
+// said this: `CREATE DEMO USER` reported success and `SHOW PROJECT SECURITY`
+// reported "Demo Users Enabled: true", while the running app had zero accounts.
+// (mxcli-todo findings #15)
+func warnDemoUsersInert(ctx *ExecContext, level string) {
+	if level != security.SecurityLevelOff {
+		return
+	}
+	fmt.Fprintf(ctx.Output, "  Note: project security level is Off, so the runtime creates no accounts "+
+		"and this demo user will not appear in the app.\n"+
+		"  Raise it first: alter app security ( SecurityLevel: prototype );\n")
+}
+
 // detectUserEntity finds the entity that generalizes System.User.
+// storedAuditMembers returns the audit members the entity actually stores, under
+// the names Mendix uses for them. They are entity FLAGS rather than entries in
+// entity.Attributes, so a member walk never yields them and a GRANT naming one
+// was rejected as "no member" (issuetracker #20).
+func storedAuditMembers(e *domainmodel.Entity) []string {
+	if e == nil {
+		return nil
+	}
+	var out []string
+	if e.HasCreatedDate {
+		out = append(out, "createdDate")
+	}
+	if e.HasChangedDate {
+		out = append(out, "changedDate")
+	}
+	if e.HasOwner {
+		out = append(out, "owner")
+	}
+	if e.HasChangedBy {
+		out = append(out, "changedBy")
+	}
+	return out
+}
+
+// namedAssociation is an association reachable from an entity, with the
+// qualified reference to store in a MemberAccess.
+type namedAssociation struct{ Name, Ref string }
+
+// ruleAssociation is one association an entity's access rule carries a
+// MemberAccess for, with the reference Mendix stores in AssociationQualifiedName.
+type ruleAssociation struct {
+	namedAssociation
+	inherited bool
+}
+
+// accessRuleAssociations lists the associations whose MemberAccess belongs on
+// entity's access rule, in the order GRANT writes them. GRANT builds the rule
+// from it and REVOKE resolves member names against it, so the two agree on
+// which side carries an association and on its stored reference.
+//
+// ParentID = FROM entity (FK owner), and for a Default-owner association the
+// MemberAccess belongs only on that side — adding it to the TO side triggers
+// CE0066. `OWNER Both` is the exception: both ends own the association and
+// Mendix expects an entry on each; emitting it only on the FROM side left the
+// TO entity's rule incomplete, CE0066 (issuetracker #20, verified against
+// mxbuild 11.12.1 — the same script with `OWNER Default` checks clean).
+//
+// The reference is qualified by the module that DECLARES the association
+// ("ModA.Tag_GuestGroup"), never by the entity as an attribute's is. REVOKE
+// qualifying an association like an attribute matched no stored entry and
+// reported "nothing to revoke" while the rule held ReadWrite (mendixlabs/mxcli#1225).
+//
+// Associations declared on an ancestor come last, marked inherited. Mendix
+// inheritance is multi-table: a specialization has ALL of its generalization's
+// members, associations included, and its rule needs an entry for each, as for
+// inherited attributes (#758). Leaving them out was CE0066 on the
+// specialization's module and made OpenAIConnector's rule inexpressible
+// (`OpenAIDeployedModel extends GenAICommons.DeployedModel`, whose
+// `DeployedModel_InputModality` is declared on the parent — mxcli-chat FINDINGS
+// §26). A caller lets one of the entity's own members shadow an inherited one.
+func accessRuleAssociations(ctx *ExecContext, moduleName string, dm *domainmodel.DomainModel, entity *domainmodel.Entity, entityQN string) []ruleAssociation {
+	var out []ruleAssociation
+	own := func(name, ref string) {
+		out = append(out, ruleAssociation{namedAssociation: namedAssociation{Name: name, Ref: ref}})
+	}
+	for _, assoc := range dm.Associations {
+		ownedHere := assoc.ParentID == entity.ID ||
+			(assoc.Owner == domainmodel.AssociationOwnerBoth && assoc.ChildID == entity.ID)
+		if ownedHere {
+			own(assoc.Name, moduleName+"."+assoc.Name)
+		}
+	}
+	for _, ca := range dm.CrossAssociations {
+		if ca.ParentID == entity.ID {
+			own(ca.Name, moduleName+"."+ca.Name)
+		}
+	}
+	// A cross-module association owned by both ends is stored in the FROM
+	// entity's module, so this entity — the TO end — has to look for it there.
+	for _, other := range otherModuleBothOwnerAssociations(ctx, moduleName, entityQN) {
+		own(other.Name, other.Ref)
+	}
+	for _, inh := range inheritedAssociations(ctx, entityQN) {
+		out = append(out, ruleAssociation{namedAssociation: inh, inherited: true})
+	}
+	return out
+}
+
+// otherModuleBothOwnerAssociations finds cross-module associations owned by BOTH
+// ends whose TO end is entityQN. They are stored in the FROM entity's module, so
+// scanning only this entity's own domain model misses them.
+func otherModuleBothOwnerAssociations(ctx *ExecContext, thisModule, entityQN string) []namedAssociation {
+	dms, err := ctx.Backend.ListDomainModels()
+	if err != nil {
+		return nil
+	}
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return nil
+	}
+	var out []namedAssociation
+	for _, dm := range dms {
+		modName := h.GetModuleName(h.FindModuleID(dm.ContainerID))
+		if modName == "" || modName == thisModule {
+			continue
+		}
+		for _, ca := range dm.CrossAssociations {
+			if ca.Owner == domainmodel.AssociationOwnerBoth && ca.ChildRef == entityQN {
+				out = append(out, namedAssociation{Name: ca.Name, Ref: modName + "." + ca.Name})
+			}
+		}
+	}
+	return out
+}
+
 func detectUserEntity(ctx *ExecContext) (string, error) {
 	modules, err := ctx.Backend.ListModules()
 	if err != nil {
@@ -1126,6 +1738,10 @@ func execDropDemoUser(ctx *ExecContext, s *ast.DropDemoUserStmt) error {
 		}
 	}
 	if !found {
+		if s.IfExists {
+			fmt.Fprintf(ctx.Output, "Demo user '%s' does not exist, skipping\n", s.UserName)
+			return nil
+		}
 		return mdlerrors.NewNotFound("demo user", s.UserName)
 	}
 
@@ -1163,6 +1779,11 @@ func execGrantODataServiceAccess(ctx *ExecContext, s *ast.GrantODataServiceAcces
 		modName := h.GetModuleName(modID)
 		if modName != s.Service.Module || svc.Name != s.Service.Name {
 			continue
+		}
+
+		// Reject cross-module role grants before they reach the model (CE0148 guard).
+		if err := checkDocumentAccessRolesSameModule("OData service", modName, svc.Name, s.Roles); err != nil {
+			return err
 		}
 
 		// Validate all roles exist
@@ -1269,9 +1890,7 @@ func execGrantPublishedRestServiceAccess(ctx *ExecContext, s *ast.GrantPublished
 		return mdlerrors.NewNotConnectedWrite()
 	}
 
-	if err := checkFeature(ctx, "integration", "published_rest_grant_revoke",
-		"grant access on published rest service",
-		"upgrade your project to 10.0+"); err != nil {
+	if err := checkVersionGates(ctx, s); err != nil {
 		return err
 	}
 
@@ -1290,6 +1909,11 @@ func execGrantPublishedRestServiceAccess(ctx *ExecContext, s *ast.GrantPublished
 		modName := h.GetModuleName(modID)
 		if modName != s.Service.Module || svc.Name != s.Service.Name {
 			continue
+		}
+
+		// Reject cross-module role grants before they reach the model (CE0148 guard).
+		if err := checkDocumentAccessRolesSameModule("published REST service", modName, svc.Name, s.Roles); err != nil {
+			return err
 		}
 
 		// Validate all roles exist
@@ -1386,6 +2010,31 @@ func execRevokePublishedRestServiceAccess(ctx *ExecContext, s *ast.RevokePublish
 }
 
 // execUpdateSecurity handles UPDATE SECURITY [IN Module].
+//
+// # Why one module's failure must not end the run
+//
+// This used to return on the first module that could not be reconciled, and one
+// module always can: SYSTEM. Its domain model is SYNTHESIZED rather than stored
+// — there is no unit file behind the id the module carries — so
+// ReconcileMemberAccesses cannot load it, and the command died there having
+// reconciled nothing:
+//
+//	$ mxcli -p app.mpr -c 'update security'
+//	Error: failed to reconcile security for module System: load domain model
+//	00000000-…-002: …/mprcontents/00/00/…002.mxunit: no such file or directory
+//
+// That made the command inert on EVERY MPR v2 project, which is the whole of
+// mendixlabs/mxcli#1047's first half: it was reported as "UPDATE SECURITY does
+// not fix the CE0066 it is meant to fix", and the reason is that it never ran.
+// Whether it had already written some modules before dying depended on where the
+// unreconcilable one fell in the list, so the failure was also non-atomic.
+//
+// System is now skipped by name rather than by letting it fail, because
+// reconciling it is not merely impossible but wrong: its entities are the
+// platform's and its access rules are not the user's to rewrite. Any OTHER
+// module that cannot be read is reported and stepped over, so a project with one
+// unreadable module still gets the rest reconciled — and is told which it
+// missed, since a silent skip is how "up to date" comes to mean "not looked at".
 func execUpdateSecurity(ctx *ExecContext, s *ast.UpdateSecurityStmt) error {
 	if !ctx.ConnectedForWrite() {
 		return mdlerrors.NewNotConnectedWrite()
@@ -1397,8 +2046,22 @@ func execUpdateSecurity(ctx *ExecContext, s *ast.UpdateSecurityStmt) error {
 	}
 
 	totalModified := 0
+	matched := false
+	var skipped []string
 	for _, mod := range modules {
-		if s.Module != "" && mod.Name != s.Module {
+		if s.Module != "" && !strings.EqualFold(mod.Name, s.Module) {
+			continue
+		}
+		matched = true
+
+		// The platform's own module: not stored, and not ours to rewrite.
+		if strings.EqualFold(mod.Name, "System") {
+			if s.Module != "" {
+				return mdlerrors.NewValidation(
+					"System is the platform's module — its entity access rules are Mendix's, " +
+						"not the project's, and its domain model is not stored in the .mpr at all. " +
+						"There is nothing here to reconcile")
+			}
 			continue
 		}
 
@@ -1409,7 +2072,10 @@ func execUpdateSecurity(ctx *ExecContext, s *ast.UpdateSecurityStmt) error {
 
 		count, err := ctx.Backend.ReconcileMemberAccesses(dm.ID, mod.Name)
 		if err != nil {
-			return mdlerrors.NewBackend(fmt.Sprintf("reconcile security for module %s", mod.Name), err)
+			// One module that cannot be read is not a reason to abandon the
+			// others, and staying quiet about it is not an option either.
+			skipped = append(skipped, fmt.Sprintf("%s (%v)", mod.Name, err))
+			continue
 		}
 		if count > 0 {
 			fmt.Fprintf(ctx.Output, "Reconciled %d access rule(s) in module %s\n", count, mod.Name)
@@ -1417,7 +2083,13 @@ func execUpdateSecurity(ctx *ExecContext, s *ast.UpdateSecurityStmt) error {
 		}
 	}
 
-	if totalModified == 0 {
+	if s.Module != "" && !matched {
+		return mdlerrors.NewNotFound("module", s.Module)
+	}
+	for _, sk := range skipped {
+		fmt.Fprintf(ctx.Output, "Skipped %s — its domain model could not be read\n", sk)
+	}
+	if totalModified == 0 && len(skipped) == 0 {
 		fmt.Fprintf(ctx.Output, "All entity access rules are up to date\n")
 	}
 
@@ -1426,3 +2098,142 @@ func execUpdateSecurity(ctx *ExecContext, s *ast.UpdateSecurityStmt) error {
 
 // Executor method wrappers — delegate to free functions for callers that
 // still use the Executor receiver (e.g. executor_query.go).
+
+// inheritedAssociations returns the associations declared on entityQN's
+// ancestors, qualified against the module that declares each.
+//
+// It walks the generalization chain the same way EntityMembersFor does, and
+// stops at the same place: System.User's own members are Mendix's, and a user
+// entity must not carry access entries for them.
+func inheritedAssociations(ctx *ExecContext, entityQN string) []namedAssociation {
+	if ctx == nil || ctx.Backend == nil {
+		return nil
+	}
+	dms, err := ctx.Backend.ListDomainModels()
+	if err != nil {
+		return nil
+	}
+	var out []namedAssociation
+	seen := map[string]bool{}
+	claimed := map[string]bool{}
+
+	current := entityQN
+	for depth := 0; current != ""; depth++ {
+		if seen[current] {
+			break // cycle guard, as in EntityMembersFor
+		}
+		seen[current] = true
+
+		ent, ok := findEntityByQN(ctx.Backend, current)
+		if !ok {
+			break
+		}
+		parent := ent.GeneralizationRef
+		if parent == "" || strings.EqualFold(parent, userEntityBase) {
+			break
+		}
+		ancestor, ok := findEntityByQN(ctx.Backend, parent)
+		if !ok {
+			break
+		}
+		ancestorModule := qualifiedModuleOf(parent)
+		for _, dm := range dms {
+			// Find the domain model that DECLARES the ancestor by looking for the
+			// entity itself, rather than by matching module names: the module-name
+			// lookup goes through the hierarchy cache and returns "" often enough
+			// that filtering on it silently collected nothing (which is how the
+			// first cut of this still produced CE0066).
+			if !domainModelHasEntity(dm, ancestor.ID) {
+				continue
+			}
+			collect := func(name string, parentID, childID model.ID, owner domainmodel.AssociationOwner) {
+				ownedThere := parentID == ancestor.ID ||
+					(owner == domainmodel.AssociationOwnerBoth && childID == ancestor.ID)
+				if !ownedThere || claimed[name] {
+					return
+				}
+				claimed[name] = true
+				out = append(out, namedAssociation{Name: name, Ref: ancestorModule + "." + name})
+			}
+			for _, a := range dm.Associations {
+				collect(a.Name, a.ParentID, a.ChildID, a.Owner)
+			}
+			for _, ca := range dm.CrossAssociations {
+				// A cross-module association names its remote end by qualified name,
+				// so the Both-owner case is matched on ChildRef rather than an ID.
+				childID := model.ID("")
+				if ca.Owner == domainmodel.AssociationOwnerBoth && ca.ChildRef == parent {
+					childID = ancestor.ID
+				}
+				collect(ca.Name, ca.ParentID, childID, ca.Owner)
+			}
+		}
+		current = parent
+	}
+	return out
+}
+
+// qualifiedModuleOf is the module part of "Module.Entity".
+func qualifiedModuleOf(qn string) string {
+	if i := strings.Index(qn, "."); i > 0 {
+		return qn[:i]
+	}
+	return ""
+}
+
+// domainModelHasEntity reports whether a domain model declares the given entity.
+func domainModelHasEntity(dm *domainmodel.DomainModel, id model.ID) bool {
+	if dm == nil {
+		return false
+	}
+	for _, e := range dm.Entities {
+		if e != nil && e.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// refuseSystemEntityGrant rejects an access rule on a System entity, which no
+// project can store.
+//
+// The System module's domain model is not a unit in the .mpr — mxcli synthesises
+// it from a built-in table so that System.User and friends can be REFERENCED —
+// so the write reached storage, missed the unit and surfaced as a filesystem
+// error naming a UUID and a .mxunit path (ako/mxcli-maintenance §4):
+//
+//	load domain model 00000000-0000-0000-0000-000000000002:
+//	open .../mprcontents/00/00/…-002.mxunit: no such file or directory
+//
+// That reads like a corrupt project, and it is not: this is a permanent property
+// of every Mendix project. Refusing up front, by name, also spares the caller the
+// half-applied state a late failure leaves — the roles have already been
+// validated by then.
+//
+// The consequence is worth stating in the message rather than leaving someone to
+// rediscover it: a constraint that TRAVERSES System is equally unusable, so
+// filtering Administration.Account by [System.UserRoles/System.UserRole/Name]
+// returns nothing. Targeting the role instead of a named user is what the
+// maintenance app did.
+func refuseSystemEntityGrant(moduleName, entityName string) error {
+	if !strings.EqualFold(moduleName, systemModuleName) {
+		return nil
+	}
+	return mdlerrors.NewValidationf(
+		"cannot grant access on %s.%s: the System module's domain model is not stored in the "+
+			"project, so it has no access rules to add to — this is true of every Mendix project, "+
+			"not a problem with this one.\n"+
+			"  System entities are readable only through the rules Mendix itself defines (a user can "+
+			"read their own row), and an XPath constraint that traverses System is equally unusable.\n"+
+			"  For a per-person assignment, grant on Administration.Account, or target a user ROLE and "+
+			"record who acted when they act.",
+		moduleName, entityName)
+}
+
+// accessRuleXPathConstraint is the constraint an access rule on entity stores:
+// a qualified attribute of entity (or of a generalization of it) bare and an
+// enumeration value as a string literal (storedModelXPathConstraint,
+// ako/mxcli#874), laid out for Studio Pro's editor.
+func accessRuleXPathConstraint(ctx *ExecContext, xpath, entity string) string {
+	return visitor.FormatXPathConstraint(storedModelXPathConstraint(ctx, xpath, entity))
+}

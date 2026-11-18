@@ -1,0 +1,69 @@
+mdl 1;
+-- ============================================================================
+-- Bug #112: COMBOBOX bound to an enum triggers CE0463 "widget definition changed"
+-- ============================================================================
+--
+-- Symptom:
+--   create ... combobox cbClass (Label: 'Class', Attribute: VesselClass)  -- enum
+--   then `mx check` (or `mxcli docker build`) fails:
+--   [CE0463] "The definition of this widget has changed. Update this widget
+--   by right-clicking it and selecting 'Update widget'…" at Combo box 'cbClass'.
+--
+-- Root cause (RESOLVED):
+--   #112 originally blamed an incomplete template (58 PropertyTypes / 52
+--   WidgetProperties). That was fixed first.
+--
+--   The residual CE0463 was NOT a version jump — a fresh 11.12.x project ships
+--   ComboBox 2.5.0, the same version as mxcli's embedded template — but two
+--   GENERIC definition-drift causes the augment reconciliation didn't yet cover:
+--
+--   1. System-property ORDER. ComboBox declares <systemProperty> Label /
+--      Visibility / Editability INLINE in the middle of its property list (its
+--      Editability group even mixes the systemProperty ahead of a regular
+--      property). mxbuild emits the WidgetType's PropertyTypes in that declared
+--      order and CE0463 checks it, but the .mpk parser split system properties
+--      into a separate list and reorderPropertyTypes pushed them to the END.
+--      (DataGrid2 / Gallery declare no inline system properties, so they were
+--      unaffected — which is why they passed and ComboBox didn't.) Fixed by
+--      preserving the .mpk's full declared order (regular + system interleaved,
+--      mpk.WidgetDefinition.AllTopLevel) and reordering to it.
+--   2. <returnType assignableTo="../staticAttribute"/>. ComboBox's
+--      staticDataSourceValue expression derives its return type from another
+--      property; the parser read only <returnType type=...> and emitted a null
+--      ReturnType where mxbuild emits a WidgetReturnType{Type:None, AssignableTo}.
+--      Fixed by parsing assignableTo and emitting the return type.
+--
+--   Both fixes are generic (no ComboBox-specific code) and live in
+--   modelsdk/widgets/{mpk/mpk.go,augment.go}. After them the emitted
+--   CustomWidgetType is byte-identical (ID-masked) to `mx update-widgets` output.
+--
+-- Verification (Mendix 11.12.1, bundled ComboBox 2.5.0):
+--   - `mxcli exec … -p app.mpr` then `mx check` → 0 errors (was 1 CE0463 on cbClass).
+--   - Definition (WidgetType) diff vs `mx update-widgets` → 0 lines (ID-masked).
+--   - No regression: DataGrid2 / Gallery / filters (incl. DropdownFilter) stay at 0.
+--
+-- Usage:
+--   mxcli exec mdl-examples/bug-tests/112-combobox-enum-ce0463-widget-version.mdl -p app.mpr
+--   mx check app.mpr        # expect 0 errors, no update-widgets needed
+-- ============================================================================
+
+create module CBBug112;
+
+create enumeration CBBug112.VesselClass (
+  Sailboat 'Sailboat',
+  Motorboat 'Motorboat'
+);
+
+create entity CBBug112.Boat (
+  Name: String,
+  VesselClass: enum CBBug112.VesselClass
+);
+
+create or modify page CBBug112.Boat_NewEdit (
+  params: ( $Boat: CBBug112.Boat ),
+  layout: Atlas_Core.Atlas_Default
+) {
+  dataview boatDV (DataSource: $Boat) {
+    combobox cbClass (Label: 'Class', Attribute: VesselClass)
+  }
+};

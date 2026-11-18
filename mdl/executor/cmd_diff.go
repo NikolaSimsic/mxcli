@@ -1,16 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package executor - Diff command implementation for comparing MDL scripts against project state
+// Package executor - diff results and their rendering, shared by `mxcli diff`
+// (mdl/scriptdiff, which runs the script against a scratch copy) and
+// `mxcli diff-local`.
 package executor
 
 import (
 	"bytes"
-	"context"
 	"fmt"
+	"io"
 	"strings"
 
+	"github.com/pmezard/go-difflib/difflib"
+	"go.mongodb.org/mongo-driver/v2/bson"
+
 	"github.com/mendixlabs/mxcli/mdl/ast"
-	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
 )
 
 // DiffFormat represents the output format for diff results
@@ -51,10 +55,31 @@ type DiffResult struct {
 	ObjectType string
 	ObjectName ast.QualifiedName
 	Current    string // MDL from MPR (empty if new)
-	Proposed   string // MDL from script
+	Proposed   string // MDL after the change (empty if deleted)
 	IsNew      bool
 	IsDeleted  bool
 	Changes    []StructuralChange
+	// Writes is what is written that the two renderings do not show (a move
+	// to another folder, a property describe does not print), or why they
+	// could not be made; "" otherwise.
+	Writes string
+	// FromLabel / ToLabel name the two sides in the headers. "" keeps the
+	// script diff's "current" / "script"; diff-local sets the git revisions,
+	// since neither side of `--ref a..b` is a script (#1393).
+	FromLabel string
+	ToLabel   string
+}
+
+// sideLabels returns the header labels for the two sides of a diff.
+func (r DiffResult) sideLabels() (from, to string) {
+	from, to = r.FromLabel, r.ToLabel
+	if from == "" {
+		from = "current"
+	}
+	if to == "" {
+		to = "script"
+	}
+	return from, to
 }
 
 // ANSI color codes
@@ -66,527 +91,178 @@ const (
 	colorYellow = "\033[33m"
 )
 
-// DiffProgram compares an MDL program against the current project state
-func diffProgram(ctx *ExecContext, prog *ast.Program, opts DiffOptions) error {
-	if !ctx.Connected() {
-		return mdlerrors.NewNotConnected()
-	}
-
-	// Set defaults
+// WriteDiffResults prints results in the chosen format. A result whose change
+// the renderings do not show is printed as one line saying what is written.
+func WriteDiffResults(w io.Writer, results []DiffResult, opts DiffOptions) {
 	if opts.Format == "" {
 		opts.Format = DiffFormatUnified
 	}
 	if opts.Width == 0 {
 		opts.Width = 120
 	}
-
-	var results []DiffResult
-	var newCount, modifiedCount, unchangedCount int
-
-	// Track processed objects to avoid duplicates (script may have multiple statements for same object)
-	processed := make(map[string]bool)
-
-	// Process each statement
-	for _, stmt := range prog.Statements {
-		result, err := diffStatement(ctx, stmt)
-		if err != nil {
-			// Skip statements that can't be diffed (e.g., connection statements)
+	ctx := &ExecContext{Output: w}
+	for _, result := range results {
+		verdict := "Modified"
+		switch {
+		case result.IsNew:
+			verdict = "New"
+		case result.IsDeleted:
+			verdict = "Removed"
+		}
+		shows := result.Current != result.Proposed
+		if !shows {
+			fmt.Fprintf(w, "%s: %s %s: %s\n", verdict, result.ObjectType, result.ObjectName, result.Writes)
 			continue
 		}
-		if result != nil {
-			// Create unique key for deduplication
-			key := result.ObjectType + ":" + result.ObjectName.String()
-			if processed[key] {
-				// Skip duplicate - already processed this object
-				continue
-			}
-			processed[key] = true
-
-			results = append(results, *result)
-			if result.IsNew {
-				newCount++
-			} else if result.Current != result.Proposed {
-				modifiedCount++
-			} else {
-				unchangedCount++
-			}
-		}
-	}
-
-	// Output results based on format
-	for _, result := range results {
-		if result.Current == result.Proposed && !result.IsNew {
-			// Skip unchanged objects unless showing structural
-			if opts.Format != DiffFormatStructural {
-				continue
-			}
-		}
-
 		switch opts.Format {
-		case DiffFormatUnified:
-			outputUnifiedDiff(ctx, result, opts.UseColor)
 		case DiffFormatSideBySide:
 			outputSideBySideDiff(ctx, result, opts.Width, opts.UseColor)
 		case DiffFormatStructural:
 			outputStructuralDiff(ctx, result, opts.UseColor)
+		default:
+			outputUnifiedDiff(ctx, result, opts.UseColor)
 		}
-	}
-
-	// Output summary
-	fmt.Fprintf(ctx.Output, "\nSummary: %d new, %d modified, %d unchanged\n",
-		newCount, modifiedCount, unchangedCount)
-
-	return nil
-}
-
-// DiffProgram is a method wrapper for external callers.
-func (e *Executor) DiffProgram(prog *ast.Program, opts DiffOptions) error {
-	return diffProgram(e.newExecContext(context.Background()), prog, opts)
-}
-
-// diffStatement generates a diff result for a single statement
-func diffStatement(ctx *ExecContext, stmt ast.Statement) (*DiffResult, error) {
-	switch s := stmt.(type) {
-	case *ast.CreateEntityStmt:
-		return diffEntity(ctx, s)
-	case *ast.CreateViewEntityStmt:
-		return diffViewEntity(ctx, s)
-	case *ast.CreateEnumerationStmt:
-		return diffEnumeration(ctx, s)
-	case *ast.CreateAssociationStmt:
-		return diffAssociation(ctx, s)
-	case *ast.CreateMicroflowStmt:
-		return diffMicroflow(ctx, s)
-	case *ast.CreateNanoflowStmt:
-		return diffNanoflow(ctx, s)
-	default:
-		return nil, nil // Skip unsupported statements
+		if result.Writes != "" {
+			fmt.Fprintf(w, "%s: %s %s: also %s\n\n", verdict, result.ObjectType, result.ObjectName, result.Writes)
+		}
 	}
 }
 
-// diffEntity compares a CREATE ENTITY statement against the project
-func diffEntity(ctx *ExecContext, s *ast.CreateEntityStmt) (*DiffResult, error) {
-	result := &DiffResult{
-		ObjectType: "Entity",
-		ObjectName: s.Name,
-		Proposed:   entityStmtToMDL(ctx, s),
+// LineChanges summarises the difference between two renderings as lines added
+// and removed, for the structural format.
+func LineChanges(current, proposed string) []StructuralChange {
+	if current == proposed {
+		return nil
 	}
-
-	// Try to find existing entity
-	module, err := findModule(ctx, s.Name.Module)
-	if err != nil {
-		result.IsNew = true
-		return result, nil
+	lines := func(s string) []string {
+		if s == "" {
+			return nil
+		}
+		return difflib.SplitLines(s)
 	}
-
-	dm, err := ctx.Backend.GetDomainModel(module.ID)
-	if err != nil {
-		result.IsNew = true
-		return result, nil
-	}
-
-	for _, entity := range dm.Entities {
-		if entity.Name == s.Name.Name {
-			// Found existing entity - get its MDL representation
-			result.Current = entityToMDL(ctx, module.Name, entity, dm)
-			result.Changes = compareEntities(ctx, result.Current, result.Proposed)
-			return result, nil
+	m := difflib.NewMatcher(lines(current), lines(proposed))
+	added, removed := 0, 0
+	for _, op := range m.GetOpCodes() {
+		switch op.Tag {
+		case 'r':
+			removed += op.I2 - op.I1
+			added += op.J2 - op.J1
+		case 'd':
+			removed += op.I2 - op.I1
+		case 'i':
+			added += op.J2 - op.J1
 		}
 	}
-
-	result.IsNew = true
-	return result, nil
+	var out []StructuralChange
+	if added > 0 {
+		out = append(out, StructuralChange{ChangeType: ChangeAdded, ElementType: "Lines", Details: fmt.Sprintf("%d line(s) added", added)})
+	}
+	if removed > 0 {
+		out = append(out, StructuralChange{ChangeType: ChangeRemoved, ElementType: "Lines", Details: fmt.Sprintf("%d line(s) removed", removed)})
+	}
+	return out
 }
 
-// diffViewEntity compares a CREATE VIEW ENTITY statement against the project
-func diffViewEntity(ctx *ExecContext, s *ast.CreateViewEntityStmt) (*DiffResult, error) {
-	result := &DiffResult{
-		ObjectType: "View Entity",
-		ObjectName: s.Name,
-		Proposed:   viewEntityStmtToMDL(ctx, s),
-	}
-
-	module, err := findModule(ctx, s.Name.Module)
-	if err != nil {
-		result.IsNew = true
-		return result, nil
-	}
-
-	dm, err := ctx.Backend.GetDomainModel(module.ID)
-	if err != nil {
-		result.IsNew = true
-		return result, nil
-	}
-
-	for _, entity := range dm.Entities {
-		if entity.Name == s.Name.Name {
-			result.Current = viewEntityFromProjectToMDL(ctx, module.Name, entity, dm)
-			return result, nil
+// ChangedPaths lists up to max property paths whose values differ between two
+// unit documents, element $IDs aside. A list element is named by its Name
+// where it has one. It names properties, never values, so a secret that
+// changed is reported by where it is stored and not by what it holds.
+//
+// Both diffs use it for a unit that is written although its MDL rendering
+// does not change: `mxcli diff` for what exec would write, diff-local for what
+// changed between two revisions (ako/mxcli#1512).
+func ChangedPaths(a, b []byte, max int) []string {
+	var out []string
+	var walk func(path string, x, y bson.RawValue)
+	walk = func(path string, x, y bson.RawValue) {
+		if len(out) >= max {
+			return
 		}
-	}
-
-	result.IsNew = true
-	return result, nil
-}
-
-// diffEnumeration compares a CREATE ENUMERATION statement against the project
-func diffEnumeration(ctx *ExecContext, s *ast.CreateEnumerationStmt) (*DiffResult, error) {
-	result := &DiffResult{
-		ObjectType: "Enumeration",
-		ObjectName: s.Name,
-		Proposed:   enumerationStmtToMDL(ctx, s),
-	}
-
-	// Try to find existing enumeration
-	existingEnum := findEnumeration(ctx, s.Name.Module, s.Name.Name)
-	if existingEnum == nil {
-		result.IsNew = true
-		return result, nil
-	}
-
-	h, _ := getHierarchy(ctx)
-	modName := h.GetModuleName(existingEnum.ContainerID)
-	result.Current = enumerationToMDL(ctx, modName, existingEnum)
-	result.Changes = compareEnumerations(ctx, result.Current, result.Proposed)
-
-	return result, nil
-}
-
-// diffAssociation compares a CREATE ASSOCIATION statement against the project
-func diffAssociation(ctx *ExecContext, s *ast.CreateAssociationStmt) (*DiffResult, error) {
-	result := &DiffResult{
-		ObjectType: "Association",
-		ObjectName: s.Name,
-		Proposed:   associationStmtToMDL(ctx, s),
-	}
-
-	module, err := findModule(ctx, s.Name.Module)
-	if err != nil {
-		result.IsNew = true
-		return result, nil
-	}
-
-	dm, err := ctx.Backend.GetDomainModel(module.ID)
-	if err != nil {
-		result.IsNew = true
-		return result, nil
-	}
-
-	for _, assoc := range dm.Associations {
-		if assoc.Name == s.Name.Name {
-			result.Current = associationToMDL(ctx, module.Name, assoc, dm)
-			return result, nil
+		if x.Type != y.Type {
+			out = append(out, path)
+			return
 		}
-	}
-
-	result.IsNew = true
-	return result, nil
-}
-
-// diffMicroflow compares a CREATE MICROFLOW statement against the project
-func diffMicroflow(ctx *ExecContext, s *ast.CreateMicroflowStmt) (*DiffResult, error) {
-	result := &DiffResult{
-		ObjectType: "Microflow",
-		ObjectName: s.Name,
-		Proposed:   microflowStmtToMDL(ctx, s),
-	}
-
-	// Try to find existing microflow
-	h, err := getHierarchy(ctx)
-	if err != nil {
-		result.IsNew = true
-		return result, nil
-	}
-
-	mfs, err := ctx.Backend.ListMicroflows()
-	if err != nil {
-		result.IsNew = true
-		return result, nil
-	}
-
-	for _, mf := range mfs {
-		modID := h.FindModuleID(mf.ContainerID)
-		modName := h.GetModuleName(modID)
-		if modName == s.Name.Module && mf.Name == s.Name.Name {
-			// Capture current MDL representation
-			var buf bytes.Buffer
-			oldOutput := ctx.Output
-			ctx.Output = &buf
-			describeMicroflow(ctx, s.Name)
-			ctx.Output = oldOutput
-			result.Current = strings.TrimSuffix(buf.String(), "\n")
-			result.Changes = compareMicroflows(ctx, result.Current, result.Proposed)
-			return result, nil
-		}
-	}
-
-	result.IsNew = true
-	return result, nil
-}
-
-// diffNanoflow compares a CREATE NANOFLOW statement against the project
-func diffNanoflow(ctx *ExecContext, s *ast.CreateNanoflowStmt) (*DiffResult, error) {
-	result := &DiffResult{
-		ObjectType: "Nanoflow",
-		ObjectName: s.Name,
-		Proposed:   nanoflowStmtToMDL(ctx, s),
-	}
-
-	// Try to find existing nanoflow
-	// Errors treated as "new" to match diffMicroflow and other diff* functions
-	h, err := getHierarchy(ctx)
-	if err != nil {
-		result.IsNew = true
-		return result, nil
-	}
-
-	nfs, err := ctx.Backend.ListNanoflows()
-	if err != nil {
-		result.IsNew = true
-		return result, nil
-	}
-
-	for _, nf := range nfs {
-		modID := h.FindModuleID(nf.ContainerID)
-		modName := h.GetModuleName(modID)
-		if modName == s.Name.Module && nf.Name == s.Name.Name {
-			// Capture current MDL representation
-			var buf bytes.Buffer
-			if err := func() error {
-				oldOutput := ctx.Output
-				ctx.Output = &buf
-				defer func() { ctx.Output = oldOutput }()
-				return describeNanoflow(ctx, s.Name)
-			}(); err != nil {
-				return nil, err
-			}
-			result.Current = strings.TrimSuffix(buf.String(), "\n")
-			result.Changes = compareMicroflows(ctx, result.Current, result.Proposed)
-			return result, nil
-		}
-	}
-
-	result.IsNew = true
-	return result, nil
-}
-
-// ============================================================================
-// Structural Comparison Functions
-// ============================================================================
-
-// compareEntities extracts structural changes between two entity MDL representations
-func compareEntities(ctx *ExecContext, current, proposed string) []StructuralChange {
-	var changes []StructuralChange
-
-	// Simple line-based comparison for now
-	currentLines := strings.Split(current, "\n")
-	proposedLines := strings.Split(proposed, "\n")
-
-	// Extract attributes from both
-	currentAttrs := extractAttributes(ctx, currentLines)
-	proposedAttrs := extractAttributes(ctx, proposedLines)
-
-	// Find added attributes
-	for name, proposed := range proposedAttrs {
-		if _, exists := currentAttrs[name]; !exists {
-			changes = append(changes, StructuralChange{
-				ChangeType:  ChangeAdded,
-				ElementType: "Attribute",
-				ElementName: name,
-				Details:     proposed,
-			})
-		}
-	}
-
-	// Find removed attributes
-	for name := range currentAttrs {
-		if _, exists := proposedAttrs[name]; !exists {
-			changes = append(changes, StructuralChange{
-				ChangeType:  ChangeRemoved,
-				ElementType: "Attribute",
-				ElementName: name,
-			})
-		}
-	}
-
-	// Find modified attributes
-	for name, proposed := range proposedAttrs {
-		if current, exists := currentAttrs[name]; exists && current != proposed {
-			changes = append(changes, StructuralChange{
-				ChangeType:  ChangeModified,
-				ElementType: "Attribute",
-				ElementName: name,
-				Details:     "changed",
-			})
-		}
-	}
-
-	return changes
-}
-
-// compareEnumerations extracts structural changes between two enumeration MDL representations
-func compareEnumerations(ctx *ExecContext, current, proposed string) []StructuralChange {
-	var changes []StructuralChange
-
-	currentValues := extractEnumValues(ctx, strings.Split(current, "\n"))
-	proposedValues := extractEnumValues(ctx, strings.Split(proposed, "\n"))
-
-	for name := range proposedValues {
-		if _, exists := currentValues[name]; !exists {
-			changes = append(changes, StructuralChange{
-				ChangeType:  ChangeAdded,
-				ElementType: "Value",
-				ElementName: name,
-			})
-		}
-	}
-
-	for name := range currentValues {
-		if _, exists := proposedValues[name]; !exists {
-			changes = append(changes, StructuralChange{
-				ChangeType:  ChangeRemoved,
-				ElementType: "Value",
-				ElementName: name,
-			})
-		}
-	}
-
-	return changes
-}
-
-// compareMicroflows extracts structural changes between two microflow MDL representations
-func compareMicroflows(ctx *ExecContext, current, proposed string) []StructuralChange {
-	var changes []StructuralChange
-
-	currentParams := extractParameters(ctx, strings.Split(current, "\n"))
-	proposedParams := extractParameters(ctx, strings.Split(proposed, "\n"))
-
-	for name := range proposedParams {
-		if _, exists := currentParams[name]; !exists {
-			changes = append(changes, StructuralChange{
-				ChangeType:  ChangeAdded,
-				ElementType: "Parameter",
-				ElementName: name,
-			})
-		}
-	}
-
-	for name := range currentParams {
-		if _, exists := proposedParams[name]; !exists {
-			changes = append(changes, StructuralChange{
-				ChangeType:  ChangeRemoved,
-				ElementType: "Parameter",
-				ElementName: name,
-			})
-		}
-	}
-
-	// Count body statements
-	currentStmts := countBodyStatements(ctx, current)
-	proposedStmts := countBodyStatements(ctx, proposed)
-	if currentStmts != proposedStmts {
-		diff := proposedStmts - currentStmts
-		if diff > 0 {
-			changes = append(changes, StructuralChange{
-				ChangeType:  ChangeAdded,
-				ElementType: "Body",
-				ElementName: "statements",
-				Details:     fmt.Sprintf("%d statements added", diff),
-			})
-		} else {
-			changes = append(changes, StructuralChange{
-				ChangeType:  ChangeRemoved,
-				ElementType: "Body",
-				ElementName: "statements",
-				Details:     fmt.Sprintf("%d statements removed", -diff),
-			})
-		}
-	}
-
-	return changes
-}
-
-// extractAttributes extracts attribute definitions from MDL lines
-func extractAttributes(_ *ExecContext, lines []string) map[string]string {
-	attrs := make(map[string]string)
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, ":") && !strings.HasPrefix(line, "create") && !strings.HasPrefix(line, "/**") && !strings.HasPrefix(line, "*") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				name := strings.TrimSpace(parts[0])
-				if !strings.HasPrefix(name, "$") && !strings.HasPrefix(name, "@") {
-					attrs[name] = strings.TrimSuffix(strings.TrimSpace(parts[1]), ",")
+		switch x.Type {
+		case bson.TypeEmbeddedDocument:
+			dx, dy := x.Document(), y.Document()
+			ex, _ := dx.Elements()
+			keys := map[string]bool{}
+			for _, e := range ex {
+				k := e.Key()
+				keys[k] = true
+				if k == "$ID" {
+					continue
+				}
+				vy, err := dy.LookupErr(k)
+				if err != nil {
+					out = append(out, diffPathJoin(path, k))
+				} else {
+					walk(diffPathJoin(path, k), e.Value(), vy)
+				}
+				if len(out) >= max {
+					return
 				}
 			}
-		}
-	}
-	return attrs
-}
-
-// extractEnumValues extracts enumeration values from MDL lines
-func extractEnumValues(_ *ExecContext, lines []string) map[string]bool {
-	values := make(map[string]bool)
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "'") && !strings.HasPrefix(line, "create") {
-			parts := strings.Fields(line)
-			if len(parts) >= 1 {
-				name := strings.TrimSuffix(parts[0], ",")
-				if name != "" && !strings.HasPrefix(name, "/") && !strings.HasPrefix(name, "*") {
-					values[name] = true
+			ey, _ := dy.Elements()
+			for _, e := range ey {
+				if !keys[e.Key()] && len(out) < max {
+					out = append(out, diffPathJoin(path, e.Key()))
 				}
 			}
-		}
-	}
-	return values
-}
-
-// extractParameters extracts parameter names from MDL lines
-func extractParameters(_ *ExecContext, lines []string) map[string]bool {
-	params := make(map[string]bool)
-	inParams := false
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "create microflow") || strings.HasPrefix(line, "create nanoflow") ||
-			strings.HasPrefix(line, "create or modify microflow") || strings.HasPrefix(line, "create or modify nanoflow") {
-			inParams = true
-			continue
-		}
-		if inParams {
-			if strings.HasPrefix(line, ")") {
-				inParams = false
-				continue
+		case bson.TypeArray:
+			vx, _ := x.Array().Values()
+			vy, _ := y.Array().Values()
+			vx, vy = withoutListMarker(vx), withoutListMarker(vy)
+			if len(vx) != len(vy) {
+				out = append(out, fmt.Sprintf("%s (%d -> %d items)", path, len(vx), len(vy)))
+				return
 			}
-			if strings.HasPrefix(line, "$") {
-				parts := strings.SplitN(line, ":", 2)
-				if len(parts) >= 1 {
-					name := strings.TrimPrefix(parts[0], "$")
-					name = strings.TrimSuffix(name, ",")
-					params[strings.TrimSpace(name)] = true
+			for i := range vx {
+				walk(fmt.Sprintf("%s[%s]", path, diffPathItemName(vx[i], i)), vx[i], vy[i])
+				if len(out) >= max {
+					return
 				}
 			}
+		case bson.TypeBinary:
+			// A pointer holds an element $ID, so a pointer to an element exec
+			// re-minted differs without anything having changed; canon has
+			// already said whether the unit did. A GUID is reported.
+			if !bytes.Equal(x.Value, y.Value) && !strings.HasSuffix(path, "Pointer") {
+				out = append(out, path)
+			}
+		default:
+			if !bytes.Equal(x.Value, y.Value) {
+				out = append(out, path)
+			}
 		}
 	}
-	return params
+	walk("", bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: a}, bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: b})
+	return out
 }
 
-// countBodyStatements counts statements in a microflow body
-func countBodyStatements(_ *ExecContext, mdl string) int {
-	count := 0
-	inBody := false
-	for line := range strings.SplitSeq(mdl, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "begin" {
-			inBody = true
-			continue
-		}
-		if line == "end;" {
-			break
-		}
-		if inBody && line != "" && !strings.HasPrefix(line, "--") {
-			count++
+func diffPathJoin(path, key string) string {
+	if path == "" {
+		return key
+	}
+	return path + "." + key
+}
+
+func diffPathItemName(v bson.RawValue, i int) string {
+	if d, ok := v.DocumentOK(); ok {
+		if n, ok := d.Lookup("Name").StringValueOK(); ok && n != "" {
+			return n
 		}
 	}
-	return count
+	return fmt.Sprint(i)
+}
+
+// withoutListMarker drops the int32 Mendix stores ahead of a list's items (the
+// typed-array marker), so a count or an index is the list's own: an empty
+// list holds one value, and counting it reported a first grant as "1 -> 2
+// items".
+func withoutListMarker(vals []bson.RawValue) []bson.RawValue {
+	if len(vals) > 0 && vals[0].Type == bson.TypeInt32 {
+		return vals[1:]
+	}
+	return vals
 }

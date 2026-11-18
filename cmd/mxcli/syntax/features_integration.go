@@ -12,8 +12,8 @@ func init() {
 			"integration", "services", "external", "contract",
 			"odata", "rest", "business events", "database",
 		},
-		Syntax:  "SHOW ODATA CLIENTS [IN Module];\nSHOW REST CLIENTS [IN Module];\nSHOW PUBLISHED REST SERVICES [IN Module];\nSHOW BUSINESS EVENT SERVICES [IN Module];\nSHOW DATABASE CONNECTIONS [IN Module];\nSHOW EXTERNAL ENTITIES [IN Module];\nSHOW EXTERNAL ACTIONS [IN Module];",
-		Example: "SHOW ODATA CLIENTS;\nSHOW REST CLIENTS IN MyModule;\nSHOW EXTERNAL ENTITIES;\nSELECT * FROM CATALOG.REST_CLIENTS;",
+		Syntax:  "LIST CONSUMED ODATA SERVICES [IN Module];\nLIST CONSUMED REST SERVICES [IN Module];\nLIST PUBLISHED REST SERVICES [IN Module];\nLIST BUSINESS EVENT SERVICES [IN Module];\nLIST DATABASE CONNECTIONS [IN Module];\nLIST EXTERNAL ENTITIES [IN Module];\nLIST EXTERNAL ACTIONS [IN Module];",
+		Example: "LIST CONSUMED ODATA SERVICES;\nLIST CONSUMED REST SERVICES IN MyModule;\nLIST EXTERNAL ENTITIES;\nSELECT * FROM CATALOG.CONSUMED_REST_SERVICES;",
 		SeeAlso: []string{"odata", "rest", "sql", "business-events"},
 	})
 
@@ -26,25 +26,28 @@ func init() {
 			"odata", "consumed odata", "published odata",
 			"external entity", "external entities", "metadata",
 		},
-		Syntax:  "SHOW ODATA CLIENTS [IN Module];\nSHOW ODATA SERVICES [IN Module];\nSHOW EXTERNAL ENTITIES [IN Module];\nSHOW EXTERNAL ACTIONS [IN Module];\nDESCRIBE ODATA CLIENT Module.Name;\nDESCRIBE ODATA SERVICE Module.Name;",
-		Example: "SHOW ODATA CLIENTS;\nDESCRIBE ODATA CLIENT MyModule.ExternalAPI;\nSHOW EXTERNAL ENTITIES IN MyModule;",
+		Syntax:  "LIST CONSUMED ODATA SERVICES [IN Module];\nLIST PUBLISHED ODATA SERVICES [IN Module];\nLIST EXTERNAL ENTITIES [IN Module];\nLIST EXTERNAL ACTIONS [IN Module];\nDESCRIBE CONSUMED ODATA SERVICE Module.Name;\nDESCRIBE PUBLISHED ODATA SERVICE Module.Name;",
+		Example: "LIST CONSUMED ODATA SERVICES;\nDESCRIBE CONSUMED ODATA SERVICE MyModule.ExternalAPI;\nLIST EXTERNAL ENTITIES IN MyModule;",
 		SeeAlso: []string{"odata.consume", "odata.show", "integration"},
 	})
 
 	Register(SyntaxFeature{
-		Path:    "odata.consume",
+		Path: "odata.consume",
+		Features: []string{"integration/odata_client", "microflows/call_external_action", "microflows/call_external_action_arguments",
+			"microflows/call_external_action_include_associations"},
 		Summary: "Create consumed OData services and external entities",
 		Keywords: []string{
-			"create odata client", "consume odata", "external entity",
+			"create consumed odata service", "create odata client", "odata client", "consume odata", "external entity",
 			"metadata url", "odata4", "headers", "proxy",
 			"configurationmicroflow", "headersmicroflow", "service url",
+			"call external action", "include associations", "associations to include",
 		},
-		Syntax: "CREATE ODATA CLIENT Module.Name (\n" +
+		Syntax: "CREATE CONSUMED ODATA SERVICE Module.Name (\n" +
 			"  Version: '1.0',\n" +
 			"  ODataVersion: OData4,\n" +
 			"  MetadataUrl: 'https://.../$metadata',\n" +
 			"  Timeout: 300,\n" +
-			"  ServiceUrl: @Module.ServiceUrlConstant,    -- must be a constant ref\n" +
+			"  ServiceUrl: Module.ServiceUrlConstant,    -- must be a constant ref\n" +
 			"  -- Configuration source dropdown — pick ONE: constants only (omit\n" +
 			"  -- both microflows), Configuration microflow, OR Headers microflow.\n" +
 			"  -- Both MDL keywords map to the same BSON field; Studio Pro picks\n" +
@@ -55,60 +58,155 @@ func init() {
 			"  ErrorHandlingMicroflow: microflow Module.HandleError\n" +
 			")\n" +
 			"[HEADERS ('Key': 'Value')];\n\n" +
+			"ALTER CONSUMED ODATA SERVICE Module.Name SET (Key: value, ...);  -- CREATE's keys\n" +
+			"ALTER PUBLISHED ODATA SERVICE Module.Name SET (Key: value, ...);\n\n" +
 			"CREATE EXTERNAL ENTITY Module.Name\n" +
-			"  FROM ODATA CLIENT Module.Client\n" +
+			"  FROM CONSUMED ODATA SERVICE Module.Client\n" +
 			"  (EntitySet: 'Name', RemoteName: 'Name')\n" +
 			"  (Attr: Type, ...);\n\n" +
 			"CREATE EXTERNAL ENTITIES FROM Module.Client\n" +
-			"  [INTO Module] [ENTITIES (Name1, Name2)];",
-		Example: "CREATE CONSTANT MyModule.SvcUrl TYPE String DEFAULT 'https://api.example.com/odata/v4/';\n\nCREATE ODATA CLIENT MyModule.SalesforceAPI (\n  Version: '1.0',\n  ODataVersion: OData4,\n  MetadataUrl: 'https://api.example.com/odata/$metadata',\n  Timeout: 300,\n  ServiceUrl: @MyModule.SvcUrl\n);\n\nCREATE EXTERNAL ENTITIES FROM MyModule.SalesforceAPI INTO Integration;",
+			"  [INTO Module] [ENTITIES (Name1, Name2)];\n\n" +
+			"ALTER ENTITY Module.Name SET (AllowCreateChangeLocally: true);\n\n" +
+			"DROP EXTERNAL ENTITY [IF EXISTS] Module.Name;  -- refuses a local entity\n\n" +
+			"$Result = CALL EXTERNAL ACTION Module.Client.Action (\n" +
+			"  Param = $Obj [INCLUDE ASSOCIATIONS (Module.Assoc [(Module.SubAssoc, ...)], ...)],\n" +
+			"  Other = nothing                       -- a blank (optional) argument\n" +
+			");\n" +
+			"-- INCLUDE ASSOCIATIONS is Studio Pro's \"Associations to include\": the\n" +
+			"-- associations whose objects are sent with the argument, as a tree. A\n" +
+			"-- name in ( ) after an association lists those included under it, from\n" +
+			"-- the entity at its far end. Which end the object is on is worked out\n" +
+			"-- from the domain model; a self-association is refused (tick it in\n" +
+			"-- Studio Pro). INCLUDE ASSOCIATIONS () removes them all. Left out on\n" +
+			"-- CREATE OR MODIFY, the stored tree is kept and MDL-ODATA10 warns.\n" +
+			"-- DESCRIBE prints the clause. Mendix 10.11+ for a non-empty clause.\n\n" +
+			"-- `SET Key = value, ...` (no parentheses) still runs and warns MDL-DEPR061;\n" +
+			"-- `SET allow_create_change_locally = true` warns MDL-DEPR063.",
+		Example: "mdl 1;\nCREATE CONSTANT MyModule.SvcUrl ( Type: String, DefaultValue: 'https://api.example.com/odata/v4/' );\n\nCREATE CONSUMED ODATA SERVICE MyModule.SalesforceAPI (\n  Version: '1.0',\n  ODataVersion: OData4,\n  MetadataUrl: 'https://api.example.com/odata/$metadata',\n  Timeout: 300,\n  ServiceUrl: MyModule.SvcUrl\n);\n\nCREATE EXTERNAL ENTITIES FROM MyModule.SalesforceAPI INTO Integration;",
 		SeeAlso: []string{"odata", "odata.publish", "odata.show"},
 	})
 
 	Register(SyntaxFeature{
-		Path:    "odata.publish",
-		Summary: "Publish entities as OData services with KEY, options, and navigation properties",
+		Path:    "odata.write",
+		Summary: "Save or delete an external (OData) object from a microflow: SEND / DELETE EXTERNAL OBJECT",
 		Keywords: []string{
-			"create odata service", "publish entity", "publish odata",
-			"expose", "key", "navigation property", "association exposure",
-			"authentication", "page size",
+			"send external object", "delete external object", "external object", "save external entity",
+			"odata write", "odata update", "odata delete", "commit external entity",
 		},
-		Syntax: "CREATE [OR MODIFY] ODATA SERVICE Module.Name (\n" +
+		Syntax: "SEND EXTERNAL OBJECT $Obj [REFRESH] [ON ERROR …];\n" +
+			"DELETE EXTERNAL OBJECT $Obj [REFRESH] [ON ERROR …];\n\n" +
+			"-- Studio Pro's \"Send external object\" and \"Delete external object\"\n" +
+			"-- activities. An external entity is saved through its consumed service:\n" +
+			"-- a plain COMMIT or DELETE on one is a Studio Pro error. The entity set must\n" +
+			"-- allow the operation (Updatable / Deletable in the service's $metadata),\n" +
+			"-- or mxbuild reports CE9435.\n" +
+			"-- ON ERROR CONTINUE is CE6035 on both (MDL076); the default and a custom\n" +
+			"-- handler, with or without rollback, are accepted.",
+		Example: "mdl 1;\nCREATE OR MODIFY MICROFLOW MyModule.ACT_SaveCustomer ($Customer: MyModule.Customer)\nBEGIN\n  CHANGE $Customer (Name = 'Renamed');\n  SEND EXTERNAL OBJECT $Customer REFRESH;\n  RETURN;\nEND;",
+		SeeAlso: []string{"odata.consume", "microflow.object-operations", "microflow.error-handling"},
+	})
+
+	Register(SyntaxFeature{
+		Path:     "odata.publish",
+		Features: []string{"integration/published_odata_service", "integration/odata_graphql"},
+		Summary:  "Publish entities as OData services with KEY, options, and navigation properties",
+		Keywords: []string{
+			"create published odata service", "create odata service", "publish entity", "publish odata",
+			"expose", "key", "navigation property", "association exposure",
+			"authentication", "page size", "servicename", "publishassociations",
+			"readmode microflow", "non-persistable", "countable", "skipsupported",
+			"topsupported",
+			"graphql",
+			"supportsgraphql",
+		},
+		Syntax: "CREATE [OR MODIFY] PUBLISHED ODATA SERVICE Module.Name (\n" +
 			"  path: 'odata/customers/',           -- no leading slash; trailing slash required\n" +
 			"  version: '1.0.0',\n" +
 			"  ODataVersion: OData4,\n" +
-			"  namespace: 'Module.Customers'\n" +
+			"  namespace: 'Module.Customers',\n" +
+			"  ServiceName: 'CustomerApi',        -- optional; defaults to the document name\n" +
+			"  PublishAssociations: Yes,          -- optional; default Yes (associations as links)\n" +
+			"  SupportsGraphQL: Yes,              -- optional; also answer GraphQL at the SAME\n" +
+			"                                     -- location (POST a query). Mendix 10.14+.\n" +
+			"                                     -- Exposed names must then be unique beyond\n" +
+			"                                     -- case (CE2881), and query fields are\n" +
+			"                                     -- camelCased: Period -> period\n" +
+			"  Authentication: (basic, session)   -- the methods, in order: basic, session,\n" +
+			"                                     -- guest, microflow Module.Authenticate;\n" +
+			"                                     -- `none` = no authentication. Left out,\n" +
+			"                                     -- CREATE OR MODIFY / ALTER keep the stored one.\n" +
 			")\n" +
-			"authentication basic, session\n" +
+			"-- Custom authentication (no per-request password hash):\n" +
+			"--   Authentication: (microflow Module.Authenticate)\n" +
+			"-- The microflow takes a List of System.HttpHeader and returns a\n" +
+			"-- System.User; returning empty denies the request. Requires app\n" +
+			"-- security to be on (CE6600) and a microflow to be named (CE0333).\n" +
+			"-- The trailing `authentication basic, session` clause is the old spelling\n" +
+			"-- (MDL-DEPR139); `mxcli fmt --upgrade` moves it into the list.\n" +
 			"{\n" +
 			"  publish entity Module.Entity as 'EntitySet' (\n" +
-			"    ReadMode: source,\n" +
-			"    InsertMode: source | not_supported,\n" +
-			"    UpdateMode: source | not_supported,\n" +
-			"    DeleteMode: source | not_supported,\n" +
+			"    ReadMode: source | microflow Module.Read_X,\n" +
+			"    InsertMode: source | not_supported | microflow Module.Insert_X,\n" +
+			"    UpdateMode: source | not_supported | microflow Module.Update_X,\n" +
+			"    DeleteMode: source | not_supported | microflow Module.Delete_X,\n" +
 			"    UsePaging: Yes,\n" +
-			"    PageSize: 100\n" +
+			"    PageSize: 100,\n" +
+			"    Countable: No,                   -- default Yes; No drops the $Response requirement\n" +
+			"    SkipSupported: No,               -- default Yes ($skip)\n" +
+			"    TopSupported: No                 -- default Yes ($top)\n" +
 			"  )\n" +
 			"  expose (\n" +
 			"    KeyAttr as 'ExposedKey' (KEY, Filterable, Sortable),\n" +
 			"    OtherAttr (Filterable),\n" +
 			"    AssocName as 'NavProp'   -- bare association name -> PublishedAssociationEnd\n" +
 			"  );\n" +
+			"\n" +
+			"  -- An OData action (an ActionImport in $metadata). Parameter types and\n" +
+			"  -- the return type come off the microflow, which already declares them;\n" +
+			"  -- omitting the expose clause publishes every parameter by its own name.\n" +
+			"  publish microflow Module.DoThing as 'DoThing'\n" +
+			"    expose ( Note as 'note', Amount as 'amount' (CanBeEmpty) );\n" +
 			"};\n" +
 			"\n" +
-			"GRANT ACCESS ON ODATA SERVICE Module.Name TO Module.Role;",
-		Example: "create persistent entity Shop.Customer (\n" +
-			"  Email: string(200) unique error 'unique' required error 'required',\n" +
+			"GRANT ACCESS ON PUBLISHED ODATA SERVICE Module.Name TO Module.Role;\n" +
+			"\n" +
+			"-- A NON-PERSISTABLE entity can be published: back it with a read\n" +
+			"-- microflow returning a list of that entity. Nothing is stored, so\n" +
+			"-- there is no copy of the data in the database.\n" +
+			"--\n" +
+			"-- While Countable is Yes (the default) the read microflow must take a\n" +
+			"-- $Response: System.ODataResponse parameter and set its Count; with\n" +
+			"-- Countable: No it takes no parameters at all.\n" +
+			"\n" +
+			"-- HTTP STATUS CODES. An OData action, and an insert/update/delete\n" +
+			"-- microflow, may take a $HttpResponse: System.HttpResponse parameter and\n" +
+			"-- set StatusCode/Content. A READ microflow may not — it cannot answer\n" +
+			"-- 400, so its contract has to be declared correctly instead:\n" +
+			"--\n" +
+			"--   * Mendix applies NO query options to a read-microflow resource. It\n" +
+			"--     returns exactly what the microflow returns, so TopSupported and\n" +
+			"--     SkipSupported describe YOUR microflow. Leaving them unspecified\n" +
+			"--     publishes Yes. Declare No for anything you do not parse.\n" +
+			"--   * A declared KEY promises a lookup by that key. A client holding a\n" +
+			"--     row re-reads it as `?$filter=key eq '…'` on its own; answer it, or\n" +
+			"--     the client adopts the first row of your collection default as that\n" +
+			"--     object's identity, silently and with a 200.\n" +
+			"--\n" +
+			"-- Take a $Request: System.HttpRequest parameter to see the query string.\n" +
+			"-- MDL-ODATA02 and MDL-ODATA03 flag a read microflow that takes none.",
+		Example: "mdl 1;\n" +
+			"create persistent entity Shop.Customer (\n" +
+			"  Email: string(200) unique error message 'unique' required error message 'required',\n" +
 			"  Name:  string(200)\n" +
 			");\n" +
 			"\n" +
-			"create odata service Shop.CustomerAPI (\n" +
+			"create published odata service Shop.CustomerAPI (\n" +
 			"  path: 'odata/customers/',\n" +
 			"  version: '1.0.0',\n" +
 			"  ODataVersion: OData4,\n" +
-			"  namespace: 'Shop.Customers'\n" +
+			"  namespace: 'Shop.Customers',\n" +
+			"  Authentication: (basic)\n" +
 			")\n" +
-			"authentication basic\n" +
 			"{\n" +
 			"  publish entity Shop.Customer as 'Customers' (\n" +
 			"    ReadMode: source\n" +
@@ -128,8 +226,8 @@ func init() {
 			"contract", "show contract", "describe contract",
 			"metadata", "entity type", "action", "navigation property",
 		},
-		Syntax:  "SHOW CONTRACT ENTITIES FROM Module.Client;\nSHOW CONTRACT ACTIONS FROM Module.Client;\nDESCRIBE CONTRACT ENTITY Module.Client.EntityName;\nDESCRIBE CONTRACT ENTITY Module.Client.EntityName FORMAT mdl;\nDESCRIBE CONTRACT ACTION Module.Client.ActionName;",
-		Example: "SHOW CONTRACT ENTITIES FROM MyModule.SalesforceAPI;\nDESCRIBE CONTRACT ENTITY MyModule.SalesforceAPI.Product;\nDESCRIBE CONTRACT ENTITY MyModule.SalesforceAPI.Product FORMAT mdl;",
+		Syntax:  "LIST CONTRACT ENTITIES FROM Module.Client;\nLIST CONTRACT ACTIONS FROM Module.Client;\nDESCRIBE CONTRACT ENTITY Module.Client.EntityName;\nDESCRIBE CONTRACT ENTITY Module.Client.EntityName FORMAT mdl;\nDESCRIBE CONTRACT ACTION Module.Client.ActionName;",
+		Example: "LIST CONTRACT ENTITIES FROM MyModule.SalesforceAPI;\nDESCRIBE CONTRACT ENTITY MyModule.SalesforceAPI.Product;\nDESCRIBE CONTRACT ENTITY MyModule.SalesforceAPI.Product FORMAT mdl;",
 		SeeAlso: []string{"odata", "odata.consume"},
 	})
 
@@ -142,35 +240,198 @@ func init() {
 			"rest", "rest client", "rest service",
 			"published rest", "api", "http",
 		},
-		Syntax:  "SHOW REST CLIENTS [IN Module];\nSHOW PUBLISHED REST SERVICES [IN Module];\nDESCRIBE REST CLIENT Module.Name;\nDESCRIBE PUBLISHED REST SERVICE Module.Name;",
-		Example: "SHOW REST CLIENTS;\nDESCRIBE REST CLIENT MyModule.PetStoreAPI;\nSHOW PUBLISHED REST SERVICES IN MyModule;",
-		SeeAlso: []string{"rest.consumed", "rest.published", "integration"},
+		Syntax:  "LIST CONSUMED REST SERVICES [IN Module];\nLIST PUBLISHED REST SERVICES [IN Module];\nDESCRIBE CONSUMED REST SERVICE Module.Name;\nDESCRIBE PUBLISHED REST SERVICE Module.Name;",
+		Example: "LIST CONSUMED REST SERVICES;\nDESCRIBE CONSUMED REST SERVICE MyModule.PetStoreAPI;\nLIST PUBLISHED REST SERVICES IN MyModule;",
+		SeeAlso: []string{"rest.call", "rest.consumed", "rest.published", "integration"},
 	})
 
 	Register(SyntaxFeature{
-		Path:    "rest.consumed",
-		Summary: "Create consumed REST clients with operations, mappings, and authentication",
+		Path:     "rest.call",
+		Features: []string{"microflows/send_rest_request", "microflows/send_rest_request_parameters", "microflows/send_rest_request_output", "microflows/send_rest_request_body", "microflows/send_rest_query_params"},
+		Summary:  "CALL REST SERVICE activity inside a microflow, and its five RETURNS forms",
 		Keywords: []string{
-			"create rest client", "consume rest", "rest operation",
+			"rest call", "call rest service", "http get", "http post",
+			"returns response", "returns string", "returns mapping",
+			"file document", "filedocument", "download", "httpresponse",
+			"body binary", "binary", "upload", "post binary",
+			"headers", "authentication", "basic auth", "timeout", "request body", "template",
+		},
+		Syntax: "[$Var =] CALL REST SERVICE GET|POST|PUT|PATCH|DELETE ('<url>' [WITH ({1} = expr, ...)] | <expr>) [(\n" +
+			"  Headers: ('Name': expr, ...),\n" +
+			"  Authentication: BASIC (Username: expr, Password: expr),\n" +
+			"  Body: TEMPLATE '<template>' [WITH ({1} = expr)]\n" +
+			"      | MAPPING Module.EMM FROM $var\n" +
+			"      | BINARY <expr>\n" +
+			"      | <expr>,\n" +
+			"  Timeout: <seconds>,\n" +
+			")] RETURNS <one of> [ON ERROR ...];\n\n" +
+			"-- The method, URL, RETURNS and ON ERROR are words; the settings of the\n" +
+			"-- activity's dialog are one property list after the URL (ADR-0013),\n" +
+			"-- keyed as the consumed REST service names them. Every key is optional.\n" +
+			"-- The clauses `header 'N' = v`, `auth basic $u password $p`, `body ...`\n" +
+			"-- and `timeout n` are the deprecated spelling (MDL-DEPR720); `mxcli fmt\n" +
+			"-- --upgrade` rewrites them, and the two forms cannot be mixed.\n\n" +
+			"-- The URL and a custom body are templates: '...{1}...' WITH ({1} = expr)\n" +
+			"-- fills each {n}. An expression instead (`Body: $Payload`, a URL like\n" +
+			"-- `@Module.BaseUrl + '/rates'`) sends its VALUE: it is stored as the\n" +
+			"-- template '{1}' with the expression as its parameter — what Studio Pro\n" +
+			"-- stores — and describe prints that form. An expression has no {n} to\n" +
+			"-- fill, so one followed by WITH (...) is refused (MDL-REST05).\n" +
+			"-- `Body: TEMPLATE '$Payload'` is the literal text $Payload.\n" +
+			"-- In a template a `{` opens a numbered placeholder or is escaped as `{{`;\n" +
+			"-- a JSON body is '{{\"name\": \"{1}\"}' (a `}` needs no escape). '{\"a\": 1}'\n" +
+			"-- and '{}' fail the build with CE0712 — check reports MDL-TEMPLATE02.\n\n" +
+			"RETURNS String                          -- the response body as a string\n" +
+			"RETURNS response                        -- the whole System.HttpResponse object\n" +
+			"RETURNS Module.MyFile                   -- store the body in a file document\n" +
+			"RETURNS MAPPING Module.IMM AS Module.E  -- apply an import mapping (single object)\n" +
+			"RETURNS MAPPING Module.IMM AS LIST OF Module.E\n" +
+			"RETURNS NOTHING                         -- ignore the response\n\n" +
+			"-- AS LIST OF needs a mapping whose root is an array: over an object-rooted\n" +
+			"-- mapping the build reports CE0243 (mxcli check: MDL103). AS Module.E is fine\n" +
+			"-- on either root (on an array it binds one object out of the list).\n\n" +
+			"-- The file document form takes a SPECIALIZATION of System.FileDocument.\n" +
+			"-- Mendix rejects the base type as a return type (CE0362), and MDL064\n" +
+			"-- reports that before the write. There is no matching form for an\n" +
+			"-- HttpResponse specialization because Mendix does not allow one\n" +
+			"-- (CE1540) — `RETURNS response` already names the only type it can be.",
+		Example: "mdl 1;\n" +
+			"create persistent entity MyModule.MyFile extends System.FileDocument ();\n\n" +
+			"create microflow MyModule.ACT_Download ($Location: String)\n" +
+			"begin\n" +
+			"  $file = call rest service get '{1}' with ({1} = $Location) (\n" +
+			"    Headers: ('Accept': 'application/octet-stream'),\n" +
+			"    Timeout: 300,\n" +
+			"  ) returns MyModule.MyFile;\n" +
+			"end;\n\n" +
+			"create microflow MyModule.ACT_Post ($Name: String, $User: String, $Password: String) returns String\n" +
+			"begin\n" +
+			"  $Response = call rest service post 'https://api.example.com/customers' (\n" +
+			"    Headers: ('Content-Type': 'application/json'),\n" +
+			"    Authentication: basic (Username: $User, Password: $Password),\n" +
+			"    Body: template '{{\"name\": \"{1}\"}' with ({1} = $Name),\n" +
+			"    Timeout: 30,\n" +
+			"  ) returns String\n" +
+			"    on error rollback;\n" +
+			"  return $Response;\n" +
+			"end;",
+		SeeAlso: []string{"rest", "rest.consumed", "microflow"},
+	})
+
+	// ── SOAP (legacy web services) ────────────────────────────────────
+
+	Register(SyntaxFeature{
+		Path:    "soap",
+		Summary: "Legacy SOAP web service calls: operations, arguments, send/receive mappings",
+		Keywords: []string{
+			"soap", "web service", "call web service", "wsdl",
+			"imported service", "consumed web service", "operation",
+			"send mapping", "receive mapping", "request body",
+			"parameter path", "ce0178", "ce0369", "ce0386",
+		},
+		Syntax: "[$Var =] CALL WEB SERVICE Module.ImportedService\n" +
+			"  [OPERATION Name [(Param = expr, ...)]]\n" +
+			"  [SEND MAPPING Module.ExportMapping FROM $var]\n" +
+			"  [RECEIVE MAPPING Module.ImportMapping]\n" +
+			"  [TIMEOUT expr]\n" +
+			"  [ON ERROR ...];\n\n" +
+			"[$Var =] CALL WEB SERVICE RAW '<base64-bson>';\n\n" +
+			"-- The REQUEST BODY is one of two things, never both: the operation's\n" +
+			"-- arguments, or an export mapping. Mendix stores ONE\n" +
+			"-- RequestBodyHandling, so asking for each is refused as MDL-SOAP01 by\n" +
+			"-- `mxcli check` and by exec, which run the same function.\n" +
+			"--\n" +
+			"-- ARGUMENTS use the same (Name = value) form as every other call\n" +
+			"-- statement. Mendix keys each one by a ParameterPath\n" +
+			"-- (http%3A//www.example.com/:GetOrder|OrderId) built from the\n" +
+			"-- operation's request body element; mxcli reads that off the consumed\n" +
+			"-- service document, so the script names only the parameter. The\n" +
+			"-- service must therefore be present and declare the operation — one it\n" +
+			"-- cannot resolve is refused, not written with a guessed path. Omitting\n" +
+			"-- arguments an operation requires is CE0178.\n" +
+			"--\n" +
+			"-- A misspelled PARAMETER NAME cannot be checked: the names live in the\n" +
+			"-- WSDL's inline schema, which mxcli does not parse. It arrives as\n" +
+			"-- CE0178 from mxbuild.\n" +
+			"--\n" +
+			"-- SEND MAPPING needs FROM $var — an export mapping maps an object and\n" +
+			"-- Mendix stores which one. Without it the call builds as CE0369.\n" +
+			"--\n" +
+			"-- DESCRIBE renders the structured form only when re-executing it would\n" +
+			"-- reproduce the stored document exactly. A call with HTTP\n" +
+			"-- authentication, a custom location, SOAP headers, a per-parameter\n" +
+			"-- export mapping, or a result typed from the WSDL rather than from an\n" +
+			"-- import mapping keeps the RAW form, which round-trips byte for byte.",
+		Example: "-- Arguments\n" +
+			"$Order = call web service Clients.OrderSoapClient\n" +
+			"  operation GetOrder (OrderId = $Customer/OrderId)\n" +
+			"  receive mapping Clients.SoapOrdersImportMapping;\n\n" +
+			"-- Export mapping as the request body\n" +
+			"call web service Clients.OrderSoapClient\n" +
+			"  operation SaveOrder\n" +
+			"  send mapping Clients.SoapOrderExportMapping from $NewSaveOrder;",
+		SeeAlso: []string{"integration", "microflow", "rest"},
+	})
+
+	Register(SyntaxFeature{
+		Path:     "rest.consumed",
+		Features: []string{"integration/rest_client_basic", "integration/rest_client_authentication", "integration/rest_client_headers", "integration/rest_client_operations", "integration/rest_client_query_params", "integration/rest_client_openapi"},
+		Summary:  "Create consumed REST clients with operations, mappings, and authentication",
+		Keywords: []string{
+			"create consumed rest service", "create rest client", "rest client", "consume rest", "rest operation",
+			"alter consumed rest service", "add operation", "modify operation", "drop operation",
 			"get", "post", "put", "delete", "patch",
 			"body", "response", "mapping", "authentication",
 			"json structure", "import mapping", "export mapping",
 		},
-		Syntax:  "CREATE [OR MODIFY] REST CLIENT Module.Name (\n  BaseUrl: 'https://...',\n  Authentication: NONE | BASIC (...)\n)\n{\n  OPERATION Name {\n    Method: GET|POST|PUT|DELETE|PATCH,\n    Path: '/path/{param}',\n    Parameters: ($param: Type),\n    Headers: ('Key' = 'Value'),\n    Body: JSON FROM $var | MAPPING Entity { ... },\n    Response: JSON AS $var | MAPPING Entity { ... }\n  }\n};",
-		Example: "CREATE REST CLIENT Module.PetStore (\n  BaseUrl: 'https://petstore.example.com/api',\n  Authentication: NONE\n)\n{\n  OPERATION GetPet {\n    Method: GET,\n    Path: '/pets/{id}',\n    Parameters: ($id: String),\n    Response: JSON AS $Result\n  }\n};",
+		Syntax:  "CREATE [OR MODIFY] CONSUMED REST SERVICE Module.Name (\n  BaseUrl: 'https://...',\n  Authentication: NONE | BASIC (...)\n)\n{\n  OPERATION Name (\n    Method: GET|POST|PUT|DELETE|PATCH,\n    Path: '/path/{param}',\n    Parameters: ($param: Type),\n    Query: ($param: Type),\n    Headers: ('Key': 'Value'),\n    Timeout: 30,\n    Body: JSON FROM $var | MAPPING Entity { jsonField = Attribute, ... },\n    Response: NONE | JSON [AS $var] | STRING | FILE | STATUS | MAPPING Entity { Attribute = jsonField, ... }\n  )\n};\n\n-- Change an existing service without restating it. An operation no action names\n-- is left exactly as stored (also one made in Studio Pro); MODIFY writes only the\n-- keys it lists. CREATE OR MODIFY instead replaces the whole operation list.\nALTER CONSUMED REST SERVICE Module.Name\n  ADD OPERATION Name ( ... ),\n  MODIFY OPERATION Name ( Timeout: 60 ),\n  DROP OPERATION Name,\n  SET ( BaseUrl: '...', Authentication: NONE | BASIC (...) );\n\n-- The response variable is not stored (the call site binds it), so describe\n-- prints `Response: JSON`; `AS $var` is optional.\n-- An operation is a child of the service, so its properties are in ( ).\n-- `OPERATION Name { ... }` is the deprecated spelling (MDL-DEPR070).\n\n-- MAPPING takes a target ENTITY plus a body listing the JSON fields; Mendix\n-- stores it inline on the operation. An existing import/export mapping\n-- document cannot be referenced here (rejected as MDL-REST01).\n-- There is no FILE request body: Mendix's consumed operation stores one of\n-- Rest$JsonBody, Rest$StringBody or Rest$ImplicitMappingBody, so a file\n-- document has nowhere to go. `Body: FILE FROM $Doc` is rejected as\n-- MDL-REST02 rather than sent as the literal text \"$Doc\" (it used to be,\n-- returning 200 with a 4-byte payload). Binary POST lives on the\n-- microflow activity: `call rest service post '<url>' (Body: binary $Doc/Contents)`.\n-- `Response: FILE AS $Doc` is unaffected — downloads work.",
+		Example: "CREATE CONSUMED REST SERVICE Module.PetStore (\n  BaseUrl: 'https://petstore.example.com/api',\n  Authentication: NONE\n)\n{\n  OPERATION GetPet (\n    Method: GET,\n    Path: '/pets/{id}',\n    Parameters: ($id: String),\n    Query: ($verbose: String),\n    Response: MAPPING Module.Pet {\n      Name = name,\n      Status = status\n    }\n  )\n};",
 		SeeAlso: []string{"rest", "rest.published"},
 	})
 
 	Register(SyntaxFeature{
-		Path:    "rest.published",
-		Summary: "Create and manage published REST services with resources and operations",
+		Path:     "rest.published",
+		Features: []string{"integration/published_rest_service", "integration/published_rest_alter", "integration/published_rest_grant_revoke"},
+		Summary:  "Create and manage published REST services with resources and operations",
 		Keywords: []string{
 			"create published rest", "publish rest", "rest resource",
 			"rest operation", "microflow", "path parameter",
-			"grant access", "revoke access",
+			"query parameter", "body parameter", "import mapping", "export mapping", "commit",
+			"grant access", "revoke access", "authentication", "custom authentication",
+			"basic authentication", "active session", "authentication microflow",
+			"authentication parameter", "header parameter", "api key", "token",
 		},
-		Syntax:  "CREATE [OR MODIFY] PUBLISHED REST SERVICE Module.Name (\n  Path: 'rest/api/v1',\n  Version: '1.0.0',\n  ServiceName: 'My API'\n)\n{\n  RESOURCE 'name' {\n    GET '' MICROFLOW Module.GetAll;\n    GET '{id}' MICROFLOW Module.GetById;\n    POST '' MICROFLOW Module.Create;\n  }\n};\n\nALTER PUBLISHED REST SERVICE Module.Name SET Version = '2.0.0';\nALTER PUBLISHED REST SERVICE Module.Name ADD RESOURCE 'items' { ... };\nALTER PUBLISHED REST SERVICE Module.Name DROP RESOURCE 'legacy';\nDROP PUBLISHED REST SERVICE Module.Name;",
-		Example: "CREATE PUBLISHED REST SERVICE Module.OrderAPI (\n  Path: 'rest/orders/v1',\n  Version: '1.0.0',\n  ServiceName: 'Order API'\n)\n{\n  RESOURCE 'orders' {\n    GET '' MICROFLOW Module.GetAllOrders;\n    GET '{id}' MICROFLOW Module.GetOrderById;\n    POST '' MICROFLOW Module.CreateOrder;\n    DELETE '{id}' MICROFLOW Module.DeleteOrder;\n  }\n};\n\nGRANT ACCESS ON PUBLISHED REST SERVICE Module.OrderAPI\n  TO Module.User, Module.Admin;",
+		Syntax: "[/** documentation */]\nCREATE [OR MODIFY] PUBLISHED REST SERVICE Module.Name (\n  Path: 'rest/api/v1',\n  Version: '1.0.0',\n  ServiceName: 'My API',\n  [Authentication: none | ( basic, session, microflow Module.Authenticate [( $Param: query|header ['HttpName'] [description '...'], ... )] )]\n)\n{\n  RESOURCE 'name' {\n    GET '' MICROFLOW Module.GetAll;\n    GET '{id}' MICROFLOW Module.GetById;\n    POST '' MICROFLOW Module.Create\n      [IMPORT MAPPING Module.IMM] [EXPORT MAPPING Module.EMM]\n      [COMMIT Yes | YesWithoutEvents | No];   -- no COMMIT clause: Yes\n  }\n};\n\n" +
+			"-- Operation parameters come from the microflow, as Studio Pro derives them:\n" +
+			"--   a parameter named in the path ('{id}')  -> path parameter\n" +
+			"--   an object or a list                     -> the body\n" +
+			"--   System.HttpRequest / HttpResponse       -> none (the request and response)\n" +
+			"--   anything else                           -> query parameter\n" +
+			"-- each with the microflow parameter's type. Create the microflow first.\n" +
+			"-- A header parameter, a renamed one or a description set in Studio Pro has\n" +
+			"-- no MDL spelling: describe notes it, CREATE OR MODIFY / ALTER keep it.\n\n" +
+			"-- Authentication: the methods in the order given (Studio Pro keeps that\n" +
+			"-- order): basic = username and password, session = active session,\n" +
+			"-- microflow = custom. `none` is \"Requires authentication: No\". Left out,\n" +
+			"-- CREATE OR MODIFY and ALTER keep the stored setting; a new service has none.\n" +
+			"-- The microflow returns System.User (empty: not authenticated). An object\n" +
+			"-- parameter can only be a System.HttpRequest or System.HttpResponse; any\n" +
+			"-- other parameter is an authentication parameter: a query or header value\n" +
+			"-- of the request, bound in the list after the microflow:\n" +
+			"--   microflow M.Auth ($Token: header 'X-Api-Token', $Tenant: query,\n" +
+			"--                     $Lang: query 'lang' description 'UI language')\n" +
+			"-- The type is the microflow parameter's. An unlisted parameter is a query\n" +
+			"-- parameter under its own name, so the list is optional (Mendix CE0336\n" +
+			"-- without one). MDL-REST04 refuses an unknown $Param, the request or the\n" +
+			"-- response, another kind, a parameter listed twice. describe prints the\n" +
+			"-- list only when it differs from that default.\n" +
+			"-- With authentication on, grant at least one module role (CE0338);\n" +
+			"-- custom authentication also needs app security on (CE6600).\n\n" +
+			"-- Documentation: the /** ... */ doc comment above CREATE, the service's own\n" +
+			"-- documentation (not the OpenAPI description, which MDL keeps unchanged).\n" +
+			"-- On OR MODIFY no comment keeps the stored text, /** */ clears it.\n\n" +
+			"ALTER PUBLISHED REST SERVICE Module.Name SET ( Version: '2.0.0', Authentication: (session) );\nALTER PUBLISHED REST SERVICE Module.Name SET Version = '2.0.0';\nALTER PUBLISHED REST SERVICE Module.Name ADD RESOURCE 'items' { ... };\nALTER PUBLISHED REST SERVICE Module.Name DROP RESOURCE 'legacy';\nDROP PUBLISHED REST SERVICE Module.Name;",
+		Example: "mdl 1;\nCREATE PUBLISHED REST SERVICE Module.OrderAPI (\n  Path: 'rest/orders/v1',\n  Version: '1.0.0',\n  ServiceName: 'Order API',\n  Authentication: (basic, session)\n)\n{\n  RESOURCE 'orders' {\n    GET '' MICROFLOW Module.GetAllOrders;\n    GET '{id}' MICROFLOW Module.GetOrderById;\n    POST '' MICROFLOW Module.CreateOrder;\n    DELETE '{id}' MICROFLOW Module.DeleteOrder;\n  }\n};\n\nGRANT ACCESS ON PUBLISHED REST SERVICE Module.OrderAPI\n  TO Module.User, Module.Admin;",
 		SeeAlso: []string{"rest", "rest.consumed"},
 	})
 
@@ -240,8 +501,9 @@ func init() {
 	// ── OQL ───────────────────────────────────────────────────────────
 
 	Register(SyntaxFeature{
-		Path:    "oql",
-		Summary: "OQL query execution against a running Mendix runtime",
+		Path:     "oql",
+		Features: []string{"oql_functions/basic_select", "oql_functions/aggregate_functions", "oql_functions/join_types", "oql_functions/subqueries", "oql_functions/comments", "oql_functions/string_agg"},
+		Summary:  "OQL query execution against a running Mendix runtime",
 		Keywords: []string{
 			"oql", "query", "runtime", "m2ee",
 			"aggregate", "view entity", "mxcli oql",
@@ -251,30 +513,155 @@ func init() {
 		SeeAlso: []string{"sql"},
 	})
 
+	// ── External database connector ───────────────────────────────────
+
+	Register(SyntaxFeature{
+		Path:     "database-connection",
+		Features: []string{"integration/database_connector_basic", "integration/database_connector_queries", "microflows/execute_database_query", "microflows/execute_database_query_runtime_connection", "integration/database_connector_execute"},
+		Summary:  "External Database Connector — query another database from a microflow",
+		Keywords: []string{
+			"database connection", "database connections", "external database",
+			"create database connection", "drop database connection",
+			"describe database connection", "list database connections",
+			"jdbc", "byod", "database connector", "execute database query",
+			"postgresql", "mysql", "oracle", "snowflake", "sql server",
+		},
+		Syntax: `CREATE [OR MODIFY] DATABASE CONNECTION Module.Name [FOLDER 'path'] (
+  Type: '<type>',
+  ConnectionString: @Module.UrlConstant,
+  Username: @Module.UserConstant,
+  Password: @Module.PasswordConstant
+  [, Host: '<host>', Port: <n>, DatabaseName: '<db>']
+) [{
+  QUERY <QueryName> (
+    Sql: $$<sql>$$
+    [, Parameters: ( <name>: <Type> [DEFAULT '<value>' | NULL], ... )]
+    [, Returns: Module.Entity]
+    [, Map: ( <Attribute> = <column>, ... )]
+  )
+  ...
+}];
+
+The properties are in ( ) and the queries are children in { } (R2). The old
+clause form -- TYPE '…' CONNECTION STRING @… BEGIN QUERY … SQL … RETURNS …
+MAP (column AS Attribute); END -- still parses and warns (MDL-DEPR127);
+mxcli fmt --upgrade rewrites it.
+
+LIST DATABASE CONNECTIONS [IN <module>];
+DESCRIBE DATABASE CONNECTION Module.Name;
+DROP DATABASE CONNECTION [IF EXISTS] Module.Name;
+
+Calling a query from a microflow:
+  EXECUTE DATABASE QUERY Module.Connection.QueryName (...);
+
+Type is one of Studio Pro's entries — 'MSSQL', 'MySQL', 'Oracle',
+'PostgreSQL', 'Snowflake' — or 'BYOD' ("bring your own driver"), which skips
+the driver-presence check and takes the connection string verbatim. Use BYOD
+for any JDBC driver Mendix has no entry for; put the driver on the classpath
+with ALTER MODULE ... ADD JAR DEPENDENCY + mxcli sync-java-deps. An
+unrecognised type is reported by MDL-DB01 — mxbuild does not check it, so the
+build stays green and the connection simply does not work.
+
+Three traps:
+
+  1. ConnectionString / Username / Password must reference CONSTANTS
+     (@Module.Name), not literals. A literal produces a project Studio Pro
+     cannot open at all: StorageLoadException "is not a valid
+     ConstantIdentifier". mxcli catches it (MDL058); mxbuild does not, so the
+     build is green.
+  2. Username and Password must be given even when the driver needs neither.
+     Omitting them writes an empty constant reference, the build stays green,
+     and the query fails only at run time with "Could not find value for
+     constant ''".
+  3. A named type needs its JDBC driver declared on the module, or the build
+     fails with CE5278 ("The PostgreSQL JDBC driver (org.postgresql:postgresql)
+     is missing from the module settings"). Unlike the first two, this one is
+     caught at build time:
+
+       ALTER MODULE Ops ADD JAR DEPENDENCY (
+         group = 'org.postgresql', artifact = 'postgresql',
+         version = '42.7.4', included = true
+       );
+
+     then run: mxcli sync-java-deps -p app.mpr — to put it on the classpath —
+     declaring without syncing gives a green build and a
+     ClassNotFoundException. BYOD skips this check, which is the point of it.
+
+The connector runtime is part of the platform — no marketplace module is
+needed in the project.`,
+		Example: `mdl 1;
+-- The three constants the connection points at.
+CREATE CONSTANT Ops.DbUrl  ( Type: String, DefaultValue: 'jdbc:postgresql://localhost:5432/erp' );
+CREATE CONSTANT Ops.DbUser ( Type: String, DefaultValue: 'reader' );
+CREATE CONSTANT Ops.DbPass ( Type: String, DefaultValue: '' );
+
+CREATE NON-PERSISTENT ENTITY Ops.EmployeeRow (
+  EmployeeId: Integer,
+  Name: String(100)
+);
+
+CREATE DATABASE CONNECTION Ops.Erp (
+  Type: 'PostgreSQL',
+  ConnectionString: @Ops.DbUrl,
+  Username: @Ops.DbUser,
+  Password: @Ops.DbPass
+) {
+  QUERY GetEmployees (
+    Sql: $$SELECT id, name FROM employees WHERE dept = {dept}$$,
+    Parameters: ( dept: String DEFAULT 'sales' ),
+    Returns: Ops.EmployeeRow,
+    Map: (
+      EmployeeId = id,
+      Name = name
+    )
+  )
+};
+
+-- A named type needs its driver declared, or the build fails with CE5278.
+ALTER MODULE Ops ADD JAR DEPENDENCY (
+  group = 'org.postgresql', artifact = 'postgresql',
+  version = '42.7.4', included = true
+);
+
+LIST DATABASE CONNECTIONS IN Ops;
+DESCRIBE DATABASE CONNECTION Ops.Erp;`,
+		SeeAlso: []string{"integration", "sql", "microflow.call"},
+	})
+
 	// ── Business Events ───────────────────────────────────────────────
 
 	Register(SyntaxFeature{
-		Path:    "business-events",
-		Summary: "Business event services — publish and subscribe to events via Kafka",
+		Path:     "business-events",
+		Features: []string{"integration/business_events"},
+		Summary:  "Business event services — publish and subscribe to events via Kafka",
 		Keywords: []string{
 			"business event", "business events", "kafka",
 			"publish", "subscribe", "message", "event channel",
 		},
-		Syntax:  "SHOW BUSINESS EVENT SERVICES [IN Module];\nSHOW BUSINESS EVENTS [IN Module];\nDESCRIBE BUSINESS EVENT SERVICE Module.Name;\nCREATE [OR MODIFY] BUSINESS EVENT SERVICE Module.Name (...) { ... };\nDROP BUSINESS EVENT SERVICE Module.Name;",
-		Example: "SHOW BUSINESS EVENT SERVICES;\nDESCRIBE BUSINESS EVENT SERVICE Module.CustomerEventsApi;",
+		Syntax:  "LIST BUSINESS EVENT SERVICES [IN Module];\nLIST BUSINESS EVENTS [IN Module];\nDESCRIBE BUSINESS EVENT SERVICE Module.Name;\nCREATE [OR MODIFY] BUSINESS EVENT SERVICE Module.Name (...) { ... };\nDROP BUSINESS EVENT SERVICE Module.Name;",
+		Example: "LIST BUSINESS EVENT SERVICES;\nDESCRIBE BUSINESS EVENT SERVICE Module.CustomerEventsApi;",
 		SeeAlso: []string{"business-events.create", "integration"},
 	})
 
 	Register(SyntaxFeature{
 		Path:    "business-events.create",
-		Summary: "Create and drop business event service definitions with messages",
+		Summary: "Create and drop business event services — published (messages) and consumed (a contract plus subscriptions)",
 		Keywords: []string{
 			"create business event", "drop business event",
 			"message", "publish", "subscribe", "entity",
 			"event name prefix",
+			"consume", "contract", "contractfile", "asyncapi", "consumed",
 		},
-		Syntax:  "CREATE [OR MODIFY] BUSINESS EVENT SERVICE Module.Name\n(\n  ServiceName: 'Name',\n  EventNamePrefix: ''\n)\n{\n  MESSAGE EventName (Attr: Type, ...) PUBLISH|SUBSCRIBE\n    ENTITY Module.PBE_Entity;\n};\n\nDROP BUSINESS EVENT SERVICE Module.Name;",
-		Example: "CREATE BUSINESS EVENT SERVICE Module.CustomerEventsApi\n(\n  ServiceName: 'CustomerEventsApi',\n  EventNamePrefix: ''\n)\n{\n  MESSAGE CustomerChangedEvent (CustomerId: Long) PUBLISH\n    ENTITY Module.PBE_CustomerChangedEvent;\n};\n\nDROP BUSINESS EVENT SERVICE Module.CustomerEventsApi;",
+		Syntax: "-- PUBLISHED: declares its own messages.\n" +
+			"CREATE [OR MODIFY] BUSINESS EVENT SERVICE Module.Name\n(\n  ServiceName: 'Name',\n  EventNamePrefix: ''\n)\n{\n  MESSAGE EventName (Attr: Type, ...) PUBLISH|SUBSCRIBE\n    ENTITY Module.PBE_Entity [MICROFLOW Module.Handler];\n};\n\n" +
+			"-- CONSUMED: names the producer's AsyncAPI contract and binds events from it.\n" +
+			"-- Exactly one of Contract / ContractFile; neither may be mixed with\n" +
+			"-- ServiceName, EventNamePrefix or MESSAGE.\n" +
+			"CREATE [OR MODIFY] BUSINESS EVENT SERVICE Module.Name\n(\n  Contract: $$<asyncapi yaml>$$ | ContractFile: 'path/to/contract.yaml'\n)\n{\n  CONSUME EventName\n    ENTITY Module.CBE_Entity\n    MICROFLOW Module.HandleBE_Event;\n};\n\n" +
+			"DROP BUSINESS EVENT SERVICE Module.Name;",
+		Example: "mdl 1;\nCREATE BUSINESS EVENT SERVICE Module.CustomerEventsApi\n(\n  ServiceName: 'CustomerEventsApi',\n  EventNamePrefix: ''\n)\n{\n  MESSAGE CustomerChangedEvent (CustomerId: Long) PUBLISH\n    ENTITY Module.PBE_CustomerChangedEvent;\n};\n\n" +
+			"-- The consuming app, from the contract the producer exported:\n" +
+			"CREATE BUSINESS EVENT SERVICE Module.CustomerEventsClient\n(\n  ContractFile: 'contracts/CustomerEventsApi.yaml'\n)\n{\n  CONSUME CustomerChangedEvent\n    ENTITY Module.CBE_CustomerChangedEvent\n    MICROFLOW Module.HandleBE_CustomerChangedEvent;\n};\n\nDROP BUSINESS EVENT SERVICE Module.CustomerEventsApi;",
 		SeeAlso: []string{"business-events"},
 	})
 
@@ -286,9 +673,11 @@ func init() {
 		Keywords: []string{
 			"xpath", "constraint", "where", "predicate",
 			"filter", "retrieve", "association path", "enumeration",
+			"formatting", "readable", "line length", "wrap", "multi-line",
+			"constant", "@",
 		},
-		Syntax:  "WHERE [condition]\nWHERE [cond1][cond2]          -- implicit AND\nWHERE [cond1] AND [cond2]\nWHERE [cond1] OR [cond2]",
-		Example: "RETRIEVE $Orders FROM Module.Order\n  WHERE [State = 'Completed'][IsPaid = true]\n  SORT BY OrderDate DESC;\n\n-- Enumeration attribute: qualified name preferred (mxcli converts to 'Open' in BSON)\nRETRIEVE $Open FROM Module.Order\n  WHERE [Status = Module.OrderStatus.Open];\n\n-- OR: string literal form also accepted\nRETRIEVE $Open FROM Module.Order\n  WHERE [Status = 'Open'];\n\n-- Association path traversal\nWHERE [Module.Order_Customer/Module.Customer/Name = $Name]\n\n-- Mendix tokens\nWHERE [System.owner = '[%CurrentUser%]']",
+		Syntax:  "WHERE [condition]\nWHERE [cond1][cond2]          -- implicit AND\nWHERE [cond1] AND [cond2]\nWHERE [cond1] OR [cond2]\n\nA constraint cannot reference a constant: [Total > @Module.C_Limit] is\nrefused (MDL-XPATH03) — mxbuild rejects it with CE0161 in a retrieve, a data\nsource, an access rule and a user task's targeting. Assign the constant to a\nvariable and compare with the variable.\n\nHow it is STORED is mxcli's choice, not your whitespace: a constraint is\nrebuilt from its parse tree on every write, so the layout is derived from the\nexpression. 80 columns or fewer is stored exactly as written. Longer is broken\nat its top-level and/or joints, one clause per line, so it can be read in\nStudio Pro's XPath editor without scrolling sideways:\n\n  [\n    Archived = false\n    and Status = 'Open'\n    and ReportedOn > '[%BeginOfCurrentDay%]'\n  ]\n\nWhere and/or meet, the and-runs get explicit parentheses (Mendix binds `and`\ntighter). A clause with no boolean joint — one long comparison or association\npath — is left whole and over width. DESCRIBE puts it back on one line, and\nre-executing that re-derives the same stored text.",
+		Example: "RETRIEVE $Orders FROM Module.Order\n  WHERE [State = 'Completed'][IsPaid = true]\n  SORT BY OrderDate DESC;\n\n-- Enumeration attribute: qualified name preferred (mxcli converts to 'Open' in BSON)\nRETRIEVE $Open FROM Module.Order\n  WHERE [Status = Module.OrderStatus.Open];\n\n-- OR: string literal form also accepted\nRETRIEVE $Open FROM Module.Order\n  WHERE [Status = 'Open'];\n\n-- Association path traversal\nWHERE [Module.Order_Customer/Module.Customer/Name = $Name]\n\n-- Mendix tokens\nWHERE [System.owner = '[%CurrentUser%]']\n\n-- A constant, through a variable\nDECLARE $Limit Integer = @Module.C_Limit;\nRETRIEVE $Big FROM Module.Order\n  WHERE [Total > $Limit];",
 		SeeAlso: []string{"xpath.functions"},
 	})
 
@@ -314,8 +703,8 @@ func init() {
 			"java action", "java", "call java",
 			"type parameter", "exposed as", "javaaction",
 		},
-		Syntax:  "SHOW JAVA ACTIONS [IN Module];\nDESCRIBE JAVA ACTION Module.Name;\nCREATE [OR MODIFY] JAVA ACTION Module.Name(...) RETURNS Type AS $$ ... $$;\nDROP JAVA ACTION Module.Name;\n\nNOTE: AS $$ ... $$ is mandatory — omitting the body causes a parse error.",
-		Example: "SHOW JAVA ACTIONS;\nDESCRIBE JAVA ACTION Utils.FormatCurrency;",
+		Syntax:  "LIST JAVA ACTIONS [IN Module];\nDESCRIBE JAVA ACTION Module.Name;\nCREATE [OR MODIFY] JAVA ACTION Module.Name [FOLDER 'path'](...) RETURNS Type AS $$ ... $$;\nDROP JAVA ACTION Module.Name;\n\nNOTE: AS $$ ... $$ is mandatory — omitting the body causes a parse error.",
+		Example: "LIST JAVA ACTIONS;\nDESCRIBE JAVA ACTION Utils.FormatCurrency;",
 		SeeAlso: []string{"java-action.create"},
 	})
 
@@ -325,13 +714,90 @@ func init() {
 		Keywords: []string{
 			"create java action", "or modify java action", "type parameter", "entity parameter",
 			"exposed as", "returns", "generics", "drop java action",
+			"extra code", "helper method", "import",
 		},
-		Syntax:  "CREATE [OR MODIFY] JAVA ACTION Module.Name(\n  Param: Type [NOT NULL],\n  EntityType: ENTITY <pEntity> NOT NULL,\n  Obj: pEntity\n) RETURNS ReturnType\n[EXPOSED AS 'Label' IN 'Category']\nAS $$\n// Java code — AS $$ ... $$ is mandatory, cannot be omitted\n$$;\n\nOR MODIFY: updates signature/body in-place, preserves UUID.",
-		Example: "CREATE JAVA ACTION Utils.FormatCurrency(\n  Amount: Decimal NOT NULL\n) RETURNS String\nEXPOSED AS 'Format Currency' IN 'Formatting'\nAS $$\nreturn String.format(\"%.2f\", Amount);\n$$;\n\n-- Generic entity validator with type parameter\nCREATE JAVA ACTION Utils.IsValid(\n  EntityType: ENTITY <pEntity> NOT NULL,\n  Obj: pEntity NOT NULL\n) RETURNS Boolean\nAS $$\nreturn Obj != null;\n$$;\n\n-- Idempotent update (preserves UUID)\nCREATE OR MODIFY JAVA ACTION Utils.FormatCurrency(\n  Amount: Decimal NOT NULL,\n  Decimals: Integer NOT NULL\n) RETURNS String\nAS $$\nreturn String.format(\"%.\" + Decimals + \"f\", Amount);\n$$;",
+		Syntax:  "CREATE [OR MODIFY] JAVA ACTION Module.Name[<T, ...>] [FOLDER 'path'](\n  [/** description */] Param: Type [NOT NULL],\n  EntityType: ENTITY <pEntity> NOT NULL,\n  Obj: pEntity\n) RETURNS ReturnType [AS $ReturnName]\n[EXPOSED AS 'Label' IN 'Category'\n   [ICON 'icon.png'] [ICON DARK 'icon-dark.png']\n   [IMAGE 'image.png'] [IMAGE DARK 'image-dark.png']]\n[NOT EXPOSED]\nAS $$\n// Java code — AS $$ ... $$ is mandatory, cannot be omitted\n$$\n[EXTRA CODE $$\n// helper methods, constants, nested classes beside executeAction()\n$$];\n\nOR MODIFY: updates signature/body in-place, preserves UUID.\n\nEXPOSED AS puts the action in Studio Pro's toolbox. The icon is a 64x64 PNG\nand the image a 256x192 PNG, read from disk relative to the .mdl file's own directory.\nAn OMITTED clause preserves what is stored — including bitmaps set in Studio\nPro — so removing an entry is NOT EXPOSED, and clearing one bitmap is\nDROP ICON / DROP IMAGE [DARK].\n\nA parameter's description is a /** ... */ doc comment before it, as on an\nentity attribute; AS $ReturnName names the return value (the default name of\nthe variable a microflow call stores it in), as on a microflow. Leaving either\nout keeps what is stored; a new action gets no description and ReturnValueName.\n\nThe .java file is written as mxbuild writes it, so a build leaves it unchanged:\nthe action's own /** ... */ (before CREATE) is the class javadoc, and a rewrite\nwithout one keeps the stored documentation.\n\nThe file has two more sections a regeneration keeps, and the statement states\nboth: an import line in the body goes to the import list, and EXTRA CODE $$ ... $$\nis the EXTRA CODE section (helpers the body calls). An OMITTED EXTRA CODE keeps\nthe stored section; EXTRA CODE $$ $$ clears it. DESCRIBE prints the imports a\ndeveloper added and the section, so its output rebuilds the same file\n(ako/mxcli#1702). Code that uses Core (Core.getConfiguration(), Core.getLogger(...))\ngets import com.mendix.core.Core; added when the list has no Core of its own;\nother classes need their import line (ako/mxcli#2310).\n\nA $$ … $$ literal ends at the first $$ it contains, so a body or EXTRA CODE\nholding $$ is written as a string literal instead (AS '…', apostrophes doubled);\nDESCRIBE does this itself (ako/mxcli#1003).\n\nType parameters: an ENTITY <T> parameter declares T. A type parameter no\nENTITY <T> parameter names is declared in the header, Module.Name<T>; an\nunqualified type that is neither is refused (MDL-JA01), since it would be\nwritten as an entity with no module (CE1613).\n\nA bare Module.Name type is an entity or an enumeration, whichever the project\n(or an earlier statement of the script) has; ENUM Module.Name says enumeration\nexplicitly. A name that is neither is refused by check --references and exec,\nsince it would be written as an entity that does not exist (CE1613).\n\nRETURNS takes Boolean, Integer, Long, Decimal, String, DateTime, an enumeration,\nan entity, a list, a type parameter or Void; leaving it out returns Boolean.\nAny other type is refused (MDL-JA03) — StringTemplate(...) is a parameter\ntype only.",
+		Example: "mdl 1;\nCREATE JAVA ACTION Utils.FormatCurrency(\n  /** The amount to format. */\n  Amount: Decimal NOT NULL\n) RETURNS String AS $FormattedAmount\nEXPOSED AS 'Format Currency' IN 'Formatting'\n  ICON 'assets/currency-64.png'\n  IMAGE 'assets/currency-256.png'\nAS $$\nreturn String.format(\"%.2f\", Amount);\n$$;\n\n-- Generic entity validator with type parameter\nCREATE JAVA ACTION Utils.IsValid(\n  EntityType: ENTITY <pEntity> NOT NULL,\n  Obj: pEntity NOT NULL\n) RETURNS Boolean\nAS $$\nreturn Obj != null;\n$$;\n\n-- Type parameter with no entity selector: the argument's entity binds it\nCREATE JAVA ACTION Utils.Describe<T>(\n  Obj: T NOT NULL\n) RETURNS String\nAS $$\nreturn Obj.toString();\n$$;\n\n-- A helper in the EXTRA CODE section, and the import it needs\nCREATE JAVA ACTION Utils.Twice(N: Integer NOT NULL) RETURNS Integer\nAS $$\nimport java.util.Objects;\nreturn twice(Objects.requireNonNull(N));\n$$\nEXTRA CODE $$\nprivate static long twice(long n) {\n\treturn n * 2L;\n}\n$$;\n\n-- Idempotent update (preserves UUID)\nCREATE OR MODIFY JAVA ACTION Utils.FormatCurrency(\n  Amount: Decimal NOT NULL,\n  Decimals: Integer NOT NULL\n) RETURNS String\nAS $$\nreturn String.format(\"%.\" + Decimals + \"f\", Amount);\n$$;",
+		SeeAlso: []string{"java-action", "javascript-action"},
+	})
+
+	Register(SyntaxFeature{
+		Path:    "javascript-action",
+		Summary: "JavaScript actions — client-side JS callable from nanoflows",
+		Keywords: []string{
+			"javascript action", "javascript", "js action", "call javascript",
+			"platform", "exposed as", "javascriptaction",
+		},
+		Syntax:  "LIST JAVASCRIPT ACTIONS [IN Module];\nDESCRIBE JAVASCRIPT ACTION Module.Name;\nCREATE [OR MODIFY] JAVASCRIPT ACTION Module.Name [FOLDER 'path'](...) RETURNS Type [AS $ReturnName] [PLATFORM Web|Native|Hybrid|All] AS $$ ... $$;\nDROP JAVASCRIPT ACTION Module.Name;\n\nParameters, their /** ... */ descriptions and AS $ReturnName are written as for a Java action (see java-action.create).\n\nWrites the unit plus javascriptsource/<Module>/actions/<Name>.js. AS $$ ... $$ is mandatory. PLATFORM defaults to Web. The body sees each parameter with its first character lower-cased (ReadOnly is readOnly, URL is uRL), as mxbuild generates the signature.",
+		Example: "mdl 1;\nCREATE JAVASCRIPT ACTION Utils.IsStrictMode() RETURNS Boolean\nPLATFORM Web\nAS $$\nreturn Promise.resolve((function(){ return !this; })());\n$$;\n\n-- Exposed, native, with parameters\nCREATE JAVASCRIPT ACTION Utils.ShowToast(\n  Message: String NOT NULL,\n  Duration: Integer\n) RETURNS Boolean\nEXPOSED AS 'Show Toast' IN 'UI'\nPLATFORM Native\nAS $$\nreturn Promise.resolve(true);\n$$;",
 		SeeAlso: []string{"java-action"},
 	})
 
 	// ── JSON Structures ───────────────────────────────────────────────
+
+	Register(SyntaxFeature{
+		Path:     "message-definition",
+		Features: []string{"integration/message_definition_collection", "integration/message_definition_document"},
+		Summary:  "Message definitions — a mapping source built from the domain model",
+		Keywords: []string{
+			"message definition", "message definition collection", "create message definition",
+			"exposed entity", "exposed attribute", "exposed association",
+		},
+		Syntax: "-- Mendix 11.15+: each message definition is its own document.\n" +
+			"LIST MESSAGE DEFINITIONS [IN Module];\n" +
+			"DESCRIBE MESSAGE DEFINITION Module.Name;\n" +
+			"CREATE [OR MODIFY] MESSAGE DEFINITION Module.Name [FOLDER 'path']\n" +
+			"  FOR Module.Entity [AS 'Exposed'] {\n" +
+			"    AttributeName [AS 'Exposed'] [EXAMPLE 'text'],\n" +
+			"    Module.Assoc/Module.TargetEntity [AS 'Exposed'] { ... }\n" +
+			"  };\n" +
+			"DROP MESSAGE DEFINITION [IF EXISTS] Module.Name;\n\n" +
+			"ALTER MESSAGE DEFINITION Module.Name\n" +
+			"  ADD MEMBER [IF NOT EXISTS] <member> [IN path]\n" +
+			"  | DROP MEMBER [IF EXISTS] Name [IN path]\n" +
+			"  | SET MEMBER Name [IN path] AS 'Exposed';\n\n" +
+			"FOLDER goes after the name, before FOR, as in every document statement.\n" +
+			"A mapping names the definition in two parts: WITH MESSAGE DEFINITION\n" +
+			"Module.Name. EXAMPLE sets an element's sample text; a published REST\n" +
+			"operation whose import mapping uses the definition shows it in its OpenAPI\n" +
+			"request schema.\n\n" +
+			"-- Mendix 11.14 and earlier: definitions are entries of a collection.\n" +
+			"-- Refused on 11.15+ (Studio Pro's converter turns a collection into a\n" +
+			"-- folder of that name holding one document per definition).\n" +
+			"LIST MESSAGE DEFINITION COLLECTIONS [IN Module];\n" +
+			"DESCRIBE MESSAGE DEFINITION COLLECTION Module.Name;\n" +
+			"CREATE [OR MODIFY] MESSAGE DEFINITION COLLECTION Module.Name [FOLDER 'path']\n" +
+			"{\n  DEFINITION Name FOR Module.Entity [AS 'Exposed'] { ...members as above... }\n};\n" +
+			"DROP MESSAGE DEFINITION COLLECTION Module.Name;\n" +
+			"ALTER MESSAGE DEFINITION COLLECTION Module.Name\n" +
+			"  ADD DEFINITION [IF NOT EXISTS] Name FOR Module.Entity [AS 'X'] { ... }\n" +
+			"  | DROP DEFINITION [IF EXISTS] Name\n" +
+			"  | RENAME DEFINITION Old TO New;\n" +
+			"ALTER MESSAGE DEFINITION Module.Collection.Definition <member op as above>;\n" +
+			"A mapping names a collection's definition in three parts\n" +
+			"(Module.Collection.Definition); on a converted 11.15+ project that\n" +
+			"reference resolves to the document in the folder named after the collection.\n\n" +
+			"A message definition is a SELECTION OVER THE DOMAIN MODEL — every element\n" +
+			"names an entity, an attribute or an association — which is why it is\n" +
+			"authorable where an XML schema or a WSDL is not. It is the source for 74 of\n" +
+			"the 327 mappings in the demo corpus.\n\n" +
+			"A bare name is an ATTRIBUTE; Assoc/Module.Entity is an ASSOCIATION.\n" +
+			"Naming the association's TARGET is required: the stored cardinality follows\n" +
+			"the DIRECTION of traversal, so the same association gives a single object\n" +
+			"one way and a list the other. One that connects neither way is refused,\n" +
+			"because a wrong cardinality builds cleanly.\n\n" +
+			"Inherited attributes are named like the entity's own and resolve to the\n" +
+			"entity that DECLARES them. Everything else — occurrence bounds, element\n" +
+			"types, paths, item names, primitive types — is derived. Studio Pro\n" +
+			"pluralises a repeating element's exposed name; mxcli defaults to the\n" +
+			"entity's own name and lets AS say otherwise.\n\n" +
+			"IN <path> reaches a nested member, in exposed names. SET changes only the\n" +
+			"exposed name — it is not a model rename. Authoring is modelsdk-only.\n\n" +
+			"Definitions and member trees are children, so they are in { } (R2); the\n" +
+			"parenthesised form is the deprecated spelling MDL-DEPR073.",
+		Example: "mdl 1;\n-- Mendix 11.15+\nCREATE OR MODIFY MESSAGE DEFINITION Sales.OrderMessage\n  FOLDER 'Messages'\n  FOR Sales.Order AS 'Orders' {\n    OrderId EXAMPLE 'ORD-1001',\n    Sales.OrderLine_Order/Sales.OrderLine AS 'Lines' { Sku, Quantity },\n    Sales.Order_Customer/Sales.Customer { FirstName }\n  };\n\nALTER MESSAGE DEFINITION Sales.OrderMessage ADD MEMBER LastName IN Customer;\n\nCREATE IMPORT MAPPING Sales.IMM_Order\n  WITH MESSAGE DEFINITION Sales.OrderMessage\n{ create Sales.Order { OrderId = OrderId } };\n\n" +
+			"mdl 1;\n-- Mendix 11.14 and earlier\nCREATE MESSAGE DEFINITION COLLECTION Sales.MD_Order\n{\n  DEFINITION OrderMessage FOR Sales.Order AS 'Orders' {\n    OrderId,\n    Sales.OrderLine_Order/Sales.OrderLine AS 'Lines' { Sku, Quantity }\n  }\n};\n\nCREATE IMPORT MAPPING Sales.IMM_Order\n  WITH MESSAGE DEFINITION Sales.MD_Order.OrderMessage\n{ create Sales.Order { OrderId = OrderId } };",
+	})
 
 	Register(SyntaxFeature{
 		Path:    "json-structure",
@@ -340,8 +806,14 @@ func init() {
 			"json structure", "create json structure", "drop json structure",
 			"snippet", "schema", "json schema",
 		},
-		Syntax:  "SHOW JSON STRUCTURES [IN Module];\nDESCRIBE JSON STRUCTURE Module.Name;\nCREATE JSON STRUCTURE Module.Name [COMMENT 'text'] SNIPPET '{ ... }';\nCREATE OR MODIFY JSON STRUCTURE Module.Name SNIPPET '{ ... }';\nDROP JSON STRUCTURE Module.Name;",
-		Example: "CREATE OR MODIFY JSON STRUCTURE MyModule.JSON_Pet\n  SNIPPET '{\"id\": 1, \"name\": \"Fido\", \"status\": \"available\"}';\n\nDESCRIBE JSON STRUCTURE MyModule.JSON_Pet;",
+		Syntax: "LIST JSON STRUCTURES [IN Module];\nDESCRIBE JSON STRUCTURE Module.Name;\n[/** documentation */]\nCREATE JSON STRUCTURE Module.Name [FOLDER 'path'] SAMPLE '{ ... }'\n  [CUSTOM NAME MAP (\n    'jsonKey' AS 'CustomName',       -- rename the element that key reaches\n    ITEM OF 'arrayKey' AS 'Name',    -- name the ARRAY's item element\n    ITEM OF 'Root' AS 'Name'         -- ... of a ROOT-level array\n  )];\nCREATE OR MODIFY JSON STRUCTURE Module.Name SAMPLE '{ ... }';\nDROP JSON STRUCTURE Module.Name;\n\n" +
+			"An array's item is the anonymous [...] entry, so it has no JSON key and the\n" +
+			"plain form cannot reach it — ITEM OF addresses it by the array's key, and\n" +
+			"names a primitive array's wrapper too. Left unnamed an item keeps its\n" +
+			"generated name. The name matters because a mapping element clones it.\n" +
+			"An entry whose key is not in the snippet is an error (MDL-JSON01), as is\n" +
+			"ITEM OF on a key that is not an array (MDL-JSON02).",
+		Example: "mdl 1;\nCREATE OR MODIFY JSON STRUCTURE MyModule.JSON_Pet\n  SAMPLE '{\"id\": 1, \"name\": \"Fido\", \"status\": \"available\"}';\n\nCREATE JSON STRUCTURE MyModule.JSON_Invoice\n  SAMPLE '{\"lines\": [{\"sku\": \"A1\"}], \"tags\": [\"urgent\"]}'\n  CUSTOM NAME MAP (\n    'lines' AS 'OrderLines',\n    ITEM OF 'lines' AS 'OrderLine',\n    ITEM OF 'tags' AS 'Tag'\n  );\n\nDESCRIBE JSON STRUCTURE MyModule.JSON_Pet;",
 		SeeAlso: []string{"import-mapping", "export-mapping"},
 	})
 
@@ -354,9 +826,45 @@ func init() {
 			"image collection", "create image collection", "drop image collection",
 			"export level", "image", "icon", "logo",
 		},
-		Syntax:  "SHOW IMAGE COLLECTION [IN Module];\nDESCRIBE IMAGE COLLECTION Module.Name;\nCREATE IMAGE COLLECTION Module.Name\n  [EXPORT LEVEL 'Hidden'|'Public']\n  [COMMENT 'text']\n  [(IMAGE 'name' FROM FILE 'path', ...)];\nCREATE OR MODIFY IMAGE COLLECTION Module.Name [...];\nDROP IMAGE COLLECTION Module.Name;",
-		Example: "CREATE OR MODIFY IMAGE COLLECTION MyModule.AppIcons\n  EXPORT LEVEL 'Public'\n  COMMENT 'Application icons' (\n  IMAGE 'logo' FROM FILE 'assets/logo.png',\n  IMAGE 'favicon' FROM FILE 'assets/favicon.ico'\n);\n\nDESCRIBE IMAGE COLLECTION MyModule.AppIcons;",
-		SeeAlso: []string{"integration"},
+		Syntax:  "LIST IMAGE COLLECTIONS [IN Module];\nDESCRIBE IMAGE COLLECTION Module.Name;\n[/** documentation */]\nCREATE IMAGE COLLECTION Module.Name [FOLDER 'path']\n  [EXPORT LEVEL 'Hidden'|'Public']\n  [{ IMAGE name ( File: 'path' ) | IMAGE name ( Data: 'base64' [, Format: png] ) ... }];\nCREATE OR MODIFY IMAGE COLLECTION Module.Name [...];\nDROP IMAGE COLLECTION Module.Name;\n\n-- The images are the collection's children, so they are in { }, each with\n-- its properties in ( ). `( IMAGE name FROM FILE 'path', ... )` is the\n-- deprecated spelling (MDL-DEPR072). DESCRIBE writes each image as\n-- Data: '<base64>', so its output needs no files.",
+		Example: "mdl 1;\n/** Application icons */\nCREATE OR MODIFY IMAGE COLLECTION MyModule.AppIcons\n  EXPORT LEVEL 'Public' {\n  IMAGE logo ( File: 'assets/logo.png' )\n  IMAGE \"favicon\" ( File: 'assets/favicon.ico' )\n};\n\nDESCRIBE IMAGE COLLECTION MyModule.AppIcons;",
+		SeeAlso: []string{"integration", "icon-collection"},
+	})
+
+	Register(SyntaxFeature{
+		Path:    "icon-collection",
+		Summary: "Icon collections (read-only) — discover icon names for a widget's icon:",
+		Keywords: []string{
+			"icon collection", "icon set", "iconset", "list icon collections",
+			"describe icon collection", "atlas icon", "button icon", "glyph",
+		},
+		Syntax:  "LIST ICON COLLECTIONS [IN Module];\nDESCRIBE ICON COLLECTION Module.Name;   -- lists every icon + its reference form",
+		Example: "-- Icon collections ship with the theme/Atlas (read-only). Their icons are\n-- referenced from a widget as Module.Collection.IconName (e.g. a button's icon:).\nLIST ICON COLLECTIONS;\nDESCRIBE ICON COLLECTION Atlas_Core.Atlas_Filled;\n-- → then: ACTIONBUTTON b (Caption: 'Edit', Action: ..., Icon: 'Atlas_Core.Atlas_Filled.pencil')",
+		SeeAlso: []string{"image-collection", "glyph", "page.action"},
+	})
+
+	Register(SyntaxFeature{
+		Path:    "glyph",
+		Summary: "Glyph icons — the numeric codes `Icon: glyph <n>` accepts, and their names",
+		Keywords: []string{
+			"glyph", "glyphs", "list glyphs", "describe glyph", "icon glyph",
+			"glyphicon", "glyph code", "menu icon", "navigation icon",
+		},
+		Syntax: "LIST GLYPHS [LIKE 'text'];       -- LIKE matches the icon NAME\n" +
+			"DESCRIBE GLYPH 57350;            -- by character code\n" +
+			"DESCRIBE GLYPH 'star';           -- or by name",
+		Example: "-- A glyph is a character code in the Mendix glyph font, not a document in the\n" +
+			"-- project, so there is no module to scope and no connection needed.\n" +
+			"LIST GLYPHS LIKE 'star';\n" +
+			"--   57350  star        Icon: glyph 57350\n" +
+			"--   57351  star-empty  Icon: glyph 57351\n" +
+			"DESCRIBE GLYPH 'star';\n" +
+			"-- → then: MENU ITEM 'Favourites' ( OnClick: SHOW PAGE M.Favourites, Icon: GLYPH 57350 )\n" +
+			"\n" +
+			"-- Prefer an icon COLLECTION reference where the icon exists there: it is a\n" +
+			"-- model reference that `check --references` resolves, while a glyph code is\n" +
+			"-- an integer that MDL078 checks against the font and refuses if undefined.",
+		SeeAlso: []string{"icon-collection", "navigation.create"},
 	})
 
 	// ── Import / Export Mappings ──────────────────────────────────────
@@ -366,11 +874,68 @@ func init() {
 		Summary: "Import mappings — map JSON/XML to Mendix entities for inbound data",
 		Keywords: []string{
 			"import mapping", "create import mapping", "drop import mapping",
-			"show import mappings", "describe import mapping",
-			"with json structure", "find or create", "object handling",
+			"list import mappings", "describe import mapping",
+			"with json structure", "with message definition", "find or create",
+			"or create", "or error", "or ignore", "overridable", "object handling backup",
+			"parameter", "input object", "mapping parameter",
+			"object handling", "converter", "value transform", "custom handling", "by microflow",
 		},
-		Syntax:  "SHOW IMPORT MAPPINGS [IN Module];\nDESCRIBE IMPORT MAPPING Module.Name;\nCREATE [OR MODIFY] IMPORT MAPPING Module.Name\n  WITH JSON STRUCTURE Module.JsonStruct\n{\n  create|find|find or create Module.Entity {\n    Attr = jsonField [KEY],\n    Assoc/Module.Child = nestedKey { ... }\n  }\n};\nDROP IMPORT MAPPING Module.Name;\n\nOR MODIFY: updates mapping in-place, preserves UUID.",
-		Example: "CREATE IMPORT MAPPING Shop.IMM_Order\n  WITH JSON STRUCTURE Shop.JSON_Order\n{\n  create Shop.Order {\n    OrderId = orderId KEY,\n    TotalAmount = total\n  }\n};\n\n-- Idempotent update\nCREATE OR MODIFY IMPORT MAPPING Shop.IMM_Order\n  WITH JSON STRUCTURE Shop.JSON_Order\n{\n  find or create Shop.Order {\n    OrderId = orderId KEY,\n    TotalAmount = total,\n    Status = status\n  }\n};",
+		Syntax: "LIST IMPORT MAPPINGS [IN Module];\nDESCRIBE IMPORT MAPPING Module.Name;\n" +
+			"[/** documentation */]\n" +
+			"CREATE [OR MODIFY] IMPORT MAPPING Module.Name [FOLDER 'path']\n" +
+			"  WITH JSON STRUCTURE Module.JsonStruct [ROOT a/b/c]\n" +
+			"    | WITH MESSAGE DEFINITION Module.Collection.Definition\n" +
+			"    | WITH XML SCHEMA Module.Schema\n" +
+			"  [PARAMETER Module.Entity]   -- the mapping's input object, bound by `P: parameter`\n{\n" +
+			"  create Module.Entity | find Module.Entity OR CREATE|ERROR|IGNORE [OVERRIDABLE]\n" +
+			"    [by Module.MF(P: parent)] {\n    Attr = jsonField [KEY],\n" +
+			"    Attr = a/b/c,\n" +
+			"    Assoc/Module.Child = nestedKey { ... }\n  }\n};\nDROP IMPORT MAPPING Module.Name;\n\n" +
+			"OR MODIFY: updates mapping in-place, preserves UUID.\n\n" +
+			"Documentation: the /** ... */ doc comment above CREATE (QUAL002 asks for\n" +
+			"it). On OR MODIFY no comment keeps the stored text, /** */ clears it.\n\n" +
+			"Nested members (Attr = a/b/c):\n" +
+			"  Reaches a leaf several levels down with NO entity for the levels in\n" +
+			"  between — the shape Studio Pro produces when you tick a nested leaf\n" +
+			"  without ticking its parents. One entity, values from several depths.\n" +
+			"  Use Assoc/Module.Child = key { ... } instead when you WANT an entity\n" +
+			"  per level. The path may not cross a 0..* element: many items cannot\n" +
+			"  collapse into one value, and mxbuild rejects it with CE0256.\n\n" +
+			"Custom object handling (find X by Module.MF(...)):\n" +
+			"  A microflow resolves the object instead of Create/Find. `by` is a\n" +
+			"  modifier on `find` because that is what it means — find the object\n" +
+			"  by calling this microflow. Parameter sources: parent (the enclosing\n" +
+			"  mapped object), parameter (the mapping's own input object),\n" +
+			"  parent(2) (an ancestor N levels up), or a member path (a value from\n" +
+			"  the payload). modelsdk engine only.\n\n" +
+			"Value transform (Attr = Module.MF(jsonField)):\n" +
+			"  The value passes through a microflow on its way to the attribute.\n" +
+			"  The stored element carries only the microflow — its input IS the\n" +
+			"  member the element binds, which is why the member is named inside\n" +
+			"  the call. The export form mirrors it: jsonField = Module.MF(Attr).\n\n" +
+			"ROOT a/b/c:\n" +
+			"  Starts the mapping at a NESTED schema element rather than the\n" +
+			"  structure's root — the shape Studio Pro produces when you pick a\n" +
+			"  node deeper in the payload. Written in member names; the path may\n" +
+			"  pass through an array, and the mapping is then rooted at the item.\n\n" +
+			"Arrays of primitives:\n" +
+			"  [\"a\",\"b\"] maps to one entity per string. Write it like any other\n" +
+			"  array — Assoc/Module.Entity = tags { ... } — and bind the primitive\n" +
+			"  to the reserved member Value. The wrapper level Mendix stores is\n" +
+			"  generated, the same way an array's item level is.\n\n" +
+			"Sources:\n" +
+			"  A JSON structure is built from a payload sample; a MESSAGE DEFINITION\n" +
+			"  is derived from the domain model and names entities and attributes\n" +
+			"  itself, so its members are the definition's exposed names and the\n" +
+			"  reference is THREE parts (the definitions live inside a collection\n" +
+			"  document). Message definitions are read-only: map over one that\n" +
+			"  already exists. An array-rooted structure needs no special syntax —\n" +
+			"  the root is taken from the structure.\n\n" +
+			"Inherited attributes:\n" +
+			"  An entity mapped with EXTENDS can map its inherited attributes too —\n" +
+			"  name them exactly like its own. mxcli resolves each to the entity that\n" +
+			"  declares it, which is what Studio Pro needs to show the field mapped.",
+		Example: "mdl 1;\nCREATE IMPORT MAPPING Shop.IMM_Order\n  WITH JSON STRUCTURE Shop.JSON_Order\n{\n  create Shop.Order {\n    OrderId = orderId KEY,\n    TotalAmount = total,\n    -- a leaf two levels down, without entities for customer/contact\n    Email = customer/contact/email\n  }\n};\n\n-- Idempotent update\nCREATE OR MODIFY IMPORT MAPPING Shop.IMM_Order\n  WITH JSON STRUCTURE Shop.JSON_Order\n{\n  find or create Shop.Order {\n    OrderId = orderId KEY,\n    TotalAmount = total,\n    Status = status\n  }\n};",
 		SeeAlso: []string{"export-mapping", "json-structure"},
 	})
 
@@ -379,25 +944,41 @@ func init() {
 		Summary: "Export mappings — map Mendix entities to JSON/XML for outbound data",
 		Keywords: []string{
 			"export mapping", "create export mapping", "drop export mapping",
-			"show export mappings", "describe export mapping",
-			"with json structure", "null values", "as jsonKey",
+			"list export mappings", "describe export mapping",
+			"with json structure", "with message definition", "null values",
+			"as jsonKey", "converter", "value transform",
 		},
-		Syntax:  "SHOW EXPORT MAPPINGS [IN Module];\nDESCRIBE EXPORT MAPPING Module.Name;\nCREATE [OR MODIFY] EXPORT MAPPING Module.Name\n  WITH JSON STRUCTURE Module.JsonStruct\n  [NULL VALUES LeaveOutElement|SendAsNil]\n{\n  Module.Entity {\n    jsonField = Attr,\n    Assoc/Module.Child AS nestedKey { ... }\n  }\n};\nDROP EXPORT MAPPING Module.Name;\n\nOR MODIFY: updates mapping in-place, preserves UUID.",
-		Example: "CREATE EXPORT MAPPING Shop.EMM_Order\n  WITH JSON STRUCTURE Shop.JSON_Order\n  NULL VALUES LeaveOutElement\n{\n  Shop.Order {\n    orderId = OrderId,\n    total = TotalAmount\n  }\n};\n\n-- Idempotent update\nCREATE OR MODIFY EXPORT MAPPING Shop.EMM_Order\n  WITH JSON STRUCTURE Shop.JSON_Order\n{\n  Shop.Order {\n    orderId = OrderId,\n    total = TotalAmount,\n    status = Status\n  }\n};",
+		Syntax: "LIST EXPORT MAPPINGS [IN Module];\nDESCRIBE EXPORT MAPPING Module.Name;\n[/** documentation */]\nCREATE [OR MODIFY] EXPORT MAPPING Module.Name [FOLDER 'path']\n  WITH JSON STRUCTURE Module.JsonStruct [ROOT a/b/c]\n    | WITH MESSAGE DEFINITION Module.Collection.Definition\n    | WITH XML SCHEMA Module.Schema\n  [NULL VALUES LeaveOutElement|SendAsNil]\n{\n  Module.Entity {\n    jsonField = Attr,\n    jsonField = Module.MF(Attr),          -- value transform\n    group AS key { ... },                 -- entity-less grouping node\n    Assoc/Module.Child AS nestedKey { ... }\n  }\n};\nDROP EXPORT MAPPING Module.Name;\n\nOR MODIFY: updates mapping in-place, preserves UUID.\n\n" +
+			"Documentation: the /** ... */ doc comment above CREATE, as on an import\n" +
+			"mapping. On OR MODIFY no comment keeps the stored text, /** */ clears it.\n\n" +
+			"Grouping nodes (group as key { ... }):\n" +
+			"  A JSON object with no Mendix object behind it — Studio Pro's\n" +
+			"  entity-less object element. It may hold OBJECT elements only: a\n" +
+			"  value there has no entity to bind its attribute to, and Mendix\n" +
+			"  reports CE0061. An ARRAY needs no such wrapper — write\n" +
+			"  Assoc/Entity AS items { values } and the container is generated.\n\n" +
+			"No nested-member form:\n" +
+			"  An import mapping can write `Attr = a/b/c` to reach a leaf without an\n" +
+			"  entity per level. An export mapping cannot: it has to PRODUCE the\n" +
+			"  intermediate node, so Mendix rejects a collapsed member with CE5015\n" +
+			"  (\"no child mapping matching schema element\"). Give the level its own\n" +
+			"  element: Assoc/Module.Child AS key { ... }.",
+		Example: "mdl 1;\nCREATE EXPORT MAPPING Shop.EMM_Order\n  WITH JSON STRUCTURE Shop.JSON_Order\n  NULL VALUES LeaveOutElement\n{\n  Shop.Order {\n    orderId = OrderId,\n    total = TotalAmount\n  }\n};\n\n-- Idempotent update\nCREATE OR MODIFY EXPORT MAPPING Shop.EMM_Order\n  WITH JSON STRUCTURE Shop.JSON_Order\n{\n  Shop.Order {\n    orderId = OrderId,\n    total = TotalAmount,\n    status = Status\n  }\n};",
 		SeeAlso: []string{"import-mapping", "json-structure"},
 	})
 
 	// ── Data Transformers ─────────────────────────────────────────────
 
 	Register(SyntaxFeature{
-		Path:    "data-transformer",
-		Summary: "Data transformers — JSLT/XSLT document transformations (Mendix 11.9+)",
+		Path:     "data-transformer",
+		Features: []string{"integration/data_transformer", "microflows/transform_json"},
+		Summary:  "Data transformers — JSLT/XSLT document transformations (Mendix 11.9+)",
 		Keywords: []string{
 			"data transformer", "create data transformer", "drop data transformer",
 			"list data transformers", "jslt", "xslt", "transform",
 		},
-		Syntax:  "LIST DATA TRANSFORMERS [IN Module];\nDESCRIBE DATA TRANSFORMER Module.Name;\nCREATE [OR MODIFY] DATA TRANSFORMER Module.Name\n  SOURCE JSON '{ ... }'\n{\n  JSLT 'single-line-expression';\n  -- or multi-line:\n  JSLT $$\n{ ... }\n  $$;\n};\nDROP DATA TRANSFORMER Module.Name;\n\nOR MODIFY: updates transformer in-place, preserves UUID.",
-		Example: "CREATE DATA TRANSFORMER ETL.FlattenOrder\n  SOURCE JSON '{\"order\": {\"id\": 1, \"total\": 99.0}}'\n{\n  JSLT '{\"id\": .order.id, \"total\": .order.total}';\n};\n\n-- Multi-line JSLT\nCREATE OR MODIFY DATA TRANSFORMER ETL.WeatherSummary\n  SOURCE JSON '{\"current\": {\"temp\": 12.8, \"wind\": 18.3}}'\n{\n  JSLT $$\n{\n  \"temperature\": .current.temp,\n  \"wind_speed\":  .current.wind\n}\n  $$;\n};",
+		Syntax:  "LIST DATA TRANSFORMERS [IN Module];\nDESCRIBE DATA TRANSFORMER Module.Name;\n[/** documentation */]\nCREATE [OR MODIFY] DATA TRANSFORMER Module.Name [FOLDER 'path']\n  SOURCE JSON '{ ... }'\n{\n  JSLT 'single-line-expression';\n  -- or multi-line:\n  JSLT $$\n{ ... }\n  $$;\n};\nDROP DATA TRANSFORMER Module.Name;\n\nOR MODIFY: updates transformer in-place, preserves UUID.\n\nDocumentation: the /** ... */ doc comment above CREATE. On OR MODIFY no\ncomment keeps the stored text, /** */ clears it.",
+		Example: "mdl 1;\nCREATE DATA TRANSFORMER ETL.FlattenOrder\n  SOURCE JSON '{\"order\": {\"id\": 1, \"total\": 99.0}}'\n{\n  JSLT '{\"id\": .order.id, \"total\": .order.total}';\n};\n\n-- Multi-line JSLT\nCREATE OR MODIFY DATA TRANSFORMER ETL.WeatherSummary\n  SOURCE JSON '{\"current\": {\"temp\": 12.8, \"wind\": 18.3}}'\n{\n  JSLT $$\n{\n  \"temperature\": .current.temp,\n  \"wind_speed\":  .current.wind\n}\n  $$;\n};",
 		SeeAlso: []string{"integration"},
 	})
 
@@ -410,63 +991,97 @@ func init() {
 			"agent", "agents", "model", "knowledge base", "mcp service",
 			"agent editor", "llm", "ai", "genai", "mxcloudgenai",
 		},
-		Syntax:  "LIST MODELS [IN Module];\nLIST KNOWLEDGE BASES [IN Module];\nLIST CONSUMED MCP SERVICES [IN Module];\nLIST AGENTS [IN Module];\nDESCRIBE MODEL Module.Name;\nCREATE MODEL Module.Name (Provider: MxCloudGenAI, Key: Module.ApiKey);\nCREATE KNOWLEDGE BASE Module.Name (Provider: MxCloudGenAI, Key: Module.KBKey);\nCREATE CONSUMED MCP SERVICE Module.Name (ProtocolVersion: v2025_03_26, ...);\nCREATE AGENT Module.Name (UsageType: Task|Chat, Model: Module.MyModel, SystemPrompt: '...') { ... };\nDROP AGENT Module.Name;",
-		Example: "CREATE MODEL MyModule.GPT4 (\n  Provider: MxCloudGenAI,\n  Key: MyModule.ModelApiKey\n);\n\nCREATE AGENT MyModule.Summarizer (\n  UsageType: Task,\n  Model: MyModule.GPT4,\n  SystemPrompt: 'Summarize in 3 sentences.',\n  UserPrompt: 'Enter text.'\n);",
+		Syntax:  "LIST AI MODELS [IN Module];\nLIST KNOWLEDGE BASES [IN Module];\nLIST CONSUMED MCP SERVICES [IN Module];\nLIST AGENTS [IN Module];\nDESCRIBE AI MODEL Module.Name;\nCREATE AI MODEL Module.Name (Provider: MxCloudGenAI, Key: @Module.ApiKey);\nCREATE KNOWLEDGE BASE Module.Name (Provider: MxCloudGenAI, Key: @Module.KBKey);\nCREATE CONSUMED MCP SERVICE Module.Name (ProtocolVersion: v2025_03_26, ...);\nCREATE AGENT Module.Name (UsageType: Task|Chat, Model: Module.MyModel, SelectedModel: '<model id>', SystemPrompt: '...') { ... };\nDROP AGENT Module.Name;",
+		Example: "mdl 1;\nCREATE AI MODEL MyModule.GPT4 (\n  Provider: MxCloudGenAI,\n  Key: @MyModule.ModelApiKey\n);\n\nCREATE AGENT MyModule.Summarizer (\n  UsageType: Task,\n  Model: MyModule.GPT4,\n  SelectedModel: 'eu.anthropic.claude-sonnet-5',\n  SystemPrompt: 'Summarize in 3 sentences.',\n  UserPrompt: 'Enter text.'\n);",
 		SeeAlso: []string{"agents.model", "agents.knowledge-base", "agents.mcp-service", "agents.agent"},
 	})
 
 	Register(SyntaxFeature{
 		Path:     "agents.model",
-		Summary:  "CREATE/DROP MODEL documents for AI agents",
-		Keywords: []string{"create model", "drop model", "describe model", "list models", "provider", "mxcloudgenai"},
-		Syntax:   "CREATE [OR MODIFY] MODEL Module.Name (\n  Provider: MxCloudGenAI,\n  Key: Module.ApiKeyConstant\n);\nDESCRIBE MODEL Module.Name;\nLIST MODELS [IN Module];\nDROP MODEL Module.Name;",
-		Example:  "create model MyModule.GPT4 (\n  Provider: MxCloudGenAI,\n  Key: MyModule.ModelApiKey\n);",
-		SeeAlso:  []string{"agents"},
+		Features: []string{"agent_documents/agent_model"},
+		Summary:  "CREATE/DROP AI MODEL documents for AI agents",
+		Keywords: []string{"create ai model", "drop ai model", "describe ai model", "list ai models",
+			"create model", "drop model", "describe model", "list models", "provider", "mxcloudgenai"},
+		Syntax:  "CREATE [OR MODIFY] AI MODEL Module.Name [FOLDER 'path'] (\n  Provider: MxCloudGenAI,\n  Key: @Module.ApiKeyConstant\n);\nDESCRIBE AI MODEL Module.Name;\nLIST AI MODELS [IN Module];\nDROP AI MODEL Module.Name;",
+		Example: "create ai model MyModule.GPT4 (\n  Provider: MxCloudGenAI,\n  Key: @MyModule.ModelApiKey\n);",
+		SeeAlso: []string{"agents"},
 	})
 
 	Register(SyntaxFeature{
 		Path:     "agents.knowledge-base",
+		Features: []string{"agent_documents/agent_knowledge_base"},
 		Summary:  "CREATE/DROP KNOWLEDGE BASE documents for AI agents",
 		Keywords: []string{"create knowledge base", "drop knowledge base", "knowledge base", "kb", "rag"},
-		Syntax:   "CREATE [OR MODIFY] KNOWLEDGE BASE Module.Name (\n  Provider: MxCloudGenAI,\n  Key: Module.KBApiKeyConstant\n);\nDESCRIBE KNOWLEDGE BASE Module.Name;\nLIST KNOWLEDGE BASES [IN Module];\nDROP KNOWLEDGE BASE Module.Name;",
-		Example:  "create knowledge base MyModule.ProductDocs (\n  Provider: MxCloudGenAI,\n  Key: MyModule.KBApiKey\n);",
+		Syntax:   "CREATE [OR MODIFY] KNOWLEDGE BASE Module.Name [FOLDER 'path'] (\n  Provider: MxCloudGenAI,\n  Key: @Module.KBApiKeyConstant\n);\nDESCRIBE KNOWLEDGE BASE Module.Name;\nLIST KNOWLEDGE BASES [IN Module];\nDROP KNOWLEDGE BASE Module.Name;",
+		Example:  "create knowledge base MyModule.ProductDocs (\n  Provider: MxCloudGenAI,\n  Key: @MyModule.KBApiKey\n);",
 		SeeAlso:  []string{"agents"},
 	})
 
 	Register(SyntaxFeature{
 		Path:     "agents.mcp-service",
+		Features: []string{"agent_documents/agent_consumed_mcp_service"},
 		Summary:  "CREATE/DROP CONSUMED MCP SERVICE documents for AI agents",
-		Keywords: []string{"consumed mcp service", "mcp", "mcp service", "protocol version"},
-		Syntax:   "CREATE [OR MODIFY] CONSUMED MCP SERVICE Module.Name (\n  ProtocolVersion: v2025_03_26,\n  Version: '1.0',\n  ConnectionTimeoutSeconds: 30,\n  Documentation: 'description'\n);\nDESCRIBE CONSUMED MCP SERVICE Module.Name;\nLIST CONSUMED MCP SERVICES [IN Module];\nDROP CONSUMED MCP SERVICE Module.Name;",
-		Example:  "create consumed mcp service MyModule.WebSearch (\n  ProtocolVersion: v2025_03_26,\n  Version: '1.0',\n  ConnectionTimeoutSeconds: 30\n);",
+		Keywords: []string{"consumed mcp service", "mcp", "mcp service", "protocol version", "endpoint", "authenticationmicroflow"},
+		Syntax:   "CREATE [OR MODIFY] CONSUMED MCP SERVICE Module.Name [FOLDER 'path'] (\n  ProtocolVersion: v2025_03_26,\n  Endpoint: @Module.UrlConstant,           -- String constant; without it the service is skipped (MDL-AGENT03)\n  [AuthenticationMicroflow: Module.GetHeaders,]  -- no parameters, returns List of System.HttpHeader\n  Version: '1.0',\n  ConnectionTimeoutSeconds: 30,\n  Documentation: 'description'\n);\nDESCRIBE CONSUMED MCP SERVICE Module.Name;\nLIST CONSUMED MCP SERVICES [IN Module];\nDROP CONSUMED MCP SERVICE Module.Name;",
+		Example:  "create consumed mcp service MyModule.WebSearch (\n  ProtocolVersion: v2025_03_26,\n  Endpoint: @MyModule.WebSearchUrl,\n  Version: '1.0',\n  ConnectionTimeoutSeconds: 30\n);",
 		SeeAlso:  []string{"agents"},
 	})
 
 	Register(SyntaxFeature{
-		Path:    "agents.agent",
-		Summary: "CREATE/DROP AGENT documents with variables, tools, KB tools, and MCP service tools",
+		Path:     "agents.published-mcp-service",
+		Features: []string{"agent_documents/agent_published_mcp_service"},
+		Summary:  "CREATE/ALTER/DROP PUBLISHED MCP SERVICE: publish the app's microflows as an MCP server (Agent Editor 2.6+, MCP Server 5.x)",
+		Keywords: []string{"published mcp service", "mcp server", "publish mcp", "mcp tool", "expose microflow", "oauth"},
+		Syntax: "CREATE [OR MODIFY] PUBLISHED MCP SERVICE Module.Name [FOLDER 'path'] (\n  [ServerName: 'Name',]  -- default: the document name\n  EndpointPath: 'path',  -- served at <app URL>/path/mcp\n  Version: '1.0.0',\n  ProtocolVersion: v2025_03_26\n  [, AuthenticationEnabled: true, AuthenticationMicroflow: Module.Auth]\n  [, AuthorizationServerUrl: 'https://...', Scopes: 'a b']\n  [, Documentation: '...']\n) [{\n  tool name ( Microflow: Module.Tool [, Description: '...'] [, Title: '...'] [, Schema: '...'] )\n}];\n" +
+			"ALTER PUBLISHED MCP SERVICE Module.Name SET Key = value | ADD TOOL name ( ... ) | DROP TOOL name;\n" +
+			"DESCRIBE PUBLISHED MCP SERVICE Module.Name;\nLIST PUBLISHED MCP SERVICES [IN Module];\nDROP PUBLISHED MCP SERVICE Module.Name;",
+		Example: "create published mcp service MyModule.CustomerMCP (\n  EndpointPath: 'customers',\n  Version: '1.0.0',\n  ProtocolVersion: v2025_03_26\n) {\n  tool count_customers ( Microflow: MyModule.MCPTool_CountCustomers, Description: 'Count customers.' )\n};",
+		SeeAlso: []string{"agents", "agents.mcp-service"},
+	})
+
+	Register(SyntaxFeature{
+		Path:     "agents.agent",
+		Features: []string{"agent_documents/agent"},
+		Summary:  "CREATE/DROP AGENT documents with variables, tools, KB tools, and MCP service tools",
 		Keywords: []string{
 			"create agent", "drop agent", "usagetype", "systemprompt", "userprompt",
 			"variables", "toolchoice", "temperature", "topp", "maxtokens",
+			"useraccessapproval", "approval", "streaming", "displaytitle", "minsimilarity",
+			"selectedmodel", "selected model",
 		},
-		Syntax: `CREATE [OR MODIFY] AGENT Module.Name (
+		Syntax: `CREATE [OR MODIFY] AGENT Module.Name [FOLDER 'path'] (
   UsageType: Task|Chat,
   Model: Module.MyModel,
+  SelectedModel: 'model id', [SelectedModelName: 'display name',]
   [Description: 'text',]
   [MaxTokens: N,]
   [Temperature: 0.7,]
   [TopP: 0.9,]
   [ToolChoice: Auto|None|Required,]
+  [EnableBackendStreaming: true|false, EnableUIStreaming: true|false,]
   [Variables: ("Key": EntityAttribute|String),]
   SystemPrompt: 'prompt or $$multi-line$$',
   [UserPrompt: 'prompt']
 )
 {
-  [MCP SERVICE Module.ServiceName { Enabled: true }]
-  [KNOWLEDGE BASE AliaName { Source: Module.KB, Collection: 'col', MaxResults: 5, Enabled: true }]
-  [TOOL MicroflowName { Description: 'desc', Enabled: true }]
-};`,
-		Example: "create agent MyModule.Assistant (\n  UsageType: Chat,\n  Model: MyModule.GPT4,\n  SystemPrompt: $$You are a helpful assistant.$$,\n  UserPrompt: 'Ask me anything.'\n)\n{\n  MCP SERVICE MyModule.WebSearch { Enabled: true }\n};",
+  [MCP SERVICE Module.ServiceName ( Enabled: true [, UserAccessApproval: …] )]
+  [KNOWLEDGE BASE AliaName ( Source: Module.KB, Collection: 'col', MaxResults: 5,
+      [MinSimilarity: 0.2, IsVisible: true|false,] Enabled: true )]
+  [TOOL ToolName ( Document: Module.Microflow, Description: 'desc', Enabled: true,
+      [UserAccessApproval: HiddenForUser|VisibleForUser|UserConfirmationRequired,]
+      [DisplayTitle: 'shown to the user', DisplayDescription: '…'] )]
+};
+
+A TOOL's Document is the microflow it runs. SelectedModel is the id of the
+model the Model document's resource offers (e.g. 'eu.anthropic.claude-sonnet-5');
+Agent Editor 2.2+ refuses to import an agent without one, and that stops the
+import of every agent (check: MDL-AGENT02, an error when the agent names a
+Model: Studio Pro reports AE018). Agent Commons stores the name in
+50 characters and Description in 200; longer fails the startup import and
+leaves the previous agent in use (check: MDL-AGENT04). SelectedModelName defaults to the
+id. On OR MODIFY, the tools, knowledge bases and entity keep their stored
+identity, and a setting the statement leaves out keeps its stored value.`,
+		Example: "create agent MyModule.Assistant (\n  UsageType: Chat,\n  Model: MyModule.GPT4,\n  SelectedModel: 'eu.anthropic.claude-sonnet-5',\n  SystemPrompt: $$You are a helpful assistant.$$,\n  UserPrompt: 'Ask me anything.'\n)\n{\n  MCP SERVICE MyModule.WebSearch ( Enabled: true )\n};",
 		SeeAlso: []string{"agents", "agents.model", "agents.knowledge-base", "agents.mcp-service"},
 	})
 }

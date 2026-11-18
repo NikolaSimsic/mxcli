@@ -1,3 +1,4 @@
+mdl 1;
 -- ============================================================================
 -- Page Examples - MDL Syntax
 -- ============================================================================
@@ -25,40 +26,38 @@ create module PgTest;
  * Country codes with full names as captions.
  */
 create enumeration PgTest.Country (
-  /** United States */
+  -- United States
   US 'United States',
-  /** United Kingdom */
+  -- United Kingdom
   UK 'United Kingdom',
-  /** Germany */
+  -- Germany
   DE 'Germany',
-  /** France */
+  -- France
   FR 'France',
-  /** Netherlands */
+  -- Netherlands
   NL 'Netherlands',
-  /** Japan */
+  -- Japan
   JP 'Japan',
-  /** Australia */
+  -- Australia
   AU 'Australia'
 );
-/
 
 /**
  * Simple status enumeration for order tracking.
  * Basic enumeration with identifier and caption.
  */
 create enumeration PgTest.OrderStatus (
-  /** Order received, awaiting processing */
+  -- Order received, awaiting processing
   PENDING 'Pending',
-  /** Order is being processed */
+  -- Order is being processed
   PROCESSING 'Processing',
-  /** Order has been shipped */
+  -- Order has been shipped
   SHIPPED 'Shipped',
-  /** Order delivered to customer */
+  -- Order delivered to customer
   DELIVERED 'Delivered',
-  /** Order was cancelled */
+  -- Order was cancelled
   CANCELLED 'Cancelled'
 );
-/
 
 @position(100,100)
 create persistent entity PgTest.Product (
@@ -115,30 +114,28 @@ owner both;
 /**
  * Empty page
  */
-create page PgTest.P001_Empty_Page
+create page PgTest.P001_Empty_Page folder 'Basic'
 (
   title: 'Empty Page',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p001_empty_page',
-  folder: 'Basic'
+  url: 'p001_empty_page'
 )
 {
   -- Nothing yet
-}
+};
 
 /**
  * Dynamic text example
  */
-create page PgTest.P002_Dynamic_Text_Page
+create page PgTest.P002_Dynamic_Text_Page folder 'Basic'
 (
   title: 'Empty Page',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p002_dynamic_text_page',
-  folder: 'Basic'
+  url: 'p002_dynamic_text_page'
 )
 {
   dynamictext text1 (content: 'Domain model', rendermode: H4)
-}
+};
 
 /**
  * Create a new object for the PgTest.P006_DataForm page
@@ -148,108 +145,106 @@ folder 'Basic'
 begin
     show page PgTest.P002_Dynamic_Text_Page();
 end;
-/
 
 /**
  * Layout grid with dynamic text
  */
-create page PgTest.P003_1_Nested_LayoutGrid_Dynamic_Text_Page
+create page PgTest.P003_1_Nested_LayoutGrid_Dynamic_Text_Page folder 'Basic'
 (
   title: 'Layoutgrid dynamic text page',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p003_1_nested_layoutgrid_dynamic_text_page',
-  folder: 'Basic'
+  url: 'p003_1_nested_layoutgrid_dynamic_text_page'
 )
 {
   layoutgrid LayoutGrid1 {
-    row row1 {
-      column col1 (desktopwidth: autofill) {
+    row {
+      column (desktopwidth: autofill) {
         layoutgrid LayoutGrid2 {
-          row row2a {
-            column col2a (desktopwidth: autofill) {
+          row {
+            column (desktopwidth: autofill) {
               dynamictext text1 (content: 'Just some H4 header', rendermode: H4)
             }
           }
-          row row2b {
-            column col2b (desktopwidth: autofill) {
+          row {
+            column (desktopwidth: autofill) {
               dynamictext text2 (content: 'Just some H4 header', rendermode: H4)
             }
           }
-          row row2c {
-            column col2c (desktopwidth: autofill) {
+          row {
+            column (desktopwidth: autofill) {
               dynamictext text3 (content: 'Just some H4 header', rendermode: H4)
             }
-            column col2d (desktopwidth: autofill) {
+            column (desktopwidth: autofill) {
               dynamictext text4 (content: 'Just some H4 header', rendermode: H4)
             }
           }
         }
       }
     }
-    row row3 {
-      column col3a (desktopwidth: autofill) {
-        actionbutton btnSave1 (caption: 'Save {1}', captionparams: [{1} = 'Hello'], action: save_changes, buttonstyle: primary)
+    row {
+      column (desktopwidth: autofill) {
+        actionbutton btnSave1 (caption: 'Save {1}', captionparams: ({1} = 'Hello'), action: save changes, buttonstyle: primary)
       }
-      column col3b (desktopwidth: autofill) {
-        actionbutton btnSave2 (caption: 'Cancel {1}', captionparams: [{1} = 'Hello'], action: cancel_changes, buttonstyle: default)
+      column (desktopwidth: autofill) {
+        actionbutton btnSave2 (caption: 'Cancel {1}', captionparams: ({1} = 'Hello'), action: cancel changes, buttonstyle: default)
       }
     }
-    row row4 {
-      column col4 (desktopwidth: autofill) {
-        dynamictext text5 (content: 'Just some H4 header: {1}', contentparams: [{1} = 'Hello'], rendermode: H4)
+    row {
+      column (desktopwidth: autofill) {
+        dynamictext text5 (content: 'Just some H4 header: {1}', contentparams: ({1} = 'Hello'), rendermode: H4)
       }
     }
   }
-}
+};
 
 /**
  * PgTest widget page
  */
-create page PgTest.P004_TestWidgetPage
+create page PgTest.P004_TestWidgetPage folder 'Basic'
 (
   title: 'Test Widget Page',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p004_testwidgetpage',
-  folder: 'Basic'
+  url: 'p004_testwidgetpage'
 )
 {
   layoutgrid gridMain {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         title titleWelcome (content: 'Welcome to PgTest Page')
         dynamictext textIntro (content: 'This is a PgTest page created via MDL', rendermode: paragraph)
       }
     }
   }
-}
+};
 
 /**
  * PgTest widget page with buttons
  */
-create page PgTest.P005_OrderEdit
+create page PgTest.P005_OrderEdit folder 'Basic'
 (
   title: 'Edit Order',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p005_orderedit',
-  folder: 'Basic'
+  url: 'p005_orderedit'
 )
 {
   layoutgrid buttonRow {
-    row row1 {
-      column col1 (desktopwidth: autofill) {
+    row {
+      column (desktopwidth: autofill) {
         dynamictext textIntro (content: 'This is a PgTest page created via MDL', rendermode: paragraph)
       }
     }
-    row row2 {
-      column col2a (desktopwidth: 6) {
-        actionbutton btnSave (caption: 'Save {1}', captionparams: [{1} = 'Hello'], action: save_changes, buttonstyle: primary)
+    row {
+      column (desktopwidth: 6) {
+        actionbutton btnSave (caption: 'Save {1}', captionparams: ({1} = 'Hello'), action: save changes, buttonstyle: primary)
       }
-      column col2b (desktopwidth: 6) {
-        actionbutton btnCancel (caption: 'Cancel', action: cancel_changes)
+      column (desktopwidth: 6) {
+        actionbutton btnCancel (caption: 'Cancel', action: cancel changes)
+        -- linkbutton renders an action button as a link (Forms$ActionButton, RenderType=Link)
+        linkbutton lnkCancel (caption: 'Cancel', action: cancel changes)
       }
     }
   }
-}
+};
 
 -- @version: 11.0+
 -- MARK: DATA FORM — requires Mendix 11.0+ (page parameters)
@@ -257,25 +252,24 @@ create page PgTest.P005_OrderEdit
 /**
  * Edit customer form
  */
-create page PgTest.P006_DataForm
+create page PgTest.P006_DataForm folder 'Forms'
 (
-  params: {
+  params: (
     $Customer: PgTest.Customer
-  },
+  ),
   title: 'Edit Customer',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p006_dataform/{Customer/Name}',
-  folder: 'Forms'
+  url: 'p006_dataform/{Customer/Name}'
 )
 {
   layoutgrid buttonRow {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext textIntro (content: 'This is a PgTest page created via MDL', rendermode: paragraph)
       }
     }
-    row row2 {
-      column col2 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dataview dataView5 (datasource: $Customer) {
           textbox textBox1 (label: 'Name', attribute: Name)
           textbox textBox2 (label: 'Email', attribute: Email)
@@ -286,21 +280,21 @@ create page PgTest.P006_DataForm
           radiobuttons radioButtons1 (label: 'Is active', attribute: IsActive)
           datepicker datePicker1 (label: 'Create date', attribute: CreateDate)
 
-          footer footer1 {
-            actionbutton actionButton1 (caption: 'Save', action: save_changes, buttonstyle: primary)
-            actionbutton actionButton2 (caption: 'Cancel', action: cancel_changes, buttonstyle: default)
+          footer {
+            actionbutton actionButton1 (caption: 'Save', action: save changes, buttonstyle: primary)
+            actionbutton actionButton2 (caption: 'Cancel', action: cancel changes, buttonstyle: default)
           }
         }
       }
     }
-    row row3 {
-      column col3a (desktopwidth: 6) { }
-      column col3b (desktopwidth: 6) {
-        actionbutton btnSave (caption: 'Save {1}', captionparams: [{1} = 'abc'], action: save_changes, buttonstyle: primary)
+    row {
+      column (desktopwidth: 6) { }
+      column (desktopwidth: 6) {
+        actionbutton btnSave (caption: 'Save {1}', captionparams: ({1} = 'abc'), action: save changes, buttonstyle: primary)
       }
     }
   }
-}
+};
 
 /**
  * Create a new object for the PgTest.P006_DataForm page
@@ -309,18 +303,16 @@ create microflow PgTest.P006_CreateObject ()
 folder 'Forms'
 begin
     $NewCustomer = create PgTest.Customer (Email = 'weqw@example.com', City = 'yourcity');
-    show page PgTest.P006_DataForm($Customer = $NewCustomer);
+    show page PgTest.P006_DataForm(Customer = $NewCustomer);
 end;
-/
 
 create microflow PgTest.P007_DataForm_Getter ()
 returns PgTest.Customer as $Customer
 folder 'Forms'
 begin
-  retrieve $Customer from PgTest.Customer limit 1;
+  retrieve $Customer from PgTest.Customer first;
   return $Customer;
 end;
-/
 
 -- TODO: offset limit implementation
 create microflow PgTest.P007_DataForm_Getter_2 ()
@@ -330,10 +322,9 @@ begin
   retrieve $CustomerList from PgTest.Customer
     where ( starts-with(Name, 'a') )
     limit 2 offset 3;
-  set $FirstCustomer = head($CustomerList);
+  $FirstCustomer = head $CustomerList;
   return $FirstCustomer;
 end;
-/
 
 create microflow PgTest.P007_DataForm_Getter_3 ()
 returns PgTest.Customer as $FirstCustomer
@@ -344,10 +335,9 @@ begin
     sort by PgTest.Customer.Name asc, PgTest.Customer.Email desc
     limit 2 +1
     offset 3 + 3;
-  $FirstCustomer = head($CustomerList);
+  $FirstCustomer = head $CustomerList;
   return $FirstCustomer;
 end;
-/
 
 create microflow PgTest.P007_DataForm_Getter_4 ()
 returns PgTest.Customer as $FirstCustomer
@@ -360,10 +350,9 @@ begin
     sort by PgTest.Customer.Name asc, PgTest.Customer.Email desc
     limit $Lim
     offset $off;
-  $FirstCustomer = head($CustomerList);
+  $FirstCustomer = head $CustomerList;
   return $FirstCustomer;
 end;
-/
 
 /**
  * Process selected products from Gallery multi-select.
@@ -375,40 +364,38 @@ begin
   declare $success boolean = true;
   return $success;
 end;
-/
 
-create page PgTest.P007_DataForm_2
+create page PgTest.P007_DataForm_2 folder 'Forms'
 (
   title: 'Edit Customer',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p007_dataform',
-  folder: 'Forms'
+  url: 'p007_dataform'
 )
 {
   layoutgrid buttonRow {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext textIntro (content: 'This is a PgTest page created via MDL', rendermode: paragraph)
       }
     }
-    row row2 {
-      column col2a (desktopwidth: 6) {
-        actionbutton btnSave (caption: 'Save', action: save_changes, buttonstyle: primary)
+    row {
+      column (desktopwidth: 6) {
+        actionbutton btnSave (caption: 'Save', action: save changes, buttonstyle: primary)
       }
-      column col2b (desktopwidth: 6) {
+      column (desktopwidth: 6) {
         dataview dataView5 (datasource: microflow PgTest.P007_DataForm_Getter) {
           textbox txtName (label: 'Name', attribute: Name)
           textbox txtEmail (label: 'Email', attribute: Email)
 
-          footer footer1 {
-            actionbutton actionButton1 (caption: 'Save', action: save_changes, buttonstyle: primary)
-            actionbutton actionButton2 (caption: 'Cancel', action: cancel_changes, buttonstyle: default)
+          footer {
+            actionbutton actionButton1 (caption: 'Save', action: save changes, buttonstyle: primary)
+            actionbutton actionButton2 (caption: 'Cancel', action: cancel changes, buttonstyle: default)
           }
         }
       }
     }
   }
-}
+};
 
 -- MARK: Data Grid
 
@@ -419,110 +406,106 @@ create page PgTest.P007_DataForm_2
 /**
  * Basic product overview page with minimal configuration.
  */
-create page PgTest.P008_Product_Overview
+create page PgTest.P008_Product_Overview folder 'DataGrid'
 (
   title: 'Products',
   layout: Atlas_Core.Atlas_Default,
-  url: 'P008_Product_Overview',
-  folder: 'DataGrid'
+  url: 'P008_Product_Overview'
 )
 {
   layoutgrid buttonRow {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext textIntro (content: 'P008_Product_Overview', rendermode: H3)
-        dynamictext textIntro2 (content: 'P008_Product_Overview: {1}', contentparams: [{1}='abc'], rendermode: H3)
+        dynamictext textIntro2 (content: 'P008_Product_Overview: {1}', contentparams: ({1}='abc'), rendermode: H3)
       }
     }
-    row row2 {
-      column col2 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         datagrid ProductGrid (datasource: database PgTest.Product) {
-          column colName (attribute: Name, caption: 'Product Name')
-          column colCode (attribute: Code, caption: 'SKU')
-          column colPrice (attribute: Price, caption: 'Unit Price')
-          column colStock (attribute: Stock, caption: 'Available')
-          column colActive (attribute: IsActive, caption: 'Active')
+          column (attribute: Name, caption: 'Product Name')
+          column (attribute: Code, caption: 'SKU')
+          column (attribute: Price, caption: 'Unit Price')
+          column (attribute: Stock, caption: 'Available')
+          column (attribute: IsActive, caption: 'Active')
         }
       }
     }
   }
-}
+};
 
 /**
  * Basic product overview page with DataGrid columns.
  */
-create page PgTest.P008_Product_Overview_2 (title: 'Products', layout: Atlas_Core.Atlas_Default, url: 'P008_Product_Overview_2', folder: 'DataGrid') {
+create page PgTest.P008_Product_Overview_2 folder 'DataGrid' (title: 'Products', layout: Atlas_Core.Atlas_Default, url: 'P008_Product_Overview_2') {
   layoutgrid buttonRow {
-    row row1 {
-      column col1 (desktopwidth: autofill) {
+    row {
+      column (desktopwidth: autofill) {
         dynamictext textIntro (content: 'P008_Product_Overview', rendermode: H3)
       }
     }
-    row row2 {
-      column col1 (desktopwidth: autofill) {
+    row {
+      column (desktopwidth: autofill) {
         datagrid ProductGrid (datasource: database PgTest.Product) {
-          column colName (attribute: Name, caption: 'Product Name')
-          column colCode (attribute: Code, caption: 'SKU')
-          column colPrice (attribute: Price, caption: 'Unit Price')
-          column colStock (attribute: Stock, caption: 'Available')
-          column colActive (attribute: IsActive, caption: 'Active')
+          column (attribute: Name, caption: 'Product Name')
+          column (attribute: Code, caption: 'SKU')
+          column (attribute: Price, caption: 'Unit Price')
+          column (attribute: Stock, caption: 'Available')
+          column (attribute: IsActive, caption: 'Active')
         }
       }
     }
   }
-}
+};
 
 /**
  * Product overview with default sorting by name.
  */
-create page PgTest.P010_Product_Sorted
+create page PgTest.P010_Product_Sorted folder 'DataGrid'
 (
   title: 'Products (A-Z)',
   layout: Atlas_Core.Atlas_Default,
-  url: 'PgTest.P010_Product_Sorted',
-  folder: 'DataGrid'
+  url: 'PgTest.P010_Product_Sorted'
 )
 {
   datagrid ProductGrid (datasource: database from PgTest.Product sort by Name asc) {
-    column colName (attribute: Name, caption: 'Product Name')
-    column colCode (attribute: Code, caption: 'SKU')
-    column colPrice (attribute: Price, caption: 'Unit Price')
-    column colStock (attribute: Stock, caption: 'Available')
-    column colActive (attribute: IsActive, caption: 'Active')
+    column (attribute: Name, caption: 'Product Name')
+    column (attribute: Code, caption: 'SKU')
+    column (attribute: Price, caption: 'Unit Price')
+    column (attribute: Stock, caption: 'Available')
+    column (attribute: IsActive, caption: 'Active')
   }
-}
+};
 
 /**
  * Show only active products.
  */
-create page PgTest.P010_Product_Sorted_filtered
+create page PgTest.P010_Product_Sorted_filtered folder 'DataGrid'
 (
   title: 'Active Products',
   layout: Atlas_Core.Atlas_Default,
-  url: 'PgTest.P010_Product_Sorted_filtered',
-  folder: 'DataGrid'
+  url: 'PgTest.P010_Product_Sorted_filtered'
 )
 {
   datagrid ProductGrid (
     datasource: database from PgTest.Product where [IsActive = true] sort by Name asc
   ) {
-    column colName (attribute: Name, caption: 'Product Name')
-    column colCode (attribute: Code, caption: 'SKU')
-    column colPrice (attribute: Price, caption: 'Unit Price')
-    column colStock (attribute: Stock, caption: 'Available')
-    column colActive (attribute: IsActive, caption: 'Active')
+    column (attribute: Name, caption: 'Product Name')
+    column (attribute: Code, caption: 'SKU')
+    column (attribute: Price, caption: 'Unit Price')
+    column (attribute: Stock, caption: 'Available')
+    column (attribute: IsActive, caption: 'Active')
   }
-}
+};
 
 /**
  * Show only active products with complex filter.
  */
-create page PgTest.P010_2_Product_Sorted_filtered
+create page PgTest.P010_2_Product_Sorted_filtered folder 'DataGrid'
 (
   title: 'Active Products',
   layout: Atlas_Core.Atlas_Default,
-  url: 'PgTest.P010_2_Product_Sorted_filtered',
-  folder: 'DataGrid'
+  url: 'PgTest.P010_2_Product_Sorted_filtered'
 )
 {
   datagrid ProductGrid (
@@ -530,23 +513,22 @@ create page PgTest.P010_2_Product_Sorted_filtered
       where [IsActive = true() and contains(Code, 'a') and Price > 10] or [Stock < 2]
       sort by Name asc, Price desc
   ) {
-    column colName (attribute: Name, caption: 'Product Name')
-    column colCode (attribute: Code, caption: 'SKU')
-    column colPrice (attribute: Price, caption: 'Unit Price')
-    column colStock (attribute: Stock, caption: 'Available')
-    column colActive (attribute: IsActive, caption: 'Active')
+    column (attribute: Name, caption: 'Product Name')
+    column (attribute: Code, caption: 'SKU')
+    column (attribute: Price, caption: 'Unit Price')
+    column (attribute: Stock, caption: 'Available')
+    column (attribute: IsActive, caption: 'Active')
   }
-}
+};
 
 /**
  * Show only active products with complex filter.
  */
-create page PgTest.P010_Product_Sorted_filtered_styled
+create page PgTest.P010_Product_Sorted_filtered_styled folder 'DataGrid'
 (
   title: 'Active Products',
   layout: Atlas_Core.Atlas_Default,
-  url: 'PgTest.P010_Product_Sorted_styled',
-  folder: 'DataGrid'
+  url: 'PgTest.P010_Product_Sorted_styled'
 )
 {
   datagrid ProductGrid (
@@ -559,34 +541,33 @@ create page PgTest.P010_Product_Sorted_filtered_styled
     Pagination: buttons,
     PagingPosition: both
   ) {
-    column colName (attribute: Name, caption: 'Product Name', Alignment: left, WrapText: false)
-    column colCode (attribute: Code, caption: 'SKU')
-    column colPrice (attribute: Price, caption: 'Unit Price', Alignment: right, WrapText: false)
-    column colStock (attribute: Stock, caption: 'Available', Alignment: right, WrapText: false)
-    column colActive (attribute: IsActive, caption: 'Active')
+    column (attribute: Name, caption: 'Product Name', Alignment: left, WrapText: false)
+    column (attribute: Code, caption: 'SKU')
+    column (attribute: Price, caption: 'Unit Price', Alignment: right, WrapText: false)
+    column (attribute: Stock, caption: 'Available', Alignment: right, WrapText: false)
+    column (attribute: IsActive, caption: 'Active')
   }
 };
 
 /**
  * Show only active products with complex filter.
  */
-create page PgTest.P010_Product_Sorted_filtered_styled_2 (
+create page PgTest.P010_Product_Sorted_filtered_styled_2 folder 'DataGrid' (
   title: 'Active Products',
   layout: Atlas_Core.Atlas_Default,
-  url: 'PgTest.P010_Product_Sorted_styled_2',
-  folder: 'DataGrid'
+  url: 'PgTest.P010_Product_Sorted_styled_2'
 ) {
   datagrid ProductGrid ( 
     datasource:  database from PgTest.Product where (IsActive = true() and contains(Code, 'a') and Price > 10) or (Stock < 2) sort by PgTest.Product.Name asc, PgTest.Product.Price desc, 
     PageSize: 10, 
     PagingPosition: both, 
-    designproperties: ['Compact': on, 'Striped': on, 'Hover': on, 'Borders': 'Horizontal']
+    designproperties: ('Compact': on, 'Striped': on, 'Hover': on, 'Borders': 'Horizontal')
   ) {
-    column colName (attribute: Name, caption: 'Product Name', Alignment: left, WrapText: false, designproperties: ['Compact': on, 'Striped': on, 'Hover': on, 'Borders': 'Horizontal'])
-    column colCode (attribute: Code, caption: 'SKU')
-    column colPrice (attribute: Price, caption: 'Unit Price', Alignment: right, WrapText: false)
-    column colStock (attribute: Stock, caption: 'Available', Alignment: right, WrapText: false)
-    column colActive (attribute: IsActive, caption: 'Active')
+    column (attribute: Name, caption: 'Product Name', Alignment: left, WrapText: false)
+    column (attribute: Code, caption: 'SKU')
+    column (attribute: Price, caption: 'Unit Price', Alignment: right, WrapText: false)
+    column (attribute: Stock, caption: 'Available', Alignment: right, WrapText: false)
+    column (attribute: IsActive, caption: 'Active')
   }
 };
 
@@ -600,31 +581,28 @@ begin
   retrieve $Products from PgTest.Product;
   return $Products;
 end;
-/
 
 /**
  * Show only active products with complex filter.
  */
-create page PgTest.P010_Product_Microflow_DataSource (
+create page PgTest.P010_Product_Microflow_DataSource folder 'DataGrid' (
   title: 'Active Products',
   layout: Atlas_Core.Atlas_Default,
-  url: 'PgTest.P010_Product_Microflow_DataSource',
-  folder: 'DataGrid'
+  url: 'PgTest.P010_Product_Microflow_DataSource'
 ) {
   datagrid ProductGrid ( 
     datasource: microflow PgTest.P010_DSO_GetProducts ,
     PageSize: 10, 
     PagingPosition: both, 
-    designproperties: ['Compact': on, 'Striped': on, 'Hover': on, 'Borders': 'Horizontal']
+    designproperties: ('Compact': on, 'Striped': on, 'Hover': on, 'Borders': 'Horizontal')
   ) {
-    column colName (attribute: Name, caption: 'Product Name', Alignment: left, WrapText: false, designproperties: ['Compact': on, 'Striped': on, 'Hover': on, 'Borders': 'Horizontal'])
-    column colCode (attribute: Code, caption: 'SKU')
-    column colPrice (attribute: Price, caption: 'Unit Price', Alignment: right, WrapText: false)
-    column colStock (attribute: Stock, caption: 'Available', Alignment: right, WrapText: false)
-    column colActive (attribute: IsActive, caption: 'Active')
+    column (attribute: Name, caption: 'Product Name', Alignment: left, WrapText: false)
+    column (attribute: Code, caption: 'SKU')
+    column (attribute: Price, caption: 'Unit Price', Alignment: right, WrapText: false)
+    column (attribute: Stock, caption: 'Available', Alignment: right, WrapText: false)
+    column (attribute: IsActive, caption: 'Active')
   }
 };
-/
 
 -- MARK: Control bar
 
@@ -637,189 +615,186 @@ create page PgTest.P010_Product_Microflow_DataSource (
  *
  * @param $Product The product to edit
  */
-create page PgTest.P011_DataGrid_ControlBar_Dummy
+create page PgTest.P011_DataGrid_ControlBar_Dummy folder 'DataGrid'
 (
-  params: {
+  params: (
     $Product: PgTest.Product
-  },
+  ),
   title: 'Edit Product',
-  layout: Atlas_Core.PopupLayout,
-  folder: 'DataGrid'
+  layout: Atlas_Core.PopupLayout
 )
 {
   layoutgrid buttonRow {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext textIntro (content: 'Dummy', rendermode: H3)
-        dynamictext textIntro2 (content: 'Dummy: {1}', contentparams: [{1}=$Product.Name], rendermode: H3)
+        dynamictext textIntro2 (content: 'Dummy: {1}', contentparams: ({1}=$Product.Name), rendermode: H3)
       }
     }
   }
-}
+};
 
 /**
  * Dummy edit page for control bar example.
  *
  * @param $Product The product to edit
  */
-create page PgTest.P011_DataGrid_ControlBar_Dummy_2
+create page PgTest.P011_DataGrid_ControlBar_Dummy_2 folder 'DataGrid'
 (
-  params: {
+  params: (
     $Product1: PgTest.Product,
     $Product2: PgTest.Product
-  },
+  ),
   title: 'Edit Product',
-  layout: Atlas_Core.PopupLayout,
-  folder: 'DataGrid'
+  layout: Atlas_Core.PopupLayout
 )
 {
   layoutgrid buttonRow {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext textIntro1 (content: 'Dummy', rendermode: H3)
-        dynamictext textIntro2 (content: 'Dummy: {1}, {2}', contentparams: [{1}=$Product1.Name, {2}=$Product1.Code], rendermode: paragraph)
-        dynamictext textIntro3 (content: 'Dummy: {1}, {2}', contentparams: [{1}=$Product2.Name, {2}=$Product2.Code], rendermode: text)
+        dynamictext textIntro2 (content: 'Dummy: {1}, {2}', contentparams: ({1}=$Product1.Name, {2}=$Product1.Code), rendermode: paragraph)
+        dynamictext textIntro3 (content: 'Dummy: {1}, {2}', contentparams: ({1}=$Product2.Name, {2}=$Product2.Code), rendermode: text)
       }
     }
   }
-}
+};
 
 /**
  * Product overview with ability to create new products.
  */
-create page PgTest.P011_DataGrid_ControlBar
+create page PgTest.P011_DataGrid_ControlBar folder 'DataGrid'
 (
   title: 'Manage Products',
   layout: Atlas_Core.Atlas_Default,
-  url: 'PgTest.P011_DataGrid_ControlBar',
-  folder: 'DataGrid'
+  url: 'PgTest.P011_DataGrid_ControlBar'
 )
 {
   layoutgrid buttonRow {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         datagrid ProductGrid (
           datasource: database from PgTest.Product where [IsActive = true] sort by Name asc
         ) {
-          controlbar controlBar1 {
+          controlbar {
             actionbutton btnNew (
               caption: 'New Product',
-              action: create_object PgTest.Product then show_page PgTest.P011_DataGrid_ControlBar_Dummy,
+              action: create object PgTest.Product then show page PgTest.P011_DataGrid_ControlBar_Dummy,
               buttonstyle: primary
             )
           }
-          column colName (attribute: Name, caption: 'Product Name')
-          column colCode (attribute: Code, caption: 'SKU')
-          column colPrice (attribute: Price, caption: 'Unit Price')
-          column colStock (attribute: Stock, caption: 'Available')
-          column colActive (attribute: IsActive, caption: 'Active')
+          column (attribute: Name, caption: 'Product Name')
+          column (attribute: Code, caption: 'SKU')
+          column (attribute: Price, caption: 'Unit Price')
+          column (attribute: Stock, caption: 'Available')
+          column (attribute: IsActive, caption: 'Active')
         }
       }
     }
   }
-}
+};
 
 /**
  * Basic product edit form with text inputs.
  *
  * @param $Product The product to edit
  */
-create page PgTest.P012_Product_Manage_Edit
+create page PgTest.P012_Product_Manage_Edit folder 'DataGrid'
 (
-  params: {
+  params: (
     $Product: PgTest.Product
-  },
+  ),
   title: 'Edit Product',
-  layout: Atlas_Core.PopupLayout,
-  folder: 'DataGrid'
+  layout: Atlas_Core.PopupLayout
 )
 {
   layoutgrid buttonRow {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dataview ProductForm (datasource: $Product) {
           textbox txtName (label: 'Product Name', attribute: Name)
           textbox txtCode (label: 'Product Code', attribute: Code)
           textarea txtDescription (label: 'Description', attribute: description)
 
-          footer footer1 {
-            actionbutton btnSave (caption: 'Save', action: save_changes close_page, buttonstyle: success)
-            actionbutton btnCancel (caption: 'Cancel', action: cancel_changes close_page, buttonstyle: default)
+          footer {
+            actionbutton btnSave (caption: 'Save', action: save changes close page, buttonstyle: success)
+            actionbutton btnCancel (caption: 'Cancel', action: cancel changes close page, buttonstyle: default)
           }
         }
       }
     }
   }
-}
+};
 
 
 
 /**
  * Full CRUD operations on products.
  */
-create page PgTest.P012_Product_Manage
+create page PgTest.P012_Product_Manage folder 'DataGrid'
 (
   title: 'Product Management',
   layout: Atlas_Core.Atlas_Default,
-  url: 'P012_Product_Manage',
-  folder: 'DataGrid'
+  url: 'P012_Product_Manage'
 )
 {
   layoutgrid buttonRow {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext textIntro (content: 'P008_Product_Overview', rendermode: H3)
-        dynamictext textIntro2 (content: 'P008_Product_Overview: {1}', contentparams: [{1}='abc'], rendermode: H3)
+        dynamictext textIntro2 (content: 'P008_Product_Overview: {1}', contentparams: ({1}='abc'), rendermode: H3)
       }
     }
-    row row2 {
-      column col2 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         datagrid ProductGrid (datasource: database PgTest.Product) {
-          controlbar controlBar1 {
+          controlbar {
             actionbutton btnNew1 (
               caption: 'New',
-              action: create_object PgTest.Product then show_page PgTest.P012_Product_Manage_Edit,
+              action: create object PgTest.Product then show page PgTest.P012_Product_Manage_Edit,
               buttonstyle: primary
             )
           }
-          column colName (attribute: Name, caption: 'Product Name')
-          column colCode (attribute: Code, caption: 'SKU')
-          column colPrice (attribute: Price, caption: 'Price')
-          column colStock (attribute: Stock, caption: 'In Stock')
-          column colActive (attribute: IsActive, caption: 'Active')
-          column colActions (caption: 'Actions') {
+          column (attribute: Name, caption: 'Product Name')
+          column (attribute: Code, caption: 'SKU')
+          column (attribute: Price, caption: 'Price')
+          column (attribute: Stock, caption: 'In Stock')
+          column (attribute: IsActive, caption: 'Active')
+          column (caption: 'Actions') {
+            -- `icon:` gives the button an icon-collection icon (Atlas). The name
+            -- must exist in the icon collection or MxBuild rejects it (CE1613).
             actionbutton btnEdit (
               caption: 'Edit',
-              action: show_page PgTest.P012_Product_Manage_Edit (Product: $currentObject),
-              buttonstyle: default
+              action: show page PgTest.P012_Product_Manage_Edit (Product = $currentObject),
+              buttonstyle: default,
+              icon: 'Atlas_Core.Atlas_Filled.pencil'
             )
-            actionbutton btnDelete (caption: 'Delete', action: delete_object, buttonstyle: danger)
+            actionbutton btnDelete (caption: 'Delete', action: delete, buttonstyle: danger)
           }
         }
       }
     }
   }
-}
+};
 
 /**
  * DataGrid with domain-specific filtering and sorting.
  */
-create page PgTest.P013_Product_Inventory
+create page PgTest.P013_Product_Inventory folder 'DataGrid'
 (
   title: 'Inventory Management',
-  layout: Atlas_Core.Atlas_Default,
-  folder: 'DataGrid'
+  layout: Atlas_Core.Atlas_Default
 )
 {
   datagrid ProductGrid (
     datasource: database from PgTest.Product where [Stock < 10] sort by Stock asc
   ) {
-    column colName (attribute: Name)
-    column colCode (attribute: Code)
-    column colStock (attribute: Stock)
-    column colPrice (attribute: Price)
+    column (attribute: Name)
+    column (attribute: Code)
+    column (attribute: Stock)
+    column (attribute: Price)
   }
-}
+};
 
 
 -- MARK: Container
@@ -836,17 +811,16 @@ create page PgTest.P013_Product_Inventory
 /**
  * Basic container usage for grouping content.
  */
-create page PgTest.P013b_Container_Basic
+create page PgTest.P013b_Container_Basic folder 'Container'
 (
   title: 'Container Examples',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p013b_container_basic',
-  folder: 'Container'
+  url: 'p013b_container_basic'
 )
 {
   layoutgrid mainGrid {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         -- Simple container without styling
         container section1 {
           dynamictext heading1 (content: 'Section One', rendermode: H3)
@@ -854,15 +828,15 @@ create page PgTest.P013b_Container_Basic
         }
       }
     }
-    row row2 {
-      column col2a (desktopwidth: 6) {
+    row {
+      column (desktopwidth: 6) {
         -- Container with CSS class
         container card1 (class: 'card') {
           dynamictext cardTitle1 (content: 'Card One', rendermode: H4)
           dynamictext cardText1 (content: 'Styled with card class')
         }
       }
-      column col2b (desktopwidth: 6) {
+      column (desktopwidth: 6) {
         -- Container with class and inline style
         container card2 (class: 'card', style: 'padding: 16px; background: #f5f5f5;') {
           dynamictext cardTitle2 (content: 'Card Two', rendermode: H4)
@@ -870,8 +844,8 @@ create page PgTest.P013b_Container_Basic
         }
       }
     }
-    row row3 {
-      column col3 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         -- Nested containers
         container outer1 (class: 'section') {
           dynamictext outerTitle (content: 'Outer Container', rendermode: H3)
@@ -883,21 +857,132 @@ create page PgTest.P013b_Container_Basic
       }
     }
   }
-}
+};
 
 /**
  * Empty container (no children).
  */
-create page PgTest.P013c_Container_Empty
+create page PgTest.P013c_Container_Empty folder 'Container'
 (
   title: 'Empty Container',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p013c_container_empty',
-  folder: 'Container'
+  url: 'p013c_container_empty'
 )
 {
   container spacer1 (class: 'spacing-outer-bottom-large')
-}
+};
+
+/**
+ * Clickable container (the Container "On click" event, Issue #603).
+ *
+ * A container is made clickable with OnClick: (the canonical Action: keyword is
+ * an exact synonym). Any client action works — microflow, nanoflow, show_page,
+ * save_changes, etc. A container WITHOUT OnClick:/Action: is non-clickable, as
+ * in Studio Pro.
+ */
+create page PgTest.P013d_Container_Clickable folder 'Container'
+(
+  title: 'Clickable Containers',
+  layout: Atlas_Core.Atlas_Default,
+  url: 'p013d_container_clickable'
+)
+{
+  layoutgrid clickGrid {
+    row {
+      column (desktopwidth: 6) {
+        -- OnClick: calls a microflow when the whole card is clicked.
+        container mfCard (onclick: call microflow PgTest.Open_P002_Dynamic_Text_Page, class: 'card clickable') {
+          dynamictext mfCardTitle (content: 'Open via microflow', rendermode: H4)
+          dynamictext mfCardText (content: 'Click anywhere on this card')
+        }
+      }
+      column (desktopwidth: 6) {
+        -- Action: is the exact synonym of OnClick:; here it opens a page.
+        container pageCard (action: show page PgTest.P002_Dynamic_Text_Page, class: 'card clickable') {
+          dynamictext pageCardTitle (content: 'Open via page', rendermode: H4)
+          dynamictext pageCardText (content: 'Click to navigate to another page')
+        }
+      }
+    }
+    row {
+      column (desktopwidth: 12) {
+        -- No OnClick:/Action: — a plain, non-clickable container for contrast.
+        container plainCard (class: 'card') {
+          dynamictext plainCardTitle (content: 'Not clickable', rendermode: H4)
+          dynamictext plainCardText (content: 'This container has no On click action')
+        }
+      }
+    }
+  }
+};
+
+/**
+ * A clickable container in a DATA GRID CONTROL BAR, calling a nanoflow that
+ * takes a parameter (mendixlabs/mxcli#1082).
+ *
+ * Three things meet here that nothing else in this gate exercised together, and
+ * the gap let a real defect through:
+ *
+ *  1. A container's action can take an ARGUMENT LIST, exactly like a button's.
+ *     The issue was filed on the belief that it could not — `Action: nanoflow
+ *     Module.NF` was assumed to be the only accepted form — so the page below is
+ *     the counter-example, and `mx check` reporting 0 errors on it is the claim.
+ *
+ *  2. A control bar is NOT row-scoped. Measured on mxbuild 11.12.0 with six
+ *     containers carrying one identical fault: inside a COLUMN the grid's row
+ *     supplies the argument (no error), inside the CONTROL BAR it does not
+ *     (CE1571). So the argument here is not decoration — drop the `($Product =
+ *     $ProductGrid)` and `mx check` goes red.
+ *
+ *  3. The grid's SELECTION is what fills it. `$ProductGrid` is the selection of
+ *     the widget named `ProductGrid`, which is why `selection: single` below is
+ *     load-bearing rather than cosmetic.
+ *
+ * The column button beside it is the control for (2): same nanoflow, same
+ * missing-argument shape, and it needs no argument because a column is
+ * row-scoped.
+ */
+create nanoflow PgTest.ACT_ToggleProductActive
+    ($Product : PgTest.Product)
+    folder 'Actions'
+begin
+    change $Product (IsActive = false) refresh;
+end;
+
+create page PgTest.P013e_ControlBar_Container_Action folder 'Container'
+(
+  title: 'Control-bar container action',
+  layout: Atlas_Core.Atlas_Default,
+  url: 'p013e_controlbar_container_action'
+)
+{
+  datagrid ProductGrid (
+    datasource: database from PgTest.Product,
+    selection: single
+  ) {
+    column (attribute: Name, caption: 'Product Name')
+
+    -- ROW-SCOPED: the grid's row supplies the nanoflow's parameter, so this
+    -- one needs no argument. The control for the control-bar case below.
+    column (caption: 'Row action') {
+      container cRowToggle (action: call nanoflow PgTest.ACT_ToggleProductActive, class: 'command') {
+        actionbutton btnRowToggle (caption: 'Deactivate')
+      }
+    }
+
+    controlbar {
+      -- NOT row-scoped: the argument is required, and it is the grid's
+      -- selection. Both spellings of an argument list are accepted; this is
+      -- the `$Param = value` one, matching how a microflow call is written.
+      container cToggleSelected (
+        class: 'command',
+        action: call nanoflow PgTest.ACT_ToggleProductActive (Product = $ProductGrid)
+      ) {
+        actionbutton btnToggleSelected (caption: 'Deactivate selected')
+      }
+    }
+  }
+};
 
 -- MARK: DataView
 
@@ -909,48 +994,46 @@ create page PgTest.P013c_Container_Empty
  * Basic product edit form with text inputs.
  * @param $Product The product to edit
  */
-create or replace page PgTest.P014_Product_Edit (
+create or modify page PgTest.P014_Product_Edit folder 'DataView' (
   title: 'Edit Product',
   layout: Atlas_Core.PopupLayout,
-  params: { $Product: PgTest.Product },
-  folder: 'DataView'
+  params: ( $Product: PgTest.Product )
 ) {
   dataview ProductForm (datasource: $Product) {
     layoutgrid layoutGrid1 {
-      row row1 {
-        column col1 (desktopwidth: autofill) {
+      row {
+        column (desktopwidth: autofill) {
           textbox txtName (label: 'Product Name', attribute: Name)
           textbox txtCode (label: 'Product Code', attribute: Code)
           textarea txtDescription (label: 'Description', attribute: description)
         }
       }
     }
-    footer footer1 {
-      actionbutton btnSave (caption: 'Save', action: save_changes, buttonstyle: success)
-      actionbutton btnCancel (caption: 'Cancel', action: cancel_changes)
+    footer {
+      actionbutton btnSave (caption: 'Save', action: save changes, buttonstyle: success)
+      actionbutton btnCancel (caption: 'Cancel', action: cancel changes)
     }
   }
-}
+};
 
 /**
  * Product form with different input widget types.
  *
  * @param $Product The product to edit
  */
-create page PgTest.P015_Product_EditFull
+create page PgTest.P015_Product_EditFull folder 'DataView'
 (
-  params: {
+  params: (
     $Product: PgTest.Product
-  },
+  ),
   title: 'Edit Product Details',
-  layout: Atlas_Core.PopupLayout,
-  folder: 'DataView'
+  layout: Atlas_Core.PopupLayout
 )
 {
   dataview ProductForm (datasource: $Product) {
      layoutgrid layoutGrid1 {
-      row row1 {
-        column col1 (desktopwidth: autofill) {
+      row {
+        column (desktopwidth: autofill) {
     textbox txtName (label: 'Product Name', attribute: Name)
     textbox txtCode (label: 'SKU', attribute: Code)
     textbox txtPrice (label: 'Unit Price', attribute: Price)
@@ -961,12 +1044,12 @@ create page PgTest.P015_Product_EditFull
         }
       }
     }
-    footer footer1 {
-      actionbutton btnSave (caption: 'Save', action: save_changes, buttonstyle: success)
-      actionbutton btnCancel (caption: 'Cancel', action: cancel_changes, buttonstyle: default)
+    footer {
+      actionbutton btnSave (caption: 'Save', action: save changes, buttonstyle: success)
+      actionbutton btnCancel (caption: 'Cancel', action: cancel changes, buttonstyle: default)
     }
   }
-}
+};
 
 -- ============================================================================
 -- LEVEL 3b: DataView Form Orientation (FormOrientation / LabelWidth)
@@ -992,63 +1075,60 @@ create page PgTest.P015_Product_EditFull
  * DataView with Vertical form orientation (labels above inputs).
  * @param $Product The product to edit
  */
-create or replace page PgTest.P018_DataView_FormOrientation_Vertical (
+create or modify page PgTest.P018_DataView_FormOrientation_Vertical folder 'DataView' (
   title: 'Vertical Form',
   layout: Atlas_Core.PopupLayout,
-  params: { $Product: PgTest.Product },
-  folder: 'DataView'
+  params: ( $Product: PgTest.Product )
 ) {
   dataview ProductForm (datasource: $Product, FormOrientation: Vertical) {
     textbox txtName (label: 'Product Name', attribute: Name)
     textbox txtCode (label: 'Product Code', attribute: Code)
-    footer footer1 {
-      actionbutton btnSave (caption: 'Save', action: save_changes, buttonstyle: success)
-      actionbutton btnCancel (caption: 'Cancel', action: cancel_changes)
+    footer {
+      actionbutton btnSave (caption: 'Save', action: save changes, buttonstyle: success)
+      actionbutton btnCancel (caption: 'Cancel', action: cancel changes)
     }
   }
-}
+};
 
 /**
  * DataView with explicit Horizontal form orientation (labels beside inputs).
  * Equivalent to the default; included to show the spelling works.
  * @param $Product The product to edit
  */
-create or replace page PgTest.P018_DataView_FormOrientation_Horizontal (
+create or modify page PgTest.P018_DataView_FormOrientation_Horizontal folder 'DataView' (
   title: 'Horizontal Form',
   layout: Atlas_Core.PopupLayout,
-  params: { $Product: PgTest.Product },
-  folder: 'DataView'
+  params: ( $Product: PgTest.Product )
 ) {
   dataview ProductForm (datasource: $Product, FormOrientation: Horizontal) {
     textbox txtName (label: 'Product Name', attribute: Name)
     textbox txtCode (label: 'Product Code', attribute: Code)
-    footer footer1 {
-      actionbutton btnSave (caption: 'Save', action: save_changes, buttonstyle: success)
-      actionbutton btnCancel (caption: 'Cancel', action: cancel_changes)
+    footer {
+      actionbutton btnSave (caption: 'Save', action: save changes, buttonstyle: success)
+      actionbutton btnCancel (caption: 'Cancel', action: cancel changes)
     }
   }
-}
+};
 
 /**
  * DataView with an explicit LabelWidth (Horizontal, label spans 5/12).
  * LabelWidth overrides FormOrientation when both are present.
  * @param $Product The product to edit
  */
-create or replace page PgTest.P018_DataView_LabelWidth (
+create or modify page PgTest.P018_DataView_LabelWidth folder 'DataView' (
   title: 'Custom Label Width',
   layout: Atlas_Core.PopupLayout,
-  params: { $Product: PgTest.Product },
-  folder: 'DataView'
+  params: ( $Product: PgTest.Product )
 ) {
   dataview ProductForm (datasource: $Product, LabelWidth: 5) {
     textbox txtName (label: 'Product Name', attribute: Name)
     textbox txtCode (label: 'Product Code', attribute: Code)
-    footer footer1 {
-      actionbutton btnSave (caption: 'Save', action: save_changes, buttonstyle: success)
-      actionbutton btnCancel (caption: 'Cancel', action: cancel_changes)
+    footer {
+      actionbutton btnSave (caption: 'Save', action: save changes, buttonstyle: success)
+      actionbutton btnCancel (caption: 'Cancel', action: cancel changes)
     }
   }
-}
+};
 
 -- MARK: Snippet
 
@@ -1060,56 +1140,51 @@ create or replace page PgTest.P018_DataView_LabelWidth (
 /**
  * Navigation menu snippet for overview pages.
  */
-create snippet PgTest.NavigationMenu(
-  folder: 'Snippets'
-)
+create snippet PgTest.NavigationMenu folder 'Snippets'
 {
   layoutgrid navGrid {
-    row row1 {
-      column col1 (desktopwidth: 12) {
-        actionbutton btnProducts (caption: 'Products', action: show_page PgTest.P008_Product_Overview, buttonstyle: default)
-        actionbutton btnCustomers (caption: 'Customers', action: show_page PgTest.P007_DataForm_2, buttonstyle: default)
-        actionbutton btnOrders (caption: 'Orders', action: show_page PgTest.P012_Product_Manage, buttonstyle: default)
+    row {
+      column (desktopwidth: 12) {
+        actionbutton btnProducts (caption: 'Products', action: show page PgTest.P008_Product_Overview, buttonstyle: default)
+        actionbutton btnCustomers (caption: 'Customers', action: show page PgTest.P007_DataForm_2, buttonstyle: default)
+        actionbutton btnOrders (caption: 'Orders', action: show page PgTest.P012_Product_Manage, buttonstyle: default)
       }
     }
   }
-}
+};
 
 /**
  * Navigation menu using NavigationList widget.
  */
-create snippet PgTest.NavigationMenuList(
-  folder: 'Snippets'
-)
+create snippet PgTest.NavigationMenuList folder 'Snippets'
 
 {
   navigationlist navMenu {
-    item item1 (action: show_page PgTest.P008_Product_Overview) {
+    item item1 (action: show page PgTest.P008_Product_Overview) {
       dynamictext text1 (content: 'Products')
     }
-    item item2 (action: show_page PgTest.P012_Product_Manage) {
+    item item2 (action: show page PgTest.P012_Product_Manage) {
       dynamictext text2 (content: 'Orders')
     }
   }
-}
+};
 
 /**
  * Customer information snippet with parameter.
  *
  * @param $Customer The customer to display
  */
-create or replace snippet PgTest.CustomerInfo
+create or modify snippet PgTest.CustomerInfo folder 'Snippets'
 (
-  params: {
+  params: (
     $Customer: PgTest.Customer
-  },
-  folder: 'Snippets'
+  )
 )
 {
   dataview customerView (datasource: $Customer) {
     layoutgrid sidebarGrid {
-      row row1 {
-        column col1 (desktopwidth: 12) {
+      row {
+        column (desktopwidth: 12) {
           textbox txtName (label: 'Name', attribute: Name)
           textbox txtEmail (label: 'Email', attribute: Email)
           textbox txtPhone (label: 'Phone', attribute: Phone)
@@ -1119,194 +1194,182 @@ create or replace snippet PgTest.CustomerInfo
       }
     }
   }
-}
+};
 
 /**
  * Customer sidebar snippet showing quick actions.
  *
  * @param $Customer The customer context
  */
-create snippet PgTest.CustomerSidebar
+create snippet PgTest.CustomerSidebar folder 'Snippets'
 (
-  params: {
+  params: (
     $Customer: PgTest.Customer
-  },
-  folder: 'Snippets'
+  )
 )
 {
   layoutgrid sidebarGrid {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext heading1 (content: 'Quick Actions', rendermode: H3)
         dataview dvCustomer (datasource: $Customer) {
           actionbutton btnEdit (
             caption: 'Edit Customer',
-            action: show_page PgTest.P006_DataForm (Customer: $Customer),
+            action: show page PgTest.P006_DataForm (Customer = $Customer),
             buttonstyle: primary
           )
-          actionbutton btnDelete (caption: 'Delete', action: delete_object, buttonstyle: danger)
+          actionbutton btnDelete (caption: 'Delete', action: delete, buttonstyle: danger)
         }
       }
     }
   }
-}
+};
 
 /**
  * Dashboard header snippet.
  */
-create snippet PgTest.DashboardHeader(
-  folder: 'Snippets'
-)
+create snippet PgTest.DashboardHeader folder 'Snippets'
 {
   layoutgrid headerGrid {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext heading1 (content: 'Dashboard', rendermode: H3)
         dynamictext dashSubtitle (content: 'Welcome to your dashboard', rendermode: paragraph)
       }
     }
   }
-}
+};
 
 /**
  * Statistics panel snippet for dashboard.
  */
-create snippet PgTest.StatsPanel(
-  folder: 'Snippets'
-)
+create snippet PgTest.StatsPanel folder 'Snippets'
 {
   layoutgrid statsGrid {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext heading1 (content: 'Statistics', rendermode: H3)
         dynamictext statsContent (content: 'Your key metrics at a glance', rendermode: paragraph)
       }
     }
   }
-}
+};
 
 /**
  * Recent activity snippet for dashboard.
  */
-create snippet PgTest.RecentActivity(
-  folder: 'Snippets'
-)
+create snippet PgTest.RecentActivity folder 'Snippets'
 {
   layoutgrid activityGrid {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext heading1 (content: 'Recent Activity', rendermode: H3)
         dynamictext activityContent (content: 'Latest updates and changes', rendermode: paragraph)
       }
     }
   }
-}
+};
 
 /**
  * Quick actions snippet for dashboard.
  */
-create snippet PgTest.QuickActions(
-  folder: 'Snippets'
-)
+create snippet PgTest.QuickActions folder 'Snippets'
 {
   layoutgrid actionsGrid {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext heading1 (content: 'Quick Actions', rendermode: H3)
         actionbutton btnNewProduct (
           caption: 'New Product',
-          action: create_object PgTest.Product then show_page PgTest.P012_Product_Manage_Edit,
+          action: create object PgTest.Product then show page PgTest.P012_Product_Manage_Edit,
           buttonstyle: primary
         )
         actionbutton btnNewCustomer (
           caption: 'New Customer',
-          action: create_object PgTest.Customer then show_page PgTest.P006_DataForm,
+          action: create object PgTest.Customer then show page PgTest.P006_DataForm,
           buttonstyle: success
         )
       }
     }
   }
-}
+};
 
 /**
  * Dashboard footer snippet.
  */
-create snippet PgTest.DashboardFooter(
-  folder: 'Snippets'
-)
+create snippet PgTest.DashboardFooter folder 'Snippets'
 {
   layoutgrid footerGrid {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext footerText (content: 'Dashboard Footer - Version 1.0', rendermode: paragraph)
       }
     }
   }
-}
+};
 
 /**
  * Overview page using a navigation menu snippet.
  */
-create page PgTest.P016_Page_With_Snippet
+create page PgTest.P016_Page_With_Snippet folder 'Snippets'
 (
   title: 'Overview with Navigation',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p016_page_with_snippet',
-  folder: 'Snippets'
+  url: 'p016_page_with_snippet'
 )
 {
   layoutgrid mainGrid {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         snippetcall navMenu (snippet: PgTest.NavigationMenu)
       }
     }
-    row row2 {
-      column col2 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext pageContent (content: 'Main page content goes here', rendermode: paragraph)
       }
     }
   }
-}
+};
 
 /**
  * Page that calls a parameterized snippet with Params: mapping.
  * Demonstrates fix for issue #291: SNIPPETCALL with Params syntax.
  *
- * Two forms are accepted:
- *   Params: {Customer: $Customer}   -- bare parameter name (keywords OK)
- *   Params: {$Customer: $Customer}  -- dollar-prefixed parameter name
+ * A snippet call binds its arguments as every call does (R4), in the ( ) of a
+ * map (R2):
+ *   Params: (Customer = $Customer)  -- parameter name without `$` (keywords OK)
+ * The old brace map, {$Customer: $Customer}, still parses and warns (MDL-DEPR126).
  */
-create or replace page PgTest.P017_SnippetCall_With_Params
+create or modify page PgTest.P017_SnippetCall_With_Params folder 'Snippets'
 (
   title: 'Customer Detail with Snippet',
   layout: Atlas_Core.Atlas_Default,
-  params: {
+  params: (
     $Customer: PgTest.Customer
-  },
-  url: 'p017_snippet_with_params/{Customer/Name}',
-  folder: 'Snippets'
+  ),
+  url: 'p017_snippet_with_params/{Customer/Name}'
 )
 {
   layoutgrid mainGrid {
-    row row1 {
-      column col1 (desktopwidth: 8) {
+    row {
+      column (desktopwidth: 8) {
         -- Call CustomerInfo snippet — bare parameter name form
         snippetcall customerInfoSnippet (
           snippet: PgTest.CustomerInfo,
-          params: {Customer: $Customer}
+          params: (Customer = $Customer)
         )
       }
-      column col2 (desktopwidth: 4) {
+      column (desktopwidth: 4) {
         -- Call CustomerSidebar snippet — dollar-prefixed parameter name form
         snippetcall sidebarSnippet (
           snippet: PgTest.CustomerSidebar,
-          params: {$Customer: $Customer}
+          params: (Customer = $Customer)
         )
       }
     }
   }
-}
+};
 
 -- MARK: Snippet call keyword param name
 -- Issue #291: param names that are grammar keywords (e.g. Agent, Customer) must
@@ -1340,36 +1403,35 @@ create or replace page PgTest.P017_SnippetCall_With_Params
 /**
  * Gallery showing customers with single selection.
  */
-create page PgTest.P019_Gallery_Simple
+create page PgTest.P019_Gallery_Simple folder 'MasterDetail'
 (
   title: 'Customer Gallery',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p019_gallery_simple',
-  folder: 'MasterDetail'
+  url: 'p019_gallery_simple'
 )
 {
   layoutgrid mainGrid {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext pageTitle (content: 'Customer Gallery', rendermode: H3)
       }
     }
-    row row2 {
-      column col2 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         gallery customerGallery (
           datasource: database from PgTest.Customer sort by Name asc,
           selection: single
         ) {
-          template template1 {
-            dynamictext custName (content: '{1}',contentparams:[{1}=Name], rendermode: H4)
-            dynamictext custEmail (content: '{1}',contentparams:[{1}=Email], rendermode: text)
-            dynamictext custCity (content: '{1}',contentparams:[{1}=City], rendermode: text)
+          template {
+            dynamictext custName (content: '{1}',contentparams:({1}=Name), rendermode: H4)
+            dynamictext custEmail (content: '{1}',contentparams:({1}=Email), rendermode: text)
+            dynamictext custCity (content: '{1}',contentparams:({1}=City), rendermode: text)
           }
         }
       }
     }
   }
-}
+};
 
 /**
  * Classic master-detail layout.
@@ -1381,33 +1443,32 @@ create page PgTest.P019_Gallery_Simple
  * (The default `clear` mode means clicking re-selects only; the DataView
  * binding requires click-to-toggle so the selection is observable.)
  */
-create page PgTest.P020_Master_Detail
+create page PgTest.P020_Master_Detail folder 'MasterDetail'
 (
   title: 'Customer Master-Detail',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p020_master_detail',
-  folder: 'MasterDetail'
+  url: 'p020_master_detail'
 )
 {
   layoutgrid mainGrid {
-    row row1 {
+    row {
       -- Master list (4 columns)
-      column colMaster (desktopwidth: 4) {
-        dynamictext masterTitle (content: 'Customers: {1}',contentparams:[{1}='too many'], rendermode: H3)
+      column (desktopwidth: 4) {
+        dynamictext masterTitle (content: 'Customers: {1}',contentparams:({1}='too many'), rendermode: H3)
         gallery customerList (
           datasource: database from PgTest.Customer sort by Name asc,
           selection: single,
           ItemSelectionMode: toggle
         ) {
-          template template1 {
-            dynamictext custName (content: '{1}',contentparams:[{1}=Name], rendermode: H4)
-            dynamictext custEmail (content: 'Email: {1}',contentparams:[{1}=Email], rendermode: text)
+          template {
+            dynamictext custName (content: '{1}',contentparams:({1}=Name), rendermode: H4)
+            dynamictext custEmail (content: 'Email: {1}',contentparams:({1}=Email), rendermode: text)
           }
         }
       }
 
       -- Detail form (8 columns)
-      column colDetail (desktopwidth: 8) {
+      column (desktopwidth: 8) {
         dynamictext detailTitle (content: 'Customer Details', rendermode: H3)
         dataview customerDetail (datasource: selection customerList) {
           textbox txtName (label: 'Name', attribute: Name)
@@ -1416,108 +1477,105 @@ create page PgTest.P020_Master_Detail
           textbox txtAddress (label: 'Address', attribute: Address)
           textbox txtCity (label: 'City', attribute: City)
 
-          footer footer1 {
-            actionbutton btnSave (caption: 'Save', action: save_changes, buttonstyle: success)
-            actionbutton btnCancel (caption: 'Cancel', action: cancel_changes, buttonstyle: default)
+          footer {
+            actionbutton btnSave (caption: 'Save', action: save changes, buttonstyle: success)
+            actionbutton btnCancel (caption: 'Cancel', action: cancel changes, buttonstyle: default)
           }
         }
       }
     }
   }
-}
+};
 
 /**
  * Gallery with text filter for searching.
  */
-create page PgTest.P022_Gallery_With_Filter
+create page PgTest.P022_Gallery_With_Filter folder 'MasterDetail'
 (
   title: 'Searchable Products',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p022_gallery_with_filter',
-    folder: 'MasterDetail'
+  url: 'p022_gallery_with_filter'
 )
 {
   layoutgrid mainGrid {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext pageTitle (content: 'Product Gallery', rendermode: H3)
       }
     }
-    row row2 {
-      column col2 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         gallery productGallery (datasource: database PgTest.Product, selection: single) {
-          filter filter1 {
+          filter {
             textfilter searchName (attributes: [Name])
           }
-          template template1 {
-            dynamictext prodName (content: '{1}',contentparams:[{1}=Name], rendermode: H4)
-            dynamictext prodCode (content: 'SKU: {1}',contentparams:[{1}=Code], rendermode: text)
-            dynamictext prodPrice (content: 'Price: {1}',contentparams:[{1}=Price], rendermode: text)
+          template {
+            dynamictext prodName (content: '{1}',contentparams:({1}=Name), rendermode: H4)
+            dynamictext prodCode (content: 'SKU: {1}',contentparams:({1}=Code), rendermode: text)
+            dynamictext prodPrice (content: 'Price: {1}',contentparams:({1}=Price), rendermode: text)
           }
         }
       }
     }
   }
-}
+};
 
-create page PgTest.P022_Gallery_With_Filter_2 (
+create page PgTest.P022_Gallery_With_Filter_2 folder 'MasterDetail' (
   title: 'Searchable Products', 
   layout: Atlas_Core.Atlas_Default, 
-  url: 'p022_gallery_with_filter_2',
-  folder: 'MasterDetail'
+  url: 'p022_gallery_with_filter_2'
 ) {
   layoutgrid mainGrid {
-    row row1 {
-      column col1 (desktopwidth: autofill) {
+    row {
+      column (desktopwidth: autofill) {
         dynamictext pageTitle (content: 'Product Gallery', rendermode: H3)
       }
     }
-    row row2 {
-      column col1 (desktopwidth: autofill) {
+    row {
+      column (desktopwidth: autofill) {
         gallery gallery1 (datasource: database PgTest.Product, selection: single) {
-          filter filter1 {
+          filter {
             textfilter textFilter1 (attributes: [Name])
           }
-          template template1 {
-            dynamictext text1 (content: '{1}', rendermode: H4, contentparams: [{1} = Name])
-            dynamictext text2 (content: 'SKU: {1}', contentparams: [{1} = Code])
-            dynamictext text3 (content: 'Price: {1}', contentparams: [{1} = Price])
+          template {
+            dynamictext text1 (content: '{1}', rendermode: H4, contentparams: ({1} = Name))
+            dynamictext text2 (content: 'SKU: {1}', contentparams: ({1} = Code))
+            dynamictext text3 (content: 'Price: {1}', contentparams: ({1} = Price))
           }
         }
       }
     }
   }
-}
+};
 
-create page PgTest.P022_Gallery_With_Filter_3 (
-  title: 'Searchable Products', layout: Atlas_Core.Atlas_Default, url: 'p022_gallery_with_filter_3',
-    folder: 'MasterDetail'
+create page PgTest.P022_Gallery_With_Filter_3 folder 'MasterDetail' (
+  title: 'Searchable Products', layout: Atlas_Core.Atlas_Default, url: 'p022_gallery_with_filter_3'
 ) {
   layoutgrid mainGrid {
-    row row1 {
-      column col1 (desktopwidth: autofill) {
+    row {
+      column (desktopwidth: autofill) {
         dynamictext pageTitle (content: 'Product Gallery', rendermode: H3)
       }
     }
-    row row2 {
-      column col1 (desktopwidth: autofill) {
+    row {
+      column (desktopwidth: autofill) {
         gallery gallery1 (datasource: database PgTest.Product, selection: single) {
-          filter filter1 {
+          filter {
             textfilter textFilter1 (attributes: [Name, Code, description])
           }
-          template template1 {
+          template {
             layoutgrid layoutGrid2 {
-              row row1 {
-                column col1 (desktopwidth: autofill) {
-                  dynamictext text1 (content: '{1}', rendermode: H4, contentparams: [{1} = Name])
+              row {
+                column (desktopwidth: autofill) {
+                  dynamictext text1 (content: '{1}', rendermode: H4, contentparams: ({1} = Name))
                 }
               }
-              row row2 {
-                column col1 (desktopwidth: autofill) {
-                  dynamictext text2 (content: 'SKU: {1}', contentparams: [{1} = Code])
+              row {
+                column (desktopwidth: autofill) {
+                  dynamictext text2 (content: 'SKU: {1}', contentparams: ({1} = Code))
                 }
-                column col2 (desktopwidth: autofill) {
-                  dynamictext text3 (content: 'Price: {1}', contentparams: [{1} = Price])
+                column (desktopwidth: autofill) {
+                  dynamictext text3 (content: 'Price: {1}', contentparams: ({1} = Price))
                 }
               }
             }
@@ -1526,38 +1584,37 @@ create page PgTest.P022_Gallery_With_Filter_3 (
       }
     }
   }
-}
+};
 
-create page PgTest.P022_Gallery_With_Filter_4 (
-  title: 'Searchable Products', layout: Atlas_Core.Atlas_Default, url: 'p022_gallery_with_filter_4',
-    folder: 'MasterDetail'
+create page PgTest.P022_Gallery_With_Filter_4 folder 'MasterDetail' (
+  title: 'Searchable Products', layout: Atlas_Core.Atlas_Default, url: 'p022_gallery_with_filter_4'
 ) 
 {
   layoutgrid mainGrid {
-    row row1 {
-      column col1 (desktopwidth: autofill) {
+    row {
+      column (desktopwidth: autofill) {
         dynamictext pageTitle (content: 'Product Gallery', rendermode: H3)
       }
     }
-    row row2 {
-      column col1 (desktopwidth: autofill) {
+    row {
+      column (desktopwidth: autofill) {
         gallery gallery1 (datasource: database PgTest.Product, selection: single) {
-          filter filter1 {
+          filter {
             textfilter textFilter1 (attributes: [description], filtertype: startsWith)
           }
-          template template1 {
+          template {
             layoutgrid layoutGrid2 {
-              row row1 {
-                column col1 (desktopwidth: autofill) {
-                  dynamictext text1 (content: '{1}', rendermode: H4, contentparams: [{1} = Name])
+              row {
+                column (desktopwidth: autofill) {
+                  dynamictext text1 (content: '{1}', rendermode: H4, contentparams: ({1} = Name))
                 }
               }
-              row row2 {
-                column col1 (desktopwidth: autofill) {
-                  dynamictext text2 (content: 'SKU: {1}', contentparams: [{1} = Code])
+              row {
+                column (desktopwidth: autofill) {
+                  dynamictext text2 (content: 'SKU: {1}', contentparams: ({1} = Code))
                 }
-                column col2 (desktopwidth: autofill) {
-                  dynamictext text3 (content: 'Price: {1}', contentparams: [{1} = Price])
+                column (desktopwidth: autofill) {
+                  dynamictext text3 (content: 'Price: {1}', contentparams: ({1} = Price))
                 }
               }
             }
@@ -1566,47 +1623,46 @@ create page PgTest.P022_Gallery_With_Filter_4 (
       }
     }
   }
-}
+};
 
 /**
  * Gallery with multiple selection mode.
  */
-create page PgTest.P023_Gallery_MultiSelect
+create page PgTest.P023_Gallery_MultiSelect folder 'MasterDetail'
 (
   title: 'Select Products',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p023_gallery_multiselect',
-    folder: 'MasterDetail'
+  url: 'p023_gallery_multiselect'
 )
 {
   layoutgrid mainGrid {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext pageTitle1 (content: 'Select Products for Batch Action', rendermode: H1)
-        dynamictext pageTitle2 (content: '{1}',contentparams:[{1}='Select Products for Batch Action'], rendermode: H2)
-        dynamictext pageTitle3 (content: 'Select {1}',contentparams:[{1}='Products for Batch Action'], rendermode: H3)
-        dynamictext pageTitle4 (content: '{1} - {2}',contentparams:[{1}='Select ', {2}='Products for Batch Action'], rendermode: H4)
-        dynamictext pageTitle5 (content: '{1} - {2} - {3}',contentparams:[{1}='Select ', {2}='Products for Batch Action', {3}='Extra'], rendermode: H5)
-        dynamictext pageTitle6 (content: '{1} - {2} - {3} - {4}',contentparams:[{1}='Select ', {2}='Products for Batch Action', {3}='Extra', {4}='More'], rendermode: H6)
+        dynamictext pageTitle2 (content: '{1}',contentparams:({1}='Select Products for Batch Action'), rendermode: H2)
+        dynamictext pageTitle3 (content: 'Select {1}',contentparams:({1}='Products for Batch Action'), rendermode: H3)
+        dynamictext pageTitle4 (content: '{1} - {2}',contentparams:({1}='Select ', {2}='Products for Batch Action'), rendermode: H4)
+        dynamictext pageTitle5 (content: '{1} - {2} - {3}',contentparams:({1}='Select ', {2}='Products for Batch Action', {3}='Extra'), rendermode: H5)
+        dynamictext pageTitle6 (content: '{1} - {2} - {3} - {4}',contentparams:({1}='Select ', {2}='Products for Batch Action', {3}='Extra', {4}='More'), rendermode: H6)
       }
     }
-    row row2 {
-      column col2 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         gallery productGallery (datasource: database PgTest.Product, selection: multiple) {
-          template template1 {
-            dynamictext prodName (content: '{1}',contentparams:[{1}=Name], rendermode: H4)
-            dynamictext prodStock (content: 'Stock: {1}',contentparams:[{1}=Stock], rendermode: text)
+          template {
+            dynamictext prodName (content: '{1}',contentparams:({1}=Name), rendermode: H4)
+            dynamictext prodStock (content: 'Stock: {1}',contentparams:({1}=Stock), rendermode: text)
           }
         }
       }
     }
-    row row3 {
-      column col3 (desktopwidth: 12) {
-        actionbutton btnProcess (caption: 'Process Selected', action: microflow PgTest.ProcessProducts, buttonstyle: primary)
+    row {
+      column (desktopwidth: 12) {
+        actionbutton btnProcess (caption: 'Process Selected', action: call microflow PgTest.ProcessProducts, buttonstyle: primary)
       }
     }
   }
-}
+};
 
 
 /**
@@ -1621,22 +1677,22 @@ create page PgTest.P024_Gallery_Columns
 )
 {
   layoutgrid mainGrid {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         gallery cellGrid (
           datasource: database PgTest.Product,
           DesktopColumns: 4,
           TabletColumns: 2,
           PhoneColumns: 1
         ) {
-          template template1 {
-            dynamictext prodName (content: '{1}', contentparams: [{1} = Name], rendermode: H4)
+          template {
+            dynamictext prodName (content: '{1}', contentparams: ({1} = Name), rendermode: H4)
           }
         }
       }
     }
   }
-}
+};
 
 -- MARK: Microflow Actions with Parameters
 
@@ -1662,7 +1718,20 @@ begin
   set $success = true;
   return $success;
 end;
-/
+
+/**
+ * Client-side nanoflow called from a widget button (Bug 2). A nanoflow widget
+ * action must serialize on the default (modelsdk) engine, with its parameter.
+ *
+ * @param $Product The product passed from the button's data context
+ */
+create nanoflow PgTest.NAV_RefreshProduct
+  ($Product: PgTest.Product)
+  folder 'MicroflowActions'
+begin
+  change $Product (ModifiedDate = [%CurrentDateTime%]) refresh;
+  log info 'Refreshed product (client-side)';
+end;
 
 /**
  * Delete a product with confirmation - called from button actions.
@@ -1677,51 +1746,49 @@ begin
   log info node 'ProductService' 'Deleting product: ' + $Product/Name;
   delete $Product;
 end;
-/
 
 /**
  * DataGrid with microflow action buttons using $currentObject.
  * Demonstrates calling microflows with parameters from list widget rows.
  */
-create page PgTest.P023b_DataGrid_MicroflowActions
+create page PgTest.P023b_DataGrid_MicroflowActions folder 'MicroflowActions'
 (
   title: 'Products with Microflow Actions',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p023b_datagrid_microflow_actions',
-  folder: 'MicroflowActions'
+  url: 'p023b_datagrid_microflow_actions'
 )
 {
   layoutgrid mainGrid {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext pageTitle (content: 'Product Management with Microflow Actions', rendermode: H3)
         dynamictext pageDesc (content: 'Click Process to call microflow with $currentObject', rendermode: paragraph)
       }
     }
-    row row2 {
-      column col2 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         datagrid ProductGrid (datasource: database PgTest.Product) {
-          controlbar controlBar1 {
+          controlbar {
             actionbutton btnNew (
               caption: 'New Product',
-              action: create_object PgTest.Product then show_page PgTest.P012_Product_Manage_Edit,
+              action: create object PgTest.Product then show page PgTest.P012_Product_Manage_Edit,
               buttonstyle: primary
             )
           }
-          column colName (attribute: Name, caption: 'Product Name')
-          column colCode (attribute: Code, caption: 'SKU')
-          column colPrice (attribute: Price, caption: 'Price')
-          column colStock (attribute: Stock, caption: 'Stock')
-          column colActions (attribute: Name, caption: 'Actions', ShowContentAs: customContent) {
+          column (attribute: Name, caption: 'Product Name')
+          column (attribute: Code, caption: 'SKU')
+          column (attribute: Price, caption: 'Price')
+          column (attribute: Stock, caption: 'Stock')
+          column (attribute: Name, caption: 'Actions', ShowContentAs: customContent) {
             -- Microflow action with $currentObject passes the current row's product
             actionbutton btnProcess (
               caption: 'Process',
-              action: microflow PgTest.ACT_ProcessProduct(Product: $currentObject),
+              action: call microflow PgTest.ACT_ProcessProduct(Product = $currentObject),
               buttonstyle: success
             )
             actionbutton btnDelete (
               caption: 'Delete',
-              action: microflow PgTest.ACT_DeleteProduct(Product: $currentObject),
+              action: call microflow PgTest.ACT_DeleteProduct(Product = $currentObject),
               buttonstyle: danger
             )
           }
@@ -1729,7 +1796,7 @@ create page PgTest.P023b_DataGrid_MicroflowActions
       }
     }
   }
-}
+};
 
 /**
  * Detail page with microflow action using page parameter.
@@ -1737,15 +1804,14 @@ create page PgTest.P023b_DataGrid_MicroflowActions
  *
  * @param $Product The product to view/edit
  */
-create page PgTest.P023c_Detail_MicroflowAction
+create page PgTest.P023c_Detail_MicroflowAction folder 'MicroflowActions'
 (
-  params: {
+  params: (
     $Product: PgTest.Product
-  },
+  ),
   title: 'Product Details',
   layout: Atlas_Core.PopupLayout,
-  url: 'p023c_detail_microflow/{Product/Code}',
-  folder: 'MicroflowActions'
+  url: 'p023c_detail_microflow/{Product/Code}'
 )
 {
   dataview dvProduct (datasource: $Product) {
@@ -1754,18 +1820,24 @@ create page PgTest.P023c_Detail_MicroflowAction
     textbox txtPrice (label: 'Price', attribute: Price)
     textbox txtStock (label: 'Stock', attribute: Stock)
 
-    footer footer1 {
+    footer {
       -- Microflow action with page parameter passes the DataView's object
       actionbutton btnProcess (
         caption: 'Process Product',
-        action: microflow PgTest.ACT_ProcessProduct(Product: $Product),
+        action: call microflow PgTest.ACT_ProcessProduct(Product = $Product),
         buttonstyle: success
       )
-      actionbutton btnSave (caption: 'Save', action: save_changes close_page, buttonstyle: primary)
-      actionbutton btnCancel (caption: 'Cancel', action: cancel_changes close_page, buttonstyle: default)
+      -- Nanoflow (client-side) action with the same page parameter (Bug 2).
+      actionbutton btnRefresh (
+        caption: 'Refresh',
+        action: call nanoflow PgTest.NAV_RefreshProduct(Product = $Product),
+        buttonstyle: default
+      )
+      actionbutton btnSave (caption: 'Save', action: save changes close page, buttonstyle: primary)
+      actionbutton btnCancel (caption: 'Cancel', action: cancel changes close page, buttonstyle: default)
     }
   }
-}
+};
 
 -- MARK: String Templates
 
@@ -1796,50 +1868,49 @@ owner both;
  *
  * @param $Order The order to display
  */
-create page PgTest.P024_Template_Basic
+create page PgTest.P024_Template_Basic folder 'Templates'
 (
-  params: {
+  params: (
     $Order: PgTest.Order
-  },
+  ),
   title: 'Order Details',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p024_template_basic/{Order/OrderNumber}',
-  folder: 'Templates'
+  url: 'p024_template_basic/{Order/OrderNumber}'
 )
 {
   layoutgrid mainGrid {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dataview dvOrder (datasource: $Order) {
           dynamictext txtOrderHeader (
             content: 'Order #{1} - Status: {2}',
-            contentparams: [{1} = $order.OrderNumber, {2} = $order.status],
+            contentparams: ({1} = $order.OrderNumber, {2} = $order.status),
             rendermode: H3
           )
 
           dynamictext txtOrderDate (
             content: 'Placed on: {1}',
-            contentparams: [{1} = $order.OrderDate],
+            contentparams: ({1} = $order.OrderDate),
             rendermode: paragraph
           )
 
           dynamictext txtTotal (
             content: 'Total Amount: ${1}',
-            contentparams: [{1} = $order.TotalAmount],
+            contentparams: ({1} = $order.TotalAmount),
             rendermode: H4
           )
 
           actionbutton btnProcess (
             caption: 'Process Order #{1}',
-            captionparams: [{1} = $order.OrderNumber],
-            action: microflow PgTest.ProcessProducts,
+            captionparams: ({1} = $order.OrderNumber),
+            action: call microflow PgTest.ProcessProducts,
             buttonstyle: primary
           )
         }
       }
     }
   }
-}
+};
 
 
 
@@ -1854,37 +1925,89 @@ create page PgTest.P024_Template_Basic
 -- Style: adds inline CSS styles to the widget's Appearance.
 --
 
-create page PgTest.StyledPage
+create page PgTest.StyledPage folder 'Styling'
 (
-  params: { $Customer: PgTest.Customer },
+  params: ( $Customer: PgTest.Customer ),
   title: 'Styled Customer',
-  layout: Atlas_Core.Atlas_Default,
-  folder: 'Styling'
+  layout: Atlas_Core.Atlas_Default
 )
 {
   container ctnCard (class: 'card', style: 'padding: 16px; border-radius: 8px;') {
     dataview dvCustomer (datasource: $Customer) {
       textbox txtName (label: 'Name', attribute: Name, class: 'form-control-lg')
       textbox txtEmail (label: 'Email', attribute: Email, style: 'font-style: italic;')
-      dynamictext dtCity (content: 'City: {1}', contentparams: [{1} = City], class: 'text-muted', style: 'font-size: 12px;')
+      -- A dynamictext takes an inline `style` too; styling the wrapping
+      -- container, as here, is the other way.
+      container ctnCity (style: 'font-size: 12px;') {
+        dynamictext dtCity (content: 'City: {1}', contentparams: ({1} = City), class: 'text-muted')
+      }
 
-      footer footer1 {
-        actionbutton btnSave (caption: 'Save', action: save_changes, buttonstyle: primary, class: 'btn-block')
-        actionbutton btnCancel (caption: 'Cancel', action: cancel_changes, class: 'btn-outline')
+      footer {
+        actionbutton btnSave (caption: 'Save', action: save changes, buttonstyle: primary, class: 'btn-block')
+        actionbutton btnCancel (caption: 'Cancel', action: cancel changes, class: 'btn-outline')
       }
     }
   }
-}
+};
 
 -- MARK: Image Widgets
 -- ============================================================================
--- Image widgets (Forms$StaticImageViewer, Forms$ImageViewer) are deprecated
--- in Mendix 11.x React/optimized client (CE0582). No pluggable replacement
--- exists. Image examples are therefore not included in this test file.
---
--- If Mendix adds a pluggable image widget in the future, examples can be
--- re-added using the same pattern as DATAGRID (pluggable widget template).
+-- Image Widget Examples
 -- ============================================================================
+--
+-- The BUILT-IN image widgets (`staticimage` -> Forms$StaticImageViewer,
+-- `dynamicimage` -> Forms$ImageViewer) are deprecated in the Mendix 11.x
+-- React/optimized client (CE0582), so they are deliberately not exercised here.
+--
+-- `image` is NOT one of them: it routes to the pluggable
+-- com.mendix.widget.web.image.Image, which is the current widget and is
+-- covered below. This file previously said no pluggable replacement existed
+-- and skipped images entirely — so this gate built ZERO image widgets and ran
+-- green through two separate image defects: a CE0463 on every image widget
+-- mxcli wrote, and an image reference that could not be authored at all. Both
+-- are fixed (597db1b2), and both were fixed with nothing here to catch a
+-- regression — bug-tests/ documents them but this gate is what CI runs.
+--
+-- `Image:` names an image-collection asset by its three-part qualified name.
+-- Bare and quoted both parse (DESCRIBE emits the quoted form); the bare form
+-- is used below to match every other qualified-name property on a page.
+-- Atlas_Core.Layout.logo ships with Atlas_Core in every Mendix app.
+--
+-- The property is effectively REQUIRED even though the widget package declares
+-- it optional: an image widget with no source fails the build with
+-- [Error] "No image selected.", which is what makes this example a real check
+-- rather than a smoke test — omit the `Image:` line and mx check goes red.
+
+create page PgTest.P042_Image
+(
+  title: 'Image Widget',
+  layout: Atlas_Core.Atlas_Default
+)
+{
+  container cImages {
+    -- Sized in pixels, so `width` is a VISIBLE property and takes the authored
+    -- value by the ordinary route.
+    image imgLogoFixed (
+      Image: Atlas_Core.Layout.logo,
+      WidthUnit: pixels, Width: 36,
+      AlternativeText: 'Company logo'
+    )
+
+    -- Default units, and the case that actually regressed: under `auto` the
+    -- width and height properties are HIDDEN, and a hidden property must be
+    -- written with its DECLARED default rather than skipped. Skipping leaves
+    -- whatever value the widget template happened to capture — image.json was
+    -- extracted from a 48px logo — and 48 against a declared 100 is CE0463 on
+    -- every image widget. Nothing in the authored MDL below distinguishes the
+    -- two behaviours, which is exactly why it needs a gate rather than a test
+    -- that asserts what the script says.
+    image imgLogoAuto (Image: Atlas_Core.Layout.logo)
+
+    -- The URL mode, whose source lives in a text template rather than on the
+    -- Image field — the two modes reach the picture by different routes.
+    image imgFromUrl (ImageType: imageUrl, ImageUrl: 'img/logo.svg')
+  }
+};
 
 -- MARK: Custom Container
 
@@ -1930,94 +2053,91 @@ end;
 /**
  * Target page for Action: SHOW_PAGE reference validation.
  */
-create page PgTest.P030_ProductDetail
+create page PgTest.P030_ProductDetail folder 'WidgetReferences'
 (
-  params: { $Product: PgTest.Product },
+  params: ( $Product: PgTest.Product ),
   title: 'Product Detail',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p030_detail/{Product}',
-  folder: 'WidgetReferences'
+  url: 'p030_detail/{Product}'
 )
 {
   dataview dvProduct (datasource: $Product) {
     textbox txtName (label: 'Name', attribute: Name)
   }
-}
+};
 
 /**
  * Page exercising all widget reference types for --references validation.
  * References: DataSource MICROFLOW, DataSource DATABASE, Action MICROFLOW,
  * Action SHOW_PAGE, Action CREATE_OBJECT, and SNIPPETCALL.
  */
-create page PgTest.P030_WidgetReferences
+create page PgTest.P030_WidgetReferences folder 'WidgetReferences'
 (
   title: 'Widget Reference Validation',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p030_widgetrefs',
-  folder: 'WidgetReferences'
+  url: 'p030_widgetrefs'
 )
 {
   layoutgrid lg1 {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         -- DataSource: MICROFLOW reference
         listview lvProducts (datasource: microflow PgTest.DSO_GetProducts) {
-          dynamictext txtProductName (content: '{1}', contentparams: [{1} = Name])
+          dynamictext txtProductName (content: '{1}', contentparams: ({1} = Name))
         }
       }
     }
-    row row2 {
-      column col2 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         -- DataSource: DATABASE entity reference
         datagrid dgProducts (datasource: database PgTest.Product) {
-          column colName (attribute: Name, caption: 'Product Name')
-          column colPrice (attribute: Price, caption: 'Price')
+          column (attribute: Name, caption: 'Product Name')
+          column (attribute: Price, caption: 'Price')
         }
       }
     }
-    row row3 {
-      column col3 (desktopwidth: 6) {
+    row {
+      column (desktopwidth: 6) {
         -- Action: MICROFLOW reference
-        actionbutton btnRefresh (caption: 'Refresh', action: microflow PgTest.ACT_RefreshProducts)
+        actionbutton btnRefresh (caption: 'Refresh', action: call microflow PgTest.ACT_RefreshProducts)
         -- Action: CREATE_OBJECT entity reference (with target page)
-        actionbutton btnNew (caption: 'New Product', action: create_object PgTest.Product then show_page PgTest.P030_ProductDetail)
+        actionbutton btnNew (caption: 'New Product', action: create object PgTest.Product then show page PgTest.P030_ProductDetail)
       }
-      column col4 (desktopwidth: 6) {
+      column (desktopwidth: 6) {
         -- SNIPPETCALL reference
         snippetcall scStats (snippet: PgTest.StatsPanel)
       }
     }
-    row row4 {
-      column col5 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         -- Action: SHOW_PAGE reference (inside list context for parameter passing)
         listview lvForAction (datasource: microflow PgTest.DSO_GetProducts) {
-          actionbutton btnDetail (caption: 'View Detail', action: show_page PgTest.P030_ProductDetail (Product: $currentObject))
+          actionbutton btnDetail (caption: 'View Detail', action: show page PgTest.P030_ProductDetail (Product = $currentObject))
         }
       }
     }
   }
-}
+};
 
 /**
  * Page using CUSTOMCONTAINER for card-style layout.
  */
-create page PgTest.P029_CustomContainer
+create page PgTest.P029_CustomContainer folder 'Container'
 (
   title: 'Custom Container',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p029_customcontainer',
-  folder: 'Container'
+  url: 'p029_customcontainer'
 )
 {
   layoutgrid mainGrid {
-    row row1 {
-      column col1 (desktopwidth: 6) {
+    row {
+      column (desktopwidth: 6) {
         customcontainer card1 (class: 'card', style: 'padding: 16px;') {
           dynamictext cardTitle1 (content: 'Card Title', rendermode: H4)
           dynamictext cardBody1 (content: 'Card body content', rendermode: paragraph)
         }
       }
-      column col2 (desktopwidth: 6) {
+      column (desktopwidth: 6) {
         customcontainer card2 (class: 'card') {
           dynamictext cardTitle2 (content: 'Another Card', rendermode: H4)
           container cardInner (class: 'card-body') {
@@ -2027,36 +2147,34 @@ create page PgTest.P029_CustomContainer
       }
     }
   }
-}
+};
 
 -- MARK: DataGrid Paging
 
 /**
  * DataGrid with paging buttons above and below (PagingPosition: both).
  */
-create page PgTest.P031_DataGrid_PagingBoth
+create page PgTest.P031_DataGrid_PagingBoth folder 'DataGrid'
 (
   title: 'DataGrid Paging Both',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p031_datagrid_paging_both',
-  folder: 'DataGrid'
+  url: 'p031_datagrid_paging_both'
 )
 {
   datagrid dgProducts (datasource: database PgTest.Product, PageSize: 25, PagingPosition: both) {
-    column col1 (attribute: Name, caption: 'Name')
-    column col2 (attribute: Price, caption: 'Price')
+    column (attribute: Name, caption: 'Name')
+    column (attribute: Price, caption: 'Price')
   }
-}
+};
 
 /**
  * DataGrid with virtual scrolling instead of paging buttons.
  */
-create page PgTest.P032_DataGrid_VirtualScroll
+create page PgTest.P032_DataGrid_VirtualScroll folder 'DataGrid'
 (
   title: 'DataGrid Virtual Scroll',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p032_datagrid_virtualscroll',
-  folder: 'DataGrid'
+  url: 'p032_datagrid_virtualscroll'
 )
 {
   datagrid dgProducts (
@@ -2064,20 +2182,19 @@ create page PgTest.P032_DataGrid_VirtualScroll
     PageSize: 50, 
     Pagination: virtualScrolling
   ) {
-    column col1 (attribute: Name, caption: 'Name')
-    column col2 (attribute: Price, caption: 'Price')
+    column (attribute: Name, caption: 'Name')
+    column (attribute: Price, caption: 'Price')
   }
-}
+};
 
 /**
  * DataGrid with all paging properties customized.
  */
-create page PgTest.P033_DataGrid_PagingFull
+create page PgTest.P033_DataGrid_PagingFull folder 'DataGrid'
 (
   title: 'DataGrid Full Paging',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p033_datagrid_paging_full',
-  folder: 'DataGrid'
+  url: 'p033_datagrid_paging_full'
 )
 {
   datagrid dgProducts (
@@ -2086,10 +2203,10 @@ create page PgTest.P033_DataGrid_PagingFull
     PagingPosition: top, 
     ShowPagingButtons: auto
   ) {
-    column col1 (attribute: Name, caption: 'Name')
-    column col2 (attribute: Price, caption: 'Price')
+    column (attribute: Name, caption: 'Name')
+    column (attribute: Price, caption: 'Price')
   }
-}
+};
 
 -- MARK: DataGrid Column Properties
 
@@ -2105,21 +2222,20 @@ create page PgTest.P033_DataGrid_PagingFull
  * - Column capabilities: Sortable, Resizable, Draggable, Hidable
  * - Appearance: Alignment, WrapText, ColumnWidth, Size, Visible, DynamicCellClass, Tooltip
  */
-create page PgTest.P033b_DataGrid_ColumnProperties
+create page PgTest.P033b_DataGrid_ColumnProperties folder 'DataGrid'
 (
   title: 'DataGrid Column Properties',
   layout: Atlas_Core.Atlas_Default,
   url: 'p033b_datagrid_column_properties',
-  folder: 'DataGrid',
-  variables: { $showStockColumn: boolean = 'if (3 < 4) then true else false' }
+  variables: ( $showStockColumn: boolean = if (3 < 4) then true else false )
 )
 {
   datagrid dgProducts (datasource: database PgTest.Product) {
     -- Default column: only Attribute and Caption, all other properties use defaults
-    column colName (attribute: Name, caption: 'Product Name')
+    column (attribute: Name, caption: 'Product Name')
 
     -- Fixed-width price column, right-aligned, not sortable
-    column colPrice (
+    column (
       attribute: Price, caption: 'Unit Price',
       Alignment: right, WrapText: true,
       Sortable: false, Resizable: false, Draggable: false,
@@ -2130,21 +2246,21 @@ create page PgTest.P033b_DataGrid_ColumnProperties
 
     -- Column with visibility controlled by page variable (not $currentObject!)
     -- and dynamic cell class using Mendix if/then/else expression syntax
-    column colStock (
+    column (
       attribute: Stock, caption: 'In Stock',
       Alignment: center,
-      visible: '$showStockColumn',
-      DynamicCellClass: 'if($currentObject/Stock < 10) then ''text-danger'' else '''' '
+      visible: $showStockColumn,
+      DynamicCellClass: if($currentObject/Stock < 10) then 'text-danger' else '' 
     )
 
     -- Non-hidable column with auto-fit width
-    column colCode (
+    column (
       attribute: Code, caption: 'SKU',
       Hidable: no,
       ColumnWidth: autoFit
     )
   }
-}
+};
 
 -- MARK: ComboBox Examples
 
@@ -2163,20 +2279,19 @@ create page PgTest.P033b_DataGrid_ColumnProperties
  *
  * @param $Customer The customer to edit
  */
-create page PgTest.P034_ComboBox_Enum
+create page PgTest.P034_ComboBox_Enum folder 'ComboBox'
 (
-  params: {
+  params: (
     $Customer: PgTest.Customer
-  },
+  ),
   title: 'ComboBox Enumeration Selection',
-  layout: Atlas_Core.PopupLayout,
-  folder: 'ComboBox'
+  layout: Atlas_Core.PopupLayout
 )
 {
   dataview dvCustomer (datasource: $Customer) {
       layoutgrid lg1 {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
     textbox txtName (label: 'Customer Name', attribute: Name)
     textbox txtEmail (label: 'Email', attribute: Email)
     textbox txtCity (label: 'City', attribute: City)
@@ -2184,12 +2299,12 @@ create page PgTest.P034_ComboBox_Enum
     -- ComboBox (pluggable widget) selecting from the Country enumeration
     combobox cmbCountry (label: 'Country (ComboBox)', attribute: Country)
       }}}
-    footer footer1 {
-      actionbutton btnSave (caption: 'Save', action: save_changes close_page, buttonstyle: success)
-      actionbutton btnCancel (caption: 'Cancel', action: cancel_changes close_page, buttonstyle: default)
+    footer {
+      actionbutton btnSave (caption: 'Save', action: save changes close page, buttonstyle: success)
+      actionbutton btnCancel (caption: 'Cancel', action: cancel changes close page, buttonstyle: default)
     }
   }
-}
+};
 
 /**
  * Order edit form with a ComboBox for Status enumeration-like field,
@@ -2197,20 +2312,19 @@ create page PgTest.P034_ComboBox_Enum
  *
  * @param $Order The order to edit
  */
-create page PgTest.P035_Order_Edit
+create page PgTest.P035_Order_Edit folder 'ComboBox'
 (
-  params: {
+  params: (
     $Order: PgTest.Order
-  },
+  ),
   title: 'Edit Order',
-  layout: Atlas_Core.PopupLayout,
-  folder: 'ComboBox'
+  layout: Atlas_Core.PopupLayout
 )
 {
   dataview dvOrder (datasource: $Order) {
       layoutgrid lg1 {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
     textbox txtOrderNumber (label: 'Order Number', attribute: OrderNumber)
     datepicker dpOrderDate (label: 'Order Date', attribute: OrderDate)
     textbox txtTotal (label: 'Total Amount', attribute: TotalAmount)
@@ -2218,45 +2332,44 @@ create page PgTest.P035_Order_Edit
 --    TEXTBOX txtStatus (Label: 'Status', Attribute: Status)
     textarea txtNotes (label: 'Notes', attribute: Notes)
       }}}
-    footer footer1 {
-      actionbutton btnSave (caption: 'Save', action: save_changes close_page, buttonstyle: success)
-      actionbutton btnCancel (caption: 'Cancel', action: cancel_changes close_page, buttonstyle: default)
+    footer {
+      actionbutton btnSave (caption: 'Save', action: save changes close page, buttonstyle: success)
+      actionbutton btnCancel (caption: 'Cancel', action: cancel changes close page, buttonstyle: default)
     }
   }
-}
+};
 
 /**
  * Order form showing an overview page that creates orders
  * and opens P035_Order_Edit to edit orders.
  * Demonstrates ComboBox in context of a full CRUD flow.
  */
-create page PgTest.P035_Order_With_ComboBox
+create page PgTest.P035_Order_With_ComboBox folder 'ComboBox'
 (
   title: 'Orders with ComboBox',
   layout: Atlas_Core.Atlas_Default,
-  url: 'p035_order_combobox',
-  folder: 'ComboBox'
+  url: 'p035_order_combobox'
 )
 {
   layoutgrid lgMain {
-    row row1 {
-      column col1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         datagrid dgOrders (datasource: database PgTest.Order) {
-          controlbar controlBar1 {
+          controlbar {
             actionbutton btnNew (
               caption: 'New Order',
-              action: create_object PgTest.Order then show_page PgTest.P035_Order_Edit,
+              action: create object PgTest.Order then show page PgTest.P035_Order_Edit,
               buttonstyle: primary
             )
           }
-          column colNumber (attribute: OrderNumber, caption: 'Order #')
-          column colDate (attribute: OrderDate, caption: 'Date')
-          column colTotal (attribute: TotalAmount, caption: 'Total')
-          column colStatus (attribute: status, caption: 'Status')
-          column colActions (caption: 'Actions') {
+          column (attribute: OrderNumber, caption: 'Order #')
+          column (attribute: OrderDate, caption: 'Date')
+          column (attribute: TotalAmount, caption: 'Total')
+          column (attribute: status, caption: 'Status')
+          column (caption: 'Actions') {
             actionbutton btnEdit (
               caption: 'Edit',
-              action: show_page PgTest.P035_Order_Edit (Order: $currentObject),
+              action: show page PgTest.P035_Order_Edit (Order = $currentObject),
               buttonstyle: default
             )
           }
@@ -2264,7 +2377,7 @@ create page PgTest.P035_Order_With_ComboBox
       }
     }
   }
-}
+};
 
 
 -- MARK: GroupBox Examples
@@ -2279,14 +2392,13 @@ create page PgTest.P035_Order_With_ComboBox
  *
  * @param $Customer The customer to edit
  */
-create page PgTest.P037_GroupBox_Example
+create page PgTest.P037_GroupBox_Example folder 'GroupBox'
 (
-  params: {
+  params: (
     $Customer: PgTest.Customer
-  },
+  ),
   title: 'GroupBox Example',
-  layout: Atlas_Core.PopupLayout,
-  folder: 'GroupBox'
+  layout: Atlas_Core.PopupLayout
 )
 {
   dataview dvCustomer (datasource: $Customer) {
@@ -2310,12 +2422,12 @@ create page PgTest.P037_GroupBox_Example
       datepicker dpCreateDate (label: 'Created On', attribute: CreateDate)
     }
 
-    footer footer1 {
-      actionbutton btnSave (caption: 'Save', action: save_changes close_page, buttonstyle: success)
-      actionbutton btnCancel (caption: 'Cancel', action: cancel_changes close_page, buttonstyle: default)
+    footer {
+      actionbutton btnSave (caption: 'Save', action: save changes close page, buttonstyle: success)
+      actionbutton btnCancel (caption: 'Cancel', action: cancel changes close page, buttonstyle: default)
     }
   }
-}
+};
 
 /**
  * Order edit form with ComboBoxes in association mode.
@@ -2328,14 +2440,13 @@ create page PgTest.P037_GroupBox_Example
  *
  * @param $Order The order to edit
  */
-create page PgTest.P036_ComboBox_Association
+create page PgTest.P036_ComboBox_Association folder 'ComboBox'
 (
-  params: {
+  params: (
     $Order: PgTest.Order
-  },
+  ),
   title: 'ComboBox Association Selection',
-  layout: Atlas_Core.PopupLayout,
-  folder: 'ComboBox'
+  layout: Atlas_Core.PopupLayout
 )
 {
   dataview dvOrder (datasource: $Order) {
@@ -2349,12 +2460,72 @@ create page PgTest.P036_ComboBox_Association
 
     textbox txtTotal (label: 'Total Amount', attribute: TotalAmount)
 
-    footer footer1 {
-      actionbutton btnSave (caption: 'Save', action: save_changes close_page, buttonstyle: success)
-      actionbutton btnCancel (caption: 'Cancel', action: cancel_changes close_page, buttonstyle: default)
+    footer {
+      actionbutton btnSave (caption: 'Save', action: save changes close page, buttonstyle: success)
+      actionbutton btnCancel (caption: 'Cancel', action: cancel changes close page, buttonstyle: default)
     }
   }
-}
+};
+
+/**
+ * Order edit form with a ComboBox in database mode (mendixlabs/mxcli#1583).
+ * The options come from a datasource of their own, and the chosen option's
+ * value is stored on an attribute of the order — no association involved.
+ *
+ * - Database mode: COMBOBOX name (optionsSourceDatabaseDataSource: <source>, Attribute: TargetAttr,
+ *   CaptionAttribute: DisplayAttr, optionsSourceDatabaseValueAttribute: ValueAttr)
+ * - Naming optionsSourceDatabaseDataSource selects the mode; the generic
+ *   `datasource:` clause selects association mode.
+ * - The target takes String, Integer, Long or Enumeration (MDL-WIDGET39); with a
+ *   target, the value attribute is required (MDL-WIDGET16, CE0642 'Value').
+ *
+ * @param $Order The order to edit
+ */
+create page PgTest.P036b_ComboBox_Database folder 'ComboBox'
+(
+  params: (
+    $Order: PgTest.Order
+  ),
+  title: 'ComboBox Database Selection',
+  layout: Atlas_Core.PopupLayout
+)
+{
+  dataview dvOrder (datasource: $Order) {
+    -- Stores the chosen customer's City in the order's Notes, showing the Name
+    combobox cmbShipCity (label: 'Ship to city of', optionsSourceDatabaseDataSource: database PgTest.Customer,
+      attribute: Notes, CaptionAttribute: Name, optionsSourceDatabaseValueAttribute: City)
+
+    footer {
+      actionbutton btnSave (caption: 'Save', action: save changes close page, buttonstyle: success)
+      actionbutton btnCancel (caption: 'Cancel', action: cancel changes close page, buttonstyle: default)
+    }
+  }
+};
+
+-- ============================================================================================ --
+
+-- MARK: Layout Placeholders (issue #532)
+
+-- ============================================================================
+-- LEVEL: assign widgets to specific layout placeholders
+-- ============================================================================
+-- Atlas_Core.Atlas_SideBar has two placeholders: Main and Topbar. A
+-- `placeholder <Name> { … }` block binds its widgets to that placeholder; bare
+-- widgets (none here) would bind to Main. DESCRIBE round-trips the blocks.
+
+create page PgTest.P041_Placeholders
+(
+  title: 'Multiple Placeholders',
+  layout: Atlas_Core.Atlas_SideBar
+)
+{
+  placeholder Main {
+    dynamictext lblMain (content: 'This widget is in the Main placeholder', rendermode: H2)
+  }
+  placeholder Topbar {
+    dynamictext lblTop (content: 'This widget is in the Topbar placeholder')
+  }
+};
 
 -- ============================================================================================ --
 
@@ -2370,7 +2541,7 @@ create page PgTest.P036_ComboBox_Association
 
 -- Add a boolean page variable for controlling column visibility
 alter page PgTest.P033b_DataGrid_ColumnProperties {
-  add variables $showPriceColumn: boolean = 'true';
+  add variables $showPriceColumn: boolean = true;
 };
 
 -- Add a string variable with an escaped string default
@@ -2385,7 +2556,7 @@ alter page PgTest.P033b_DataGrid_ColumnProperties {
 
 -- Multiple variable operations in a single ALTER statement
 alter page PgTest.P033b_DataGrid_ColumnProperties {
-  add variables $pageSize: integer = '20';
+  add variables $pageSize: integer = 20;
   drop variables $showPriceColumn;
 };
 
@@ -2434,10 +2605,9 @@ create microflow PgTest.DS_GetFirstCustomer ()
   returns PgTest.Customer  
 folder 'DataSources'
 begin
-  retrieve $Customer from PgTest.Customer limit 1;
+  retrieve $Customer from PgTest.Customer first;
   return $Customer;
 end;
-/
 
 
 -- @version: 11.0+
@@ -2451,20 +2621,19 @@ create page PgTest.P040_ConditionalProps
 )
 {
   layoutgrid lg1 {
-    row row1 {
-      column col1 (desktopwidth: 8, tabletwidth: 6, phonewidth: 12) {
+    row {
+      column (desktopwidth: 8, tabletwidth: 6, phonewidth: 12) {
         dataview dv1 (datasource: microflow PgTest.DS_GetFirstCustomer) {
-          textbox txtName (label: 'Name', attribute: Name, visible: [$currentObject/Name != empty])
+          textbox txtName (label: 'Name', attribute: Name, visible: $currentObject/Name != empty)
           textbox txtPhone (label: 'Phone', attribute: Phone, editable: [true])
         }
       }
-      column col2 (desktopwidth: 4, tabletwidth: 6, phonewidth: 12) {
+      column (desktopwidth: 4, tabletwidth: 6, phonewidth: 12) {
         dynamictext sidebarText (content: 'Sidebar')
       }
     }
   }
 };
-/
 
 -- @version: any
 -- MARK: Move Examples
@@ -2564,16 +2733,99 @@ move snippet PgTest.CustomerSidebar to folder 'Shared' in PgTest2;
 create page PgTest.UserTaskPage (
   title: 'User Task Page',
   layout: Atlas_Core.Atlas_Default,
-  params: { $WorkflowUserTask: System.WorkflowUserTask }
+  params: ( $WorkflowUserTask: System.WorkflowUserTask )
 ) {
   actionbutton btnApprove (
     caption: 'Approve',
-    action: complete_task 'Approve',
+    action: complete task 'Approve',
     buttonstyle: success
   )
   actionbutton btnReject (
     caption: 'Reject',
-    action: complete_task 'Reject',
+    action: complete task 'Reject',
     buttonstyle: danger
   )
-}
+};
+
+-- ============================================================================
+-- Association data source ("data from context") — to-one referenced object
+-- ============================================================================
+-- A nested DATAVIEW can bind over an association to show the to-one REFERENCED
+-- object's attributes. Order_Customer is `from Order to Customer`, so from an
+-- Order it navigates to the one Customer; the inner DataView's children bind to
+-- Customer. (A to-many collection uses a list widget over the association — see
+-- master-detail-pages.md.)
+create page PgTest.P_OrderWithCustomer (
+  Title: 'Order + Customer',
+  Layout: Atlas_Core.Atlas_Default,
+  Params: ( $Order: PgTest.Order )
+)
+{
+  dataview dvOrder (DataSource: $Order) {
+    textbox tbNumber (Label: 'Order #', Attribute: OrderNumber)
+    dataview dvCustomer (DataSource: $currentObject/PgTest.Order_Customer) {
+      textbox tbCustName (Label: 'Customer', Attribute: Name)
+      textbox tbCustEmail (Label: 'Email', Attribute: Email)
+    }
+  }
+};
+
+-- ============================================================================
+-- MARK: An explicitly inert widget — `action: nothing`
+-- ============================================================================
+-- NOTHING is the spelling for a control that is deliberately wired to no
+-- action: a button that only carries a caption for a layout, a container that
+-- is styled as a card but is not clickable. It writes Forms$NoAction.
+--
+-- It is here because it only became a real action expression in
+-- mendixlabs/mxcli#1062. Before that it was documented and used but absent from
+-- the grammar: it reached Forms$NoAction by FAILING to parse as an action and
+-- falling through to the generic property branch, which stores the slot as a
+-- plain string. `Action: OPEN_LINK` (a real keyword short its argument) and
+-- `Action: TOTALLY_MADE_UP` took the same route to the same dead widget, with
+-- check, exec and mxbuild all clean — so the fall-through could not be rejected
+-- until this form had a branch of its own.
+--
+-- The gate is the point: this must survive `exec` into a real project and
+-- `mx check`, which is what distinguishes a promoted grammar form from one that
+-- parses and then cannot be written (the builder's action switch ends in a
+-- `default:` that refuses unknown types).
+create page PgTest.P014_InertControls (
+  Title: 'Inert controls',
+  Layout: Atlas_Core.Atlas_Default
+)
+{
+  actionbutton btnDecorative (Caption: 'Decorative', Action: NOTHING)
+  linkbutton lnkDecorative (Caption: 'Also decorative', action: nothing)
+  container cCard (OnClick: NOTHING, Class: 'card') {
+    dynamictext txtCard (Content: 'A card that is not clickable')
+  }
+};
+
+-- ============================================================================
+-- MARK: Submit while typing, and a fixed-width layout grid
+-- ============================================================================
+-- SubmitBehaviour (OnEndEditing default | WhileEditing) and SubmitOnInputDelay
+-- (milliseconds, default 300) are a text box's and a text area's; Width
+-- (FullWidth default | FixedWidth) is a layout grid's. describe prints each only
+-- when it is not the default. Before ako/mxcli-ledger FINDINGS #170 the writer
+-- hard-coded the defaults, so describe -> exec reset a Studio Pro page's
+-- WhileEditing and FixedWidth, and check accepted the property and dropped it.
+create page PgTest.P043_SubmitWhileTyping (
+  Title: 'Search customers',
+  Layout: Atlas_Core.Atlas_Default,
+  Params: ( $Customer: PgTest.Customer )
+)
+{
+  layoutgrid gridFixed (Width: FixedWidth) {
+    row {
+      column (DesktopWidth: 12) {
+        dataview dvCustomer (DataSource: $Customer) {
+          textbox tbName (Label: 'Name', Attribute: Name, SubmitBehaviour: WhileEditing, SubmitOnInputDelay: 500)
+          textarea taAddress (Label: 'Address', Attribute: Address, SubmitBehaviour: WhileEditing)
+          textbox tbEmail (Label: 'Email', Attribute: Email)
+        }
+      }
+    }
+  }
+};

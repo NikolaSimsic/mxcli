@@ -5,6 +5,9 @@ package executor
 import (
 	"context"
 	"strings"
+	"sync"
+
+	"github.com/mendixlabs/mxcli/mdl/types"
 )
 
 // buildPropertyTypeKeyMap builds a map from PropertyType $ID to PropertyKey for a CustomWidget.
@@ -41,6 +44,45 @@ func buildPropertyTypeKeyMap(w map[string]any, withFallback bool) map[string]str
 	return propTypeKeyMap
 }
 
+// buildPropertyValueTypeMap maps a PropertyType's $ID to its DECLARED value
+// type ("String", "Boolean", "Integer", "Enumeration", ...).
+//
+// It walks the same PropertyTypes array as buildPropertyTypeKeyMap, which reads
+// only the key and throws the type away. The type is what tells DESCRIBE
+// whether to quote a value; the value's own shape cannot, because a String
+// property holding "30" is indistinguishable from an Integer holding 30 once it
+// is a string in BSON (ledger #104).
+//
+// An absent entry is not an error — a document whose widget schema is missing
+// still describes, with the emitter falling back to the value's shape.
+func buildPropertyValueTypeMap(w map[string]any) map[string]string {
+	out := make(map[string]string)
+	widgetType, ok := w["Type"].(map[string]any)
+	if !ok {
+		return out
+	}
+	objType, ok := widgetType["ObjectType"].(map[string]any)
+	if !ok {
+		return out
+	}
+	for _, pt := range getBsonArrayElements(objType["PropertyTypes"]) {
+		ptMap, ok := pt.(map[string]any)
+		if !ok {
+			continue
+		}
+		id := extractBinaryID(ptMap["$ID"])
+		if id == "" {
+			continue
+		}
+		if vt, ok := ptMap["ValueType"].(map[string]any); ok {
+			if t := extractString(vt["Type"]); t != "" {
+				out[id] = t
+			}
+		}
+	}
+	return out
+}
+
 // extractCustomWidgetAttribute extracts the attribute from a CustomWidget (e.g., ComboBox).
 // Specifically looks for attributeAssociation or attributeEnumeration properties by key,
 // avoiding false matches from other properties that also have AttributeRef (e.g., CaptionAttribute).
@@ -48,6 +90,12 @@ func extractCustomWidgetAttribute(ctx *ExecContext, w map[string]any) string {
 	// Try association attribute first, then enumeration attribute
 	for _, key := range []string{"attributeAssociation", "attributeEnumeration"} {
 		if attr := extractCustomWidgetPropertyAttributeRef(ctx, w, key); attr != "" {
+			// Read from a page or snippet parameter — the combo box placed in a
+			// snippet with no data container (TestApp
+			// Snip_TaskDashboard_Header): `$Param.Attr`.
+			if param := customWidgetPropertyParameter(w, key); param != "" {
+				return parameterAttributeMDL(param, attr)
+			}
 			return attr
 		}
 	}
@@ -101,8 +149,15 @@ func extractComboBoxDataSource(ctx *ExecContext, w map[string]any) *rawDataSourc
 	if sourceType != "association" {
 		return nil
 	}
+	return extractCustomWidgetPropertyDataSource(ctx, w, "optionsSourceAssociationDataSource")
+}
 
-	// Extract datasource from optionsSourceAssociationDataSource property
+// extractCustomWidgetPropertyDataSource reads the DataSource held by a named
+// pluggable-widget property. Used by the association modes, where the option
+// list lives on a mode-specific property rather than the widget's own
+// `datasource` (ComboBox `optionsSourceAssociationDataSource`, drop-down filter
+// `refOptions`).
+func extractCustomWidgetPropertyDataSource(ctx *ExecContext, w map[string]any, wantKey string) *rawDataSource {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
 		return nil
@@ -110,7 +165,6 @@ func extractComboBoxDataSource(ctx *ExecContext, w map[string]any) *rawDataSourc
 
 	propTypeKeyMap := buildPropertyTypeKeyMap(w, false)
 
-	// Search through properties for optionsSourceAssociationDataSource
 	props := getBsonArrayElements(obj["Properties"])
 	for _, prop := range props {
 		propMap, ok := prop.(map[string]any)
@@ -118,8 +172,7 @@ func extractComboBoxDataSource(ctx *ExecContext, w map[string]any) *rawDataSourc
 			continue
 		}
 		typePointerID := extractBinaryID(propMap["TypePointer"])
-		propKey := propTypeKeyMap[typePointerID]
-		if propKey != "optionsSourceAssociationDataSource" {
+		if propTypeKeyMap[typePointerID] != wantKey {
 			continue
 		}
 		value, ok := propMap["Value"].(map[string]any)
@@ -137,92 +190,25 @@ func extractComboBoxDataSource(ctx *ExecContext, w map[string]any) *rawDataSourc
 	return nil
 }
 
-// extractDataGrid2DataSource extracts the datasource from a DataGrid2 CustomWidget.
-func extractDataGrid2DataSource(ctx *ExecContext, w map[string]any) *rawDataSource {
-	obj, ok := w["Object"].(map[string]any)
-	if !ok {
-		return nil
+// gridSortDirection reads a grid sort item's direction. A Pages/Forms$GridSortItem
+// (pluggable DataGrid2/Gallery, ListView) stores it under SortDirection — the name
+// Studio Pro and the modelsdk engine write. The legacy sdk/mpr writer used the
+// SortOrder key (correct only for Microflows$SortItem / DocumentTemplates), so we
+// fall back to it to keep pre-fix files readable. Returns the raw Mendix enum value
+// ("Ascending"/"Descending"), or "" when unset.
+func gridSortDirection(sortItem map[string]any) string {
+	if v := extractString(sortItem["SortDirection"]); v != "" {
+		return v
 	}
-
-	// Search through properties for datasource
-	props := getBsonArrayElements(obj["Properties"])
-	for _, prop := range props {
-		propMap, ok := prop.(map[string]any)
-		if !ok {
-			continue
-		}
-		value, ok := propMap["Value"].(map[string]any)
-		if !ok {
-			continue
-		}
-		// Check for DataSource
-		ds, ok := value["DataSource"].(map[string]any)
-		if !ok || ds == nil {
-			continue
-		}
-
-		dsType := extractString(ds["$Type"])
-		switch dsType {
-		case "Forms$DatabaseSource":
-			entityRef, ok := ds["EntityRef"].(map[string]any)
-			if ok && entityRef != nil {
-				entity := extractString(entityRef["Entity"])
-				if entity != "" {
-					return &rawDataSource{Type: "database", Reference: entity}
-				}
-			}
-		case "CustomWidgets$CustomWidgetXPathSource":
-			// CustomWidget datasource format - EntityRef contains Entity as qualified name
-			result := &rawDataSource{Type: "database"}
-			entityRef, ok := ds["EntityRef"].(map[string]any)
-			if ok && entityRef != nil {
-				result.Reference = extractString(entityRef["Entity"])
-			}
-			// Extract XPathConstraint
-			result.XPathConstraint = extractString(ds["XPathConstraint"])
-			// Extract sorting from SortBar - support multiple sort columns
-			if sortBar, ok := ds["SortBar"].(map[string]any); ok {
-				sortItems := getBsonArrayElements(sortBar["SortItems"])
-				for _, item := range sortItems {
-					sortItem, ok := item.(map[string]any)
-					if !ok {
-						continue
-					}
-					col := rawSortColumn{Order: "asc"}
-					// Extract attribute from AttributeRef
-					if attrRef, ok := sortItem["AttributeRef"].(map[string]any); ok {
-						col.Attribute = shortAttributeName(extractString(attrRef["Attribute"]))
-					}
-					// Extract sort order
-					sortOrder := extractString(sortItem["SortOrder"])
-					if sortOrder == "Descending" {
-						col.Order = "desc"
-					}
-					if col.Attribute != "" {
-						result.SortColumns = append(result.SortColumns, col)
-					}
-				}
-			}
-			if result.Reference != "" {
-				return result
-			}
-		case "Forms$MicroflowSource":
-			microflow := extractString(ds["Microflow"])
-			if microflow != "" {
-				return &rawDataSource{Type: "microflow", Reference: microflow}
-			}
-		case "Forms$EntityPathSource", "Forms$DataViewSource":
-			entityPath := extractString(ds["EntityPath"])
-			if entityPath != "" {
-				return &rawDataSource{Type: "parameter", Reference: entityPath}
-			}
-		}
-	}
-	return nil
+	return extractString(sortItem["SortOrder"])
 }
 
-// extractDataGrid2Columns extracts the columns from a DataGrid2 CustomWidget.
-// entityContext is the resolved entity context from the DataGrid2's datasource.
+// extractDataGrid2DataSource extracts the datasource from a DataGrid2
+// CustomWidget: it lives on one of the widget object's properties.
+func extractDataGrid2DataSource(ctx *ExecContext, w map[string]any) *rawDataSource {
+	return firstObjectPropertyDataSource(w)
+}
+
 func extractDataGrid2Columns(ctx *ExecContext, w map[string]any, entityContext ...string) []rawDataGridColumn {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
@@ -231,12 +217,18 @@ func extractDataGrid2Columns(ctx *ExecContext, w map[string]any, entityContext .
 
 	// Build column property key map from Type.ObjectType.PropertyTypes -> columns -> ValueType.ObjectType.PropertyTypes
 	colPropKeyMap := buildColumnPropertyKeyMap(ctx, w)
+	// The widget's own property keys, to find the `columns` list by name.
+	propTypeKeyMap := buildPropertyTypeKeyMap(w, false)
 
 	// Search through properties for columns
 	props := getBsonArrayElements(obj["Properties"])
 	for _, prop := range props {
 		propMap, ok := prop.(map[string]any)
 		if !ok {
+			continue
+		}
+		propKey := propTypeKeyMap[extractBinaryID(propMap["TypePointer"])]
+		if propKey != "" && propKey != "columns" {
 			continue
 		}
 		value, ok := propMap["Value"].(map[string]any)
@@ -254,13 +246,23 @@ func extractDataGrid2Columns(ctx *ExecContext, w map[string]any, entityContext .
 			entCtx = entityContext[0]
 		}
 		var columns []rawDataGridColumn
+		colSchemas := objectListPropertySchemas(w, "columns")
 		for _, colObj := range objects {
 			colMap, ok := colObj.(map[string]any)
 			if !ok {
 				continue
 			}
 			col := extractDataGrid2Column(ctx, colMap, colPropKeyMap, entCtx)
-			if col.Attribute != "" || col.Caption != "" {
+			col.ExtraProps, col.OmittedProps = extractDataGrid2ColumnByKeyProps(ctx, colMap, colSchemas, entCtx)
+			// Every object of the resolved `columns` list is a column. The
+			// actions column has no attribute and an empty header, and keeping
+			// only columns with one of those dropped it with all its widgets,
+			// so the next describe -> edit -> exec deleted it
+			// (mendixlabs/mxcli#1520). Only when the key did not resolve does
+			// the heuristic separate columns from another object list, widened
+			// to a column that carries content or a content mode.
+			if propKey == "columns" || col.Attribute != "" || col.Caption != "" ||
+				col.ShowContentAs != "" || len(col.ContentWidgets) > 0 || len(col.FilterWidgets) > 0 {
 				columns = append(columns, col)
 			}
 		}
@@ -332,6 +334,20 @@ func buildColumnPropertyKeyMap(ctx *ExecContext, w map[string]any) map[string]st
 // - "dynamicText": TextTemplate for dynamic text (when showContentAs = "dynamicText")
 // - "alignment": enum value ("left", "center", "right")
 // - "wrapText": boolean ("true", "false")
+// columnAttributeFromRef reconstructs a DataGrid2 column's `attribute:` value
+// from its DomainModels$AttributeRef. For an own-entity attribute it returns the
+// short attribute name; for an attribute navigated over associations
+// (AttributeRef.EntityRef = IndirectEntityRef of steps) it returns
+// `Assoc/.../Attr` using SHORT association names — the column-attribute grammar
+// (attributePathV3) accepts bare segments only, so a module-qualified association
+// would not re-parse.
+func columnAttributeFromRef(ctx *ExecContext, attrRef map[string]any) string {
+	if path := associationPathMDL(attrRef, true, describeAssociationEnds(ctx)); path != "" {
+		return path
+	}
+	return shortAttributeName(extractString(attrRef["Attribute"]))
+}
+
 func extractDataGrid2Column(ctx *ExecContext, colObj map[string]any, colPropKeyMap map[string]string, entityContext string) rawDataGridColumn {
 	col := rawDataGridColumn{}
 
@@ -458,14 +474,7 @@ func extractDataGrid2Column(ctx *ExecContext, colObj map[string]any, colPropKeyM
 		// Check for AttributeRef (attribute property)
 		if col.Attribute == "" {
 			if attrRef, ok := value["AttributeRef"].(map[string]any); ok && attrRef != nil {
-				attr := extractString(attrRef["Attribute"])
-				if attr != "" {
-					// Extract just the attribute name from qualified path
-					parts := strings.Split(attr, ".")
-					if len(parts) > 0 {
-						col.Attribute = parts[len(parts)-1]
-					}
-				}
+				col.Attribute = columnAttributeFromRef(ctx, attrRef)
 			}
 		}
 
@@ -479,16 +488,25 @@ func extractDataGrid2Column(ctx *ExecContext, colObj map[string]any, colPropKeyM
 			}
 		}
 
-		// Check for Widgets array (content property for custom widgets)
-		if len(col.ContentWidgets) == 0 {
-			widgets := getBsonArrayElements(value["Widgets"])
-			if len(widgets) > 0 {
-				for _, w := range widgets {
-					if wMap, ok := w.(map[string]any); ok {
-						col.ContentWidgets = append(col.ContentWidgets, parseRawWidget(ctx, wMap, entityContext)...)
-					}
-				}
+		// A column has TWO Widgets-typed slots — `content` (custom content) and
+		// `filter` — so route on the property key. Taking the first Widgets array
+		// instead dropped the filter of any column that also had custom content:
+		// the writer emits properties alphabetically, so `content` came first and
+		// won, and describe→exec then deleted the filter (ako/mxcli#489).
+		if propKey == "content" || propKey == "filter" {
+			widgets := parseColumnSlotWidgets(ctx, value, entityContext)
+			if propKey == "filter" {
+				col.FilterWidgets = append(col.FilterWidgets, widgets...)
+			} else {
+				col.ContentWidgets = append(col.ContentWidgets, widgets...)
 			}
+			continue
+		}
+
+		// Fallback for a document whose property keys did not resolve (no key map):
+		// the first Widgets array is the column's content.
+		if propKey == "" && len(col.ContentWidgets) == 0 {
+			col.ContentWidgets = append(col.ContentWidgets, parseColumnSlotWidgets(ctx, value, entityContext)...)
 		}
 
 		// Check for TextTemplate (could be header or dynamicText property)
@@ -552,39 +570,75 @@ func extractTextTemplateText(value map[string]any) (string, map[string]any) {
 	return "", nil
 }
 
-// extractTextTemplateParameters extracts parameters from a TextTemplate (Forms$ClientTemplate).
+// sourceVariableBinding reads the SourceVariable of a stored
+// Forms$ClientTemplateParameter and reports which variable it names, and whether
+// that variable is a page-level LOCAL one.
+//
+// Studio Pro distinguishes three bindings on the same Forms$PageVariable —
+// LocalVariable (a page `Variables:` entry), PageParameter, and SnippetParameter
+// — and exactly one is populated. The two describers used to read this
+// separately, and one of them looked only at PageParameter: a local-variable
+// binding came back as `<unbound>` from that reader and as `$Name` from the
+// other, for the same bytes (upstream #977). One shape, one resolver.
+//
+// A local variable renders bare (`$Name`); the other two carry an AttributeRef
+// and render as `$Name.Attr`, which is why the caller needs the distinction.
+func sourceVariableBinding(param map[string]any) (name string, isLocal bool) {
+	srcVar, ok := param["SourceVariable"].(map[string]any)
+	if !ok || srcVar == nil {
+		return "", false
+	}
+	// Read through a data view: Widget names it, and the data view's own
+	// variable sits beside it. `$dataView1.Attr` is what re-executes into that
+	// pair; the parameter alone would drop the Widget (ako/mxcli#826).
+	if v, ok := srcVar["Widget"].(string); ok && v != "" {
+		return v, false
+	}
+	if v, ok := srcVar["LocalVariable"].(string); ok && v != "" {
+		return v, true
+	}
+	if v, ok := srcVar["PageParameter"].(string); ok && v != "" {
+		return v, false
+	}
+	if v, ok := srcVar["SnippetParameter"].(string); ok && v != "" {
+		return v, false
+	}
+	return "", false
+}
+
+// extractTextTemplateParameters renders the parameters of a stored
+// Forms$ClientTemplate as the MDL values of its `{n} = …` list. It is the one
+// reader of a template parameter: the core describer's
+// extractClientTemplateParameters delegates here.
 func extractTextTemplateParameters(ctx *ExecContext, textTemplate map[string]any) []string {
 	params := getBsonArrayElements(textTemplate["Parameters"])
 	if params == nil || len(params) == 0 {
 		return nil
 	}
 	var result []string
+	var suffixes []string // per-param format block " (decimalPrecision: 0, …)", "" when default
 	for _, p := range params {
 		pMap, ok := p.(map[string]any)
 		if !ok {
 			continue
 		}
+		// One suffix per emitted param, in the same order, zipped in after the
+		// value string is chosen so a DataGrid2 dynamic-text column's per-parameter
+		// formatting round-trips through DESCRIBE (ledger #77).
+		suffixes = append(suffixes, formatParamFormatSuffix(ctx, pMap))
 		// Check for Expression first (literal value)
 		if expr, ok := pMap["Expression"].(string); ok && expr != "" {
-			result = append(result, expr)
+			// The expression as stored. `toString($Order/Total)` used to be
+			// unwrapped to `$Order.Total`, the spelling mxcli once wrapped in
+			// toString itself; that spelling now binds the attribute (#823,
+			// MDL-V1-TEMPLATEATTR), so unwrapping changed the page's output on
+			// describe -> exec. The write side stores a non-attribute value as
+			// an expression (isTemplateExpression), so the text round-trips.
+			result = append(result, strings.TrimSpace(expr))
 			continue
 		}
 
-		// Check for SourceVariable (page parameter / local variable / snippet parameter)
-		sourceVarName := ""
-		isLocalVariable := false
-		if srcVar, ok := pMap["SourceVariable"].(map[string]any); ok && srcVar != nil {
-			// Local page-level variable — Studio Pro UI emits this form for
-			// $varName references that bind to a Variables entry.
-			if name, ok := srcVar["LocalVariable"].(string); ok && name != "" {
-				sourceVarName = name
-				isLocalVariable = true
-			} else if name, ok := srcVar["PageParameter"].(string); ok && name != "" {
-				sourceVarName = name
-			} else if name, ok := srcVar["SnippetParameter"].(string); ok && name != "" {
-				sourceVarName = name
-			}
-		}
+		sourceVarName, isLocalVariable := sourceVariableBinding(pMap)
 
 		// Local variable: emit as bare $varName (no .attribute suffix).
 		if isLocalVariable {
@@ -594,6 +648,20 @@ func extractTextTemplateParameters(ctx *ExecContext, textTemplate map[string]any
 
 		// Check for AttributeRef
 		if attrRef, ok := pMap["AttributeRef"].(map[string]any); ok && attrRef != nil {
+			// Attribute navigated over associations (AttributeRef.EntityRef):
+			// reconstruct the "Assoc/.../Attr" path so DESCRIBE round-trips. The
+			// bare attribute re-executes against the widget's own entity (CE1365,
+			// mendixlabs/mxcli#1494).
+			if assocPath := associationTemplateParamPath(ctx, attrRef); assocPath != "" {
+				// Read from a named object (a parameter, a data view): the root
+				// is part of the binding. Without it the path re-executed against
+				// the context with no source, CE0402 (ako/mxcli#833).
+				if sourceVarName != "" {
+					assocPath = "$" + sourceVarName + "/" + assocPath
+				}
+				result = append(result, assocPath)
+				continue
+			}
 			if attr, ok := attrRef["Attribute"].(string); ok {
 				if sourceVarName != "" {
 					// Has SourceVariable - this is a page parameter reference
@@ -602,159 +670,131 @@ func extractTextTemplateParameters(ctx *ExecContext, textTemplate map[string]any
 					result = append(result, "$"+sourceVarName+"."+attrName)
 				} else {
 					// No SourceVariable - use short attribute name
-					result = append(result, shortAttributeName(attr))
+					result = append(result, describeAttr(ctx, attr))
 				}
+				continue
+			}
+		}
+		// A page parameter or page variable with no attribute: a primitive
+		// page parameter bound as itself (ako/mxcli#2132), which the builder
+		// writes back to the same slot from the bare `$Name`.
+		if sourceVarName != "" {
+			if srcVar, _ := pMap["SourceVariable"].(map[string]any); extractString(srcVar["Widget"]) == "" {
+				result = append(result, "$"+sourceVarName)
 				continue
 			}
 		}
 		// Parameter exists but has no binding
 		result = append(result, "<unbound>")
 	}
+	// Append each param's format block to its value string; result and suffixes
+	// are aligned (one of each per param that had a valid pMap).
+	for i := range result {
+		if i < len(suffixes) && suffixes[i] != "" {
+			result[i] += suffixes[i]
+		}
+	}
 	return result
 }
 
-// extractGalleryDataSource extracts the datasource from a Gallery widget.
-// Handles both Forms$Gallery and CustomWidgets$CustomWidget Gallery formats.
+// extractGalleryDataSource extracts the datasource from a Gallery widget,
+// which may be stored either as a pluggable widget (datasource on one of the
+// object's properties) or as the older Forms$Gallery (datasource at the top
+// level).
 func extractGalleryDataSource(ctx *ExecContext, w map[string]any) *rawDataSource {
-	// First check for CustomWidget Gallery format (datasource in Object.Properties)
-	if obj, ok := w["Object"].(map[string]any); ok {
-		props := getBsonArrayElements(obj["Properties"])
-		for _, prop := range props {
-			propMap, ok := prop.(map[string]any)
-			if !ok {
-				continue
-			}
-			value, ok := propMap["Value"].(map[string]any)
-			if !ok {
-				continue
-			}
-			// Check for DataSource field in Value - only process if not nil
-			dsVal, hasDS := value["DataSource"]
-			if !hasDS {
-				continue
-			}
-			if ds, ok := dsVal.(map[string]any); ok && ds != nil {
-				result := parseCustomWidgetDataSource(ctx, ds)
-				if result != nil {
-					return result
-				}
-			}
-		}
+	if ds := firstObjectPropertyDataSource(w); ds != nil {
+		return ds
 	}
-
-	// Fall back to Forms$Gallery format (DataSource at top level)
-	ds, ok := w["DataSource"].(map[string]any)
-	if !ok || ds == nil {
+	top, ok := w["DataSource"].(map[string]any)
+	if !ok || top == nil {
 		return nil
 	}
+	return parseDataSource(top)
+}
 
-	dsType := extractString(ds["$Type"])
-	switch dsType {
-	case "Forms$DatabaseSource":
-		result := &rawDataSource{Type: "database"}
-		entityRef, ok := ds["EntityRef"].(map[string]any)
-		if ok && entityRef != nil {
-			result.Reference = extractString(entityRef["Entity"])
+// firstObjectPropertyDataSource returns the datasource of the first property of
+// a pluggable widget's object that carries one.
+//
+// Shared by every pluggable container rather than copied per widget: where the
+// datasource sits is a property of the storage format, not of the widget, and
+// the per-widget copies of this walk were what let their datasource switches
+// drift apart (#941).
+func firstObjectPropertyDataSource(w map[string]any) *rawDataSource {
+	obj, ok := w["Object"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	for _, prop := range getBsonArrayElements(obj["Properties"]) {
+		propMap, ok := prop.(map[string]any)
+		if !ok {
+			continue
 		}
-		result.XPathConstraint = extractString(ds["XPathConstraint"])
-		// Extract sorting
-		if sortBar, ok := ds["SortBar"].(map[string]any); ok {
-			sortItems := getBsonArrayElements(sortBar["SortItems"])
-			for _, item := range sortItems {
-				sortItem, ok := item.(map[string]any)
-				if !ok {
-					continue
-				}
-				col := rawSortColumn{Order: "asc"}
-				if attrRef, ok := sortItem["AttributeRef"].(map[string]any); ok {
-					col.Attribute = shortAttributeName(extractString(attrRef["Attribute"]))
-				}
-				sortOrder := extractString(sortItem["SortOrder"])
-				if sortOrder == "Descending" {
-					col.Order = "desc"
-				}
-				if col.Attribute != "" {
-					result.SortColumns = append(result.SortColumns, col)
-				}
-			}
+		value, ok := propMap["Value"].(map[string]any)
+		if !ok {
+			continue
 		}
-		if result.Reference != "" {
+		ds, ok := value["DataSource"].(map[string]any)
+		if !ok || ds == nil {
+			continue
+		}
+		if result := parseDataSource(withWidgetValueSourceVariable(ds, value)); result != nil {
 			return result
 		}
-	case "Forms$MicroflowSource":
-		microflow := extractString(ds["Microflow"])
-		if microflow != "" {
-			return &rawDataSource{Type: "microflow", Reference: microflow}
-		}
-	case "Forms$EntityPathSource", "Forms$DataViewSource":
-		entityPath := extractString(ds["EntityPath"])
-		if entityPath != "" {
-			return &rawDataSource{Type: "parameter", Reference: entityPath}
-		}
 	}
 	return nil
 }
 
-// parseCustomWidgetDataSource parses datasource from CustomWidget property format.
+// withWidgetValueSourceVariable returns ds with the WidgetValue's SourceVariable
+// when ds has no SourceVariable key of its own. Before Mendix 10 a pluggable
+// widget's datasource did not declare one (Forms$EntityPathSource.sourceVariable
+// is introduced in 10.0.0): the page or snippet parameter a source reached over
+// an association starts from is stored on the WidgetValue beside it. Reading the
+// datasource alone described the path from $currentObject (mendixlabs/mxcli#1399).
+// A source that declares the key — null included — is returned as it is.
+func withWidgetValueSourceVariable(ds, value map[string]any) map[string]any {
+	if _, declared := ds["SourceVariable"]; declared {
+		return ds
+	}
+	sv, ok := value["SourceVariable"].(map[string]any)
+	if !ok || sv == nil {
+		return ds
+	}
+	out := make(map[string]any, len(ds)+1)
+	for k, v := range ds {
+		out[k] = v
+	}
+	out["SourceVariable"] = sv
+	return out
+}
+
+func microflowSourceRef(ds map[string]any) string {
+	if mf := extractString(ds["Microflow"]); mf != "" {
+		return mf
+	}
+	if settings, ok := ds["MicroflowSettings"].(map[string]any); ok {
+		return extractString(settings["Microflow"])
+	}
+	return ""
+}
+
+// nanoflowSourceRef is the Forms$NanoflowSource counterpart of microflowSourceRef.
+func nanoflowSourceRef(ds map[string]any) string {
+	if nf := extractString(ds["Nanoflow"]); nf != "" {
+		return nf
+	}
+	if settings, ok := ds["NanoflowSettings"].(map[string]any); ok {
+		return extractString(settings["Nanoflow"])
+	}
+	return ""
+}
+
+// parseCustomWidgetDataSource reads a pluggable widget property's datasource.
+// Kept as a named seam over the shared reader because callers read better for
+// it; the switch itself lives in one place (see cmd_pages_describe_datasource.go).
 func parseCustomWidgetDataSource(ctx *ExecContext, ds map[string]any) *rawDataSource {
-	dsType := extractString(ds["$Type"])
-	switch dsType {
-	case "CustomWidgets$CustomWidgetXPathSource":
-		result := &rawDataSource{Type: "database"}
-		entityRef, ok := ds["EntityRef"].(map[string]any)
-		if ok && entityRef != nil {
-			result.Reference = extractString(entityRef["Entity"])
-		}
-		result.XPathConstraint = extractString(ds["XPathConstraint"])
-		// Extract sorting if present
-		if sortBar, ok := ds["SortBar"].(map[string]any); ok {
-			sortItems := getBsonArrayElements(sortBar["SortItems"])
-			for _, item := range sortItems {
-				sortItem, ok := item.(map[string]any)
-				if !ok {
-					continue
-				}
-				col := rawSortColumn{Order: "asc"}
-				if attrRef, ok := sortItem["AttributeRef"].(map[string]any); ok {
-					col.Attribute = shortAttributeName(extractString(attrRef["Attribute"]))
-				}
-				sortOrder := extractString(sortItem["SortOrder"])
-				if sortOrder == "Descending" {
-					col.Order = "desc"
-				}
-				if col.Attribute != "" {
-					result.SortColumns = append(result.SortColumns, col)
-				}
-			}
-		}
-		return result
-	case "Forms$MicroflowSource":
-		// Pluggable widgets use Forms$MicroflowSource with MicroflowSettings
-		if settings, ok := ds["MicroflowSettings"].(map[string]any); ok {
-			microflow := extractString(settings["Microflow"])
-			if microflow != "" {
-				return &rawDataSource{Type: "microflow", Reference: microflow}
-			}
-		}
-	case "Forms$NanoflowSource":
-		// Pluggable widgets use Forms$NanoflowSource with NanoflowSettings
-		if settings, ok := ds["NanoflowSettings"].(map[string]any); ok {
-			nanoflow := extractString(settings["Nanoflow"])
-			if nanoflow != "" {
-				return &rawDataSource{Type: "nanoflow", Reference: nanoflow}
-			}
-		}
-	case "CustomWidgets$CustomWidgetNanoflowSource":
-		nanoflow := extractString(ds["Nanoflow"])
-		if nanoflow != "" {
-			return &rawDataSource{Type: "nanoflow", Reference: nanoflow}
-		}
-	}
-	return nil
+	return parseDataSource(ds)
 }
 
-// extractGalleryContent extracts the content widgets from a CustomWidget Gallery.
-// entityContext is the resolved entity context from the Gallery's datasource.
 func extractGalleryContent(ctx *ExecContext, w map[string]any, entityContext ...string) []rawWidget {
 	entCtx := ""
 	if len(entityContext) > 0 {
@@ -883,6 +923,32 @@ func extractGallerySelection(ctx *ExecContext, w map[string]any) string {
 	return ""
 }
 
+// gallerySelectionIsNone reports whether a Gallery's stored itemSelection is
+// "None". extractGallerySelection reads None as unset, which is right for a
+// widget whose default is None and wrong for the Gallery, whose MDL default is
+// Single: a Studio Pro gallery with no selection described without one, and
+// describe → exec gave it a single selection (#842).
+func gallerySelectionIsNone(w map[string]any) bool {
+	obj, ok := w["Object"].(map[string]any)
+	if !ok {
+		return false
+	}
+	propTypeKeyMap := buildPropertyTypeKeyMap(w, true)
+	for _, prop := range getBsonArrayElements(obj["Properties"]) {
+		propMap, ok := prop.(map[string]any)
+		if !ok || propTypeKeyMap[extractBinaryID(propMap["TypePointer"])] != "itemSelection" {
+			continue
+		}
+		value, ok := propMap["Value"].(map[string]any)
+		if !ok {
+			return false
+		}
+		sel, _ := value["Selection"].(string)
+		return sel == "None"
+	}
+	return false
+}
+
 // extractFilterAttributes extracts the filter attributes from a TextFilter/NumberFilter widget.
 func extractFilterAttributes(ctx *ExecContext, w map[string]any) []string {
 	// Use the generic property extraction helper
@@ -921,7 +987,7 @@ func extractCustomWidgetPropertyAttributeRef(ctx *ExecContext, w map[string]any,
 		}
 		if attrRef, ok := value["AttributeRef"].(map[string]any); ok && attrRef != nil {
 			if attr, ok := attrRef["Attribute"].(string); ok && attr != "" {
-				return shortAttributeName(attr)
+				return describeAttr(ctx, attr)
 			}
 		}
 	}
@@ -936,6 +1002,34 @@ func extractCustomWidgetPropertyAttributeRef(ctx *ExecContext, w map[string]any,
 // This is the symmetric counterpart of extractCustomWidgetPropertyAttributeRef,
 // handling the EntityRef storage format instead of AttributeRef.
 func extractCustomWidgetPropertyAssociation(ctx *ExecContext, w map[string]any, propertyKey string) string {
+	return shortAttributeName(extractCustomWidgetPropertyAssociationQN(ctx, w, propertyKey))
+}
+
+// associationRefForContext renders a stored association reference for MDL:
+// bare when it is declared in the context entity's module, qualified otherwise.
+//
+// exec qualifies a bare name by looking the association up from the context,
+// but the qualified form means the same thing without a lookup — so it is what
+// describe emits whenever the modules differ, or the context is unknown. A
+// bare `UserRoles` on a page over Administration.Account (extends System.User)
+// was written back as `Administration.UserRoles` → CE1613 (ako/mxcli#662).
+func associationRefForContext(assocQN, entityContext string) string {
+	if assocQN == "" {
+		return ""
+	}
+	dot := strings.Index(assocQN, ".")
+	if dot < 0 {
+		return assocQN
+	}
+	if ctxDot := strings.Index(entityContext, "."); ctxDot > 0 && entityContext[:ctxDot] == assocQN[:dot] {
+		return assocQN[dot+1:]
+	}
+	return assocQN
+}
+
+// extractCustomWidgetPropertyAssociationQN returns the association a
+// CustomWidget property binds, as stored: Module.Association.
+func extractCustomWidgetPropertyAssociationQN(ctx *ExecContext, w map[string]any, propertyKey string) string {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
 		return ""
@@ -970,7 +1064,7 @@ func extractCustomWidgetPropertyAssociation(ctx *ExecContext, w map[string]any, 
 				continue
 			}
 			if assoc := extractString(stepMap["Association"]); assoc != "" {
-				return shortAttributeName(assoc)
+				return assoc
 			}
 		}
 	}
@@ -978,6 +1072,114 @@ func extractCustomWidgetPropertyAssociation(ctx *ExecContext, w map[string]any, 
 }
 
 // extractCustomWidgetPropertyString extracts a string property value from a CustomWidget.
+// extractCustomWidgetPropertyImage reads an image-typed property's stored
+// reference — the WidgetValue's `Image` key, holding a three-part
+// Module.Collection.Image qualified name.
+//
+// It resolves the property through its TypePointer like every other extractor
+// here, rather than by position: the Image widget has TWO image-typed
+// properties (`imageObject` and `defaultImageDynamic`), so taking the first
+// Image found would return the wrong one.
+func extractCustomWidgetPropertyImage(ctx *ExecContext, w map[string]any, propertyKey string) string {
+	obj, ok := w["Object"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	propTypeKeyMap := buildPropertyTypeKeyMap(w, false)
+	for _, prop := range getBsonArrayElements(obj["Properties"]) {
+		propMap, ok := prop.(map[string]any)
+		if !ok {
+			continue
+		}
+		if propTypeKeyMap[extractBinaryID(propMap["TypePointer"])] != propertyKey {
+			continue
+		}
+		value, ok := propMap["Value"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if img, ok := value["Image"].(string); ok {
+			return img
+		}
+	}
+	return ""
+}
+
+// extractCustomWidgetPropertyIcon reads an icon-typed property's stored Icon
+// element — the Image widget's `imageIcon`, the icon an `ImageType: icon` image
+// shows. It is the same element a button's Icon holds, so it is read the same
+// way: name, $Type and glyph code, all three needed to rebuild the same element.
+// Describe used to skip it, so a re-created icon image named no icon and
+// mxbuild refused it with "No icon selected." (ako/mxcli#2174).
+func extractCustomWidgetPropertyIcon(w map[string]any, propertyKey string) (name, iconType string, code int) {
+	obj, ok := w["Object"].(map[string]any)
+	if !ok {
+		return "", "", 0
+	}
+	propTypeKeyMap := buildPropertyTypeKeyMap(w, false)
+	for _, prop := range getBsonArrayElements(obj["Properties"]) {
+		propMap, ok := prop.(map[string]any)
+		if !ok {
+			continue
+		}
+		if propTypeKeyMap[extractBinaryID(propMap["TypePointer"])] != propertyKey {
+			continue
+		}
+		if value, ok := propMap["Value"].(map[string]any); ok {
+			return extractButtonIcon(value)
+		}
+	}
+	return "", "", 0
+}
+
+// extractCustomWidgetPropertyImageBound reports whether an image-typed
+// property is bound to the object in context: its WidgetValue carries an
+// EntityRef rather than a collection entry (mendixlabs/mxcli#1476).
+func extractCustomWidgetPropertyImageBound(ctx *ExecContext, w map[string]any, propertyKey string) bool {
+	obj, ok := w["Object"].(map[string]any)
+	if !ok {
+		return false
+	}
+	propTypeKeyMap := buildPropertyTypeKeyMap(w, false)
+	for _, prop := range getBsonArrayElements(obj["Properties"]) {
+		propMap, ok := prop.(map[string]any)
+		if !ok {
+			continue
+		}
+		if propTypeKeyMap[extractBinaryID(propMap["TypePointer"])] != propertyKey {
+			continue
+		}
+		value, ok := propMap["Value"].(map[string]any)
+		if !ok {
+			continue
+		}
+		ref, ok := value["EntityRef"].(map[string]any)
+		return ok && ref != nil
+	}
+	return false
+}
+
+// extractCustomWidgetPropertyExpression reads an expression-typed property's
+// stored Expression, or "" when it is unset.
+func extractCustomWidgetPropertyExpression(w map[string]any, propertyKey string) string {
+	obj, ok := w["Object"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	propTypeKeyMap := buildPropertyTypeKeyMap(w, false)
+	for _, prop := range getBsonArrayElements(obj["Properties"]) {
+		propMap, ok := prop.(map[string]any)
+		if !ok || propTypeKeyMap[extractBinaryID(propMap["TypePointer"])] != propertyKey {
+			continue
+		}
+		if value, ok := propMap["Value"].(map[string]any); ok {
+			expr, _ := value["Expression"].(string)
+			return expr
+		}
+	}
+	return ""
+}
+
 func extractCustomWidgetPropertyString(ctx *ExecContext, w map[string]any, propertyKey string) string {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
@@ -1009,6 +1211,27 @@ func extractCustomWidgetPropertyString(ctx *ExecContext, w map[string]any, prope
 		// Extract PrimitiveValue for string properties
 		if pv, ok := value["PrimitiveValue"].(string); ok && pv != "" {
 			return pv
+		}
+	}
+	return ""
+}
+
+// extractCustomWidgetPropertySelection reads the Selection a named property
+// holds ("None", "Single", "Multi"); "" when the widget has no such property.
+func extractCustomWidgetPropertySelection(ctx *ExecContext, w map[string]any, propertyKey string) string {
+	obj, ok := w["Object"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	propTypeKeyMap := buildPropertyTypeKeyMap(w, false)
+	for _, prop := range getBsonArrayElements(obj["Properties"]) {
+		propMap, ok := prop.(map[string]any)
+		if !ok || propTypeKeyMap[extractBinaryID(propMap["TypePointer"])] != propertyKey {
+			continue
+		}
+		if value, ok := propMap["Value"].(map[string]any); ok {
+			sel, _ := value["Selection"].(string)
+			return sel
 		}
 	}
 	return ""
@@ -1065,7 +1288,7 @@ func extractCustomWidgetPropertyAttributes(ctx *ExecContext, w map[string]any, p
 				// Check for AttributeRef
 				if attrRef, ok := objValue["AttributeRef"].(map[string]any); ok && attrRef != nil {
 					if attr, ok := attrRef["Attribute"].(string); ok && attr != "" {
-						result = append(result, shortAttributeName(attr))
+						result = append(result, describeAttr(ctx, attr))
 					}
 				}
 			}
@@ -1100,7 +1323,12 @@ func isKnownCustomWidgetType(widgetType string) bool {
 
 // extractExplicitProperties extracts non-default property values from a CustomWidget BSON.
 // Returns attribute references and primitive values for properties that differ from defaults.
-func extractExplicitProperties(ctx *ExecContext, w map[string]any) []rawExplicitProp {
+//
+// enclosingEntity is the entity of the data container the widget sits in. An
+// attribute property linked to no datasource binds to that object, so one of
+// another entity keeps its qualified name: shortened, re-exec bound it to the
+// container's entity (mendixlabs/mxcli#1591, CE1613).
+func extractExplicitProperties(ctx *ExecContext, w map[string]any, enclosingEntity ...string) []rawExplicitProp {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
 		return nil
@@ -1110,8 +1338,16 @@ func extractExplicitProperties(ctx *ExecContext, w map[string]any) []rawExplicit
 	if len(propTypeKeyMap) == 0 {
 		return nil
 	}
+	valueTypes := buildPropertyValueTypeMap(w)
+	schemas := widgetPropertySchemas(w)
+	enclosing := ""
+	if len(enclosingEntity) > 0 {
+		enclosing = enclosingEntity[0]
+	}
 
 	var result []rawExplicitProp
+	stored := map[string]string{}   // primitive values, for the visibility rules
+	defaults := map[string]string{} // the stored schema's DefaultValue per key
 	props := getBsonArrayElements(obj["Properties"])
 	for _, prop := range props {
 		propMap, ok := prop.(map[string]any)
@@ -1127,39 +1363,152 @@ func extractExplicitProperties(ctx *ExecContext, w map[string]any) []rawExplicit
 		if !ok {
 			continue
 		}
+		if pv := extractString(value["PrimitiveValue"]); pv != "" {
+			stored[propKey] = pv
+		}
+		defaults[propKey] = schemas[typePointerID].Default
 
 		// Check for AttributeRef (attribute binding)
 		if attrRef, ok := value["AttributeRef"].(map[string]any); ok && attrRef != nil {
 			if attr := extractString(attrRef["Attribute"]); attr != "" {
+				described := describeAttr(ctx, attr)
+				if root := namedObjectSourceName(value["SourceVariable"]); root != "" && attrRef["EntityRef"] != nil {
+					// The same object, with association steps: `$Root/Assoc/Attr`
+					// (ako/mxcli#833), as FactoryManagement's
+					// ConversationalUI.Span_TextGeneration_SlideIn stores it
+					// (ako/mxcli#2107).
+					if path := columnAttributeFromRef(ctx, attrRef); strings.Contains(path, "/") {
+						described = "$" + root + "/" + path
+					}
+				} else if param := namedObjectSourceName(value["SourceVariable"]); param != "" && attrRef["EntityRef"] == nil {
+					// Read from a page or snippet parameter, `$Param.Attr`, or an
+					// enclosing data view, `$dataView1.Attr`. The qualified name
+					// re-executes without the SourceVariable and binds against
+					// the nearest container — CE7247 (mendixlabs/mxcli#1591,
+					// ako/mxcli#2107).
+					described = parameterAttributeMDL(param, attr)
+				} else if path := columnAttributeFromRef(ctx, attrRef); attrRef["EntityRef"] != nil && strings.Contains(path, "/") {
+					// Read over associations from the context object,
+					// `Assoc/Attr` — what create page and alter page set store as
+					// the final attribute plus its steps (ako/mxcli#2279,
+					// #2283). The final attribute alone re-executed against the
+					// context entity: another binding, or a refusal
+					// (ako/mxcli#2295).
+					described = path
+				} else if schemas[typePointerID].DataSourceProperty == "" && strings.Contains(enclosing, ".") &&
+					!strings.EqualFold(attributeEntity(attr), enclosing) {
+					described = attr
+				}
 				result = append(result, rawExplicitProp{
 					Key:   propKey,
-					Value: shortAttributeName(attr),
+					Value: described,
 					IsRef: true,
 				})
 				continue
 			}
 		}
 
-		// Check for non-default PrimitiveValue
-		if pv := extractString(value["PrimitiveValue"]); pv != "" {
-			// Skip common defaults
-			if pv == "true" || pv == "false" {
-				continue
-			}
+		// A text-template property: its text, plus the `{N}` bindings under the
+		// `<Key>Params` companion. An unset or widget-hidden template stores a
+		// null or an empty ClientTemplate and yields "", so it emits nothing.
+		if text, tt := extractTextTemplateText(value); text != "" {
 			result = append(result, rawExplicitProp{
-				Key:   propKey,
-				Value: pv,
+				Key:       propKey,
+				Value:     text,
+				ValueType: valueTypes[typePointerID],
+				Params:    extractTextTemplateParameters(ctx, tt),
+			})
+			continue
+		}
+
+		// An expression property: its text, quoted. This path had no branch for
+		// one, so a stored expression was described as absent — the Calendar's
+		// `editable` and `showEventDate` (mendixlabs/mxcli#1578). Only an
+		// Expression-typed property is read: a value of another type keeps
+		// whatever its PrimitiveValue says below.
+		if valueTypes[typePointerID] == "Expression" {
+			if expr := extractString(value["Expression"]); expr != "" {
+				result = append(result, rawExplicitProp{
+					Key:       propKey,
+					Value:     expr,
+					ValueType: "Expression",
+				})
+			}
+			continue
+		}
+
+		// Check for a PrimitiveValue.
+		//
+		// Booleans used to be dropped here as "common defaults". They are not:
+		// a widget's default may be either, the document only stores what the
+		// author set, and discarding one made DESCRIBE emit a page whose
+		// re-execution silently turned the property off (ledger #104).
+		if pv := extractString(value["PrimitiveValue"]); pv != "" {
+			result = append(result, rawExplicitProp{
+				Key:       propKey,
+				Value:     pv,
+				ValueType: valueTypes[typePointerID],
 			})
 		}
 	}
-	return result
+	return withoutHiddenDefaults(ctx, extractCustomWidgetID(ctx, w), result, stored, defaults)
+}
+
+// withoutHiddenDefaults drops the described properties the widget's own
+// editorConfig hides in its stored configuration while they hold their
+// default. Such a property says nothing — exec writes a hidden property the
+// script leaves out at that same default (hiddenUnnamedProperties) — and
+// printing it drew an MDL-WIDGET10 warning on describe's own output: every
+// Timeline hides one of its two format enumerations (ako/mxcli#1762).
+//
+// The rules are the ones `check` evaluates (the project's widget registry), so
+// the two cannot disagree about what is hidden. A hidden property holding a
+// NON-default value is kept: that widget fails mx check with CE0463, and
+// printing the value is what lets `check` say so instead of describe hiding it.
+func withoutHiddenDefaults(ctx *ExecContext, widgetID string, props []rawExplicitProp, stored, defaults map[string]string) []rawExplicitProp {
+	reg := ctx.GetWidgetRegistry()
+	if reg == nil || widgetID == "" || len(props) == 0 {
+		return props
+	}
+	def, ok := reg.GetByWidgetID(widgetID)
+	if !ok {
+		return props
+	}
+	hidden := map[string]bool{}
+	for _, rule := range visibilityRulesFor(def, reg) {
+		if rule.Nested() || rule.HiddenWhen == nil {
+			continue
+		}
+		fires, determinable := rule.Fires(func(c types.WidgetVisibilityCondition) (string, bool) {
+			v, ok := stored[c.PropertyKey]
+			return v, ok
+		})
+		if determinable && fires {
+			hidden[rule.PropertyKey] = true
+		}
+	}
+	if len(hidden) == 0 {
+		return props
+	}
+	out := props[:0:0]
+	for _, p := range props {
+		if hidden[p.Key] && !p.IsRef && len(p.Params) == 0 && defaults[p.Key] != "" && p.Value == defaults[p.Key] {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // extractImageProperties extracts properties from a pluggable Image CustomWidget.
 func extractImageProperties(ctx *ExecContext, w map[string]any, widget *rawWidget) {
 	widget.ImageType = extractCustomWidgetPropertyString(ctx, w, "datasource")
-	widget.ImageUrl = extractCustomWidgetPropertyTextTemplate(ctx, w, "imageUrl")
-	widget.AlternativeText = extractCustomWidgetPropertyTextTemplate(ctx, w, "alternativeText")
+	widget.ImageObject = extractCustomWidgetPropertyImage(ctx, w, "imageObject")
+	widget.ImageFromObject = extractCustomWidgetPropertyImageBound(ctx, w, "imageObject")
+	widget.DefaultImage = extractCustomWidgetPropertyImage(ctx, w, "defaultImageDynamic")
+	widget.Icon, widget.IconType, widget.IconCode = extractCustomWidgetPropertyIcon(w, "imageIcon")
+	widget.ImageUrl, widget.ImageUrlParams = extractCustomWidgetPropertyTextTemplate(ctx, w, "imageUrl")
+	widget.AlternativeText, widget.AlternativeTextParams = extractCustomWidgetPropertyTextTemplate(ctx, w, "alternativeText")
 	widget.ImageWidth = extractCustomWidgetPropertyString(ctx, w, "width")
 	widget.ImageHeight = extractCustomWidgetPropertyString(ctx, w, "height")
 	widget.WidthUnit = extractCustomWidgetPropertyString(ctx, w, "widthUnit")
@@ -1170,11 +1519,16 @@ func extractImageProperties(ctx *ExecContext, w map[string]any, widget *rawWidge
 	widget.Action = extractCustomWidgetPropertyAction(ctx, w, "onClick")
 }
 
-// extractCustomWidgetPropertyTextTemplate extracts text from a TextTemplate property of a CustomWidget.
-func extractCustomWidgetPropertyTextTemplate(ctx *ExecContext, w map[string]any, propertyKey string) string {
+// extractCustomWidgetPropertyTextTemplate extracts the text of a TextTemplate
+// property of a CustomWidget, together with the `{N}` parameters bound to it.
+//
+// The parameters are returned separately rather than folded into the text
+// because MDL spells them separately: `imageUrl: '{1}', imageUrlParams: ({1} =
+// PictureUrl)` (#575).
+func extractCustomWidgetPropertyTextTemplate(ctx *ExecContext, w map[string]any, propertyKey string) (string, []string) {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
-		return ""
+		return "", nil
 	}
 
 	propTypeKeyMap := buildPropertyTypeKeyMap(w, false)
@@ -1195,26 +1549,95 @@ func extractCustomWidgetPropertyTextTemplate(ctx *ExecContext, w map[string]any,
 			continue
 		}
 		// Extract text from TextTemplate
-		if textTemplate, ok := value["TextTemplate"].(map[string]any); ok && textTemplate != nil {
-			if template, ok := textTemplate["Template"].(map[string]any); ok && template != nil {
-				items := getBsonArrayElements(template["Items"])
-				for _, item := range items {
-					itemMap, ok := item.(map[string]any)
-					if !ok {
-						continue
-					}
-					if text := extractString(itemMap["Text"]); text != "" {
-						return text
-					}
-				}
-			}
+		if text, tt := extractTextTemplateText(value); text != "" {
+			return text, extractTextTemplateParameters(ctx, tt)
 		}
 	}
-	return ""
+	return "", nil
+}
+
+// customWidgetPropertyActionMap returns the raw Forms$*ClientAction map stored on
+// a CustomWidget property (e.g. DataGrid2 `onClick`), or nil when unset or a
+// NoAction. Unlike extractCustomWidgetPropertyAction (which formats a one-line
+// summary), this returns the action map so callers can render it with full
+// parameter mappings via renderClientActionMDL — a faithful describe round-trip.
+func customWidgetPropertyActionMap(ctx *ExecContext, w map[string]any, propertyKey string) map[string]any {
+	obj, ok := w["Object"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	// DataGrid2/Gallery keep PropertyTypes at the ObjectType level, so use the
+	// fallback form (same as the widget-slot readers).
+	propTypeKeyMap := buildPropertyTypeKeyMap(w, true)
+	for _, prop := range getBsonArrayElements(obj["Properties"]) {
+		propMap, ok := prop.(map[string]any)
+		if !ok {
+			continue
+		}
+		if propTypeKeyMap[extractBinaryID(propMap["TypePointer"])] != propertyKey {
+			continue
+		}
+		value, ok := propMap["Value"].(map[string]any)
+		if !ok {
+			continue
+		}
+		action, ok := value["Action"].(map[string]any)
+		if !ok || action == nil {
+			return nil
+		}
+		// A default/empty action serializes as NoAction — treat it as unset so the
+		// describe output stays clean.
+		if t := extractString(action["$Type"]); t == "Forms$NoAction" || t == "Pages$NoAction" {
+			return nil
+		}
+		return action
+	}
+	return nil
+}
+
+// customWidgetActionForSource returns the raw Forms$*ClientAction map stored on
+// whichever of a widget's action slots MDL addresses as `source` ("OnClick" or
+// "OnChange"), or nil when that slot is unset or holds a NoAction.
+//
+// It exists because the stored key is NOT the MDL name. Mendix's own widgets
+// suffix their action slots — a BadgeButton's click slot is `onClickEvent`, a
+// HeatMap's is `onClickAction`, a Combobox's change slot is `onChangeEvent` —
+// and the writer already accounts for that: actionSourceForKey strips one
+// Event/Action suffix before matching, which is the only reason `onClick:` and
+// `OnChange:` reach those widgets. Looking the property up by the literal string
+// "onClick" found it only on widgets spelled exactly that way, so on the rest
+// mxcli wrote an action it could not read back and a describe→exec round-trip
+// dropped the wiring (#956).
+//
+// Resolved through actionSourceForKey rather than a second copy of the rule, so
+// the reader cannot drift from the writer again — a key the writer accepts is by
+// construction a key this finds.
+func customWidgetActionForSource(ctx *ExecContext, w map[string]any, source string) map[string]any {
+	obj, ok := w["Object"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	// DataGrid2/Gallery keep PropertyTypes at the ObjectType level, so use the
+	// fallback form (same as the widget-slot readers).
+	propTypeKeyMap := buildPropertyTypeKeyMap(w, true)
+	for _, prop := range getBsonArrayElements(obj["Properties"]) {
+		propMap, ok := prop.(map[string]any)
+		if !ok {
+			continue
+		}
+		key := propTypeKeyMap[extractBinaryID(propMap["TypePointer"])]
+		if key == "" || actionSourceForKey(key) != source {
+			continue
+		}
+		if action := customWidgetPropertyActionMap(ctx, w, key); action != nil {
+			return action
+		}
+	}
+	return nil
 }
 
 // extractCustomWidgetPropertyAction extracts an action description from a CustomWidget property.
-// Returns a formatted string like "CALL_MICROFLOW Module.Flow" or "SHOW_PAGE Module.Page".
+// Returns a formatted string like "call microflow Module.Flow" or "show page Module.Page".
 func extractCustomWidgetPropertyAction(ctx *ExecContext, w map[string]any, propertyKey string) string {
 	obj, ok := w["Object"].(map[string]any)
 	if !ok {
@@ -1247,19 +1670,19 @@ func extractCustomWidgetPropertyAction(ctx *ExecContext, w map[string]any, prope
 		case "Forms$MicroflowAction", "Pages$MicroflowClientAction":
 			if settings, ok := action["MicroflowSettings"].(map[string]any); ok {
 				if mf := extractString(settings["Microflow"]); mf != "" {
-					return "microflow " + mf
+					return "call microflow " + mf
 				}
 			}
 		case "Forms$CallNanoflowClientAction", "Pages$CallNanoflowClientAction":
 			if settings, ok := action["NanoflowSettings"].(map[string]any); ok {
 				if nf := extractString(settings["Nanoflow"]); nf != "" {
-					return "nanoflow " + nf
+					return "call nanoflow " + nf
 				}
 			}
 		case "Forms$FormAction", "Pages$FormAction":
 			if settings, ok := action["PageSettings"].(map[string]any); ok {
 				if page := extractString(settings["Page"]); page != "" {
-					return "show_page " + page
+					return "show page " + page
 				}
 			}
 		case "Forms$NoAction", "Pages$NoAction":
@@ -1272,3 +1695,122 @@ func extractCustomWidgetPropertyAction(ctx *ExecContext, w map[string]any, prope
 func (e *Executor) extractCustomWidgetPropertyAssociation(w map[string]any, propertyKey string) string {
 	return extractCustomWidgetPropertyAssociation(e.newExecContext(context.Background()), w, propertyKey)
 }
+
+// namedCustomWidgetDataSources returns every datasource a pluggable widget's
+// properties hold that names something, each with the schema property key it
+// was stored under — skipping any that parse to an empty reference.
+//
+// firstObjectPropertyDataSource is NOT a substitute, and the difference is the
+// whole point: it returns as soon as a property's DataSource parses to a
+// non-nil value, even one carrying no reference. A File Uploader has such a
+// property ahead of its real one, so the caller received an empty datasource,
+// discarded it, and described the widget as having none — which is exactly the
+// silent drop this exists to prevent (#956).
+//
+// The empty-reference filter also decides the single-vs-multi question for the
+// caller: an unset second datasource parses to no reference and drops out, so a
+// widget with one configured source is still described with the generic clause.
+//
+// A key that cannot be resolved from the widget's PropertyTypes is returned
+// EMPTY rather than skipped. Skipping it would lose the datasource entirely,
+// which is #956 again — the caller falls back to the unnamed spelling, which is
+// the same output as before there was a key to print.
+func namedCustomWidgetDataSources(w map[string]any) []rawNamedDataSource {
+	obj, ok := w["Object"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	propTypeKeyMap := buildPropertyTypeKeyMap(w, true)
+	var out []rawNamedDataSource
+	for _, prop := range getBsonArrayElements(obj["Properties"]) {
+		propMap, ok := prop.(map[string]any)
+		if !ok {
+			continue
+		}
+		value, ok := propMap["Value"].(map[string]any)
+		if !ok {
+			continue
+		}
+		ds, ok := value["DataSource"].(map[string]any)
+		if !ok || ds == nil {
+			continue
+		}
+		// An unsupported datasource is kept too, so the emitter can say it is
+		// there: dropping it here was the silent half of mendixlabs/mxcli#1399.
+		if result := parseDataSource(withWidgetValueSourceVariable(ds, value)); result != nil && (result.Reference != "" || result.Unsupported != "") {
+			out = append(out, rawNamedDataSource{
+				Key:        propTypeKeyMap[extractBinaryID(propMap["TypePointer"])],
+				DataSource: result,
+			})
+		}
+	}
+	return out
+}
+
+// parseColumnSlotWidgets reads the widgets stored in one of a DataGrid2 column's
+// Widgets-typed slots (`content` or `filter`).
+func parseColumnSlotWidgets(ctx *ExecContext, value map[string]any, entityContext string) []rawWidget {
+	var out []rawWidget
+	for _, w := range getBsonArrayElements(value["Widgets"]) {
+		wMap, ok := w.(map[string]any)
+		if !ok {
+			continue
+		}
+		out = append(out, parseRawWidget(ctx, wMap, entityContext)...)
+	}
+	return out
+}
+
+// declaresSeveralAuthorableDataSources reports whether a pluggable widget's
+// stored schema declares more than one datasource property MDL can set — the
+// same count the builder's refuseAmbiguousGenericDataSource makes, read from the
+// document instead of the definition.
+//
+// The two agree because a generated definition (the only kind a widget like the
+// File Uploader has) maps every top-level datasource the package declares. A
+// LINKED one is not counted: the platform fills it from the containing widget
+// and a definition may not map it. A widget with an EMBEDDED definition is not
+// counted either: those are hand-written, choose one datasource mapping per
+// mode, and so accept the generic clause — a database-mode ComboBox declares
+// two datasources and must keep describing as it always has.
+func declaresSeveralAuthorableDataSources(w map[string]any) bool {
+	widgetType, ok := w["Type"].(map[string]any)
+	if !ok {
+		return false
+	}
+	if id, _ := widgetType["WidgetId"].(string); embeddedDefinitionWidgetIDs()[id] {
+		return false
+	}
+	objType, ok := widgetType["ObjectType"].(map[string]any)
+	if !ok {
+		return false
+	}
+	n := 0
+	for _, pt := range getBsonArrayElements(objType["PropertyTypes"]) {
+		ptMap, ok := pt.(map[string]any)
+		if !ok {
+			continue
+		}
+		vt, ok := ptMap["ValueType"].(map[string]any)
+		if !ok || extractString(vt["Type"]) != "DataSource" {
+			continue
+		}
+		if linked, _ := vt["IsLinked"].(bool); linked {
+			continue
+		}
+		n++
+	}
+	return n > 1
+}
+
+var embeddedDefinitionWidgetIDs = sync.OnceValue(func() map[string]bool {
+	ids := map[string]bool{}
+	reg, err := NewWidgetRegistry()
+	if err != nil {
+		return ids
+	}
+	for _, def := range reg.All() {
+		ids[def.WidgetID] = true
+	}
+	return ids
+})

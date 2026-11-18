@@ -15,6 +15,39 @@ mxcli docker build -p app.mpr
 3. **PAD patching** -- Applies Platform-Agnostic Deployment patches (Phase 1) to the build output
 4. **Produces artifact** -- Generates a deployable Mendix deployment package (MDA file)
 
+## The Project Is Not Modified
+
+`mx check` and MxBuild write into the project they are given: mx check
+compiles the theme into `theme-cache/` and `deployment/sass/`, and MxBuild
+regenerates the `javasource/` proxies, the `.launch`, `.classpath` and
+`.project` files and all of `deployment/`.
+
+So `docker build` copies the project to a temporary directory (in `$TMPDIR`)
+and runs them there. The only thing
+written is the output directory (`.docker/build/` by default, or `-o`). Build
+output, caches and VCS folders (`deployment/`, `.docker/`, `.git/`,
+`node_modules/`, ...) are not copied.
+
+## The Project Is Built as Stored
+
+The pre-build check runs on the project as stored, exactly as
+[`mxcli docker check`](docker-check.md) checks it, and MxBuild builds that same
+model: a deployment is built from what is committed. A project whose stored
+widget definitions are stale (CE0463) therefore fails the build, with each
+CE0463 labelled as one `mxcli fix widgets` clears or one that persists — the
+same verdict `docker check`, `mxcli run --local` and Studio Pro give.
+
+| Flag | Checks and builds | Use |
+|------|-------------------|-----|
+| *(default)* | the project as stored | a build that matches what is committed |
+| `--update-widgets` | a copy normalised by `mx update-widgets` first | build anyway; the project keeps its stale widgets, `mxcli fix widgets` fixes them |
+| `--no-update-widgets` | the project as stored, without the re-check that labels CE0463s | scripts that passed it before |
+| `--skip-check` | no check at all | — |
+
+`--update-widgets` is how `docker build` (and `docker run` / `docker reload`,
+which build through it) behaved before ako/mxcli#1794; `docker run` and
+`docker reload` take the same flag.
+
 ## PAD Patching
 
 PAD (Platform-Agnostic Deployment) patching modifies the build output to be compatible with container-based deployment platforms. This is essential for deploying Mendix applications to Kubernetes, Cloud Foundry, or other container orchestrators.

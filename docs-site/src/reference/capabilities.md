@@ -16,12 +16,12 @@ Everything mxcli can do, organized by use case.
 | List nanoflows | `LIST NANOFLOWS [IN Module]` | |
 | List layouts | `LIST LAYOUTS [IN Module]` | |
 | List snippets | `LIST SNIPPETS [IN Module]` | |
-| Compact overview | `LIST STRUCTURE [DEPTH 1\|2\|3]` | Tree view of entire project |
+| Compact overview | `DESCRIBE STRUCTURE [DEPTH 1\|2\|3]` | Tree view of entire project |
 | Describe any document | `DESCRIBE ENTITY\|MICROFLOW\|PAGE ...` | Full MDL output (re-executable) |
 | Full-text search | `SEARCH 'keyword'` | Across all strings and source |
 | Show languages | `LIST LANGUAGES` | All languages in the project |
-| Show project security | `LIST PROJECT SECURITY` | Security overview |
-| Show access rules | `LIST ACCESS ON Module.Entity` | Entity/microflow/page access |
+| Describe app security | `DESCRIBE APP SECURITY` | Security overview |
+| Show access rules | `LIST ACCESS ON [ENTITY] Module.Name` | Entity/microflow/page/nanoflow access |
 | Show settings | `LIST SETTINGS` | Project-level settings |
 
 ## Write: Create and modify documents
@@ -32,7 +32,7 @@ Everything mxcli can do, organized by use case.
 |---|---|---|
 | Create entity | `CREATE PERSISTENT ENTITY` | Full support |
 | Create non-persistent entity | `CREATE NON-PERSISTENT ENTITY` | Full support |
-| Create view entity (OQL) | `CREATE VIEW ENTITY ... AS SELECT` | 10.18+ |
+| Create view entity (OQL) | `CREATE VIEW ENTITY ... AS SELECT` | 10.21+ |
 | Modify entity | `ALTER ENTITY ... ADD/MODIFY/DROP ATTRIBUTE` | Full support |
 | Create association | `CREATE ASSOCIATION ... FROM ... TO` | Full support |
 | Create enumeration | `CREATE ENUMERATION` | Full support |
@@ -48,7 +48,7 @@ Everything mxcli can do, organized by use case.
 | Retrieve | `RETRIEVE ... FROM ... WHERE` | Database/association queries |
 | Control flow | `IF/THEN/ELSE`, `LOOP`, `WHILE` | Including nested |
 | Call flows | `CALL MICROFLOW`, `CALL NANOFLOW` | With parameters |
-| Show page | `LIST PAGE Module.Page(...)` | With page parameters (11.0+) |
+| Show page | `LIST PAGE Module.Page(...)` | With page parameters (9.7+) |
 | REST requests | `SEND REST REQUEST` | GET/POST/PUT/DELETE |
 | Database queries | `EXECUTE DATABASE QUERY` | External databases |
 | Log messages | `LOG INFO\|WARNING\|ERROR` | With templates |
@@ -64,7 +64,7 @@ Everything mxcli can do, organized by use case.
 | Modify page | `ALTER PAGE ... SET/INSERT/DROP/REPLACE` | In-place modifications |
 | Built-in widgets | TEXTBOX, TEXTAREA, DATEPICKER, etc. | All standard widgets |
 | Layout widgets | LAYOUTGRID, CONTAINER, GROUPBOX | With responsive columns |
-| Display widgets | DYNAMICTEXT, STATICTEXT, IMAGE | Including pluggable Image |
+| Display widgets | DYNAMICTEXT, IMAGE | Including pluggable Image |
 | Data widgets | DATAVIEW, LISTVIEW | With datasource binding |
 | Pluggable widgets | DATAGRID2, GALLERY, COMBOBOX | Template-based |
 | Action buttons | ACTIONBUTTON | Save, cancel, microflow, page |
@@ -83,11 +83,11 @@ Everything mxcli can do, organized by use case.
 
 | Capability | Command | Status |
 |---|---|---|
-| REST clients | `CREATE REST CLIENT` | Consumed REST services |
-| OpenAPI import | `CREATE REST CLIENT (OpenAPI: '...')` | Generate REST client from OpenAPI 3.0 spec |
+| REST clients | `CREATE CONSUMED REST SERVICE` | Consumed REST services |
+| OpenAPI import | `CREATE CONSUMED REST SERVICE (OpenAPI: '...')` | Generate REST client from an OpenAPI 3.x spec (Swagger 2.0 refused; responses imported as JSON, no entities yet) |
 | Business events | `CREATE BUSINESS EVENT SERVICE` | Event definitions |
 | Database connections | `CREATE DATABASE CONNECTION` | External SQL |
-| OData services | `LIST ODATA CLIENTS/SERVICES` | Read-only browsing |
+| OData services | `LIST CONSUMED ODATA SERVICES/SERVICES` | Read-only browsing |
 
 ### Navigation and Settings
 
@@ -110,7 +110,7 @@ Everything mxcli can do, organized by use case.
 | Cross-references | `LIST CALLERS/CALLEES OF` | Who calls what |
 | Impact analysis | `LIST IMPACT OF Module.Entity` | What breaks if I change this |
 | Transitive callers | `LIST CALLERS OF ... TRANSITIVE` | Full call chain |
-| Linting | `mxcli lint -p app.mpr` | 14 built-in + 27 Starlark rules |
+| Linting | `mxcli lint -p app.mpr` | 19 built-in + 31 Starlark rules |
 | Best practices report | `mxcli report -p app.mpr` | Scored report with categories |
 | Missing translations | QUAL005 linter rule | Detects incomplete translations |
 | Catalog queries | `SELECT ... FROM CATALOG.tables` | SQL over project metadata |
@@ -126,7 +126,7 @@ Everything mxcli can do, organized by use case.
 | Stdin piping | `echo "CMD" \| mxcli -p app.mpr` | Quiet mode, no prompts |
 | Docker build | `mxcli docker build -p app.mpr` | Build MDA in container |
 | Docker check | `mxcli docker check -p app.mpr` | Validate in container |
-| Testing | `mxcli test tests/ -p app.mpr` | `.test.mdl` / `.test.md` |
+| Testing | `mxcli test tests/ -p app.mpr [--local] [--watch] [--attach]` | `.test.mdl` / `.test.md`; `--local` needs no Docker, `--watch` keeps the runtime warm (~2s per run), `--attach` runs against an app already up |
 | SARIF output | `mxcli lint --format sarif` | For CI integration |
 | New project | `mxcli new <name> --version X.Y.Z` | Create project from scratch with all tooling |
 | Init project | `mxcli init` | Set up `.claude/` with skills |
@@ -135,18 +135,17 @@ Everything mxcli can do, organized by use case.
 | Marketplace browse | `mxcli marketplace search/info/versions` | Discover content; `--min-mendix` compatibility filter |
 | Marketplace download | `mxcli marketplace download <id> [--version X]` | Fetch a content version's `.mpk` to disk |
 | Marketplace install | `mxcli marketplace install <id> -p app.mpr` | Widget → `widgets/`; new module → `mx module-import`; existing module reported, not updated |
+| Marketplace package | `mxcli marketplace package <Module> -p app.mpr [-o dir]` | Export a module as a `.mpk` via `mx create-module-package` (module's own libs only; warns about other modules' files); installs back with `install --file` |
 
 ## Known Limitations
 
 | Area | Limitation | Workaround |
 |---|---|---|
-| Page parameters | Requires Mendix 11.0+ | Use non-persistent entity pattern on 10.x |
 | Design properties (Atlas v3) | Requires Mendix 11.0+ | Use CSS classes on 10.x |
 | REST query parameters | Requires Mendix 11.0+ | Build query string manually on 10.x |
-| Pluggable widget ImageUrl mode | Cannot set imageUrl from MDL | Configure in Studio Pro |
-| Concurrent editing | Not supported | Close Studio Pro before mxcli writes |
+| Concurrent editing | Not supported — a file-based write is refused while Studio Pro has the project open (`<project>.mpr.lock` present) | Close Studio Pro before mxcli writes, or write through it with `--mcp`; `exec --force` overrides |
 | Widget template drift | CE0463 on version mismatch | MPK augmentation handles most cases |
-| Marketplace module update | Existing modules are reported, not updated in place | Update via Studio Pro (preserves local edits and entity IDs) |
+| Marketplace module update | `install` reports an existing module and does not update it | `mxcli marketplace diff` / `update <id> -p app.mpr --to <version>` (preserves entity identity and role grants; local edits are refused or saved with `--save-edits`) |
 | 47 of 52 metamodel domains | Not yet implemented | REST, OData write, etc. pending |
 
 ## Version Compatibility

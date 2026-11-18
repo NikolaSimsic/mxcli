@@ -3,9 +3,10 @@
 package modelsdkbackend
 
 import (
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/mendixlabs/mxcli/model"
+	"github.com/mendixlabs/mxcli/modelsdk/bsoncompat"
 	"github.com/mendixlabs/mxcli/modelsdk/codec"
 	"github.com/mendixlabs/mxcli/modelsdk/element"
 	genSet "github.com/mendixlabs/mxcli/modelsdk/gen/settings"
@@ -54,8 +55,14 @@ func (b *Backend) readSettingsRawParts(unitID string) []map[string]any {
 	if err != nil {
 		return nil
 	}
+	return settingsRawParts(raw)
+}
+
+// settingsRawParts returns each element of a Settings$ProjectSettings
+// document's Settings array as a map, skipping the versioned-array marker.
+func settingsRawParts(raw []byte) []map[string]any {
 	var doc bson.M
-	if err := bson.Unmarshal(raw, &doc); err != nil {
+	if err := bsoncompat.UnmarshalDocM(raw, &doc); err != nil {
 		return nil
 	}
 	arr, ok := doc["Settings"].(bson.A)
@@ -90,6 +97,11 @@ func projectSettingsFromGen(g *genSet.ProjectSettings) *model.ProjectSettings {
 				UseOptimizedClient:                  p.UseOptimizedClient(),
 				UrlPrefix:                           p.UrlPrefix(),
 			}
+			for _, item := range p.ThemeModuleOrderItems() {
+				if e, ok := item.(*genSet.ThemeModuleEntry); ok && e.ModuleName() != "" {
+					ps.WebUI.ThemeModuleOrder = append(ps.WebUI.ThemeModuleOrder, e.ModuleName())
+				}
+			}
 			setBase(&ps.WebUI.BaseElement, p, "Forms$WebUIProjectSettingsPart")
 		case *genSet.ConfigurationSettings:
 			ps.Configuration = configurationSettingsFromGen(p)
@@ -109,6 +121,7 @@ func projectSettingsFromGen(g *genSet.ProjectSettings) *model.ProjectSettings {
 				DefaultTaskParallelism:    int(p.DefaultTaskParallelism()),
 				WorkflowEngineParallelism: int(p.WorkflowEngineParallelism()),
 			}
+			ps.Workflows.Groups, ps.Workflows.GroupsIncomplete = workflowGroupsFromGen(p)
 			setBase(&ps.Workflows.BaseElement, p, "Settings$WorkflowsProjectSettingsPart")
 		case *genSet.DistributionSettings:
 			ps.Distribution = &model.DistributionSettings{
@@ -130,6 +143,30 @@ func projectSettingsFromGen(g *genSet.ProjectSettings) *model.ProjectSettings {
 	return ps
 }
 
+// rawInt reads an integer property from an element's stored BSON, falling back to
+// the value the gen accessor produced when the key is absent or not an integer.
+func rawInt(el element.Element, key string, fallback int32) int {
+	v := el.Raw().Lookup(key)
+	if i, ok := v.Int32OK(); ok {
+		return int(i)
+	}
+	if i, ok := v.Int64OK(); ok {
+		return int(i)
+	}
+	return int(fallback)
+}
+
+// javaVersionOf reads the runtime Java version under whichever key this Mendix
+// version stores it: 11.6 writes "JavaVersion" ("Java21"), 11.12 renamed it to
+// "JavaMajorVersion" ("21") and the gen accessor only knows the former.
+// See settingsoverlay.JavaVersionKey (mendixlabs/mxcli#759).
+func javaVersionOf(p *genSet.RuntimeSettings) string {
+	if v, ok := p.Raw().Lookup("JavaMajorVersion").StringValueOK(); ok {
+		return v
+	}
+	return p.JavaVersion()
+}
+
 func modelSettingsFromGen(p *genSet.RuntimeSettings) *model.ModelSettings {
 	ms := &model.ModelSettings{
 		AfterStartupMicroflow:              p.AfterStartupMicroflowQualifiedName(),
@@ -138,13 +175,17 @@ func modelSettingsFromGen(p *genSet.RuntimeSettings) *model.ModelSettings {
 		AllowUserMultipleSessions:          p.AllowUserMultipleSessions(),
 		HashAlgorithm:                      p.HashAlgorithm(),
 		BcryptCost:                         int(p.BcryptCost()),
-		JavaVersion:                        p.JavaVersion(),
+		JavaVersion:                        javaVersionOf(p),
 		RoundingMode:                       p.RoundingMode(),
 		ScheduledEventTimeZoneCode:         p.ScheduledEventTimeZoneCode(),
+		DefaultTimeZoneCode:                p.DefaultTimeZoneCode(),
 		FirstDayOfWeek:                     p.FirstDayOfWeek(),
 		DecimalScale:                       int(p.DecimalScale()),
 		EnableDataStorageOptimisticLocking: p.EnableDataStorageOptimisticLocking(),
 		UseDatabaseForeignKeyConstraints:   p.UseDatabaseForeignKeyConstraints(),
+		UseOQLVersion2:                     p.UseOQLVersion2(),
+		UseSystemContextForBackgroundTasks: p.UseSystemContextForBackgroundTasks(),
+		SslCertificateAlgorithm:            p.SslCertificateAlgorithm(),
 	}
 	setBase(&ms.BaseElement, p, "Settings$ModelSettings")
 	return ms
@@ -166,11 +207,18 @@ func configurationSettingsFromGen(p *genSet.ConfigurationSettings) *model.Config
 			DatabaseUserName:              cfg.DatabaseUserName(),
 			DatabasePassword:              cfg.DatabasePassword(),
 			DatabaseUseIntegratedSecurity: cfg.DatabaseUseIntegratedSecurity(),
-			HttpPortNumber:                int(cfg.RuntimePortNumber()),
-			ServerPortNumber:              int(cfg.AdminPortNumber()),
-			ApplicationRootUrl:            cfg.ApplicationRootUrl(),
-			MaxJavaHeapSize:               int(cfg.MaxJavaHeapSize()),
-			ExtraJvmParameters:            cfg.ExtraJvmParameters(),
+			// The gen Configuration binds the two ports under their SDK names
+			// (RuntimePortNumber / AdminPortNumber); Studio Pro stores them as
+			// HttpPortNumber / ServerPortNumber, so the accessors always returned 0
+			// and the overlay wrote that 0 straight back — every existing
+			// configuration lost its ports on any settings write
+			// (mendixlabs/mxcli#759). Read the stored keys, keeping the accessors as
+			// the fallback in case a future version adopts the SDK spelling.
+			HttpPortNumber:     rawInt(cfg, "HttpPortNumber", cfg.RuntimePortNumber()),
+			ServerPortNumber:   rawInt(cfg, "ServerPortNumber", cfg.AdminPortNumber()),
+			ApplicationRootUrl: cfg.ApplicationRootUrl(),
+			MaxJavaHeapSize:    int(cfg.MaxJavaHeapSize()),
+			ExtraJvmParameters: cfg.ExtraJvmParameters(),
 		}
 		setBase(&sc.BaseElement, cfg, "Settings$Configuration")
 		for _, cvEl := range cfg.ConstantValuesItems() {
@@ -190,6 +238,7 @@ func configurationSettingsFromGen(p *genSet.ConfigurationSettings) *model.Config
 			mcv := &model.ConstantValue{
 				ConstantId: constantID,
 				Value:      constantValueOf(cv),
+				IsPrivate:  isPrivateConstantValue(cv),
 			}
 			setBase(&mcv.BaseElement, cv, "Settings$ConstantValue")
 			sc.ConstantValues = append(sc.ConstantValues, mcv)
@@ -218,8 +267,24 @@ func languageSettingsFromGen(p *genSet.LanguageSettings) *model.LanguageSettings
 	return ls
 }
 
+// isPrivateConstantValue reports whether an override's value is private — stored
+// on the developer's workstation rather than in the shared model. Studio Pro marks
+// that by nesting a Settings$PrivateValue, a type with no properties at all, in
+// place of the Settings$SharedValue that would carry a value.
+//
+// The gen registry may not have a factory for the marker, so the decoded child can
+// be a bare element.Base; match on the type name rather than the Go type.
+func isPrivateConstantValue(cv *genSet.ConstantValue) bool {
+	spv := cv.SharedOrPrivateValue()
+	if spv == nil {
+		return false
+	}
+	return spv.TypeName() == "Settings$PrivateValue"
+}
+
 // constantValueOf extracts a constant's configured value. The value lives in the
-// nested SharedOrPrivateValue (a SharedValue); private values are not stored.
+// nested SharedOrPrivateValue (a SharedValue); a private value is not in the model
+// at all, so this returns "" and isPrivateConstantValue tells the two apart.
 func constantValueOf(cv *genSet.ConstantValue) string {
 	if v := cv.Value(); v != "" {
 		return v
@@ -235,4 +300,29 @@ func constantValueOf(cv *genSet.ConstantValue) string {
 func setBase(b *model.BaseElement, el interface{ ID() element.ID }, typeName string) {
 	b.ID = model.ID(el.ID())
 	b.TypeName = typeName
+}
+
+// workflowGroupsFromGen converts the Groups part-list of a workflows settings
+// part to the semantic model. The second return reports that some element of the
+// stored list did not decode as a Settings$WorkflowGroup: the write path rebuilds
+// the list from the returned slice, so such an element would be dropped by any
+// rewrite, and UpdateProjectSettings refuses rather than lose it.
+func workflowGroupsFromGen(p *genSet.WorkflowsProjectSettingsPart) ([]model.WorkflowGroup, bool) {
+	items := p.GroupsItems()
+	if len(items) == 0 {
+		return nil, false
+	}
+	groups := make([]model.WorkflowGroup, 0, len(items))
+	incomplete := false
+	for _, it := range items {
+		g, ok := it.(*genSet.WorkflowGroup)
+		if !ok {
+			incomplete = true
+			continue
+		}
+		wg := model.WorkflowGroup{Name: g.Name(), Description: g.Description()}
+		setBase(&wg.BaseElement, g, "Settings$WorkflowGroup")
+		groups = append(groups, wg)
+	}
+	return groups, incomplete
 }

@@ -9,6 +9,8 @@ These document types support moving data between Mendix entities and external da
 | Statement | Description |
 |-----------|-------------|
 | [CREATE JSON STRUCTURE](create-json-structure.md) | Define the shape of a JSON document from a sample snippet |
+| [CREATE MESSAGE DEFINITION COLLECTION](create-message-definition-collection.md) | Define a mapping source as a selection over the domain model |
+| [CREATE MESSAGE DEFINITION](create-message-definition.md) | One message definition as its own document (Mendix 11.15+) |
 | [CREATE IMPORT MAPPING](create-import-mapping.md) | Map incoming JSON/XML to Mendix entities |
 | [CREATE EXPORT MAPPING](create-export-mapping.md) | Map Mendix entities to outgoing JSON/XML |
 | [CREATE DATA TRANSFORMER](create-data-transformer.md) | Transform raw JSON or XML with JSLT/XSLT steps |
@@ -18,8 +20,8 @@ These document types support moving data between Mendix entities and external da
 | Statement | Syntax |
 |-----------|--------|
 | List JSON structures | `LIST JSON STRUCTURES [IN module]` |
-| List import mappings | `LIST IMPORT MAPPINGS [IN module]` or `SHOW IMPORT MAPPINGS [IN module]` |
-| List export mappings | `LIST EXPORT MAPPINGS [IN module]` or `SHOW EXPORT MAPPINGS [IN module]` |
+| List import mappings | `LIST IMPORT MAPPINGS [IN module]` or `LIST IMPORT MAPPINGS [IN module]` |
+| List export mappings | `LIST EXPORT MAPPINGS [IN module]` or `LIST EXPORT MAPPINGS [IN module]` |
 | List data transformers | `LIST DATA TRANSFORMERS [IN module]` |
 | Describe JSON structure | `DESCRIBE JSON STRUCTURE module.Name` |
 | Describe import mapping | `DESCRIBE IMPORT MAPPING module.Name` |
@@ -29,6 +31,7 @@ These document types support moving data between Mendix entities and external da
 ## Drop Statements
 
 ```sql
+mdl 1;
 DROP JSON STRUCTURE module.Name;
 DROP IMPORT MAPPING module.Name;
 DROP EXPORT MAPPING module.Name;

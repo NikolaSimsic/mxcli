@@ -11,6 +11,7 @@ type ShowStmt struct {
 	ObjectType ShowObjectType
 	InModule   string         // Optional module filter
 	Name       *QualifiedName // Optional specific object name
+	Like       string         // For SHOW GLYPHS LIKE 'pattern' — a name substring
 	Transitive bool           // For SHOW CALLERS/CALLEES TRANSITIVE
 	Depth      int            // For SHOW CONTEXT/STRUCTURE DEPTH N (default 2)
 	All        bool           // For SHOW STRUCTURE ALL (include system modules)
@@ -24,6 +25,7 @@ type ShowObjectType int
 const (
 	ShowModules ShowObjectType = iota
 	ShowEnumerations
+	ShowFolders
 	ShowConstants
 	ShowEntities
 	ShowEntity
@@ -31,6 +33,7 @@ const (
 	ShowAssociation
 	ShowMicroflows
 	ShowNanoflows
+	ShowRules
 	ShowPages
 	ShowSnippets
 	ShowLayouts
@@ -73,32 +76,42 @@ const (
 	ShowNavigationMenu  // SHOW NAVIGATION MENU [profile]
 	ShowNavigationHomes // SHOW NAVIGATION HOMES
 
-	ShowStructure             // SHOW STRUCTURE [DEPTH n] [IN module] [ALL]
-	ShowWorkflows             // SHOW WORKFLOWS [IN module]
-	ShowBusinessEventServices // SHOW BUSINESS EVENT SERVICES [IN module]
-	ShowBusinessEventClients  // SHOW BUSINESS EVENT CLIENTS [IN module]
-	ShowBusinessEvents        // SHOW BUSINESS EVENTS [IN module] (individual messages)
-	ShowSettings              // SHOW SETTINGS
-	ShowFragments             // SHOW FRAGMENTS
-	ShowDatabaseConnections   // SHOW DATABASE CONNECTIONS [IN module]
-	ShowImageCollections      // SHOW IMAGE COLLECTIONS [IN module]
-	ShowRestClients           // SHOW REST CLIENTS [IN module]
-	ShowPublishedRestServices // SHOW PUBLISHED REST SERVICES [IN module]
-	ShowDataTransformers      // LIST DATA TRANSFORMERS [IN module]
-	ShowConstantValues        // SHOW CONSTANT VALUES [IN module]
-	ShowContractEntities      // SHOW CONTRACT ENTITIES FROM Module.Service
-	ShowContractActions       // SHOW CONTRACT ACTIONS FROM Module.Service
-	ShowContractChannels      // SHOW CONTRACT CHANNELS FROM Module.Service (AsyncAPI)
-	ShowContractMessages      // SHOW CONTRACT MESSAGES FROM Module.Service (AsyncAPI)
-	ShowLanguages             // SHOW LANGUAGES
-	ShowJsonStructures        // SHOW JSON STRUCTURES [IN module]
-	ShowImportMappings        // SHOW IMPORT MAPPINGS [IN module]
-	ShowExportMappings        // SHOW EXPORT MAPPINGS [IN module]
-	ShowModels                // SHOW MODELS [IN module] (agent-editor Model documents)
-	ShowAgents                // SHOW AGENTS [IN module] (agent-editor Agent documents)
-	ShowKnowledgeBases        // SHOW KNOWLEDGE BASES [IN module] (agent-editor KB documents)
-	ShowConsumedMCPServices   // SHOW CONSUMED MCP SERVICES [IN module] (agent-editor MCP documents)
-	ShowJarDependencies       // LIST JAR DEPENDENCIES [IN module]
+	ShowStructure                    // SHOW STRUCTURE [DEPTH n] [IN module] [ALL]
+	ShowWorkflows                    // SHOW WORKFLOWS [IN module]
+	ShowBusinessEventServices        // SHOW BUSINESS EVENT SERVICES [IN module]
+	ShowBusinessEventClients         // SHOW BUSINESS EVENT CLIENTS [IN module]
+	ShowBusinessEvents               // SHOW BUSINESS EVENTS [IN module] (individual messages)
+	ShowSettings                     // SHOW SETTINGS
+	ShowFragments                    // SHOW FRAGMENTS
+	ShowDatabaseConnections          // SHOW DATABASE CONNECTIONS [IN module]
+	ShowImageCollections             // SHOW IMAGE COLLECTIONS [IN module]
+	ShowIconCollections              // SHOW ICON COLLECTIONS [IN module]
+	ShowGlyphs                       // SHOW GLYPHS [LIKE 'pattern']
+	ShowRestClients                  // SHOW REST CLIENTS [IN module]
+	ShowPublishedRestServices        // SHOW PUBLISHED REST SERVICES [IN module]
+	ShowDataTransformers             // LIST DATA TRANSFORMERS [IN module]
+	ShowConstantValues               // SHOW CONSTANT VALUES [IN module]
+	ShowContractEntities             // SHOW CONTRACT ENTITIES FROM Module.Service
+	ShowContractActions              // SHOW CONTRACT ACTIONS FROM Module.Service
+	ShowContractChannels             // SHOW CONTRACT CHANNELS FROM Module.Service (AsyncAPI)
+	ShowContractMessages             // SHOW CONTRACT MESSAGES FROM Module.Service (AsyncAPI)
+	ShowLanguages                    // SHOW LANGUAGES
+	ShowWorkflowGroups               // SHOW WORKFLOW GROUPS (project settings, not a module listing)
+	ShowJsonStructures               // SHOW JSON STRUCTURES [IN module]
+	ShowMessageDefinitionCollections // SHOW MESSAGE DEFINITION COLLECTIONS [IN module]
+	ShowMessageDefinitions           // SHOW MESSAGE DEFINITIONS [IN module] (11.15 documents)
+	ShowImportMappings               // SHOW IMPORT MAPPINGS [IN module]
+	ShowExportMappings               // SHOW EXPORT MAPPINGS [IN module]
+	ShowModels                       // SHOW MODELS [IN module] (agent-editor Model documents)
+	ShowAgents                       // SHOW AGENTS [IN module] (agent-editor Agent documents)
+	ShowKnowledgeBases               // SHOW KNOWLEDGE BASES [IN module] (agent-editor KB documents)
+	ShowConsumedMCPServices          // SHOW CONSUMED MCP SERVICES [IN module] (agent-editor MCP documents)
+	ShowJarDependencies              // LIST JAR DEPENDENCIES [IN module]
+	ShowBuildingBlocks               // SHOW BUILDING BLOCKS [IN module]
+	ShowConnections                  // SHOW CONNECTIONS (open external SQL connections in this session)
+	// ShowAnnotations lists a domain model's canvas notes.
+	ShowAnnotations
+	ShowPublishedMCPServices // LIST PUBLISHED MCP SERVICES [IN module] (agent-editor, MCP Server 5.x)
 )
 
 // String returns the human-readable name of the show object type.
@@ -108,6 +121,8 @@ func (t ShowObjectType) String() string {
 		return "MODULES"
 	case ShowEnumerations:
 		return "ENUMERATIONS"
+	case ShowFolders:
+		return "FOLDERS"
 	case ShowConstants:
 		return "CONSTANTS"
 	case ShowEntities:
@@ -116,12 +131,16 @@ func (t ShowObjectType) String() string {
 		return "ENTITY"
 	case ShowAssociations:
 		return "ASSOCIATIONS"
+	case ShowAnnotations:
+		return "ANNOTATIONS"
 	case ShowAssociation:
 		return "ASSOCIATION"
 	case ShowMicroflows:
 		return "MICROFLOWS"
 	case ShowNanoflows:
 		return "NANOFLOWS"
+	case ShowRules:
+		return "RULES"
 	case ShowPages:
 		return "PAGES"
 	case ShowSnippets:
@@ -202,6 +221,10 @@ func (t ShowObjectType) String() string {
 		return "DATABASE CONNECTIONS"
 	case ShowImageCollections:
 		return "IMAGE COLLECTIONS"
+	case ShowIconCollections:
+		return "ICON COLLECTIONS"
+	case ShowGlyphs:
+		return "GLYPHS"
 	case ShowRestClients:
 		return "REST CLIENTS"
 	case ShowPublishedRestServices:
@@ -220,8 +243,14 @@ func (t ShowObjectType) String() string {
 		return "CONTRACT MESSAGES"
 	case ShowLanguages:
 		return "LANGUAGES"
+	case ShowWorkflowGroups:
+		return "WORKFLOW GROUPS"
 	case ShowJsonStructures:
 		return "JSON STRUCTURES"
+	case ShowMessageDefinitionCollections:
+		return "MESSAGE DEFINITION COLLECTIONS"
+	case ShowMessageDefinitions:
+		return "MESSAGE DEFINITIONS"
 	case ShowImportMappings:
 		return "IMPORT MAPPINGS"
 	case ShowExportMappings:
@@ -234,8 +263,14 @@ func (t ShowObjectType) String() string {
 		return "KNOWLEDGE BASES"
 	case ShowConsumedMCPServices:
 		return "CONSUMED MCP SERVICES"
+	case ShowPublishedMCPServices:
+		return "PUBLISHED MCP SERVICES"
 	case ShowJarDependencies:
 		return "JAR DEPENDENCIES"
+	case ShowBuildingBlocks:
+		return "BUILDING BLOCKS"
+	case ShowConnections:
+		return "CONNECTIONS"
 	default:
 		return "UNKNOWN"
 	}
@@ -271,7 +306,23 @@ type DescribeStmt struct {
 	Name       QualifiedName
 	WithAll    bool   // For DESCRIBE MODULE ... WITH ALL
 	Format     string // For DESCRIBE CONTRACT ... FORMAT mdl
-	Qualifier  string // For DESCRIBE JAR DEPENDENCY: the 'group:artifact' coordinate
+	// Qualifier carries the subject of a DESCRIBE whose subject is not a
+	// qualified name: the 'group:artifact' coordinate of a JAR DEPENDENCY, and
+	// the code or name of a GLYPH (a glyph has no qualified name — it is a
+	// character code in a font, not an element in the project).
+	Qualifier string
+	// Normalized selects Mode 3 for DESCRIBE MICROFLOW: an irreducible but
+	// recombinable graph is rendered by folding the branch guards into one
+	// condition instead of being flattened. Opt-in because the output
+	// re-executes to a DIFFERENT graph — equivalent behaviour, fewer nodes —
+	// and silently reshaping someone's diagram because they asked to read it
+	// is its own guard-don't-drop violation.
+	Normalized bool
+	// WithHandles makes DESCRIBE MICROFLOW print, above each activity, the
+	// content address an `alter microflow` target would use for it (output
+	// variable, caption or statement, with an ordinal when needed). The
+	// handles are comments, so the output still executes unchanged.
+	WithHandles bool
 }
 
 func (s *DescribeStmt) isStatement() {}
@@ -290,36 +341,50 @@ const (
 	DescribeLayout
 	DescribeConstant
 	DescribeJavaAction
-	DescribeJavaScriptAction     // DESCRIBE JAVASCRIPT ACTION Module.Name
-	DescribeModuleRole           // DESCRIBE MODULE ROLE Module.RoleName
-	DescribeUserRole             // DESCRIBE USER ROLE Name
-	DescribeDemoUser             // DESCRIBE DEMO USER 'name'
-	DescribeODataClient          // DESCRIBE ODATA CLIENT Module.ServiceName
-	DescribeODataService         // DESCRIBE ODATA SERVICE Module.ServiceName
-	DescribeExternalEntity       // DESCRIBE EXTERNAL ENTITY Module.EntityName
-	DescribeNavigation           // DESCRIBE NAVIGATION [profile]
-	DescribeWorkflow             // DESCRIBE WORKFLOW Module.Name
-	DescribeBusinessEventService // DESCRIBE BUSINESS EVENT SERVICE Module.Name
-	DescribeDatabaseConnection   // DESCRIBE DATABASE CONNECTION Module.Name
-	DescribeSettings             // DESCRIBE SETTINGS
-	DescribeFragment             // DESCRIBE FRAGMENT Name
-	DescribeImageCollection      // DESCRIBE IMAGE COLLECTION Module.Name
-	DescribeRestClient           // DESCRIBE REST CLIENT Module.Name
-	DescribePublishedRestService // DESCRIBE PUBLISHED REST SERVICE Module.Name
-	DescribeDataTransformer      // DESCRIBE DATA TRANSFORMER Module.Name
-	DescribeContractEntity       // DESCRIBE CONTRACT ENTITY Service.EntityName [FORMAT mdl]
-	DescribeContractAction       // DESCRIBE CONTRACT ACTION Service.ActionName [FORMAT mdl]
-	DescribeContractMessage      // DESCRIBE CONTRACT MESSAGE Service.MessageName
-	DescribeJsonStructure        // DESCRIBE JSON STRUCTURE Module.Name
-	DescribeNanoflow             // DESCRIBE NANOFLOW Module.Name
-	DescribeImportMapping        // DESCRIBE IMPORT MAPPING Module.Name
-	DescribeExportMapping        // DESCRIBE EXPORT MAPPING Module.Name
-	DescribeModel                // DESCRIBE MODEL Module.Name (agent-editor Model document)
-	DescribeAgent                // DESCRIBE AGENT Module.Name (agent-editor Agent document)
-	DescribeKnowledgeBase        // DESCRIBE KNOWLEDGE BASE Module.Name (agent-editor KB document)
-	DescribeConsumedMCPService   // DESCRIBE CONSUMED MCP SERVICE Module.Name (agent-editor MCP document)
-	DescribeJarDependency        // DESCRIBE JAR DEPENDENCY ModuleName 'group:artifact'
-	DescribeAuto                 // DESCRIBE Module.Name — type auto-detected at execution time
+	DescribeJavaScriptAction            // DESCRIBE JAVASCRIPT ACTION Module.Name
+	DescribeModuleRole                  // DESCRIBE MODULE ROLE Module.RoleName
+	DescribeUserRole                    // DESCRIBE USER ROLE Name
+	DescribeDemoUser                    // DESCRIBE DEMO USER 'name'
+	DescribeODataClient                 // DESCRIBE ODATA CLIENT Module.ServiceName
+	DescribeODataService                // DESCRIBE ODATA SERVICE Module.ServiceName
+	DescribeExternalEntity              // DESCRIBE EXTERNAL ENTITY Module.EntityName
+	DescribeNavigation                  // DESCRIBE NAVIGATION [profile]
+	DescribeWorkflow                    // DESCRIBE WORKFLOW Module.Name
+	DescribeBusinessEventService        // DESCRIBE BUSINESS EVENT SERVICE Module.Name
+	DescribeDatabaseConnection          // DESCRIBE DATABASE CONNECTION Module.Name
+	DescribeSettings                    // DESCRIBE SETTINGS
+	DescribeFragment                    // DESCRIBE FRAGMENT Name
+	DescribeImageCollection             // DESCRIBE IMAGE COLLECTION Module.Name
+	DescribeIconCollection              // DESCRIBE ICON COLLECTION Module.Name
+	DescribeGlyph                       // DESCRIBE GLYPH 57350 | DESCRIBE GLYPH 'star'
+	DescribeRestClient                  // DESCRIBE REST CLIENT Module.Name
+	DescribePublishedRestService        // DESCRIBE PUBLISHED REST SERVICE Module.Name
+	DescribeDataTransformer             // DESCRIBE DATA TRANSFORMER Module.Name
+	DescribeContractEntity              // DESCRIBE CONTRACT ENTITY Service.EntityName [FORMAT mdl]
+	DescribeContractAction              // DESCRIBE CONTRACT ACTION Service.ActionName [FORMAT mdl]
+	DescribeContractMessage             // DESCRIBE CONTRACT MESSAGE Service.MessageName
+	DescribeJsonStructure               // DESCRIBE JSON STRUCTURE Module.Name
+	DescribeMessageDefinitionCollection // DESCRIBE MESSAGE DEFINITION COLLECTION Module.Name
+	DescribeMessageDefinition           // DESCRIBE MESSAGE DEFINITION Module.Name (11.15 document)
+	DescribeNanoflow                    // DESCRIBE NANOFLOW Module.Name
+	DescribeRule                        // DESCRIBE RULE Module.Name
+	DescribeImportMapping               // DESCRIBE IMPORT MAPPING Module.Name
+	DescribeExportMapping               // DESCRIBE EXPORT MAPPING Module.Name
+	DescribeModel                       // DESCRIBE MODEL Module.Name (agent-editor Model document)
+	DescribeAgent                       // DESCRIBE AGENT Module.Name (agent-editor Agent document)
+	DescribeKnowledgeBase               // DESCRIBE KNOWLEDGE BASE Module.Name (agent-editor KB document)
+	DescribeConsumedMCPService          // DESCRIBE CONSUMED MCP SERVICE Module.Name (agent-editor MCP document)
+	DescribeJarDependency               // DESCRIBE JAR DEPENDENCY ModuleName 'group:artifact'
+	DescribeBuildingBlock               // DESCRIBE BUILDING BLOCK Module.Name
+	DescribeMenu                        // DESCRIBE MENU Module.Name (standalone Menus$MenuDocument)
+	DescribeQueue                       // DESCRIBE QUEUE Module.Name
+	DescribeScheduledEvent              // DESCRIBE SCHEDULED EVENT Module.Name
+	// DescribeWidget is not a document — it is a widget DEFINITION, named by
+	// MDL keyword or widget id. Name carries whichever was written.
+	DescribeWidget              // DESCRIBE WIDGET combobox | DESCRIBE WIDGET 'com.mendix.widget.web.combobox.Combobox'
+	DescribeRegularExpression   // DESCRIBE REGULAR EXPRESSION Module.Name
+	DescribeAuto                // DESCRIBE Module.Name — type auto-detected at execution time
+	DescribePublishedMCPService // DESCRIBE PUBLISHED MCP SERVICE Module.Name (agent-editor, MCP Server 5.x)
 )
 
 // String returns the human-readable name of the describe object type.
@@ -373,6 +438,10 @@ func (t DescribeObjectType) String() string {
 		return "FRAGMENT"
 	case DescribeImageCollection:
 		return "IMAGE COLLECTION"
+	case DescribeIconCollection:
+		return "ICON COLLECTION"
+	case DescribeGlyph:
+		return "GLYPH"
 	case DescribeRestClient:
 		return "REST CLIENT"
 	case DescribePublishedRestService:
@@ -385,10 +454,16 @@ func (t DescribeObjectType) String() string {
 		return "CONTRACT ACTION"
 	case DescribeContractMessage:
 		return "CONTRACT MESSAGE"
+	case DescribeMessageDefinitionCollection:
+		return "MESSAGE DEFINITION COLLECTION"
+	case DescribeMessageDefinition:
+		return "MESSAGE DEFINITION"
 	case DescribeJsonStructure:
 		return "JSON STRUCTURE"
 	case DescribeNanoflow:
 		return "NANOFLOW"
+	case DescribeRule:
+		return "RULE"
 	case DescribeImportMapping:
 		return "IMPORT MAPPING"
 	case DescribeExportMapping:
@@ -401,8 +476,14 @@ func (t DescribeObjectType) String() string {
 		return "KNOWLEDGE BASE"
 	case DescribeConsumedMCPService:
 		return "CONSUMED MCP SERVICE"
+	case DescribePublishedMCPService:
+		return "PUBLISHED MCP SERVICE"
 	case DescribeJarDependency:
 		return "JAR DEPENDENCY"
+	case DescribeBuildingBlock:
+		return "BUILDING BLOCK"
+	case DescribeMenu:
+		return "MENU"
 	case DescribeAuto:
 		return "AUTO"
 	default:

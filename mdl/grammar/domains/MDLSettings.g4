@@ -11,27 +11,90 @@ options { tokenVocab = MDLLexer; }
 // =============================================================================
 
 /**
- * ALTER SETTINGS MODEL Key = Value, ...;
- * ALTER SETTINGS CONFIGURATION 'name' Key = Value, ...;
- * ALTER SETTINGS CONSTANT 'name' VALUE 'value' [IN CONFIGURATION 'name'];
- * ALTER SETTINGS LANGUAGE Key = Value, ...;
- * ALTER SETTINGS WORKFLOWS Key = Value, ...;
+ * ALTER SETTINGS RUNTIME ( Key: Value, ... );   (MODEL is a deprecated alias)
+ * ALTER SETTINGS CONFIGURATION 'name' ( Key: Value, ... );
+ * ALTER SETTINGS CONSTANT @Module.Name VALUE 'value' [IN CONFIGURATION 'name'];
+ * ALTER SETTINGS LANGUAGE ( Key: Value, ... );
+ * ALTER SETTINGS LANGUAGE ADD [OR MODIFY] 'ar_SD' [(Key: Value, ...)];
+ * ALTER SETTINGS LANGUAGE MODIFY 'ar_SD' (Key: Value, ...);
+ * ALTER SETTINGS LANGUAGE DROP 'ar_SD';          (REMOVE is a deprecated alias)
+ * ALTER SETTINGS WORKFLOWS ( Key: Value, ... );
+ *
+ * `Key = Value, …` without the parentheses is the old spelling of the property
+ * list (MDL-DEPR060, R3).
+ * ALTER SETTINGS WORKFLOWS ADD [OR MODIFY] GROUP 'Approvers' [(Description: '...')];
+ * ALTER SETTINGS WORKFLOWS MODIFY GROUP 'Approvers' (Description: '...');
+ * ALTER SETTINGS WORKFLOWS DROP GROUP 'Approvers'; (REMOVE is a deprecated alias)
+ *
+ * ADD/DROP name the ENABLED languages — the list Studio Pro shows under
+ * App Settings > Languages, and the only languages a build emits anything for.
+ * A language is identified by its code alone: Studio Pro's "Arabic, Sudan" is
+ * derived from `ar_SD` for display and is not stored (verified against a
+ * Studio Pro-authored reference on 11.13.0).
+ *
+ * The GROUP forms name the workflow groups under App Settings > Workflows >
+ * Groups. They take the same four verbs, and for the same reason: a group is
+ * identified by its name alone (Settings$WorkflowGroup declares Name and
+ * Description and no identifier), so it is addressed the way a language is.
+ * The GROUP keyword is what separates the two — without it the clause is about
+ * languages, which is the only other thing ALTER SETTINGS adds and removes.
  */
 alterSettingsClause
-    : settingsSection settingsAssignment (COMMA settingsAssignment)*
-    | CONSTANT STRING_LITERAL (VALUE settingsValue | DROP) (IN CONFIGURATION STRING_LITERAL)?
-    | DROP CONSTANT STRING_LITERAL (IN CONFIGURATION STRING_LITERAL)?
-    | CONFIGURATION STRING_LITERAL settingsAssignment (COMMA settingsAssignment)*
+    : settingsSection ADD OR MODIFY GROUP STRING_LITERAL settingsItemOptions?
+    | settingsSection ADD GROUP STRING_LITERAL settingsItemOptions?
+    | settingsSection MODIFY GROUP STRING_LITERAL settingsItemOptions
+    | settingsSection (DROP | REMOVE /* @alias MDL-DEPR092 */) GROUP STRING_LITERAL
+    | settingsSection ADD OR MODIFY STRING_LITERAL settingsItemOptions?
+    | settingsSection ADD STRING_LITERAL settingsItemOptions?
+    | settingsSection MODIFY STRING_LITERAL settingsItemOptions
+    | settingsSection (DROP | REMOVE /* @alias MDL-DEPR092 */) STRING_LITERAL
+    | settingsSection settingsItemOptions                                  // runtime ( Key: value, … )
+    | settingsSection settingsAssignment (COMMA settingsAssignment)*        // old spelling (MDL-DEPR060)
+    | CONSTANT settingsConstantRef (VALUE settingsValue | DROP) (IN CONFIGURATION STRING_LITERAL)?
+    | DROP CONSTANT settingsConstantRef (IN CONFIGURATION STRING_LITERAL)?
+    | CONFIGURATION STRING_LITERAL settingsItemOptions                      // configuration 'X' ( Key: value, … )
+    | CONFIGURATION STRING_LITERAL settingsAssignment (COMMA settingsAssignment)*  // old spelling (MDL-DEPR060)
     ;
 
+// R5 (ako/mxcli#753): a constant is referred to one way everywhere,
+// `@Module.Const`. The quoted name is the deprecated spelling.
+settingsConstantRef
+    : AT qualifiedName
+    | STRING_LITERAL /* @alias MDL-DEPR085 */
+    ;
+
+// RUNTIME is Studio Pro's tab for Settings$ModelSettings (R10); MODEL, the
+// old name, is an alias. The visitor stores both as the "model" section.
 settingsSection
     : IDENTIFIER   // LANGUAGE, etc.
-    | MODEL
+    | RUNTIME
+    | MODEL /* @alias MDL-DEPR555 */
     | WORKFLOWS
     ;
 
+// The old spelling of a settings property: `Key = value`, outside a list. R3
+// (ako/mxcli#751): `:` sets a model property, in the ( Key: value, … ) list
+// every other statement uses.
 settingsAssignment
-    : IDENTIFIER EQUALS settingsValue
+    : IDENTIFIER EQUALS /* @alias MDL-DEPR060 */ settingsValue
+    ;
+
+// The optional properties of an added language or workflow group, in the
+// ( key: value ) form every other MDL statement uses. For a language all five
+// are what Texts$Language stores; omitting them reproduces what Studio Pro's Add
+// Language dialog writes. For a workflow group the only option is Description.
+//   ( CheckCompleteness: true, CustomDateFormat: 'yyyy-MM-dd' )
+//   ( Description: 'Primary approval group' )
+settingsItemOptions
+    : LPAREN settingsItemOption (COMMA settingsItemOption)* RPAREN
+    ;
+
+// The key is identifierOrKeyword, not IDENTIFIER: `Description` is an MDL
+// keyword (DESCRIPTION, from the security statements), so a group's only option
+// would otherwise be a parse error — "mismatched input 'Description' expecting
+// IDENTIFIER" — on the one statement the feature exists for.
+settingsItemOption
+    : identifierOrKeyword COLON settingsValue
     ;
 
 settingsValue
@@ -39,6 +102,7 @@ settingsValue
     | NUMBER_LITERAL
     | booleanLiteral
     | qualifiedName
+    | LPAREN (settingsValue (COMMA settingsValue)*)? RPAREN   // a list: ThemeModuleOrder: ('Atlas_Core', 'Brand')
     ;
 
 // =============================================================================
@@ -170,17 +234,25 @@ debugStatement
 /**
  * SQL statements for external database connectivity.
  */
+/*
+ * Connection aliases, driver names and table names are user-chosen words, so
+ * they take identifierOrKeyword rather than bare IDENTIFIER — `source` lexes as
+ * SOURCE_KW, and it is both the most natural alias and the one used in mxcli's
+ * own documentation. IMPORT FROM (below) already accepts an alias this way; the
+ * SQL statements were the odd ones out, and a bare IDENTIFIER there meant
+ * `SQL DISCONNECT source` did not parse at all.
+ */
 sqlStatement
-    : SQL CONNECT IDENTIFIER STRING_LITERAL AS IDENTIFIER          # sqlConnect
-    | SQL DISCONNECT IDENTIFIER                                     # sqlDisconnect
+    : SQL CONNECT identifierOrKeyword STRING_LITERAL AS identifierOrKeyword  # sqlConnect
+    | SQL DISCONNECT identifierOrKeyword                            # sqlDisconnect
     | SQL CONNECTIONS                                               # sqlConnections
-    | SQL IDENTIFIER SHOW IDENTIFIER                                # sqlShowTables
-    | SQL IDENTIFIER DESCRIBE IDENTIFIER                            # sqlDescribeTable
-    | SQL IDENTIFIER GENERATE CONNECTOR INTO identifierOrKeyword
+    | SQL identifierOrKeyword SHOW identifierOrKeyword              # sqlShowTables
+    | SQL identifierOrKeyword DESCRIBE identifierOrKeyword          # sqlDescribeTable
+    | SQL identifierOrKeyword GENERATE CONNECTOR INTO identifierOrKeyword
       (TABLES LPAREN identifierOrKeyword (COMMA identifierOrKeyword)* RPAREN)?
       (VIEWS LPAREN identifierOrKeyword (COMMA identifierOrKeyword)* RPAREN)?
       EXEC?                                                          # sqlGenerateConnector
-    | SQL IDENTIFIER sqlPassthrough                                  # sqlQuery
+    | SQL identifierOrKeyword sqlPassthrough                         # sqlQuery
     ;
 
 sqlPassthrough
@@ -205,15 +277,66 @@ linkMapping
     | identifierOrKeyword TO identifierOrKeyword                          # linkDirect
     ;
 
+/**
+ * HELP [topic], EXIT, QUIT
+ *
+ * The topic reaches the same registry `mxcli syntax` reads, so it takes the
+ * same spellings: plain words (`help workflow user task`), the hyphenated
+ * segments the listing prints (`help workflow user-task`), and the dotted
+ * path it prints them AS (`help workflow.user-task.targeting`). A hyphen is
+ * its own token (HYPHENATED_ID) and a dot is DOT, so both have to be named
+ * here — copying a printed path into HELP was a parse error until they were
+ * (mendixlabs/mxcli#1025).
+ *
+ * The DOT must follow a topic word, and that shape is load-bearing rather
+ * than tidy. This rule is the grammar's catch-all — a statement that is just
+ * an IDENTIFIER and some words — so anything it can swallow, it swallows from
+ * the statement that should have had it. With a leading `DOT?` in the loop,
+ * `Sec.ApiUser` became a complete statement of its own, and
+ * `create module role Sec.ApiUser` therefore parsed as CREATE MODULE (named
+ * "role") followed by a help topic: two statements, no module role, no parse
+ * error. Requiring a word first leaves `.ApiUser` unconsumable, so the
+ * CREATE MODULE ROLE alternative wins as it did before.
+ */
 helpStatement
-    : IDENTIFIER (identifierOrKeyword)*  // HELP [topic words...]
+    // Only `help`, `exit` and `quit` start one (IsHelpWord, MDLParser.g4).
+    // Without the predicate every IDENTIFIER did, so `craete entity M.E;`
+    // was a help statement with a topic, parsed without error and dropped
+    // (ako/mxcli#755, R7).
+    : {IsHelpWord(p.GetTokenStream().LT(1).GetText())}?
+      IDENTIFIER (helpTopicWord (DOT? helpTopicWord)*)?  // HELP [topic]
+    ;
+
+helpTopicWord
+    : identifierOrKeyword
+    | HYPHENATED_ID
     ;
 
 /**
- * DEFINE FRAGMENT Name AS { widgets }
+ * CREATE FRAGMENT Name [($p: datasource, $q: action)] AS { widgets }
+ *
+ * R6: `create`, the verb every other definition uses; DEFINE is a deprecated
+ * alias (MDL-DEPR096). A fragment is still session-scoped and unqualified.
+ *
+ * Optional typed parameters let a fragment bind a datasource or an action
+ * handler supplied by the caller (`use fragment Name ($p: $Data, $q: microflow M)`).
+ * References in the body use the bare `$p` form in a datasource/action position.
  */
 defineFragmentStatement
-    : DEFINE FRAGMENT identifierOrKeyword AS LBRACE pageBodyV3 RBRACE
+    : (CREATE | DEFINE /* @alias MDL-DEPR096 */) FRAGMENT identifierOrKeyword fragmentParams? AS LBRACE pageBodyV3 RBRACE
+    ;
+
+fragmentParams
+    : LPAREN fragmentParam (COMMA fragmentParam)* RPAREN
+    ;
+
+fragmentParam
+    : VARIABLE COLON fragmentParamType
+    ;
+
+fragmentParamType
+    : DATASOURCE
+    | ACTION
     ;
 
 // =============================================================================
@@ -392,6 +515,38 @@ booleanLiteral
     | FALSE
     ;
 
+/**
+ * CREATE [OR MODIFY|REPLACE] TRANSLATIONS [IN Module | WITHOUT MARKETPLACE] FOR <lang> ( 'src' AS 'target', ... );
+ *
+ * A translation maps a user-provided name to another name, so entries use AS
+ * rather than COLON — the same rule CUSTOM NAME map follows
+ * (.claude/skills/design-mdl-syntax.md, "colon vs as").
+ *
+ * The thing that exists is the LANGUAGE: bare CREATE refuses when it already has
+ * translations, OR MODIFY merges, OR REPLACE makes the file authoritative.
+ *
+ * The entry list may be EMPTY. Under OR REPLACE that is the statement's own
+ * semantics taken to the limit — the file names nothing, so every translation in
+ * scope is removed — and it is the only way to take a language's translations
+ * out of the model, which `alter settings LANGUAGE remove` points at. It parsed
+ * as an error before, so the documented way to do it did not exist.
+ * WITHOUT MARKETPLACE keeps an unscoped run out of Marketplace modules, whose
+ * contents — Atlas page templates and building blocks included — the next
+ * module update replaces (ako/mxcli#970). Additive: without it the statement
+ * still reaches the whole project, as it always has, and warns when it wrote
+ * into a Marketplace module. `IN <Module>` already names one module, so the two
+ * are alternatives rather than combinable.
+ * See docs/11-proposals/PROPOSAL_translations.md.
+ */
+createTranslationsStatement
+    : TRANSLATIONS (IN identifierOrKeyword | WITHOUT MARKETPLACE)? FOR identifierOrKeyword
+      LPAREN (translationEntry (COMMA translationEntry)* COMMA?)? RPAREN
+    ;
+
+translationEntry
+    : STRING_LITERAL AS STRING_LITERAL
+    ;
+
 /** Documentation comment */
 docComment
     : DOC_COMMENT
@@ -409,9 +564,11 @@ annotationName
     | ICON
     | FOLDER
     | REQUIRED
+    | NULLABLE
     | CAPTION
     | ANNOTATION
     | ANCHOR
+    | MERGE       // @merge(x, y) — the layout hint predates the `merge` keyword
     ;
 
 annotationParams
@@ -419,7 +576,11 @@ annotationParams
     ;
 
 annotationParam
-    : annotationParamName COLON (annotationValue | annotationParenValue)   // Named parameter
+    // annotationParenValue FIRST: `(to: top)` is also an expression — `:` is
+    // Mendix's division operator — and ANTLR takes the first alternative that
+    // matches, so with annotationValue first `@anchor(true: (to: top))` parsed
+    // as `true: to ÷ top` and set no anchor (mendixlabs/mxcli#992).
+    : annotationParamName COLON (annotationParenValue | annotationValue)   // Named parameter
     | annotationValue                                                      // Positional parameter
     ;
 
@@ -431,6 +592,21 @@ annotationParamName
     | TRUE
     | FALSE
     | TAIL        // @anchor(... tail: (...))
+    // @annotation(id: n1, text: '…', position: (x, y), size: (w, h)) — #1077.
+    // `id` and `size` are already IDENTIFIER; these two are lexer keywords, and
+    // a keyword key does NOT fail to parse — annotationParam falls through to
+    // its positional alternative, so the parameter is accepted and silently
+    // means nothing. Anything added here must be listed, not assumed.
+    | POSITION    // the note's own place on the canvas, distinct from the
+                  // @position of the activity it documents
+    | TEXT
+    // @anchor(A: (from: right), (empty): (from: bottom)) on a CASE: one outcome,
+    // keyed by its WHEN value. A value can be a lexer keyword (`Open`) or the
+    // empty value, so both are keys here; without them the parameter fell
+    // through to the positional form and was refused (mendixlabs/mxcli#1587).
+    | LPAREN EMPTY RPAREN
+    | QUOTED_IDENTIFIER
+    | keyword
     ;
 
 annotationValue
@@ -460,15 +636,16 @@ annotationParenValue
  */
 keyword
     // DDL / DML
-    : ADD | ALTER | BATCH | BROWSER | CHANGE | CLOSE | COMMIT | CREATE | DECLARE | DELETE | DESCRIBE
+    : QUEUE | QUEUES | ADD | ALTER | BATCH | BROWSER | CHANGE | CLOSE | COMMIT | CREATE | DECLARE | DELETE | DESCRIBE
     | DOWNLOAD | DROP | EXECUTE | EXPORT | GENERATE | IMPORT | INSERT | INTO | MODIFY | MOVE | REFRESH
+    | SYNCHRONIZE | UNSYNCHRONIZED
     | REMOVE | RENAME | REPLACE | RETRIEVE | RETURN | ROLLBACK | SET | UPDATE
 
     // Entity / Domain model
     | ASSOCIATION | ASSOCIATIONS | CALCULATED | CONSTANT | CONSTANTS | ENTITY | ENTITIES
     | ENUMERATION | ENUMERATIONS | GENERALIZATION | EXTENDS | INDEX | PERSISTENT
     | NON_PERSISTENT | REFERENCE | REFERENCE_SET | STORAGE | TABLE | UNIQUE
-    | CASCADE | PREVENT | DELETE_BEHAVIOR | DELETE_AND_REFERENCES
+    | CASCADE | PREVENT | RESTRICT | ERROR_MESSAGE | DELETE_BEHAVIOR | DELETE_AND_REFERENCES
     | DELETE_BUT_KEEP_REFERENCES | DELETE_IF_NO_REFERENCES
     | ALLOW_CREATE_CHANGE_LOCALLY
     | CHANGED | CREATED
@@ -480,13 +657,19 @@ keyword
     | INTEGER_TYPE | LONG_TYPE | STRING_TYPE | STRINGTEMPLATE_TYPE
 
     // Module / project structure
-    | ACTIONS | ARTIFACT | COLLECTION | DEPENDENCIES | DEPENDENCY | EXCLUSION | FOLDER
+    | ACTIONS | ARTIFACT | COLLECTION | DEPENDENCIES | DEPENDENCY | EXCLUSION | FOLDER | FOLDERS
     | INCLUDED | JAR | LAYOUT | LAYOUTS | LOCAL | MODEL | MODELS | MODULE | MODULES
-    | NOTEBOOK | NOTEBOOKS | PAGE | PAGES | PROJECT | SNIPPET | SNIPPETS
+    | PAGE | PAGES | PROJECT | SNIPPET | SNIPPETS
+    | BUILDING | BLOCK | BLOCKS
     | STORE | STRUCTURE | STRUCTURES | VIEW
 
     // Agent editor
-    | AGENT | AGENTS | KNOWLEDGE | BASES | CONSUMED | MCP | TOOL
+    | AGENT | AGENTS | KNOWLEDGE | BASES | CONSUMED | CONSUME | MCP | TOOL
+
+    // Workflow user task settings — words, so still usable as names
+    | DECIDE | CONSENSUS | MAJORITY | MORE_KW | THAN | HALF | MOST | CHOSEN | THRESHOLD
+    | PERCENT_KW | VOTES | VETO | FALLBACK | PARTICIPANTS | AWAIT | AUTO | ASSIGN
+    | REPEAT | EVERY | TIMES
 
     // Microflow / Nanoflow
     | MICROFLOW | MICROFLOWS | NANOFLOW | NANOFLOWS
@@ -494,15 +677,19 @@ keyword
     | BREAK | CONTINUE | THROW | RAISE | CASE | WHEN
     | CALL | LOG | TRACE | WITH | FOR | TO | OF | RETURNING | RETURNS
     | NOTHING | EXPRESSION | JAVASCRIPT
+    | MERGE
+    | NORMALIZED
+    | HANDLES
+    | INCLUDE
 
     // Query / SQL
     | SELECT | FROM | WHERE | JOIN | LEFT | RIGHT | INNER | OUTER | FULL | CROSS
-    | ORDER_BY | GROUP_BY | SORT_BY | HAVING | LIMIT | OFFSET | AS | ON
+    | ORDER_BY | GROUP_BY | SORT_BY | SEARCH_BY | HAVING | LIMIT | OFFSET | FIRST | AS | ON
     | AND | OR | NOT | NULL | IN | LIKE | BETWEEN | TRUE | FALSE
     | COUNT | SUM | AVG | MIN | MAX | DISTINCT | ALL
     | ASC | DESC | UNION | INTERSECT | SUBTRACT | EXISTS
     | CAST | COALESCE | TRIM | LENGTH | CONTAINS | MATCH
-    | AVERAGE | MINIMUM | MAXIMUM
+    | AVERAGE | MINIMUM | MAXIMUM | REDUCE | ANY | INITIAL | USING
     | IS_NULL | IS_NOT_NULL | NOT_NULL
     | HEAD | TAIL | FIND | SORT | EMPTY
     | LIST_OF | LIST_KW | EQUALS_OP
@@ -528,26 +715,34 @@ keyword
     | ACTIONBUTTON | CHECKBOX | COMBOBOX | CONTAINER | CONTROLBAR
     | CUSTOMCONTAINER | CUSTOMWIDGET | DATAGRID | DATEPICKER | DATAVIEW
     | DATEFILTER | DROPDOWN | DROPDOWNFILTER | DROPDOWNSORT | DYNAMICTEXT
-    | FILEINPUT | GALLERY | GROUPBOX | IMAGE | IMAGEINPUT
+    | FILEINPUT | FILEMANAGER | GALLERY | GROUPBOX | IMAGE | IMAGEINPUT
     | INPUTREFERENCESETSELECTOR | LAYOUTGRID | LINKBUTTON | LISTVIEW
     | NAVIGATIONLIST | NUMBERFILTER | PLACEHOLDER | PLUGGABLEWIDGET
     | RADIOBUTTONS | REFERENCESELECTOR | SEARCHBAR | SNIPPETCALL
     | STATICIMAGE | STATICTEXT | DYNAMICIMAGE | TEXTAREA | TEXTBOX | TEXTFILTER
     | TABCONTAINER | TABPAGE | WIDGET | WIDGETS
+    // Layout structure. SCROLLREGION is spelled `region`, an ordinary enough
+    // word that leaving it out of this rule would make `region` unusable as an
+    // attribute or widget name anywhere in MDL.
+    | SCROLLCONTAINER | SCROLLREGION | NAVIGATIONTREE | MENUBAR | SIMPLEMENUBAR | SIDEBARTOGGLE | LAYOUTHEADER
     // Object-list container keywords for pluggable widgets (#538)
-    | GROUP | CUSTOMITEM | MARKER | DYNAMICMARKER | SERIES
+    | GROUP | CUSTOMITEM | MARKER | DYNAMICMARKER | SERIES | LINE | SCALECOLOR
+    | CUSTOMBUTTON | ALLOWEDFILEFORMAT
     // Dual-stack keyword (#539)
     | LEGACYDATAGRID
 
     // Widget properties
-    | ATTR | ATTRIBUTES | ATTRIBUTE | AUTOFILL | BINDS | BUTTONSTYLE
+    | ATTR | ATTRIBUTES | ATTRIBUTE | AUTOFILL | AUTOFIT | BINDS | BUTTONSTYLE
     | CAPTION | CAPTIONPARAMS | CLASS | COLUMN | COLUMNS | CONTENT | CONTENTPARAMS
     | DATASOURCE | DEFAULT | DESIGNPROPERTIES | DESKTOPWIDTH | DISPLAY | DOCUMENTATION
     | EDITABLE | FILTER | FILTERTYPE | HEADER | FOOTER
-    | ICON | LABEL | ONCLICK | ONCHANGE | PARAMS | PASSING
-    | PHONEWIDTH | TABLETWIDTH | READONLY | RENDERMODE | REQUIRED
+    | ICON | GLYPH | GLYPHS | DARK | LABEL | ONCLICK | ONCHANGE | PARAMS | PASSING
+    | PHONEWIDTH | TABLETWIDTH | READONLY | RENDERMODE | REQUIRED | NULLABLE | LOCALIZED | OPTIONAL
     | SELECTION | STYLE | STYLING | TABINDEX | TITLE | TOOLTIP
     | URL | POSITION | VISIBLE | WIDTH | HEIGHT | WIDGETTYPE
+    // Microflow document properties — keywords only inside a microflow header,
+    // so they must stay usable as element names everywhere else.
+    | HIDDEN_KW | ALLOW | DISALLOW | CONCURRENT | EXECUTION
     | VARIABLES_KW
 
     // Button actions
@@ -560,43 +755,59 @@ keyword
     | H1 | H2 | H3 | H4 | H5 | H6 | PARAGRAPH | ROW
 
     // Security
-    | ACCESS | APPLY | AUTH | AUTHENTICATION | BASIC | DEMO
+    | ACCESS | AI | APP | APPLY | AUTH | AUTHENTICATION | BASIC | DEMO
     | DESCRIPTION | GRANT | GUEST | LEVEL | MANAGE | MATRIX
     | OFF | OWNER | PASSWORD | PRODUCTION | PROTOTYPE
-    | REVOKE | ROLE | ROLES | SECURITY | SESSION | USER | USERNAME | USERS
+    | REVOKE | ROLE | ROLES | SECURITY | SESSION | STRICT | USER | USERNAME | USERS
+    // MODE is listed here rather than left reserved because `mode` is an
+    // entirely plausible attribute or widget-property name, and a new keyword
+    // that is not in this rule silently breaks every model that already uses
+    // the word.
+    | MODE
 
     // Validation
     | CONSTRAINT | FEEDBACK | PATTERN | RANGE | REGEX | RULE | VALIDATION | WITHOUT
 
     // Navigation
     | FOUND | HOME | HOMES | LOGIN | MENU_KW | NAVIGATION
+    // Offline synchronization. These have to stay usable as identifiers: NEVER
+    // is already a value elsewhere in MDL (`editable: never` on a list view),
+    // and ONLINE/SYNC/PRESERVE are plausible entity and attribute names. A new
+    // keyword that is not listed here silently steals every existing use of
+    // that word — which is what TestKeywordRuleCoverage exists to catch.
+    | SYNC | ONLINE | NEVER | PRESERVE
 
-    // Log levels
-    | CRITICAL | DEBUG | ERROR | INFO | SUCCESS | WARNING
+    // Log levels, and the log activity's `with stacktrace`. STACKTRACE has to
+    // stay a name: System.Error's attribute is `$latestError/Stacktrace`.
+    | CRITICAL | DEBUG | ERROR | INFO | STACKTRACE | SUCCESS | WARNING
 
     // OData / REST / API
-    | API | BASE | BODY | CHANNELS | CLIENT | CLIENTS | CONTRACT | OPENAPI
+    | API | SAMPLE | BASE | BODY | CHANNELS | CLIENT | CLIENTS | CONTRACT | OPENAPI
     | DEPRECATED | EXPOSE | EXPOSED | EXTERNAL | HEADERS | JSON
+    // A Java action's `extra code $$ … $$`. CODE has to stay a name: `Code` is
+    // one of the most common attribute names there is.
+    | EXTRA | CODE
     | MAP | MAPPING | MAPPINGS | MESSAGES | METHOD | NAMESPACE_KW
     | NOT_SUPPORTED | ODATA | OAUTH | OPERATION | PAGING
-    | PARAMETER | PARAMETERS | PATH | PUBLISH | PUBLISHED
+    | PARAMETER | PARAMETERS | PATH | PLATFORM | PUBLISH | PUBLISHED
     | RAW | RECEIVE | REQUEST | RESOURCE | RESPONSE | REST | SEND | SERVICE | SERVICES
-    | SOURCE_KW | TIMEOUT | VERSION | WEB | XML
+    | SOURCE_KW | TIMEOUT | VERSION | WEB | PROGRESSIVE | XML
     | FILE_KW | LINK | DYNAMIC
+    | EMAIL
 
     // HTTP methods
     | GET | POST | PUT | PATCH
 
     // Workflow
-    | ABORT | ACTIVITY | ANNOTATION | BOUNDARY | BY | COMPLETE_TASK
+    | ABORT | ACTIVITY | ANNOTATION | ANNOTATIONS | AT_KW | BOUNDARY | BY | COMPLETE_TASK
     | CONDITION | DATE | DECISION | DUE | GROUPS | INTERRUPTING | JUMP
     | LOCK | MULTI | NODE | NON | NOTIFICATION | NOTIFY
     | OPEN | OUTCOME | OUTCOMES | OVERVIEW | PARALLEL | PAUSE
-    | REASON | RESTART | RETRY | SPLIT | TARGETING | TASK | TIMER
+    | REASON | RESTART | RETRY | SPLIT | SUBPROCESS | TARGET | TARGETING | TASK | TIMER
     | UNLOCK | UNPAUSE | WAIT | WORKFLOW | WORKFLOWS
 
     // Business events / settings
-    | BUSINESS | CONFIGURATION | EVENT | EVENTS | HANDLER | SETTINGS | SUBSCRIBE
+    | BUSINESS | CONFIGURATION | EVENT | EVENTS | HANDLER | REGULAR | EXPRESSIONS | SCHEDULED | SETTINGS | SUBSCRIBE
 
     // Code search / analysis
     | BACKGROUND | CALLERS | CALLEES | DEPTH | IMPACT | REFERENCES
@@ -605,23 +816,24 @@ keyword
     // CLI commands
     | BUILD | CATALOG | CHECK | CLEAR | COMMENT | CUSTOM_NAME_MAP
     | DESIGN | DRY | EXEC | FEATURES | ADDED | SINCE | FORCE
-    | LANGUAGES | LINT | PROPERTIES | READ | RULES | RUN | SARIF | SCRIPT
+    | LANGUAGES | LINT | MARKETPLACE | PROPERTIES | READ | RULES | RUN | SARIF | SCRIPT | TRANSLATIONS
     | SHOW | USE | STATUS | WRITE | VIA | VIEWS | TABLES
 
     // Sequence flow anchors (for @anchor annotation)
     | ANCHOR | TOP | BOTTOM
 
     // Fragment / ALTER PAGE
-    | AFTER | BEFORE | DEFINE | FRAGMENT | FRAGMENTS
+    | AFTER | BEFORE | DEFINE | FRAGMENT | FRAGMENTS | SLOT | WRAP
 
     // General-purpose words (only tokens not already listed above)
-    | ACTION | BOTH | CONTEXT | DATA | FORMAT | ITEM | LIST
-    | MESSAGE | MOD | DIV | MULTIPLE | NONE | OBJECT | OBJECTS
+    | ACTION | BLOCKING | BOTH | CELL | CONTEXT | DATA | FORMAT | ITEM | LIST
+    | DEFINITION | DEFINITIONS | IGNORE | MESSAGE | MOD | DIV | MULTIPLE | NONE | OBJECT | OBJECTS
+    | OVERRIDABLE | ROOT
     | SINGLE | SQL | TEMPLATE | TEXT | TYPE | VALUE
 
     // Data transformers
     | TRANSFORM | TRANSFORMER | TRANSFORMERS | JSLT | XSLT
 
     // Import/Export mapping / SQL generate
-    | ATTRIBUTE_NAME | CONNECTOR | MEMBERS | OVER | JAVA | XPATH
+    | ATTRIBUTE_NAME | CONNECTOR | EXAMPLE | MEMBER | MEMBERS | OVER | JAVA | XPATH
     ;

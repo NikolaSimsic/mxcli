@@ -47,8 +47,9 @@ Implementing a new MDL feature requires changes across multiple layers:
                   ┌───────────────┴───────────────┐
                   ▼                               ▼
 ┌─────────────────────────────┐   ┌─────────────────────────────┐
-│  6a. PARSER (BSON → Go)     │   │  6b. WRITER (Go → BSON)     │
-│  sdk/mpr/parser_*.go        │   │  sdk/mpr/writer_*.go        │
+│  6a. READER (BSON → Go)     │   │  6b. WRITER (Go → BSON)     │
+│  mdl/backend/modelsdk/      │   │  mdl/backend/modelsdk/      │
+│         *_read.go           │   │         *_write.go          │
 │  for describe to work       │   │  for create to work         │
 └─────────────────────────────┘   └─────────────────────────────┘
                   │                               │
@@ -136,13 +137,12 @@ Based on the BSON structure, design MDL syntax that:
 
 Example design for REST call:
 ```sql
-$response = rest call get 'http://api.example.com/data'
-  header 'Content-Type' = 'application/json'
-  header Accept = 'application/json'
-  auth basic $username password $password
-  body '{"key": "{1}"}' with ({1} = $value)
-  timeout 30
-  returns string
+$response = call rest service get 'http://api.example.com/data' (
+  Headers: ('Content-Type': 'application/json', 'Accept': 'application/json'),
+  Authentication: basic (Username: $username, Password: $password),
+  Body: template '{{"key": "{1}"}' with ({1} = $value),
+  Timeout: 30,
+) returns string
   on error rollback;
 ```
 
@@ -155,9 +155,9 @@ Add examples to `mdl-examples/doctype-tests/`:
 create microflow RestExamples.SimpleGet()
 returns string as $response
 begin
-  $response = rest call get 'https://api.example.com/data'
-    timeout 30
-    returns string;
+  $response = call rest service get 'https://api.example.com/data' (
+    Timeout: 30,
+  ) returns string;
   return $response;
 end;
 ```
@@ -340,7 +340,7 @@ type HttpConfiguration struct {
 
 ## Part 6a: Parser (BSON → Go)
 
-Add parsing logic in `sdk/mpr/parser_microflow.go`:
+Add read logic in `mdl/backend/modelsdk/microflow_read_actions.go`:
 
 ```go
 // add case in parseActionActivity switch
@@ -371,7 +371,7 @@ func parseRestCallAction(raw map[string]interface{}) *microflows.RestCallAction 
 
 ## Part 6b: Writer (Go → BSON)
 
-Add serialization logic in `sdk/mpr/writer_microflow.go`:
+Add serialization logic in `mdl/backend/modelsdk/microflow_write.go`:
 
 ```go
 func serializeRestCallAction(action *microflows.RestCallAction) bson.D {
@@ -596,7 +596,7 @@ Expected: Valid MDL output that could be re-parsed.
 create microflow Test.RestExample()
 returns string as \$R
 begin
-  \$R = rest call get 'http://example.com' timeout 30 returns string;
+  \$R = call rest service get 'http://example.com' (Timeout: 30) returns string;
   return \$R;
 end;"
 
@@ -624,8 +624,8 @@ Before considering the implementation complete:
 - [ ] AST types added (`mdl/ast/`)
 - [ ] Visitor implemented (`mdl/visitor/`)
 - [ ] SDK types added/updated (`sdk/microflows/` or `sdk/pages/`)
-- [ ] BSON parser added (`sdk/mpr/parser_*.go`)
-- [ ] BSON writer added (`sdk/mpr/writer_*.go`)
+- [ ] BSON reader added (`mdl/backend/modelsdk/*_read.go`)
+- [ ] BSON writer added (`mdl/backend/modelsdk/*_write.go`)
 - [ ] Executor builder added (`mdl/executor/cmd_*_builder.go`)
 - [ ] Executor show/describe added (`mdl/executor/cmd_*_show.go`)
 - [ ] Syntax check passes
@@ -646,10 +646,11 @@ Before considering the implementation complete:
 | Visitor | `mdl/visitor/visitor_page.go` | Page parsing |
 | SDK | `sdk/microflows/microflows_actions.go` | Action Go types |
 | SDK | `sdk/pages/pages.go` | Widget Go types |
-| Parser | `sdk/mpr/parser_microflow.go` | BSON → Go (microflows) |
-| Parser | `sdk/mpr/parser_page.go` | BSON → Go (pages) |
-| Writer | `sdk/mpr/writer_microflow.go` | Go → BSON (microflows) |
-| Writer | `sdk/mpr/writer_widgets.go` | Go → BSON (widgets) |
+| Reader | `mdl/backend/modelsdk/microflow_read_actions.go` | BSON → Go (microflows) |
+| Reader | `mdl/backend/modelsdk/page.go` | BSON → Go (pages) |
+| Writer | `mdl/backend/modelsdk/microflow_write.go` | Go → BSON (microflows) |
+| Writer | `mdl/backend/modelsdk/widget_write.go` | Go → BSON (widgets) |
+| Codec | `modelsdk/codec/encoder.go`, `decoder.go` | the layer underneath both |
 | Executor | `mdl/executor/cmd_microflows_builder.go` | AST → microflow BSON |
 | Executor | `mdl/executor/cmd_microflows_show.go` | Microflow → MDL |
 | Executor | `mdl/executor/cmd_pages_builder.go` | AST → page BSON |

@@ -1,16 +1,16 @@
 # View Entities
 
-View entities are read-only entities backed by an OQL query. They appear in the domain model but have no database table -- their data is computed from other entities via aggregation and joins.
+View entities are backed by an OQL query. They appear in the domain model but have no database table (and no database view either) -- their rows are computed from other entities via aggregation and joins, evaluated by the runtime per query. "Read-only" is a common but imprecise shorthand: a view row has no storage and `commit` does not write it back, yet it *is* editable in memory (it behaves like a non-persistent object), so a form can bind to one and write changes back through the source entity. See [View Entity](../language/entities.md#view-entity) for the full model and the `CE6770` type-match gotcha.
 
 ## Sales Summary by Category
 
 ```sql
+mdl 1;
 -- Source entities
 CREATE PERSISTENT ENTITY Reports.ProductCategory (
   /** Category display name */
   CategoryName: String(200) NOT NULL
 );
-/
 
 CREATE PERSISTENT ENTITY Reports.SaleTransaction (
   /** Transaction amount */
@@ -18,12 +18,10 @@ CREATE PERSISTENT ENTITY Reports.SaleTransaction (
   /** Date of the sale */
   SaleDate: DateTime NOT NULL
 );
-/
 
 CREATE ASSOCIATION Reports.SaleTransaction_ProductCategory
   FROM Reports.ProductCategory TO Reports.SaleTransaction
   TYPE Reference OWNER Default;
-/
 
 -- View entity: aggregates sales by category
 CREATE VIEW ENTITY Reports.SalesTotalByCategory (
@@ -39,7 +37,7 @@ CREATE VIEW ENTITY Reports.SalesTotalByCategory (
   INNER JOIN s/Reports.SaleTransaction_ProductCategory/Reports.ProductCategory AS c
   GROUP BY c.CategoryName
 );
-/
+
 ```
 
 ## Querying a View Entity in a Microflow
@@ -56,7 +54,7 @@ BEGIN
 
   RETRIEVE $Summary FROM Reports.SalesTotalByCategory
     WHERE CategoryName = $Category/CategoryName
-    LIMIT 1;
+    FIRST;
 
   IF $Summary != empty THEN
     SET $TotalAmount = $Summary/TotalAmount;
@@ -64,7 +62,7 @@ BEGIN
 
   RETURN $TotalAmount;
 END;
-/
+
 ```
 
 ## Displaying in a Page
@@ -76,11 +74,11 @@ CREATE PAGE Reports.SalesByCategory_Overview (
   Title: 'Sales by Category',
   Layout: Atlas_Core.Atlas_Default
 ) {
-  DATAGRID2 ON Reports.SalesTotalByCategory (
-    COLUMN CategoryName { Caption: 'Category' }
-    COLUMN TotalAmount { Caption: 'Total Sales' }
-    COLUMN TransactionCount { Caption: 'Transactions' }
-  )
+  DATAGRID dgSales (DataSource: DATABASE Reports.SalesTotalByCategory) {
+    COLUMN (Attribute: CategoryName, Caption: 'Category')
+    COLUMN (Attribute: TotalAmount, Caption: 'Total Sales')
+    COLUMN (Attribute: TransactionCount, Caption: 'Transactions')
+  }
 };
-/
+
 ```

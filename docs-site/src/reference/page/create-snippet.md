@@ -3,11 +3,10 @@
 ## Synopsis
 
 ```sql
-CREATE [ OR REPLACE ] SNIPPET module.Name
-(
-    [ Params: { $param : Module.Entity | Type [, ...] } ]
-    [, Folder: 'path' ]
-)
+CREATE [ OR REPLACE ] SNIPPET module.Name [ FOLDER 'path' ]
+[(
+    Params: ( $param : Module.Entity | Type [, ...] )
+)]
 {
     widget_tree
 }
@@ -27,18 +26,26 @@ Snippets can optionally declare parameters. When a snippet has parameters, the `
 
 ### Folder Placement
 
-The optional `Folder` property places the snippet in a subfolder within the module.
+The optional `FOLDER 'path'` clause, after the name, places the snippet in a subfolder within the module.
 
 ## Parameters
 
 `module.Name`
 :   The qualified name of the snippet (`Module.SnippetName`). The module must already exist.
 
-`Params: { ... }`
-:   Optional snippet parameters. Each parameter has a `$`-prefixed name and a type (entity or primitive).
+`Params: ( ... )`
+:   Optional snippet parameters. Each parameter has a `$`-prefixed name and an
+    **entity** type (`Module.Entity`).
 
-`Folder: 'path'`
-:   Optional folder path within the module.
+    A snippet parameter cannot be a primitive. Mendix rejects one with
+    **CE0046** *"Invalid data type 'String'."* — a *page* parameter may be a
+    primitive, a snippet parameter may not — so `mxcli check` refuses it as
+    **MDL087** rather than letting it reach a build. To parameterise a snippet
+    on a value, keep the primitive on the calling page's parameters, or pass an
+    object and read the member inside the snippet.
+
+`FOLDER 'path'`
+:   Optional folder path within the module, as a clause after the name. The `Folder: 'path'` property is its deprecated alias (`MDL-DEPR105`).
 
 ## Examples
 
@@ -47,12 +54,14 @@ Simple snippet with a header:
 ```sql
 CREATE SNIPPET MyModule.CustomerHeader
 (
-    Params: { $Customer: MyModule.Customer }
+    Params: ( $Customer: MyModule.Customer )
 )
 {
     CONTAINER cntHeader (Class: 'card-header') {
-        DYNAMICTEXT txtName (Attribute: Name)
-        DYNAMICTEXT txtEmail (Attribute: Email)
+        DATAVIEW dvCustomer (DataSource: $Customer) {
+            DYNAMICTEXT txtName (Attribute: Name)
+            DYNAMICTEXT txtEmail (Attribute: Email)
+        }
     }
 };
 ```
@@ -62,13 +71,15 @@ Snippet with form fields:
 ```sql
 CREATE SNIPPET MyModule.AddressFields
 (
-    Params: { $Address: MyModule.Address }
+    Params: ( $Address: MyModule.Address )
 )
 {
-    TEXTBOX txtStreet (Label: 'Street', Attribute: Street)
-    TEXTBOX txtCity (Label: 'City', Attribute: City)
-    TEXTBOX txtZip (Label: 'Zip Code', Attribute: ZipCode)
-    TEXTBOX txtCountry (Label: 'Country', Attribute: Country)
+    DATAVIEW dvAddress (DataSource: $Address) {
+        TEXTBOX txtStreet (Label: 'Street', Attribute: Street)
+        TEXTBOX txtCity (Label: 'City', Attribute: City)
+        TEXTBOX txtZip (Label: 'Zip Code', Attribute: ZipCode)
+        TEXTBOX txtCountry (Label: 'Country', Attribute: Country)
+    }
 };
 ```
 
@@ -78,7 +89,7 @@ Snippet without parameters:
 CREATE SNIPPET MyModule.AppFooter
 {
     CONTAINER cntFooter (Class: 'app-footer') {
-        DYNAMICTEXT txtVersion (Attribute: Version)
+        DYNAMICTEXT txtVersion (Content: 'Version 1.0')
     }
 };
 ```
@@ -88,15 +99,15 @@ Embedding a snippet in a page:
 ```sql
 CREATE PAGE MyModule.Customer_Edit
 (
-    Params: { $Customer: MyModule.Customer },
+    Params: ( $Customer: MyModule.Customer ),
     Title: 'Edit Customer',
     Layout: Atlas_Core.PopupLayout
 )
 {
     DATAVIEW dvCustomer (DataSource: $Customer) {
         SNIPPETCALL snpAddress (Snippet: MyModule.AddressFields)
-        FOOTER footer1 {
-            ACTIONBUTTON btnSave (Caption: 'Save', Action: SAVE_CHANGES, ButtonStyle: Primary)
+        FOOTER {
+            ACTIONBUTTON btnSave (Caption: 'Save', Action: SAVE CHANGES, ButtonStyle: Primary)
         }
     }
 };

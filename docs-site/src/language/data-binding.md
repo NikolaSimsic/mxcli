@@ -30,7 +30,7 @@ The simplest binding -- connects a DataView to a page parameter:
 ```sql
 CREATE PAGE MyModule.Customer_Edit
 (
-  Params: { $Customer: MyModule.Customer },
+  Params: ( $Customer: MyModule.Customer ),
   Title: 'Edit Customer',
   Layout: Atlas_Core.PopupLayout
 )
@@ -38,7 +38,7 @@ CREATE PAGE MyModule.Customer_Edit
   DATAVIEW dvCustomer (DataSource: $Customer) {
     TEXTBOX txtName (Label: 'Name', Attribute: Name)
   }
-}
+};
 ```
 
 ### Database Source
@@ -47,8 +47,8 @@ Retrieves entities directly from the database. Works with list widgets (DataGrid
 
 ```sql
 DATAGRID dgCustomers (DataSource: DATABASE MyModule.Customer) {
-  COLUMN colName (Attribute: Name, Caption: 'Customer Name')
-  COLUMN colEmail (Attribute: Email, Caption: 'Email')
+  COLUMN (Attribute: Name, Caption: 'Customer Name')
+  COLUMN (Attribute: Email, Caption: 'Email')
 }
 ```
 
@@ -64,7 +64,7 @@ DATAVIEW dvStats (DataSource: MICROFLOW MyModule.DS_GetStatistics) {
 
 -- List for a DataGrid
 DATAGRID dgFiltered (DataSource: MICROFLOW MyModule.DS_GetFilteredOrders) {
-  COLUMN colId (Attribute: OrderId)
+  COLUMN (Attribute: OrderId)
 }
 ```
 
@@ -101,8 +101,8 @@ Binds to the currently selected item in another list widget. Enables master-deta
 ```sql
 -- Master: list of products
 DATAGRID dgProducts (DataSource: DATABASE MyModule.Product) {
-  COLUMN colName (Attribute: Name)
-  COLUMN colPrice (Attribute: Price)
+  COLUMN (Attribute: Name)
+  COLUMN (Attribute: Price)
 }
 
 -- Detail: shows the selected product
@@ -128,6 +128,22 @@ DATAVIEW dvOrder (DataSource: $Order) {
 }
 ```
 
+An input can name the data view it reads through: `Attribute: $dvOrder.OrderId`.
+Studio Pro stores that as a widget-scoped variable (the data view, plus the
+parameter the data view shows), and `DESCRIBE` prints it back in this form. A
+dynamic-text parameter reads through a data view the same way,
+`ContentParams: ({1} = $dvOrder.OrderId)`. The `$name` must be a data view that
+encloses the widget (Studio Pro reports CE7001 for any other), and the input must be
+a textbox, textarea, checkbox, datepicker, radiobuttons or dropdown — other widgets
+bind by attribute name:
+
+```sql
+DATAVIEW dvOrder (DataSource: $Order) {
+  TEXTBOX txtOrderId (Label: 'Order #', Attribute: $dvOrder.OrderId)
+  DYNAMICTEXT txtHeader (Content: 'Order {1}', ContentParams: ({1} = $dvOrder.OrderId))
+}
+```
+
 ## Dynamic Text Content
 
 The `DYNAMICTEXT` widget uses `{1}`, `{2}`, etc. as placeholders for attribute values in the `Content` property. The `Attribute` property specifies which attribute fills the first placeholder:
@@ -144,7 +160,7 @@ Action buttons can pass the current data context to microflows and pages:
 DATAVIEW dvOrder (DataSource: $Order) {
   ACTIONBUTTON btnProcess (
     Caption: 'Process Order',
-    Action: MICROFLOW Sales.ACT_ProcessOrder(Order: $Order),
+    Action: MICROFLOW Sales.ACT_ProcessOrder(Order = $Order),
     ButtonStyle: Primary
   )
 

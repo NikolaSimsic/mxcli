@@ -143,8 +143,13 @@ func TestEmitObjectAnnotations_EscapesMultilineText(t *testing.T) {
 		},
 	}
 
-	annotationsByTarget := map[model.ID][]string{
-		mkID("act"): {"Note\nLine\tTabbed"},
+	// Asked for mdl 0 (`describe --mdl 0`); under mdl 1, the default, the
+	// break is written into the literal (TestDescribersQuoteForTheDescribeLanguage).
+	annotationsByTarget := &annotationEmitter{
+		ctx: mdl0Ctx(),
+		byTarget: map[model.ID][]describedAnnotation{
+			mkID("act"): {{Caption: "Note\nLine\tTabbed", Position: mustDefaultAnnotationPos(model.Point{X: 100, Y: 200}, 0)}},
+		},
 	}
 
 	var lines []string
@@ -160,7 +165,14 @@ func TestEmitObjectAnnotations_EscapesMultilineText(t *testing.T) {
 	}
 }
 
-func TestEmitObjectAnnotations_LoopCaption(t *testing.T) {
+// A LoopedActivity must emit NO @caption. generated/metamodel declares no Caption
+// on Microflows$LoopedActivity, so a stored loop can never carry one — emitting it
+// produced MDL that `check` then reports as MDL042 (mendixlabs/mxcli#1187). The
+// in-memory field is set here deliberately: even then, nothing may be emitted.
+// mdlQuote's escaping is covered directly by TestMdlQuote_* in
+// cmd_microflows_annotation_escape_test.go, so nothing is lost by not asserting it
+// on a caption that cannot exist.
+func TestEmitObjectAnnotations_LoopCaptionNotEmitted(t *testing.T) {
 	obj := &microflows.LoopedActivity{
 		BaseMicroflowObject: microflows.BaseMicroflowObject{
 			BaseElement: model.BaseElement{ID: mkID("loop")},
@@ -174,8 +186,8 @@ func TestEmitObjectAnnotations_LoopCaption(t *testing.T) {
 	emitObjectAnnotations(obj, &lines, "", nil, nil, nil, nil)
 
 	got := strings.Join(lines, "\n")
-	if !strings.Contains(got, "@caption 'Loop owner''s\\ncaption'") {
-		t.Fatalf("expected escaped loop caption, got:\n%s", got)
+	if strings.Contains(got, "@caption") {
+		t.Fatalf("a loop must not describe a @caption (it is not storable), got:\n%s", got)
 	}
 }
 
@@ -206,11 +218,15 @@ func TestPrependFreeAnnotationLines_ModelAnnotationsStayFree(t *testing.T) {
 		"log info 'Synthetic' 'message';",
 	}
 
-	gotLines := prependFreeAnnotationLines(oc, activityLines)
+	gotLines := prependFreeAnnotationLines(nil, oc, activityLines)
 	got := strings.Join(gotLines, "\n")
 
 	want := strings.Join([]string{
-		"@annotation 'free synthetic note'",
+		// A free note is wired to no activity, so there is no activity position
+		// for the writer to derive its place from — its own position is always
+		// emitted. This fixture sets none, hence (0, 0); a real canvas note
+		// carries the coordinates Studio Pro gave it (#1077).
+		"@annotation(text: 'free synthetic note', position: (0, 0))",
 		"@position(100, 200)",
 		"@annotation 'attached synthetic note'",
 		"log info 'Synthetic' 'message';",
@@ -227,13 +243,18 @@ func TestPrependFreeAnnotationLines_ModelAnnotationsStayFree(t *testing.T) {
 // formatErrorHandlingSuffix
 // =============================================================================
 
+// Rollback is the value stored when the author wrote no clause at all
+// (convertErrorHandlingType(nil)) and the value the parser falls back to when
+// the BSON key is absent. It therefore carries no information about what the
+// author wrote, and read-back must not emit it — see issue #840 and
+// TestFormatErrorHandlingSuffix_RollbackIsNotEmitted below.
 func TestFormatErrorHandlingSuffix(t *testing.T) {
 	tests := []struct {
 		errType microflows.ErrorHandlingType
 		want    string
 	}{
 		{microflows.ErrorHandlingTypeContinue, " on error continue"},
-		{microflows.ErrorHandlingTypeRollback, " on error rollback"},
+		{microflows.ErrorHandlingTypeRollback, ""},
 		{microflows.ErrorHandlingTypeCustom, " on error"},
 		{microflows.ErrorHandlingTypeCustomWithoutRollback, " on error without rollback"},
 		{microflows.ErrorHandlingTypeAbort, ""},
@@ -501,4 +522,47 @@ func TestFormatActivity_ErrorEvent(t *testing.T) {
 	if got != "raise error;" {
 		t.Errorf("got %q, want %q", got, "raise error;")
 	}
+}
+
+// TestFormatErrorHandlingSuffix_RollbackIsNotEmitted guards issue #840.
+//
+// DESCRIBE MICROFLOW invented an `on error rollback` clause on activities that
+// were never written with one:
+//
+//	call microflow TFC.MF_Leaf();            -- authored
+//	call microflow TFC.MF_Leaf() on error rollback;   -- described
+//
+// "Rollback" is what convertErrorHandlingType(nil) stores for an activity with
+// no clause, and what the parser falls back to when ErrorHandlingType is absent
+// from the BSON. It is structurally valid, so no checker can flag the invented
+// clause — it just quietly grows the diff on every describe round-trip.
+//
+// Emitting nothing for Rollback is lossless: re-executing describe output
+// without the clause stores Rollback again, so the model round-trips exactly.
+// Emitting it is the lossy direction, because it adds a clause to the script
+// that the author did not write.
+func TestFormatErrorHandlingSuffix_RollbackIsNotEmitted(t *testing.T) {
+	if got := formatErrorHandlingSuffix(microflows.ErrorHandlingTypeRollback); got != "" {
+		t.Errorf("Rollback suffix = %q, want \"\" — Rollback is the stored default and cannot be distinguished from an authored clause", got)
+	}
+	// The explicit-only values must still round-trip: none of them is ever a
+	// default, so their presence always means the author wrote them.
+	explicit := map[microflows.ErrorHandlingType]string{
+		microflows.ErrorHandlingTypeContinue:              " on error continue",
+		microflows.ErrorHandlingTypeCustom:                " on error",
+		microflows.ErrorHandlingTypeCustomWithoutRollback: " on error without rollback",
+	}
+	for errType, want := range explicit {
+		if got := formatErrorHandlingSuffix(errType); got != want {
+			t.Errorf("formatErrorHandlingSuffix(%q) = %q, want %q", errType, got, want)
+		}
+	}
+}
+
+// mustDefaultAnnotationPos is the position the writer would give an unplaced
+// note, so this test exercises the SHORT emit form rather than accidentally
+// asserting escaping on the parameterised one.
+func mustDefaultAnnotationPos(activity model.Point, index int) model.Point {
+	pos, _ := defaultAnnotationGeometry(activity, index, ActivityHeight)
+	return pos
 }

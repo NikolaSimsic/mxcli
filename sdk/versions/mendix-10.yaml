@@ -12,15 +12,19 @@ features:
       min_version: "10.0.0"
       mdl: "CREATE NON-PERSISTENT ENTITY Module.Name (...)"
     view_entities:
-      min_version: "10.18.0"
+      min_version: "10.21.0"
       mdl: "CREATE VIEW ENTITY Module.Name (...) AS SELECT ..."
-      notes: "OQL stored inline on OqlViewEntitySource in 10.x"
+      notes: "View entities arrived in 10.18 with their OQL inline; mxcli stores the query in a separate DomainModels$ViewEntitySourceDocument that the entity's OqlViewEntitySource.SourceDocument names, both 10.21.0 (mendixmodelsdk 4.117.0), and the write refuses them below. 10.x also stores the OQL inline. Was 10.18.0 (ako/mxcli#1811)."
     calculated_attributes:
       min_version: "10.0.0"
       mdl: "CALCULATED BY Module.Microflow"
     entity_generalization:
       min_version: "10.0.0"
       mdl: "EXTENDS Module.ParentEntity"
+    export_levels:
+      min_version: "10.0.0"
+      mdl: "EXPORT LEVEL API | HIDDEN on an entity, attribute, association or enumeration"
+      notes: "DomainModels Entity/Attribute/AssociationBase.exportLevel and Projects Document.exportLevel (enumerations) introduced in 9.3.0 (mendixmodelsdk 4.116.0 StructureVersionInfo); mendixlabs/mxcli#1498"
     alter_entity:
       min_version: "10.0.0"
       mdl: "ALTER ENTITY Module.Name ADD ATTRIBUTE ..."
@@ -38,43 +42,121 @@ features:
     join_types:
       min_version: "10.18.0"
       mdl: "INNER JOIN, LEFT JOIN, RIGHT JOIN, FULL JOIN"
+    string_agg:
+      # STRING_AGG(expression, 'separator'), the OQL aggregate that joins a
+      # group's values into one string. On the 10.24 line it arrived in a
+      # patch: mxbuild 10.24.21's OQL lexer has no 'STRING_AGG' token and mx
+      # check reports every such view as CE0174 "Unknown function
+      # 'string_agg'"; 10.24.22 has the token and builds them at 0 errors.
+      # Never in 10.18-10.23. 11.x has its own floor (mendix-11.yaml), hence
+      # the max_version (ako/mxcli#1650).
+      min_version: "10.24.22"
+      max_version: "10.99.99"
+      mdl: "STRING_AGG(expression, 'separator') in a view entity's OQL query"
+      notes: "Measured with mx check: 10.24.21 CE0174 \"Unknown function 'string_agg'\", 10.24.22 and 10.24.24 0 errors. The column is a String(200) whatever it aggregates. ako/mxcli#1650"
 
   microflows:
     basic:
       min_version: "10.0.0"
       mdl: "CREATE MICROFLOW Module.Name (...) BEGIN ... END"
+    deep_link_url:
+      min_version: "10.6.0"
+      mdl: "URL 'item/{Key}' / URL SEARCH PARAMETERS ($Filter) / DROP URL"
+      notes: "Microflow deep links. A path parameter may not also be a search parameter (CE5612)."
+    synchronize:
+      min_version: "10.0.0"
+      mdl: "SYNCHRONIZE ALL | $Var[, $Var...]  (nanoflow only)"
+    synchronize_unsynchronized:
+      min_version: "10.0.0"
+      mdl: "SYNCHRONIZE UNSYNCHRONIZED  (nanoflow only)"
     show_page_with_params:
-      min_version: "11.0.0"
-      workaround:
-        description: "Pass data via a non-persistent entity or microflow parameter"
-        max_version: "10.99.99"
+      min_version: "10.0.0"
+      mdl: "SHOW PAGE Module.PageName WITH PARAMS ..."
+      notes: "Pages$PageSettings.parameterMappings introduced in 9.7.0, so every 10.x supports it"
     send_rest_request:
       min_version: "10.1.0"
       mdl: "SEND REST REQUEST ..."
+      notes: "Microflows$RestOperationCallAction introduced in 10.1.0 (mendixmodelsdk 4.117.0). mx 9.24.30 loads the action (CE7053 \"No REST operation specified\", not a load failure), but the consumed REST service it calls, Rest$ConsumedRestService, is 10.1 as well, so a 9.24 author cannot set one up. check -p names the statement before the write refuses it (ako/mxcli#1811)."
     send_rest_query_params:
       min_version: "11.0.0"
       notes: "Query parameters in REST requests"
     execute_database_query:
-      min_version: "10.6.0"
+      min_version: "9.24.0"
       mdl: "EXECUTE DATABASE QUERY ..."
+      notes: "DatabaseConnector$ExecuteDatabaseQueryAction and QueryParameterMapping introduced in 9.24.0 (mendixmodelsdk 4.117.0); mx 9.24.30 loads the action (CE1613 for a query that does not exist, not a load failure). Was 10.6.0, a floor nothing measured (ako/mxcli#1811)."
     execute_database_query_runtime_connection:
-      min_version: "11.0.0"
-      notes: "Runtime connection override for database queries"
+      min_version: "11.1.0"
+      notes: "DatabaseConnector$ConnectionParameterMapping and ExecuteDatabaseQueryAction.ConnectionParameterMappings introduced in 11.1.0 (mendixmodelsdk 4.117.0). Was 11.0.0 (ako/mxcli#1811)."
     loop_in_branch:
       min_version: "10.0.0"
       notes: "LOOP inside IF/ELSE branches"
+    list_find_filter_by_expression:
+      min_version: "9.0.3"
+      mdl: "$Found = FIND $List WHERE expression; $Kept = FILTER $List WHERE expression;"
+      notes: "Microflows$FindByExpression and FilterByExpression introduced in 9.0.3 (mendixmodelsdk 4.117.0); `BY Member = value` writes Microflows$Find/Filter, which every version has. The write refuses each type below it (canon.UndeclaredTypeError); check -p names the statement first (ako/mxcli#1811)."
+    send_external_object:
+      min_version: "9.6.0"
+      mdl: "SEND EXTERNAL OBJECT $Obj [REFRESH];"
+      notes: "Microflows$SendExternalObject introduced in 9.6.0 (mendixmodelsdk; ako/mxcli#1939)."
+    delete_external_object:
+      min_version: "9.12.0"
+      mdl: "DELETE EXTERNAL OBJECT $Obj [REFRESH];"
+      notes: "Microflows$DeleteExternalObject introduced in 9.12.0 (mendixmodelsdk; ako/mxcli#1939)."
+    call_external_action:
+      min_version: "9.19.0"
+      mdl: "CALL EXTERNAL ACTION Module.Service.Action ();"
+      notes: "Microflows$CallExternalAction introduced in 9.19.0 (mendixmodelsdk 4.117.0; ako/mxcli#1811)."
+    list_range:
+      min_version: "9.24.0"
+      mdl: "$Page = RANGE $List OFFSET $Offset LIMIT $Amount;"
+      notes: "Microflows$ListRange introduced in 9.24.0 (mendixmodelsdk 4.117.0; ako/mxcli#1811)."
+    send_rest_request_parameters:
+      min_version: "10.2.0"
+      mdl: "SEND REST REQUEST Module.Service.Operation WITH (Id = $Order/Id);"
+      notes: "Microflows$RestOperationParameterMapping introduced in 10.2.0 (mendixmodelsdk 4.117.0). Below 11.0 an operation has only path parameters (Rest$QueryParameter is 11.0), so every argument is one (ako/mxcli#1811)."
+    call_external_action_arguments:
+      min_version: "10.2.0"
+      mdl: "CALL EXTERNAL ACTION Module.Service.Action (Name = $Value);"
+      notes: "Microflows$ExternalActionParameterMapping introduced in 10.2.0 (mendixmodelsdk 4.117.0); an action called with no arguments writes none (ako/mxcli#1811)."
+    call_external_action_include_associations:
+      min_version: "10.11.0"
+      mdl: "CALL EXTERNAL ACTION Module.Service.Action (Command = $Cmd INCLUDE ASSOCIATIONS (Module.Assoc (Module.SubAssoc)));"
+      notes: "Microflows$IncludedAssociation and ExternalActionParameterMapping.IncludedAssociations introduced in 10.11.0 (mendixmodelsdk); an empty clause writes nothing (ako/mxcli#1914)."
+    send_rest_request_output:
+      min_version: "10.4.0"
+      mdl: "$Response = SEND REST REQUEST Module.Service.Operation;"
+      notes: "Microflows$OutputVariable introduced in 10.4.0 (mendixmodelsdk 4.117.0; ako/mxcli#1811)."
+    send_rest_request_body:
+      min_version: "10.5.0"
+      mdl: "SEND REST REQUEST Module.Service.Operation BODY $Order;"
+      notes: "Microflows$BodyVariable introduced in 10.5.0 (mendixmodelsdk 4.117.0). Written for an operation whose body is an export mapping; the clause is gated as written (ako/mxcli#1811)."
+    loop_over_list:
+      min_version: "9.0.4"
+      mdl: "LOOP $Item IN $List BEGIN … END LOOP;"
+      notes: "Microflows$IterableList and LoopedActivity.LoopSource introduced in 9.0.4 (mendixmodelsdk 4.117.0); before, a loop stored its list on the activity itself, which mxcli does not write. The write refuses the loop below it; check -p names the statement first (ako/mxcli#1811)."
+    while_loop:
+      min_version: "9.0.4"
+      mdl: "WHILE condition BEGIN … END WHILE;"
+      notes: "Microflows$WhileLoopCondition introduced in 9.0.4 (mendixmodelsdk 4.117.0; ako/mxcli#1811)."
+    queued_calls:
+      min_version: "9.10.0"
+      mdl: "CALL MICROFLOW Module.Flow() IN QUEUE Module.Queue; CALL JAVA ACTION Module.Action() IN QUEUE Module.Queue;"
+      notes: "Queues$QueueSettings and the calls' QueueSettings introduced in 9.10.0 (mendixmodelsdk 4.117.0; ako/mxcli#1811)."
 
   pages:
     basic:
       min_version: "10.0.0"
       mdl: "CREATE PAGE Module.Name (...) { ... }"
     page_parameters:
-      min_version: "11.0.0"
-      workaround:
-        description: "Use non-persistent entity or microflow parameter"
-        max_version: "10.99.99"
+      min_version: "10.0.0"
+      mdl: "CREATE PAGE Module.Name (Params: ($P: Module.Entity)) { ... }"
+      notes: "Pages$PageParameter introduced in 9.4.0, so every 10.x supports it. The
+        optional/default-value half (PageParameter.IsRequired, PageParameter.DefaultValue)
+        is 11.5.0 and MDL cannot express it; the writer omits both below 11.5."
     page_variables:
-      min_version: "11.0.0"
+      min_version: "10.20.0"
+      notes: "Pages$LocalVariable introduced in 10.17.0, but its DefaultValue in 10.20.0.
+        MDL always writes a default expression, so the floor is the later of the two."
     pluggable_widgets:
       min_version: "10.0.0"
       notes: "Widget templates are currently extracted from 11.6; may cause CE0463 on 10.x"
@@ -96,6 +178,18 @@ features:
     alter_page:
       min_version: "10.0.0"
       mdl: "ALTER PAGE Module.Name SET/INSERT/DROP/REPLACE ..."
+    workflow_page_actions:
+      min_version: "9.0.2"
+      mdl: "action: open user task | open workflow | call workflow Module.WF"
+      notes: "Forms$OpenUserTaskClientAction, OpenWorkflowClientAction and CallWorkflowClientAction introduced in 9.0.2 with workflows (mendixmodelsdk 4.117.0; ako/mxcli#1811)."
+    complete_task_action:
+      min_version: "9.19.0"
+      mdl: "action: complete task 'Outcome'"
+      notes: "Forms$SetTaskOutcomeClientAction is 9.0.2, but the OutcomeValue mxcli writes is 9.19.0 (mendixmodelsdk 4.117.0); below, the write refuses the page (ako/mxcli#1811)."
+    snippet_parameters:
+      min_version: "9.21.0"
+      mdl: "CREATE SNIPPET Module.Name (Params: ($P: Module.Entity)) { … }"
+      notes: "Forms$SnippetParameter and Snippet.Parameters introduced in 9.21.0 (mendixmodelsdk 4.117.0). A snippet call writes a mapping only for a parameter the called snippet declares, so it cannot reach an older project (ako/mxcli#1811)."
 
   security:
     module_roles:
@@ -128,26 +222,177 @@ features:
       min_version: "11.9.0"
       mdl: "CREATE DATA TRANSFORMER Module.Name SOURCE JSON '...' { JSLT '...'; }"
     database_connector_basic:
-      min_version: "10.6.0"
-      mdl: "CREATE DATABASE CONNECTION Module.Name ..."
-    database_connector_execute:
-      min_version: "10.6.0"
-      mdl: "EXECUTE DATABASE QUERY in microflows"
-      notes: "Full BSON format requires 11.0+"
-    business_events:
       min_version: "10.0.0"
+      mdl: "CREATE DATABASE CONNECTION Module.Name ..."
+      notes: "DatabaseConnector$DatabaseConnection is 9.22.0, but the ConnectionInput (a DatabaseConnector$ConnectionString) mxcli writes is 10.0.0 (mendixmodelsdk 4.117.0); below, the write refuses the connection. Was 10.6.0, a floor nothing measured (ako/mxcli#1811)."
+    database_connector_execute:
+      min_version: "9.24.0"
+      mdl: "EXECUTE DATABASE QUERY in microflows"
+      notes: "The action microflows.execute_database_query gates: 9.24.0 (ako/mxcli#1811)."
+    business_events:
+      min_version: "9.24.0"
       mdl: "CREATE BUSINESS EVENT SERVICE Module.Name ..."
+      notes: "BusinessEvents$BusinessEventService and its children introduced in 9.24.0 (mendixmodelsdk 4.117.0). mx 9.24.30 loads a service mxcli writes; its errors there are the content (the Business Events module, an attribute's length). Was 10.0.0 (ako/mxcli#1811)."
     odata_client:
       min_version: "10.0.0"
+    published_odata_service:
+      # mxcli writes a published OData service as ODataPublish$PublishedODataService2,
+      # introduced in 10.4.0 (mendixmodelsdk); before, it is a
+      # Rest$PublishedODataService, a different document with its own children,
+      # which mxcli does not write. Measured: mx check 9.24.30 cannot load a
+      # project holding a PublishedODataService2 —
+      # "TypeCacheUnknownTypeException: ... ODataPublish$PublishedODataService2"
+      # (ako/mxcli#1163). Below this the property floor used to refuse
+      # IncludeMetadataByDefault instead, which named the wrong thing.
+      min_version: "10.4.0"
+      mdl: "CREATE PUBLISHED ODATA SERVICE Module.Name (...) { PUBLISH ENTITY ... }"
+    odata_graphql:
+      # A published OData service can also answer GraphQL — one boolean, same
+      # resources, an extra endpoint. Introduced in Studio Pro 10.14 as an
+      # EXPERIMENTAL feature: "Studio Pro now supports publishing GraphQL
+      # services. When you enable this setting, you can specify that a published
+      # OData service supports GraphQL, resulting in a service that supports both
+      # OData and GraphQL." (release notes, 10.14)
+      #
+      # The floor is documentary, not measured: the Mendix CDN no longer serves
+      # any 10.x mxbuild from here, so the earliest assembly available to check
+      # is 11.x. It matters because writing a property a version does not have
+      # is what makes Studio Pro refuse to open the document, so the gate is a
+      # real guard rather than a nicety.
+      min_version: "10.14.0"
+      mdl: "CREATE ODATA SERVICE Module.Name (SupportsGraphQL: Yes) ..."
+    message_definition_collection:
+      # Message definitions as entries of a MessageDefinitionCollection. Mendix
+      # 11.15 removed the collection: `mx convert` turns one into a folder of the
+      # same name holding one MessageDefinition2 document per entry, and a
+      # mapping's source moves from MessageDefinition (Module.Collection.Name)
+      # to MessageDefinition2 (Module.Name). Measured with mxbuild 11.15.0
+      # (ako/mxcli#987).
+      min_version: "10.0.0"
+      mdl: "CREATE MESSAGE DEFINITION COLLECTION Module.Name { DEFINITION ... }"
+    rest_client_authentication:
+      min_version: "10.2.0"
+      mdl: "authentication: basic (username: '…', password: '…')"
+      notes: "Rest$BasicAuthenticationScheme and ConsumedRestService.AuthenticationScheme introduced in 10.2.0 (mendixmodelsdk 4.117.0; ako/mxcli#1811)."
+    rest_client_operations:
+      min_version: "10.4.0"
+      mdl: "OPERATION Name ( method: get, path: '…', response: … )"
+      notes: "Rest$RestOperation.Method (RestOperationMethodWithBody / WithoutBody) is 10.4.0 and ResponseHandling 10.3.0 (mendixmodelsdk 4.117.0); every operation mxcli writes holds both, so a consumed REST service with an operation needs 10.4 (ako/mxcli#1811)."
+    rest_client_openapi:
+      min_version: "10.21.0"
+      mdl: "CREATE CONSUMED REST SERVICE Module.Name ( OpenAPI: '…' )"
+      notes: "Rest$OpenApiFile and ConsumedRestService.OpenApiFile introduced in 10.21.0 (mendixmodelsdk 4.117.0; ako/mxcli#1811)."
+    database_connector_queries:
+      min_version: "10.12.0"
+      mdl: "CREATE DATABASE CONNECTION Module.Name ( … ) { QUERY Name ( Sql: '…' ) }"
+      notes: "DatabaseConnector$DatabaseQuery is 9.22.0, but its QueryType, which mxcli writes for every query, and TableMappings are 10.12.0 (mendixmodelsdk 4.117.0); measured on stamped projects, the write refuses a connection with a query below 10.12 (ako/mxcli#1811)."
 
   workflows:
     basic:
-      min_version: "9.0.0"
+      min_version: "9.0.2"
       mdl: "CREATE WORKFLOW Module.Name ..."
+      notes: "Workflows$Workflow introduced in 9.0.2 (mendixmodelsdk 4.117.0); the CDN lists mxbuild 9.0.0 and 9.0.1, which have no workflows. The write refuses the type below it (canon.UndeclaredTypeError); create workflow, create or modify workflow and alter workflow are refused by check -p first (ako/mxcli#1809)."
     parallel_split:
       min_version: "9.0.0"
     user_task:
-      min_version: "9.0.0"
+      min_version: "9.19.0"
+      notes: "Workflows$UserTask is 9.0.2, but the outcome value (Workflows$UserTaskOutcome.Value) mxcli writes is 9.19.0, its task page 9.11.0 and its on-created event 9.0.5 (mendixmodelsdk 4.117.0). Measured on stamped 9.x projects: the write refuses a user task below 9.19 (ako/mxcli#1811)."
+    multi_user_task:
+      min_version: "9.22.0"
+      mdl: "MULTI USER TASK Vote 'Vote' PAGE M.TaskPage OUTCOMES 'Yes' { } 'No' { };"
+      notes: "Before 10.12 a Workflows$UserTask whose UserTaskCompletion is a MultiInputCompletion, introduced with consensus and veto in 9.22.0 (mendixmodelsdk 4.117.0; ako/mxcli#1771)."
+    multi_user_task_majority_threshold:
+      min_version: "10.0.0"
+      mdl: "MULTI USER TASK … DECIDE BY MAJORITY MORE THAN HALF | DECIDE BY THRESHOLD 60 PERCENT"
+      notes: "MajorityCompletionCriteria and ThresholdCompletionCriteria introduced in 10.0.0 (mendixmodelsdk 4.117.0; ako/mxcli#1771)."
+    multi_user_task_await_all:
+      min_version: "10.2.0"
+      mdl: "MULTI USER TASK … AWAIT ALL USERS"
+      notes: "MultiInputCompletion.awaitAllUsers introduced in 10.2.0, on MultiUserTaskActivity from 10.12 (mendixmodelsdk 4.117.0; ako/mxcli#1771)."
+    multi_user_task_microflow_rule:
+      min_version: "10.3.0"
+      mdl: "MULTI USER TASK … DECIDE BY MICROFLOW M.Decide"
+      notes: "MicroflowCompletionCriteria introduced in 10.3.0 (mendixmodelsdk 4.117.0; ako/mxcli#1771)."
+    wait_for_notification:
+      min_version: "10.0.0"
+      mdl: "WAIT FOR NOTIFICATION Name;"
+      notes: "Workflows$WaitForNotificationActivity introduced in 10.0.0 (mendixmodelsdk 4.117.0, the type's versionInfo). The write refuses the type below it (canon.UndeclaredTypeError, ako/mxcli#1774)."
+    wait_for_timer:
+      min_version: "10.6.0"
+      mdl: "WAIT FOR TIMER Name addHours([%CurrentDateTime%], 1);"
+      notes: "Workflows$WaitForTimerActivity introduced in 10.6.0 (mendixmodelsdk 4.117.0; ako/mxcli#1774)."
+    timer_boundary_event:
+      min_version: "10.14.0"
+      mdl: "BOUNDARY EVENT TIMER addDays([%CurrentDateTime%], 1) { … }"
+      notes: "Workflows$TimerBoundaryEvent and the boundaryEvents of an activity introduced in 10.14.0 (mendixmodelsdk 4.117.0; ako/mxcli#1774). From 11.0 the bare form is MDL-WF07: no 11.x runtime has the class."
+    interrupting_timer_boundary_event:
+      min_version: "10.20.0"
+      mdl: "BOUNDARY EVENT [NON] INTERRUPTING TIMER addDays([%CurrentDateTime%], 1) { … }"
+      notes: "Workflows$InterruptingTimerBoundaryEvent and NonInterruptingTimerBoundaryEvent introduced in 10.20.0; 10.14–10.19 store a Workflows$TimerBoundaryEvent (mendixmodelsdk 4.117.0; ako/mxcli#1774)."
+    workflow_definition_selection:
+      min_version: "10.0.0"
+      mdl: "LOCK WORKFLOW Module.Workflow; UNLOCK WORKFLOW $Workflow;"
+      notes: "Lock/UnlockWorkflowAction.workflowSelection and the Workflows$WorkflowDefinition(Name|Object)Selection it holds introduced in 10.0.0; 9.21–9.24 store the workflow as the action's own Workflow (mendixmodelsdk 4.117.0; ako/mxcli#1774)."
+    workflow_microflow_actions:
+      min_version: "9.0.2"
+      mdl: "CALL WORKFLOW Module.WF ($Ctx); SET TASK OUTCOME $Task 'Approve'; OPEN USER TASK $Task; OPEN WORKFLOW $Wf;"
+      notes: "Microflows$WorkflowCallAction, SetTaskOutcomeAction, OpenUserTaskAction and OpenWorkflowAction introduced in 9.0.2 with workflows (mendixmodelsdk 4.117.0). The write refuses each type below it (canon.UndeclaredTypeError); check -p names the statement first (ako/mxcli#1787)."
+    workflow_operations:
+      min_version: "9.2.0"
+      mdl: "WORKFLOW OPERATION ABORT $Wf REASON '…'; WORKFLOW OPERATION RESTART $Wf;"
+      notes: "Microflows$WorkflowOperationAction, AbortOperation and RestartOperation introduced in 9.2.0 (mendixmodelsdk 4.117.0; ako/mxcli#1787)."
+    workflow_operation_pause_continue:
+      min_version: "9.3.0"
+      mdl: "WORKFLOW OPERATION PAUSE $Wf; WORKFLOW OPERATION CONTINUE $Wf;"
+      notes: "Microflows$PauseOperation and ContinueOperation introduced in 9.3.0 (mendixmodelsdk 4.117.0; ako/mxcli#1787)."
+    get_workflow_data:
+      min_version: "9.10.0"
+      mdl: "$Data = GET WORKFLOW DATA $Wf AS Module.WF;"
+      notes: "Microflows$GetWorkflowDataAction introduced in 9.10.0 (mendixmodelsdk 4.117.0; ako/mxcli#1787)."
+    workflow_operation_retry_unpause:
+      min_version: "9.12.0"
+      mdl: "WORKFLOW OPERATION RETRY $Wf; WORKFLOW OPERATION UNPAUSE $Wf;"
+      notes: "Microflows$RetryOperation and UnpauseOperation introduced in 9.12.0, replacing ResumeOperation (9.3.0 to 9.11; mendixmodelsdk 4.117.0; ako/mxcli#1787)."
+    notify_workflow:
+      min_version: "10.0.0"
+      mdl: "$Notified = NOTIFY WORKFLOW $Wf TARGET Module.WF.WaitForApproval;"
+      notes: "Microflows$NotifyWorkflowAction introduced in 10.0.0, with the wait for notification it resumes (mendixmodelsdk 4.117.0); absent from the 9.24.30 mxbuild (ako/mxcli#1787)."
+    get_workflows:
+      min_version: "10.4.0"
+      mdl: "$Workflows = GET WORKFLOWS FOR $Ctx;"
+      notes: "Microflows$GetWorkflowsAction introduced in 10.4.0 (mendixmodelsdk 4.117.0); absent from the 9.24.30 mxbuild (ako/mxcli#1787)."
+    get_workflow_activity_records:
+      min_version: "10.4.0"
+      mdl: "$Records = GET WORKFLOW ACTIVITY RECORDS $Wf;"
+      notes: "Microflows$GetWorkflowActivityRecordsAction introduced in 10.4.0 (mendixmodelsdk 4.117.0); absent from the 9.24.30 mxbuild (ako/mxcli#1787)."
+    event_handlers:
+      min_version: "10.7.0"
+      mdl: "CREATE WORKFLOW … ON WORKFLOW EVENTS (…) MICROFLOW Module.Handler AS '…'"
+      notes: "Workflow.onWorkflowEvent introduced in 10.7.0 (modelsdk gen). `ON ANY WORKFLOW EVENT` expands to the measured per-version type list and needs 11.6.0+."
+    jump_to:
+      min_version: "9.0.5"
+      mdl: "JUMP TO Activity;"
+      notes: "Workflows$JumpToActivity introduced in 9.0.5 (mendixmodelsdk 4.117.0; ako/mxcli#1811)."
+    call_workflow_activity:
+      min_version: "9.6.0"
+      mdl: "CALL WORKFLOW Module.WF;  (an activity of a workflow)"
+      notes: "Workflows$CallWorkflowActivity is 9.0.2, but the ParameterExpression mxcli writes is 9.6.0 (mendixmodelsdk 4.117.0; ako/mxcli#1811)."
+    overview_page:
+      min_version: "9.11.0"
+      mdl: "OVERVIEW PAGE Module.Page"
+      notes: "Workflow.AdminPage, a Workflows$PageReference, introduced in 9.11.0 (mendixmodelsdk 4.117.0); before, the property was OverviewPage, which mxcli does not write (ako/mxcli#1811)."
+    annotations:
+      min_version: "9.15.0"
+      mdl: "ANNOTATION '…' (on a workflow or an activity)"
+      notes: "Workflows$Annotation and Workflow.Annotation introduced in 9.15.0 (mendixmodelsdk 4.117.0; ako/mxcli#1811)."
+    workflow_parameter:
+      min_version: "9.18.0"
+      mdl: "PARAMETER $WorkflowContext: Module.Entity"
+      notes: "Workflows$Parameter is 9.6.0, its Entity 9.10.0 and its Name 9.18.0 (mendixmodelsdk 4.117.0); mxcli writes all three. Measured on stamped 9.x projects: below 9.18 the write refuses every workflow with a parameter (ako/mxcli#1811)."
+    call_workflow_parameter_mappings:
+      min_version: "9.18.0"
+      mdl: "CALL WORKFLOW Module.WF (WorkflowContext = $Expr);  (an activity of a workflow)"
+      notes: "Workflows$WorkflowCallParameterMapping and CallWorkflowActivity.ParameterMappings introduced in 9.18.0 (mendixmodelsdk 4.117.0; ako/mxcli#1811)."
 
   navigation:
     profiles:
@@ -156,6 +401,22 @@ features:
       min_version: "10.0.0"
     home_pages:
       min_version: "10.0.0"
+    progressive_web_app:
+      min_version: "9.0.3"
+      mdl: "CREATE OR MODIFY NAVIGATION Profile PROGRESSIVE WEB APP ( Precaching: true )"
+      notes: "Navigation$ProgressiveWebAppSettings introduced in 9.0.3 (mendixmodelsdk 4.117.0); `progressive web app off` writes none (ako/mxcli#1811)."
+    native_home_page:
+      min_version: "9.4.0"
+      mdl: "CREATE OR MODIFY NAVIGATION NativePhone HOME PAGE Module.Page"
+      notes: "Navigation$NativeHomePage and NativeNavigationProfile.NativeHomePage introduced in 9.4.0 (mendixmodelsdk 4.117.0); the native profile itself is older (ako/mxcli#1811)."
+    menu_item_icons:
+      min_version: "9.20.0"
+      mdl: "MENU ITEM 'Home' ( OnClick: …, Icon: Module.Collection.icon )"
+      notes: "Forms$IconCollectionIcon introduced in 9.20.0 with icon collections (mendixmodelsdk 4.117.0); `Icon:` names an icon collection entry and nothing else (ako/mxcli#1811)."
+    not_found_page:
+      min_version: "10.13.0"
+      mdl: "NOT FOUND PAGE Module.Page"
+      notes: "Navigation$NotFoundHomePage and NavigationProfile.NotFoundHomepage introduced in 10.13.0 (mendixmodelsdk 4.117.0; ako/mxcli#1811)."
 
   mpr_format:
     mpr_v2:
@@ -164,6 +425,26 @@ features:
     portable_app:
       min_version: "11.6.0"
       notes: "New portable app deployment format"
+
+  modules:
+    jar_dependencies:
+      min_version: "10.0.0"
+      mdl: "ALTER MODULE Module ADD JAR DEPENDENCY (group = '…', artifact = '…', version = '…')"
+      notes: "Projects$JarDependency and ModuleSettings.JarDependencies introduced in 10.0.0 (mendixmodelsdk 4.117.0; ako/mxcli#1811)."
+    jar_dependency_exclusions:
+      min_version: "10.12.0"
+      mdl: "ALTER MODULE Module SET JAR DEPENDENCY 'group:artifact' ADD EXCLUSION '…'"
+      notes: "Projects$JarDependencyExclusion introduced in 10.12.0 (mendixmodelsdk 4.117.0; ako/mxcli#1811)."
+    module_type:
+      min_version: "9.12.0"
+      mdl: "CREATE MODULE M ( ModuleType: addon ) / ALTER MODULE M SET ( ModuleType: addon )"
+      notes: "An add-on module is ModuleSettings.ExportLevel = Protected with ProtectedModuleType = AddOn; ProtectedModuleType introduced in 9.12.0 (mendixmodelsdk 4.117.0; ako/mxcli#1921)."
+
+  scheduled_events:
+    schedules:
+      min_version: "9.12.0"
+      mdl: "CREATE SCHEDULED EVENT Module.Name ( Microflow: …, Repeat: Daily, … )"
+      notes: "ScheduledEvents$MinuteSchedule … YearWeekdaySchedule, ScheduledEvent.Schedule and OnOverlap introduced in 9.12.0 (mendixmodelsdk 4.117.0); before, an event has only an interval, which mxcli does not write (ako/mxcli#1811)."
 
 deprecated:
   - id: "DEP001"
@@ -174,9 +455,6 @@ deprecated:
 
 upgrade_opportunities:
   from_10_to_11:
-    - feature: "page_parameters"
-      description: "Replace non-persistent entity parameter passing with direct page parameters"
-      effort: "low"
     - feature: "design_properties_v3"
       description: "Atlas v3 design properties available for richer styling"
       effort: "low"

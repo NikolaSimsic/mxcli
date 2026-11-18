@@ -22,7 +22,7 @@ BEGIN
   );
   COMMIT $Customer;
 
-  SHOW PAGE Sales.Customer_Edit ($Customer = $Customer);
+  SHOW PAGE Sales.Customer_Edit (Customer = $Customer);
   RETURN $Customer;
 END;
 ```
@@ -102,7 +102,7 @@ BEGIN
   IF $IsValid THEN
     RETRIEVE $Existing FROM Sales.Customer
       WHERE Email = $Customer/Email
-      LIMIT 1;
+      FIRST;
     IF $Existing != empty THEN
       VALIDATION FEEDBACK $Customer/Email MESSAGE 'A customer with this email already exists';
       SET $IsValid = false;
@@ -135,11 +135,11 @@ BEGIN
   BEGIN
     CALL MICROFLOW Sales.SUB_ProcessOrder (
       Order = $Order
-    ) ON ERROR {
+    ) ON ERROR BEGIN
       LOG ERROR NODE 'BatchProcess' 'Failed to process order: ' + $Order/OrderNumber;
       SET $ErrorCount = $ErrorCount + 1;
       CONTINUE;
-    };
+    END ERROR;
 
     SET $SuccessCount = $SuccessCount + 1;
   END LOOP;
@@ -172,7 +172,7 @@ BEGIN
 
   -- Finalize
   CHANGE $Order (Status = 'Placed');
-  COMMIT $Order WITH EVENTS;
+  COMMIT $Order;
 
   RETURN true;
 END;
@@ -261,24 +261,24 @@ BEGIN
   DECLARE $Config Integration.SyncConfig;
   DECLARE $Success Boolean = false;
 
-  RETRIEVE $Config FROM Integration.SyncConfig LIMIT 1;
+  RETRIEVE $Config FROM Integration.SyncConfig FIRST;
 
   @caption 'Call external API'
   $Response = CALL MICROFLOW Integration.SUB_CallExternalAPI (
     Config = $Config
-  ) ON ERROR {
+  ) ON ERROR BEGIN
     LOG ERROR NODE 'Integration' 'External API call failed';
     RETURN false;
-  };
+  END ERROR;
 
   IF $Response != empty THEN
     @caption 'Process response'
     CALL MICROFLOW Integration.SUB_ProcessResponse (
       Response = $Response
-    ) ON ERROR {
+    ) ON ERROR BEGIN
       LOG ERROR NODE 'Integration' 'Failed to process response';
       RETURN false;
-    };
+    END ERROR;
     SET $Success = true;
   END IF;
 
@@ -363,7 +363,8 @@ CHANGE $Customer (Notes = $NewNotes);
 ```sql
 -- CORRECT: append with guard
 IF $NewNotes != empty THEN
-  CHANGE $Customer (Notes = $Customer/Notes + '\n' + $NewNotes);
+  CHANGE $Customer (Notes = $Customer/Notes + '
+' + $NewNotes);
 END IF;
 ```
 

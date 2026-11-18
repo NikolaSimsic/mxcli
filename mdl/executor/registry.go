@@ -3,6 +3,7 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 
@@ -37,12 +38,18 @@ func NewRegistry() *Registry {
 	registerPageHandlers(r)
 	registerSecurityHandlers(r)
 	registerNavigationHandlers(r)
+	registerTranslationHandlers(r)
 	registerImageHandlers(r)
+	registerQueueHandlers(r)
+	registerScheduledEventHandlers(r)
+	registerRegularExpressionHandlers(r)
+	registerValidationRuleHandlers(r)
 	registerWorkflowHandlers(r)
 	registerBusinessEventHandlers(r)
 	registerSettingsHandlers(r)
 	registerODataHandlers(r)
 	registerJSONStructureHandlers(r)
+	registerMessageDefinitionHandlers(r)
 	registerMappingHandlers(r)
 	registerRESTHandlers(r)
 	registerDataTransformerHandlers(r)
@@ -82,7 +89,32 @@ func (r *Registry) Dispatch(ctx *ExecContext, stmt ast.Statement) error {
 	if h == nil {
 		return mdlerrors.NewUnsupported(fmt.Sprintf("unhandled statement type %T", stmt))
 	}
-	return h(ctx, stmt)
+	// CREATE … IF NOT EXISTS: an element that is already there is left
+	// untouched, and the handler — which would refuse or rewrite it — never
+	// runs (ako/mxcli#731).
+	if skipped, err := skipExistingCreate(ctx, stmt); skipped || err != nil {
+		return err
+	}
+	// A create that would give an element a name another kind already has in
+	// its module — a nanoflow over a microflow, a snippet over a page, an
+	// enumeration over an entity — is refused before the handler writes it:
+	// Mendix rejects the model (CE0122 / CE0065, ako/mxcli#793).
+	if err := refuseNameClash(ctx, stmt); err != nil {
+		return err
+	}
+	err := h(ctx, stmt)
+	// DROP … IF EXISTS: a missing target is a skip, not a failure (#531). The
+	// guard lives here rather than in the ~35 drop handlers because every one
+	// of them already reports a missing target as NotFoundError; any other
+	// error — not connected, a failed write — still propagates.
+	if g, ok := stmt.(ast.IfExistsDrop); ok && g.DropIfExists() && err != nil {
+		var nf *mdlerrors.NotFoundError
+		if errors.As(err, &nf) {
+			fmt.Fprintf(ctx.Output, "%s, skipped (if exists)\n", nf.Error())
+			return nil
+		}
+	}
+	return err
 }
 
 // Validate checks that every known AST statement type has a registered

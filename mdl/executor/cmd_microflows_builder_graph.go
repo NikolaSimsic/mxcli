@@ -19,6 +19,9 @@ func (fb *flowBuilder) buildFlowGraph(stmts []ast.MicroflowStatement, returns *a
 	if fb.measurer == nil {
 		fb.measurer = &layoutMeasurer{varTypes: fb.varTypes}
 	}
+	if fb.measurer.layout == nil {
+		fb.measurer.layout = fb.layout
+	}
 	if fb.declaredVars == nil {
 		fb.declaredVars = make(map[string]string)
 	}
@@ -36,23 +39,47 @@ func (fb *flowBuilder) buildFlowGraph(stmts []ast.MicroflowStatement, returns *a
 	// Set baseY for branch restoration (this is the center line)
 	fb.baseY = fb.posY
 
-	// Pre-scan: if the first statement carries an @position annotation, shift the
-	// StartEvent to be one spacing unit to the left of that position so it doesn't
-	// end up behind activities that use explicit coordinates.
-	for _, stmt := range stmts {
-		if ann := getStatementAnnotations(stmt); ann != nil && ann.Position != nil {
+	// If the first statement carries an @position annotation, shift the StartEvent
+	// to be one spacing unit to the left of that position so it doesn't end up
+	// behind activities that use explicit coordinates.
+	//
+	// The first statement only. This used to take the first statement that had an
+	// @position, wherever it was, so a position on a later statement moved the
+	// start — and every unplaced statement before it, which follows the start — to
+	// that statement's place: `declare $A …; @position(840, 200) declare $B …`
+	// stored both at 840;200 (ako/mxcli#1768). Statements before a placed one keep
+	// the places the builder derives for them, as alter's patch already assumed
+	// (patchDiff.startEvent reads declared[0]).
+	if len(stmts) > 0 {
+		if ann := getStatementAnnotations(stmts[0]); ann != nil && ann.Position != nil {
 			fb.posX = ann.Position.X - fb.spacing
 			fb.posY = ann.Position.Y
 			fb.baseY = fb.posY
-			break
 		}
 	}
 
 	// Create StartEvent - Position is the CENTER point (RelativeMiddlePoint in Mendix)
+	//
+	// Three sources, weakest first. The derived spot above is the fallback; a
+	// hand-placed position carried over from the flow being replaced beats it
+	// (#884); an explicit @start(x, y) beats both, because it is the one source
+	// that states the position rather than inferring it (#951).
+	startX, startY := fb.posX, fb.posY
+	if fb.startPosition != nil {
+		startX, startY = fb.startPosition.X, fb.startPosition.Y
+	}
+	for _, stmt := range stmts {
+		ann := getStatementAnnotations(stmt)
+		if ann == nil || ann.Start == nil {
+			continue
+		}
+		startX, startY = ann.Start.X, ann.Start.Y
+		break
+	}
 	startEvent := &microflows.StartEvent{
 		BaseMicroflowObject: microflows.BaseMicroflowObject{
 			BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
-			Position:    model.Point{X: fb.posX, Y: fb.posY},
+			Position:    model.Point{X: startX, Y: startY},
 			Size:        model.Size{Width: EventSize, Height: EventSize},
 		},
 	}
@@ -60,6 +87,9 @@ func (fb *flowBuilder) buildFlowGraph(stmts []ast.MicroflowStatement, returns *a
 	lastID := startEvent.ID
 
 	fb.posX += fb.spacing
+	// The main line starts here, at the first statement's column. Rows wrap back to
+	// it (layout_rows.go); a flow that never reaches MaxRowWidth never notices.
+	fb.noteRowStart()
 
 	// Process each statement
 	// pendingCase holds the case value for the NEXT flow (set by merge-less splits)
@@ -75,7 +105,41 @@ func (fb *flowBuilder) buildFlowGraph(stmts []ast.MicroflowStatement, returns *a
 		// previousStmtAnchor so the NEXT iteration can apply it.
 		stmtAnchor := stmtOwnAnchor(stmt)
 
+		// Whether the path is still open, read BEFORE the statement runs. A
+		// `merge` reached after a RETURN or a `join` must not also gain a
+		// fall-through edge from whatever came before — that path already ended,
+		// and wiring it produced a duplicate flow into the merge.
+		pathOpen := !fb.endsWithReturn
+
+		// Wrap the main line before placing a statement that would run past the
+		// readable width. A statement carrying its own @position places itself, so
+		// it is left alone and becomes the start of the current row instead.
+		if x, ok := ownPositionX(stmt); ok {
+			// The statement places itself, so this is where the current row now
+			// begins; wrapping measures from here on.
+			fb.row.startX = x
+			fb.row.firstObject = len(fb.objects)
+		} else if fb.shouldWrap(stmt, stmts[i:]) {
+			fb.wrapRow(startsWithNote(stmt))
+		}
+
 		activityID := fb.addStatement(stmt)
+		if fb.takePendingJoin(lastID, pendingCase, fb.previousStmtAnchor) {
+			pendingCase = ""
+			fb.previousStmtAnchor = nil
+			continue
+		}
+		if activityID != "" && !pathOpen {
+			// Resuming after a terminator: this statement starts a new path, so
+			// it gets no inbound edge here. Only a `merge` can legitimately be
+			// reached that way — it is the one construct other paths join.
+			fb.applyPendingAnnotations(activityID)
+			lastID = activityID
+			pendingCase = ""
+			pendingFlowAnchor = nil
+			fb.previousStmtAnchor = stmtAnchor
+			continue
+		}
 		if activityID != "" {
 			fb.applyPendingAnnotations(activityID)
 			// Connect to previous object with horizontal SequenceFlow.
@@ -103,6 +167,14 @@ func (fb *flowBuilder) buildFlowGraph(stmts []ast.MicroflowStatement, returns *a
 			// overrides its own To.
 			originAnchor, destAnchor := pendingFlowAnchors(fb.previousStmtAnchor, pendingFlowAnchor, stmtAnchor)
 			pendingFlowAnchor = nil
+			// An edge that crosses from one row to the next leaves the bottom of
+			// the last element and enters the left of the first — anchored right
+			// to left it is drawn straight back across the row above, through
+			// whatever sits between the two columns.
+			if from, to, wraps := fb.takeWrapAnchors(); wraps && originAnchor == nil && destAnchor == nil {
+				flow.OriginConnectionIndex = from
+				flow.DestinationConnectionIndex = to
+			}
 			applyUserAnchors(flow, originAnchor, destAnchor)
 			fb.flows = append(fb.flows, flow)
 			fb.addPendingErrorHandlerFlowForStatement(lastID, activityID, stmt, statementsReferenceVar(stmts[i+1:], fb.errorHandlerSkipVar))
@@ -131,11 +203,12 @@ func (fb *flowBuilder) buildFlowGraph(stmts []ast.MicroflowStatement, returns *a
 		// Free annotations are standalone Annotation objects. Flush them before
 		// creating the activity so they do not get attached to it; buildFlowGraph
 		// has a final leftover flush for annotations with no following activity.
-		for _, text := range fb.pendingAnnotations.FreeAnnotations {
-			fb.attachFreeAnnotation(text)
+		for _, note := range fb.pendingAnnotations.FreeNotes {
+			fb.attachFreeAnnotation(note)
 		}
-		if fb.pendingAnnotations.AnnotationText != "" {
-			fb.attachFreeAnnotation(fb.pendingAnnotations.AnnotationText)
+		// An attached note with no activity left to attach to is a free one.
+		for _, note := range fb.pendingAnnotations.Notes {
+			fb.attachFreeAnnotation(note)
 		}
 		fb.pendingAnnotations = nil
 	}
@@ -155,6 +228,7 @@ func (fb *flowBuilder) buildFlowGraph(stmts []ast.MicroflowStatement, returns *a
 		}
 
 		fb.objects = append(fb.objects, endEvent)
+		fb.fallThroughEndID = endEvent.ID
 
 		// Connect last activity to end event
 		var endFlow *microflows.SequenceFlow
@@ -180,6 +254,31 @@ func (fb *flowBuilder) buildFlowGraph(stmts []ast.MicroflowStatement, returns *a
 	} else {
 		fb.terminatePendingErrorHandlersAtEnd(returns)
 	}
+
+	// Stamp @curve onto each annotated activity's outgoing flows. Done once here,
+	// after every flow exists, rather than at the seven-odd sites that create
+	// one. (#884)
+	fb.applyFlowCurves()
+
+	// Give any end event that two paths reach a merge to join them at. Also
+	// here, and for the same reason as the curves: the two flows can be created
+	// by unrelated builders in either order, so no single creation site can see
+	// the collision.
+	fb.mergeOverConnectedEndEvents()
+
+	// Named join points last: a `join` may reference a `merge` declared later,
+	// so no edge can be drawn until every statement has been seen. Deliberately
+	// after mergeOverConnectedEndEvents — a join lands on a merge, never on an
+	// end event, so it cannot create the over-connection that pass fixes.
+	fb.resolveJoins()
+
+	// Rows last: every object exists and every container has its final size, so
+	// this is the first point where a row's real depth is known.
+	fb.separateRows()
+
+	// Note lines after everything has moved: the sides that face each other
+	// depend on where the note and its element finally sit.
+	orientAnnotationFlows(fb.objects, fb.annotationFlows)
 
 	return &microflows.MicroflowObjectCollection{
 		BaseElement:     model.BaseElement{ID: model.ID(types.GenerateID())},
@@ -209,10 +308,15 @@ func collectListInputVariables(stmts []ast.MicroflowStatement) map[string]bool {
 				}
 				walk(s.Body)
 			case *ast.AddToListStmt:
-				if s.List != "" {
+				// With an association target, List names an object (#1288).
+				if s.List != "" && s.Association == "" {
 					inputs[s.List] = true
 				}
 			case *ast.RemoveFromListStmt:
+				if s.List != "" && s.Association == "" {
+					inputs[s.List] = true
+				}
+			case *ast.ClearListStmt:
 				if s.List != "" {
 					inputs[s.List] = true
 				}
@@ -244,6 +348,10 @@ func collectListInputVariables(stmts []ast.MicroflowStatement) map[string]bool {
 					walk(s.ErrorHandling.Body)
 				}
 			case *ast.RestCallStmt:
+				if s.ErrorHandling != nil {
+					walk(s.ErrorHandling.Body)
+				}
+			case *ast.SendEmailStmt:
 				if s.ErrorHandling != nil {
 					walk(s.ErrorHandling.Body)
 				}
@@ -340,12 +448,20 @@ func collectObjectInputVariables(stmts []ast.MicroflowStatement) map[string]bool
 			case *ast.AggregateListStmt:
 				walkExpr(s.Expression)
 			case *ast.AddToListStmt:
-				if s.Value != nil {
+				if s.Association != "" {
+					// `add $X to $Obj/Assoc` changes $Obj; $X may be an
+					// object or a list, so it says nothing either way (#1288).
+					inputs[s.List] = true
+				} else if s.Value != nil {
 					for _, ref := range exprVarRefs(s.Value) {
 						inputs[ref] = true
 					}
 				} else if s.Item != "" {
 					inputs[s.Item] = true
+				}
+			case *ast.RemoveFromListStmt:
+				if s.Association != "" {
+					inputs[s.List] = true
 				}
 			case *ast.CallMicroflowStmt:
 				for _, arg := range s.Arguments {
@@ -393,6 +509,13 @@ func collectObjectInputVariables(stmts []ast.MicroflowStatement) map[string]bool
 					}
 				}
 				walkExpr(s.Timeout)
+				if s.ErrorHandling != nil {
+					walk(s.ErrorHandling.Body)
+				}
+			case *ast.SendEmailStmt:
+				for _, e := range s.Expressions() {
+					walkExpr(e)
+				}
 				if s.ErrorHandling != nil {
 					walk(s.ErrorHandling.Body)
 				}
@@ -496,7 +619,7 @@ func (fb *flowBuilder) addTerminalEndEventForPendingHandler(returns *ast.Microfl
 	end := &microflows.EndEvent{
 		BaseMicroflowObject: microflows.BaseMicroflowObject{
 			BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
-			Position:    model.Point{X: fb.posX + HorizontalSpacing/2, Y: fb.baseY + VerticalSpacing},
+			Position:    model.Point{X: fb.posX + HorizontalSpacing/2, Y: fb.baseY + ErrorHandlerPitch},
 			Size:        model.Size{Width: EventSize, Height: EventSize},
 		},
 		ReturnValue: returnValue,
@@ -507,6 +630,13 @@ func (fb *flowBuilder) addTerminalEndEventForPendingHandler(returns *ast.Microfl
 
 // addStatement converts an AST statement to a microflow activity and returns its ID.
 func (fb *flowBuilder) addStatement(stmt ast.MicroflowStatement) model.ID {
+	// The loop-body tail is this statement's alone: only an IF reads it, and a
+	// CASE or anything else must not leave it set for an IF nested inside,
+	// which is not at the tail (atBodyTail).
+	if _, isIf := stmt.(*ast.IfStmt); !isIf {
+		fb.atBodyTail = false
+	}
+
 	// Extract annotations from the statement and merge into pendingAnnotations
 	fb.mergeStatementAnnotations(stmt)
 
@@ -514,12 +644,14 @@ func (fb *flowBuilder) addStatement(stmt ast.MicroflowStatement) model.ID {
 	if fb.pendingAnnotations != nil && fb.pendingAnnotations.Position != nil {
 		fb.posX = fb.pendingAnnotations.Position.X
 		fb.posY = fb.pendingAnnotations.Position.Y
+	} else {
+		fb.clearLowerLane(stmt)
 	}
 	if fb.pendingAnnotations != nil {
-		for _, text := range fb.pendingAnnotations.FreeAnnotations {
-			fb.attachFreeAnnotation(text)
+		for _, note := range fb.pendingAnnotations.FreeNotes {
+			fb.attachFreeAnnotation(note)
 		}
-		fb.pendingAnnotations.FreeAnnotations = nil
+		fb.pendingAnnotations.FreeNotes = nil
 	}
 
 	switch s := stmt.(type) {
@@ -542,6 +674,10 @@ func (fb *flowBuilder) addStatement(stmt ast.MicroflowStatement) model.ID {
 				Annotations: s.Annotations,
 			})
 		}
+		if fb.isListVariable(s.Target) {
+			return fb.addReplaceListAction(s)
+		}
+		fb.refuseSetOnObject(s.Target)
 		return fb.addChangeVariableAction(s)
 	case *ast.ReturnStmt:
 		return fb.addEndEventWithReturn(s)
@@ -551,6 +687,10 @@ func (fb *flowBuilder) addStatement(stmt ast.MicroflowStatement) model.ID {
 		return fb.addBreakEvent()
 	case *ast.ContinueStmt:
 		return fb.addContinueEvent()
+	case *ast.MergeStmt:
+		return fb.addMergeStatement(s)
+	case *ast.JoinStmt:
+		return fb.addJoinStatement(s)
 	case *ast.LogStmt:
 		return fb.addLogMessageAction(s)
 	case *ast.CreateObjectStmt:
@@ -565,6 +705,8 @@ func (fb *flowBuilder) addStatement(stmt ast.MicroflowStatement) model.ID {
 		return fb.addDeleteAction(s)
 	case *ast.RollbackStmt:
 		return fb.addRollbackAction(s)
+	case *ast.ExternalObjectStmt:
+		return fb.addExternalObjectAction(s)
 	case *ast.IfStmt:
 		return fb.addIfStatement(s)
 	case *ast.LoopStmt:
@@ -581,6 +723,8 @@ func (fb *flowBuilder) addStatement(stmt ast.MicroflowStatement) model.ID {
 		return fb.addAddToListAction(s)
 	case *ast.RemoveFromListStmt:
 		return fb.addRemoveFromListAction(s)
+	case *ast.ClearListStmt:
+		return fb.addClearListAction(s)
 	case *ast.CallMicroflowStmt:
 		return fb.addCallMicroflowAction(s)
 	case *ast.CallNanoflowStmt:
@@ -605,10 +749,14 @@ func (fb *flowBuilder) addStatement(stmt ast.MicroflowStatement) model.ID {
 		return fb.addShowMessageAction(s)
 	case *ast.DownloadFileStmt:
 		return fb.addDownloadFileAction(s)
+	case *ast.SynchronizeStmt:
+		return fb.addSynchronizeAction(s)
 	case *ast.ValidationFeedbackStmt:
 		return fb.addValidationFeedbackAction(s)
 	case *ast.RestCallStmt:
 		return fb.addRestCallAction(s)
+	case *ast.SendEmailStmt:
+		return fb.addSendEmailAction(s)
 	case *ast.SendRestRequestStmt:
 		return fb.addSendRestRequestAction(s)
 	case *ast.ImportFromMappingStmt:

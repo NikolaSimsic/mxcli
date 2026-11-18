@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/mendixlabs/mxcli/cmd/mxcli/testrunner"
 	"github.com/mendixlabs/mxcli/mdl/ast"
 	"github.com/mendixlabs/mxcli/mdl/executor"
 	"github.com/mendixlabs/mxcli/mdl/linter"
@@ -18,6 +19,46 @@ import (
 
 // errLineRegexp parses error messages in the format "line N:M msg".
 var errLineRegexp = regexp.MustCompile(`^line (\d+):(\d+) (.+)$`)
+
+// checkableDocument renders a document as the MDL to parse, plus the diagnostics
+// that come from the document's own format rather than from the grammar.
+//
+// The extension binds the MDL language to `.mdl`, which `.test.mdl` matches, so
+// until now every test file in the editor was diagnosed against the top-level
+// grammar it is not written in — a wall of squiggles saying nothing true
+// (mendixlabs/mxcli#1103). A test block is a microflow body; testrunner renders
+// it as one, on the same lines, so the positions below need no adjustment.
+func checkableDocument(docURI uri.URI, text string) (string, []protocol.Diagnostic) {
+	path := documentPath(docURI)
+	if !testrunner.IsTestFile(path) {
+		return text, nil
+	}
+	checked, err := testrunner.CheckSource(text, path)
+	if err != nil {
+		// The file is not a usable test file at all. Report that, at the top,
+		// rather than whatever the grammar makes of it.
+		return "", []protocol.Diagnostic{{
+			Range:    protocol.Range{Start: protocol.Position{Line: 0}, End: protocol.Position{Line: 0}},
+			Severity: protocol.DiagnosticSeverityError,
+			Source:   "mdl-test",
+			Message:  err.Error(),
+		}}
+	}
+	var diags []protocol.Diagnostic
+	for _, p := range checked.Problems {
+		line := uint32(0)
+		if p.Line > 0 {
+			line = uint32(p.Line - 1)
+		}
+		diags = append(diags, protocol.Diagnostic{
+			Range:    protocol.Range{Start: protocol.Position{Line: line}, End: protocol.Position{Line: line}},
+			Severity: protocol.DiagnosticSeverityError,
+			Source:   "mdl-test",
+			Message:  p.Message,
+		})
+	}
+	return checked.MDL, diags
+}
 
 // parseMDLDiagnostics runs the MDL parser on text and converts errors to LSP diagnostics.
 func parseMDLDiagnostics(text string) []protocol.Diagnostic {
@@ -58,13 +99,22 @@ func parseMDLDiagnostics(text string) []protocol.Diagnostic {
 	return diagnostics
 }
 
-// publishDiagnostics parses the document and sends diagnostics to the client.
-func (s *mdlServer) publishDiagnostics(ctx context.Context, docURI uri.URI, text string) {
-	diags := parseMDLDiagnostics(text)
+// documentDiagnostics is what the editor reports for a document as typed: parse
+// errors, and when it parses, the checks `mxcli check` runs inline (a flow's
+// Java/JavaScript action calls resolved through the workspace project, if any).
+func (s *mdlServer) documentDiagnostics(docURI uri.URI, text string) []protocol.Diagnostic {
+	text, diags := checkableDocument(docURI, text)
+	diags = append(diags, parseMDLDiagnostics(text)...)
 	// If no parse errors, run semantic validation inline
 	if len(diags) == 0 {
 		diags = append(diags, s.runSemanticValidation(text)...)
 	}
+	return diags
+}
+
+// publishDiagnostics parses the document and sends diagnostics to the client.
+func (s *mdlServer) publishDiagnostics(ctx context.Context, docURI uri.URI, text string) {
+	diags := s.documentDiagnostics(docURI, text)
 	if diags == nil {
 		diags = []protocol.Diagnostic{} // send empty array to clear diagnostics
 	}
@@ -130,7 +180,8 @@ func (s *mdlServer) DidSave(ctx context.Context, params *protocol.DidSaveTextDoc
 	s.mu.Unlock()
 
 	// If there are parse errors, don't run semantic checks
-	if diags := parseMDLDiagnostics(text); len(diags) > 0 {
+	checkable, diags := checkableDocument(docURI, text)
+	if len(diags) > 0 || len(parseMDLDiagnostics(checkable)) > 0 {
 		return nil
 	}
 
@@ -146,7 +197,11 @@ func (s *mdlServer) runSemanticCheck(ctx context.Context, docURI uri.URI, text s
 		return
 	}
 
-	// Write to a temp file path based on the URI
+	// The check reads the document from disk; a virtual document
+	// (mendix-mdl:, mendixlabs/mxcli#1245) has no file to read.
+	if !isFileURI(docURI) {
+		return
+	}
 	filePath := uriToPath(string(docURI))
 	if filePath == "" {
 		return
@@ -262,6 +317,12 @@ func (s *mdlServer) runSemanticValidation(text string) []protocol.Diagnostic {
 	// filesystem isn't walked on every keystroke. Nil-safe: when the registry
 	// hasn't loaded (no project context, etc.) widget validation is skipped.
 	s.ensureWidgetRegistry()
+	s.ensureThemeRegistry()
+
+	// A call to a stored void Java/JavaScript action declares no variable; the
+	// flow rules can only know that through the project (ako/mxcli#962).
+	flows := executor.NewFlowRules(prog, s.findMprPath(), s.codeActions)
+	defer flows.Close()
 
 	var diags []protocol.Diagnostic
 	for i, stmt := range prog.Statements {
@@ -272,17 +333,45 @@ func (s *mdlServer) runSemanticValidation(text string) []protocol.Diagnostic {
 		if entityStmt, ok := stmt.(*ast.CreateEntityStmt); ok {
 			violations = append(violations, executor.ValidateEntity(entityStmt)...)
 		}
+		if alterStmt, ok := stmt.(*ast.AlterEntityStmt); ok {
+			violations = append(violations, executor.ValidateAlterEntity(alterStmt)...)
+		}
 		if mfStmt, ok := stmt.(*ast.CreateMicroflowStmt); ok {
-			violations = append(violations, executor.ValidateMicroflow(mfStmt)...)
+			violations = append(violations, flows.Microflow(mfStmt)...)
+			violations = append(violations, executor.ValidateFlowParameterAnnotations(
+				"microflow '"+mfStmt.Name.String()+"'", mfStmt.Parameters)...)
+		}
+		// The editor reports an unusable parameter annotation for the same
+		// reason `check` does — a typo of @position parses and does nothing.
+		if nfStmt, ok := stmt.(*ast.CreateNanoflowStmt); ok {
+			violations = append(violations, flows.Nanoflow(nfStmt)...)
+			violations = append(violations, executor.ValidateFlowParameterAnnotations(
+				"nanoflow '"+nfStmt.Name.String()+"'", nfStmt.Parameters)...)
+		}
+		if ruleStmt, ok := stmt.(*ast.CreateRuleStmt); ok {
+			violations = append(violations, executor.ValidateFlowParameterAnnotations(
+				"rule '"+ruleStmt.Name.String()+"'", ruleStmt.Parameters)...)
+		}
+		if setStmt, ok := stmt.(*ast.AlterSettingsStmt); ok {
+			violations = append(violations, executor.ValidateSettings(setStmt)...)
+		}
+		if cfgStmt, ok := stmt.(*ast.CreateConfigurationStmt); ok {
+			violations = append(violations, executor.ValidateCreateConfiguration(cfgStmt)...)
 		}
 		if viewStmt, ok := stmt.(*ast.CreateViewEntityStmt); ok {
 			if viewStmt.Query.RawQuery != "" {
 				violations = append(violations, executor.ValidateOQLSyntax(viewStmt.Query.RawQuery)...)
 				violations = append(violations, executor.ValidateOQLTypes(viewStmt.Query.RawQuery, viewStmt.Attributes)...)
+				violations = append(violations, executor.ValidateOQLPortability(viewStmt.Query.RawQuery)...)
+				violations = append(violations, executor.ValidateViewAttributeDeclarations(viewStmt.Query.RawQuery, viewStmt.Attributes)...)
 			}
 		}
 		if s.widgetRegistry != nil {
-			violations = append(violations, executor.ValidateWidgetPropertiesForStatement(stmt, s.widgetRegistry)...)
+			violations = append(violations, executor.GateWidgetViolations(
+				executor.ValidateWidgetPropertiesForStatement(stmt, s.widgetRegistry), prog.LanguageVersion)...)
+		}
+		if s.themeRegistry != nil {
+			violations = append(violations, executor.ValidateDesignPropertiesForStatement(stmt, s.themeRegistry)...)
 		}
 
 		lineNum := uint32(0)
@@ -307,7 +396,7 @@ func (s *mdlServer) runSemanticValidation(text string) []protocol.Diagnostic {
 			})
 		}
 	}
-	return diags
+	return append(diags, languageDiagnostics(text, prog)...)
 }
 
 // violationToLSPSeverity maps linter.Severity to protocol.DiagnosticSeverity.

@@ -12,7 +12,21 @@ import (
 // executeInner dispatches a statement to its registered handler.
 func (e *Executor) executeInner(ctx context.Context, stmt ast.Statement) error {
 	ectx := e.newExecContext(ctx)
+	// Remember the connection this outer context was snapshotted with. A handler
+	// that runs nested statements (EXECUTE SCRIPT, generated-connector MDL) calls
+	// e.Execute recursively; a nested reconnect — e.g. REFRESH CATALOG finding the
+	// on-disk cache stale ("project file modified") — swaps e.backend for a fresh
+	// connection and syncs it back. This outer ectx, snapshotted before that,
+	// still points at the now-closed backend; without the adoption below, syncBack
+	// would clobber the live connection with it and silently disconnect the
+	// session (next statement fails with "not connected to a project").
+	before := e.backend
 	err := e.registry.Dispatch(ectx, stmt)
+	// What the statement wrote beside the model, after its own report and
+	// whether or not it then failed: a file on disk is there either way.
+	if ctx.Err() == nil {
+		e.reportSourceFileChanges(ectx.Backend, ectx.Output)
+	}
 	// Only sync back when the context has not been cancelled. Execute() runs
 	// executeInner in a goroutine with a wall-clock timeout; if the timeout
 	// fires, the goroutine keeps running but Execute() has already returned.
@@ -20,6 +34,17 @@ func (e *Executor) executeInner(ctx context.Context, stmt ast.Statement) error {
 	// Any handler-side state changes made after cancellation are intentionally
 	// lost — this is expected behavior, not a regression.
 	if ctx.Err() == nil {
+		// If a nested statement replaced the connection and this handler didn't
+		// change its own snapshot, adopt the live connection and its project-scoped
+		// caches so syncBack preserves the reconnect instead of reverting it.
+		if ectx.Backend == before && e.backend != before {
+			ectx.Backend = e.backend
+			ectx.MprPath = e.mprPath
+			ectx.Cache = e.cache
+			e.catalogMu.RLock()
+			ectx.Catalog = e.catalog
+			e.catalogMu.RUnlock()
+		}
 		e.syncBack(ectx)
 	}
 	return err
@@ -68,23 +93,34 @@ func (e *Executor) newExecContext(ctx context.Context) *ExecContext {
 	gen := e.catalogGen
 	e.catalogMu.RUnlock()
 	return &ExecContext{
-		Context:          ctx,
-		Backend:          e.backend,
-		Output:           e.output,
-		Format:           e.format,
-		Quiet:            e.quiet,
-		Logger:           e.logger,
-		Fragments:        e.fragments,
-		Catalog:          cat,
-		Cache:            e.cache,
-		MprPath:          e.mprPath,
-		SqlMgr:           e.sqlMgr,
-		ThemeRegistry:    e.themeRegistry,
-		Settings:         e.settings,
-		BackendFactory:   e.backendFactory,
-		ExecuteFn:        e.Execute,
-		ExecuteProgramFn: e.ExecuteProgram,
-		FinalizeFn:       e.finalizeProgramExecution,
+		Context:            ctx,
+		Backend:            e.backend,
+		lastWriteStats:     currentWriteStats(e.backend),
+		Output:             e.output,
+		Format:             e.format,
+		Quiet:              e.quiet,
+		terminal:           e.terminal,
+		tally:              e.tally,
+		accessRun:          e.accessRun,
+		Logger:             e.logger,
+		Fragments:          e.fragments,
+		Catalog:            cat,
+		Cache:              e.cache,
+		MprPath:            e.mprPath,
+		FlowLayoutOverride: e.flowLayoutOverride,
+		ScriptDir:          e.scriptDir,
+		LanguageVersion:    e.langVersion,
+		forwardFlowCalls:   e.forwardFlowCalls,
+		scriptFlows:        e.scriptFlows,
+		scriptTargets:      e.scriptTargets,
+		describeLang:       e.describeLang,
+		SqlMgr:             e.sqlMgr,
+		ThemeRegistry:      e.themeRegistry,
+		Settings:           e.settings,
+		BackendFactory:     e.backendFactory,
+		ExecuteFn:          e.Execute,
+		ExecuteProgramFn:   e.ExecuteProgram,
+		FinalizeFn:         e.finalizeProgramExecution,
 		SyncCatalog: func(cat *catalog.Catalog) {
 			e.catalogMu.Lock()
 			defer e.catalogMu.Unlock()

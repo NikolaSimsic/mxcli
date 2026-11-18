@@ -79,7 +79,7 @@ $HasNetwork = CALL JAVASCRIPT ACTION NanoflowCommons.HasConnectivity();
 
 ```sql
 -- Show a page
-SHOW PAGE Sales.CartDetail ($Cart = $Cart);
+SHOW PAGE Sales.CartDetail (Cart = $Cart);
 
 -- Close the current page
 CLOSE PAGE;
@@ -104,7 +104,7 @@ IF $Cart/ItemCount = 0 THEN
   VALIDATION FEEDBACK $Cart/ItemCount MESSAGE 'Cart is empty';
   RETURN false;
 ELSE
-  SHOW PAGE Sales.Checkout ($Cart = $Cart);
+  SHOW PAGE Sales.Checkout (Cart = $Cart);
   RETURN true;
 END IF;
 ```
@@ -124,14 +124,14 @@ The following activities are server-only and cannot be used in nanoflows:
 - `CALL EXTERNAL ACTION` — external actions are server-side
 - All **workflow actions** (call/open workflow, set task outcome, user task, etc.)
 
-> **Note:** Per-action error handling (`on error continue`) IS supported in nanoflows. Only `ErrorEvent` (raise error as a standalone flow action) is forbidden. Note that `on error rollback` is syntactically valid but only rolls back in-memory changes — nanoflows have no database transactions.
+> **Note:** Per-action error handling is supported in nanoflows, per activity. Only `ErrorEvent` (raise error as a standalone flow action) is forbidden. A nanoflow has no database transaction, so an activity without a clause aborts the flow on error. `declare`, `set`, `retrieve` and `delete` take every clause; `create`, `commit`, `call nanoflow` and `call microflow` take only `on error without rollback begin … end error`; `change`, `log`, `show page`, `close page`, `show message` and `validation feedback` take none. Every other form is CE6035 at build time, and mxcli refuses it (MDL091) — measured on Mendix 11.14.0.
 
 ## SHOW and DESCRIBE
 
 ```sql
-SHOW NANOFLOWS
-SHOW NANOFLOWS IN MyModule
-DESCRIBE NANOFLOW MyModule.NAV_ShowDetails
+LIST NANOFLOWS;
+LIST NANOFLOWS IN MyModule;
+DESCRIBE NANOFLOW MyModule.NAV_ShowDetails;
 ```
 
 ## DROP
@@ -184,7 +184,7 @@ CREATE NANOFLOW Sales.NAV_GoToOrderDetail
 BEGIN
   DECLARE $Order Sales.Order;
 
-  SHOW PAGE Sales.Order_Detail ($Order = $Order);
+  SHOW PAGE Sales.Order_Detail (Order = $Order);
 END;
 ```
 

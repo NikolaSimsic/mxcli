@@ -1,0 +1,681 @@
+---
+title: Structured description of irreducible microflow graphs
+status: partial
+date: 2026-08-20
+---
+
+# Proposal: Structured description of irreducible microflow graphs
+
+**Status:** Implemented for every class the proposal set out to cover.
+Phase 0 (detector, `MDL-FLOW01`), **Phase E** (`merge`/`join` for error-path
+rejoins), **Mode 2** (faithful DEFAULT rendering of a crossed graph, using the
+same `merge`/`join` vocabulary) and **Mode 3** (`DESCRIBE … NORMALIZED`, opt-in
+guard folding) are all shipped.
+
+What remains unfaithful is the **interleaved** class only — branches overlapping
+at more than one entry, where nesting requires a duplicated activity or an
+invented boolean (Böhm–Jacopini) and no faithful rendering exists. Those keep
+MDL-FLOW01, which is now a true statement about them rather than a blanket one.
+One [known limitation](#known-limitation-a-merge-outside-both-described-forms-is-dropped)
+is open but reported: a merge that is neither an error rejoin, an `if`/`else`
+join, nor a crossed entry is dropped by a describe → exec round trip, and
+DESCRIBE warns.
+**Date:** 2026-08-20 (scan: 2026-09-12; Phase E, the runtime measurements and Mode 3: 2026-09-13; Mode 2: 2026-09-14)
+
+`DESCRIBE MICROFLOW` renders a microflow's control flow as nested `if/then/else`.
+That works only for graphs that are *properly nested*. A Mendix microflow is an
+arbitrary directed graph, and when a branch re-enters a sibling branch's path the
+describer walks it as though it were a tree and emits MDL that **means something
+else** — with no error, no warning, and no indication that anything was lost.
+
+Origin: [mendixlabs/mxcli#923](https://github.com/mendixlabs/mxcli/issues/923).
+
+## Problem Statement
+
+### The measured case
+
+The reporter's microflow was reconstructed from the coordinates in their own
+`describe` output and reproduced exactly (a unit test on a hand-built graph
+emits their output verbatim, `@merge` annotations included):
+
+```
+start  → split1
+split1 : true → split2      false → merge1
+split2 : true → merge1      false → merge2
+merge1 → log → merge2 → end
+```
+
+`log` runs when `¬c1 ∨ (c1 ∧ c2)`. mxcli describes it as:
+
+```
+if not(true) then
+  if not(true) then
+    log info node 'NODE' 'Do something';
+  end if;
+end if;
+```
+
+which means `c1 ∧ c2`. The edge `split1 --false--> merge1` is silently dropped and
+rendered as an absent `else`.
+
+**With the reporter's actual expressions this is the exact inverse on every run.**
+Both conditions are `not(true)` = false, so `¬c1` is true and the original
+**always** logs; the description's outer guard is false, so it **never** logs. The
+issue title says "roundtrip does not work"; the accurate statement is that
+`DESCRIBE` produces a program with the opposite behaviour.
+
+### Why it is not nested
+
+`merge1` is split1's join, but it also sits on split2's true path. The two blocks
+*interleave*: split1's branches are not disjoint before their join. MDL's
+`if/then/else` can only express single-entry/single-exit regions, and nothing
+checks that the graph is one.
+
+### The second, related defect
+
+Two independent merge-finders disagree on exactly this graph:
+
+| | split1 | split2 |
+|---|---|---|
+| `findSplitMergePointsForGraph` (drives structure) | **merge2** | merge2 |
+| `commonMergeAfter` (emits `@merge(x, y)`) | **merge1** | merge2 |
+
+On a properly nested graph they always agree, so **the disagreement is itself a
+reliable detector**. Here it means the emitted `@merge(-200, 173)` places split1's
+merge *before* the log at `(-50, 173)`, while structurally the outer `end if` falls
+*after* it — which is the tangled diagram in the reporter's third screenshot. Their
+"apart from positioning issues" is the same root cause, not a separate annoyance.
+
+Not a regression: latent since the describer was written, visible only on
+non-nested graphs.
+
+## BSON Structure
+
+No new BSON is written by this proposal. The relevant finding is a **negative**
+one, and it forecloses the most obvious design.
+
+### A merge node cannot carry a label
+
+`Microflows$ExclusiveMerge` has no name, caption or documentation field. Three
+independent sources agree:
+
+| Source | Built from | Properties |
+|---|---|---|
+| `generated/metamodel` | Mendix reflection data | `RelativeMiddlePoint`, `Size` |
+| `modelsdk/gen` | TypeScript SDK 4.114.0 | `RelativeMiddlePoint`, `Size` |
+| Real documents (FeedbackModule, 11.13) | Studio Pro | `$ID`, `$Type`, `RelativeMiddlePoint`, `Size` |
+
+`Microflows$ExclusiveSplit` sits directly above it in the metamodel *with*
+`Caption` and `Documentation`. Mendix gave splits text and deliberately gave
+merges none. The `generated/metamodel` snapshot caveat (it is 11.6.0) is covered
+here by the third row: real 11.13 documents were dumped and carry nothing extra.
+
+The only Mendix-native text attachable to a merge is an `Annotation`
+(has `Caption`) wired by an `AnnotationFlow` (has `Origin`/`Destination`).
+**Rejected**: it puts visible sticky notes in the user's diagram as mxcli
+bookkeeping, the user can edit or delete them, and it authors model content the
+model does not own — the failure mode ADR-0005 exists to prevent. Free
+annotations also already have their own round-trip semantics
+([PROPOSAL_microflow_free_annotation.md](PROPOSAL_microflow_free_annotation.md)),
+which this would collide with.
+
+### Labels do not need to survive storage
+
+This is the key realisation, and it is why the negative finding above is not
+fatal. A label is an artifact of the *text*, not of the model:
+
+```
+graph --DESCRIBE--> MDL (labels minted) --EXEC--> graph (labels consumed, discarded)
+```
+
+Nothing between two runs must remember `m1`. The requirement is not persistence
+but **determinism**: the same graph must yield the same labels, so re-running a
+script is a model-level no-op ([ADR-0008](../13-decisions/0008-identity-and-idempotence.md)).
+Ordinal labels in a deterministic traversal order satisfy that, are more readable
+than anything position-derived, and are *more* stable — moving a node in Studio
+Pro changes its coordinates but not its ordinal.
+
+Merge identity across re-runs is then the ordinary unnamed-element problem handled
+by `canon.TransplantIDs`. **Flagged as a risk to measure, not to assume**: a merge
+is the weakest possible case for that matcher — no `Name`, and a shape of just
+`Microflows$ExclusiveMerge` — so matching degrades to positional.
+
+## Proposed MDL Syntax
+
+Three rendering modes. The first is today's behaviour, kept for the overwhelmingly
+common case.
+
+### Mode 1 — structured (default, unchanged)
+
+Properly nested graphs describe exactly as they do today. No change, no new
+syntax, no regression in readability for the ~all case.
+
+### Mode 2 — faithful, with named merges (default for irreducible graphs) — SHIPPED 2026-09-14
+
+Implementation notes, where they differ from the sketch below:
+
+- **Fall-through is permitted in the language but never RELIED ON by the
+  emitter.** The proposal wanted fall-through into a `merge` banned outright;
+  Phase E shipped the permissive alternative. Mode 2 gets the same safety by
+  labelling the split's **post-dominator** as well as the shared entry, so every
+  branch ends in an explicit `join`. Without that, an empty branch (split2's
+  false arm in the reporter's graph) falls into the shared merge instead of past
+  it — silently describing a different graph, which is the exact failure Mode 2
+  exists to end.
+- **A crossed merge is emitted the OPPOSITE way from an error-rejoin merge**, and
+  the label alone does not say which: a rejoin is *declared* where the traversal
+  meets it, a crossed merge is *joined* by each branch and declared once
+  afterwards. Hence `mergeLabels` carries a crossed set beside the names.
+- **A `join` is emitted on every arrival, before the `visited` guard.** Arriving
+  more than once is what "crossed" means; letting the guard swallow the second
+  branch's join leaves that path falling off the end of the description.
+- **MDL-FLOW01 is retired per decision, on the strength of what was EMITTED**,
+  not of what was labelled. Those differ: an inheritance split has its own
+  traversal that walks through a labelled merge without emitting a join, so the
+  label goes unused and the reader still gets the nested rendering. Suppressing
+  on the label alone retired the warning on `Administration.ManageMyAccount`,
+  whose description is byte-identical with and without Mode 2 — measured, and
+  the reason the warnings are now computed after the body rather than before it.
+  (That microflow's MDL-FLOW01 is a pre-existing false positive in the
+  classifier — its shared entry is the split's own join, reached because some
+  branches return early. Left alone here rather than silenced by an unrelated
+  mechanism.)
+- **Regression control**: 16 of 18 microflows in a blank 11.14 app plus
+  FeedbackModule and Administration describe **byte-identically** to before; the
+  two that change are the two genuinely crossed ones. Both round-trip with their
+  merge `$ID`s intact, converge after one step, and a re-exec is elided
+  (`Unchanged`). Behaviour verified on a **real runtime** across the complete
+  truth table — the two `$A = false` rows are the ones the old flattening got
+  wrong (`mdl-examples/bug-tests/923-crossed-branches{,.test}.mdl`).
+
+The original sketch:
+
+A merge becomes a first-class **statement** rather than an inferred annotation,
+and branches `join` it. Both words are Mendix's own vocabulary for the concept,
+which keeps this closer to ADR-0003's "reads as English" than a bare `goto`:
+
+```sql
+create or modify microflow Test.Test_merge_boolean_codebug () returns Boolean as $output begin
+  @position(-335, 173)
+  if not(true) then
+    @position(-335, 336)
+    if not(true) then join m1; else join m2; end if;
+  else
+    join m1;
+  end if;
+
+  merge m1 @position(-200, 173);
+  @position(-50, 173)
+  log info node 'NODE' 'Do something';
+  join m2;
+
+  merge m2 @position(100, 173);
+  @position(200, 173)
+  return true;
+end;
+```
+
+Properties:
+
+- **`merge <name>` declares; `join <name>` jumps.** Forward and backward
+  references both resolve, so declaration order is free.
+- **It subsumes `@merge(x, y)`.** The merge carries its own `@position`, so there
+  is nothing left to infer — which removes the two-merge-finders disagreement
+  described above rather than papering over it.
+- **No fall-through into a `merge` declaration.** In a microflow containing any
+  `merge`, every path must end in `join`, `return`, or an end event. Fall-through
+  would be ambiguous exactly where precision matters; a missing terminator is a
+  `check` error, not a guess. (See Open Questions — the permissive alternative is
+  viable and cheaper for hand-authors.)
+
+### Mode 3 — normalized (opt-in) — SHIPPED 2026-09-13
+
+Implementation notes, where they differ from the sketch below:
+
+- **It is not a second describer.** `normalizeCollection` rewrites a *copy* of
+  the graph into the equivalent properly-nested one and hands that to the
+  existing describer, so Mode 3 inherits every activity renderer, annotation and
+  layout rule and cannot drift from Mode 1.
+- **The folded split keeps its identity** — same `$ID`, position and annotations
+  — but its stored `Caption` is cleared: it labels the *original* guard, and
+  leaving it puts a second, wrong condition in the more prominent place.
+- **The entry merge is spliced out.** After folding it has one predecessor and
+  one successor, and describe → exec would delete it anyway; removing it in the
+  transform makes Mode 3's output describe exactly the graph re-executing it
+  builds.
+- **Refusals are per-decision and explained**, and the rest of the microflow
+  still renders: an activity in the region (would move a side effect), a
+  rule-based decision (a rule call cannot go inside an expression), and
+  interleaved branches.
+- **Verified behaviourally, not just algebraically.** `microflownorm`'s
+  simplifier is checked against truth tables over 3000 generated formulas (with
+  a deliberately broken rewrite rule as the control), and the whole pipeline
+  against a **real runtime**: the original graph and the microflow rebuilt from
+  its normalized description return the same value for all four inputs
+  (`mdl-examples/bug-tests/923-normalized-describe{,.test}.mdl`). The two
+  `$A = false` rows are exactly the ones the flattened Mode 1 rendering gets
+  wrong.
+
+The original sketch:
+
+Recombine guards into an equivalent nested form. For the reporter's graph,
+`¬c1 ∨ (c1 ∧ c2)` simplifies to `¬c1 ∨ c2` and the whole microflow collapses to:
+
+```sql
+if not(not(true)) or not(true) then
+  log info node 'NODE' 'Do something';
+end if;
+return true;
+```
+
+```sql
+describe microflow Test.Test_merge_boolean_codebug normalized;
+```
+
+**Opt-in is load-bearing, not a convenience.** `DESCRIBE` → edit → `EXEC` is used
+as a round-trip. Mode 3's output re-executes to a *different graph* — fewer nodes,
+different layout, equivalent behaviour. Silently reshaping someone's diagram
+because they asked to read it is its own guard-don't-drop violation. Someone
+describing a microflow to change one activity must not get their canvas rebuilt.
+
+## Can every graph be normalized? No — and the boundary is known
+
+This is Böhm–Jacopini (1966): any control flow can be expressed with
+sequence/selection/iteration, **but only if auxiliary boolean variables and/or
+node duplication are permitted**. Without those two, no.
+
+- **Recombinable** — the extra edges land on a shared *suffix*. The reporter's
+  case: `merge1 → log → merge2` is one tail reached by two paths, so folding the
+  guards costs nothing and duplicates nothing.
+- **Interleaved** — genuinely crossed. Canonically `A → {B, C}`, `B → {D, E}`,
+  `C → {D, E}`, where `D` runs iff `(a∧b) ∨ (¬a∧c)`. Nesting that requires either
+  duplicating `D` and `E` — in Mendix, **two log activities where the user drew
+  one** — or introducing a boolean temp the user never wrote. Both are model
+  rewrites, not descriptions, and both are refused.
+
+### Two preconditions before folding
+
+**Purity and ordering.** Mendix split conditions are pure expressions, so
+re-evaluating one is semantically safe. But the region being folded must contain
+**only splits and merges**. If split1's true branch runs `create object` before
+reaching split2, the guards cannot be folded without moving a side effect.
+Checkable on the graph; cheap.
+
+**Short-circuit evaluation — unresolved and load-bearing.** The original evaluates
+`c2` *only when `c1` is true*. The folded `¬c1 ∨ c2` may evaluate `c2`
+unconditionally. Mendix's reference guide documents `and`/`or` **without stating
+whether they short-circuit**. If they do not, and `c2` can fail — division by
+zero, or whatever the original guard was protecting against — normalization
+introduces an error the original avoided. This must be **measured on a real
+runtime** (`.claude/skills/verify-in-runtime.md`), not reasoned about, before Mode
+3 ships. If `or` turns out to be eager, Mode 3 is restricted to conditions proven
+total, or dropped.
+
+## Implementation Plan
+
+### Phase 0 — the detector, shipped first (gates everything else) — **DONE**
+
+Nothing can choose a rendering mode without knowing whether a graph is nested, and
+**no decision about how much machinery Modes 2 and 3 deserve should be made
+without prevalence data**. Phase 0 ships the detector as a lint rule so the scan
+below can be run against real projects.
+
+Detection, for each split `S` with join `J`: compute each branch's reachable set
+(`collectReachableDistances` already does this inside `findMergeForSplit`),
+excluding `J`. If any two branches' sets intersect, the region is not
+single-entry → irreducible. Cross-check: `findSplitMergePointsForGraph` and
+`commonMergeAfter` disagree on `S`.
+
+Classification for each irreducible split:
+
+- **recombinable** — the intersection contains only splits and merges;
+- **interleaved** — the intersection contains an activity, or the branches have
+  more than one shared entry point.
+
+### The prevalence scan
+
+```bash
+mxcli lint -p app.mpr -r MDL-FLOW01 --format json
+```
+
+Emit per finding: qualified microflow name, module, split position,
+classification, branch count, size of the overlap region. What the numbers decide:
+
+| Result | Consequence |
+|---|---|
+| Irreducible graphs are rare | Ship Mode 2 only; refuse the rest. Mode 3 not worth building. |
+| **Common and mostly *recombinable*** | **Mode 3 earns its cost; it is the pretty answer for most of them.** |
+| Common and mostly *interleaved* | Mode 2 is the whole feature; Mode 3 would rarely apply. |
+
+#### Measured, 2026-09-12
+
+Corpus: **555 microflows** across **10 Mendix-authored Marketplace modules**
+installed into one 11.6.6 project. Administration 4.3.2 and FeedbackModule 4.0.2
+ship with a blank app; the rest were installed with
+`mxcli marketplace install <id> -p app.mpr`:
+
+| Module | Content id | Version |
+|---|---:|---|
+| Workflow Commons | 117066 | 4.5.0 (newest built for 11.6.6) |
+| Email Connector | 120739 | 6.4.3 |
+| DatabaseReplication | 160 | 9.3.1 |
+| ExcelImporter | 72 | 11.2.2 |
+| Encryption | 1011 | 11.1.2 |
+| Audittrail | 138 | 10.2.2 |
+| Community Commons | 170 | 11.5.1 |
+
+Marketplace code was chosen
+over demo projects because the result is **reproducible by anyone** from a
+content id and a version, rather than resting on two numbers pasted into a doc.
+All 44 findings — module, microflow, class, branch count, overlap size, split
+position — are in
+[`data/flow01-prevalence-2026-09-12.json`](data/flow01-prevalence-2026-09-12.json),
+so the table below can be recomputed rather than taken on trust.
+
+| Module | Microflows | With a branching split | Flagged | recombinable | interleaved |
+|---|---:|---:|---:|---:|---:|
+| WorkflowCommons | 176 | 63 | 3 | 3 | 0 |
+| Email_Connector | 135 | 65 | 12 | 17 | 0 |
+| DatabaseReplication | 121 | 72 | 8 | 7 | 6 |
+| ExcelImporter | 79 | 37 | 6 | 4 | 3 |
+| Encryption | 16 | 6 | 1 | 1 | 0 |
+| AuditTrail | 8 | 3 | 0 | 0 | 0 |
+| Administration | 8 | 4 | 1 | 1 | 0 |
+| FeedbackModule | 7 | 3 | 1 | 2 | 0 |
+| CommunityCommons | 4 | 4 | 0 | 0 | 0 |
+| MyFirstModule | 1 | 0 | 0 | 0 | 0 |
+| **Total** | **555** | **257** | **32** | **35** | **9** |
+
+- **5.8 %** of all microflows are irreducible (32 / 555), and **12.5 %** of the
+  ones that actually branch (32 / 257). **7 of 10** modules contain at least one.
+- **44 findings** over those 32 microflows — a microflow can carry more than one
+  irreducible split. **80 % recombinable** (35), **20 % interleaved** (9).
+- Interleaved graphs cluster: all 9 are in DatabaseReplication (6) and
+  ExcelImporter (3). Both are old modules — 9.3.1 and a long lineage — which is
+  consistent with crossed flows being something that accretes under maintenance
+  rather than something anyone draws on purpose.
+
+**This is the middle row.** Irreducible graphs are not a curiosity — one in eight
+branching microflows written by Mendix's own teams cannot be described faithfully
+today — and they are overwhelmingly *recombinable*, which is the class Mode 3 can
+render as ordinary nested `if`s. So **Mode 3 earns its cost**, and Mode 2 is the
+honest fallback for the ~20 % that stay crossed. Scheduling is still a separate
+call; what is settled is that Mode 3 is not speculative work.
+
+Three caveats that matter more than the percentages:
+
+- **The shipped lint rule never sees this corpus.** `LintContext.Microflows()`
+  filters through `notPlatformModule`, so `mxcli lint` deliberately skips
+  Marketplace and System modules — linting code the user cannot edit would be
+  noise. The numbers above were obtained by bypassing that filter in a
+  throwaway build. The coverage that *does* reach these microflows is the
+  **describe-time warning**, which is not lint: describing
+  `Administration.ManageMyAccount` emits the #923 warning today. Prevalence in a
+  user's own modules is therefore still unmeasured, and may differ.
+- **Rules are not covered.** `FullMicroflow` returns nothing for the 5
+  `RULE`-typed flows (and the 39 nanoflows) in this project, so the rule skips
+  them silently. A rule is "a special kind of microflow" and can branch, so this
+  is a real gap in the detector's reach, not just in this measurement.
+- **Error-handler rejoins are excluded by construction, and are a separate
+  population needing the same syntax.** `successors()` in
+  `mdl/microflowgraph/structure.go` skips every flow with `IsErrorHandler` before
+  the graph is built, so an error path that rejoins the normal one contributes
+  **zero** to the 5.8 % — not because it is rare, but because the detector cannot
+  see it. Measured across three whole projects (ako/TestApp, CapTrack, RestLab —
+  235 microflows, so **user-written modules included**, unlike the table above):
+  7 microflows carry a true error-handler flow, and **1 of them rejoins the
+  normal path** — `FeedbackModule.SUB_Feedback_SendToServer`, in 3 of 3 projects,
+  always landing on a `Microflows$ExclusiveMerge`. That single microflow is what
+  DESCRIBE flattens into an empty `on error … { }` block, and what produced the
+  CE0709 over-connected end event fixed in #450. The control that the scan
+  discriminates rather than flagging every handler: the other 6 — including one
+  in an app module — terminate on their own end event and are not flagged, and
+  the same scan over the *mxcli-rewritten* copy of one project reports the rejoin
+  landing on an `EndEvent` instead of a merge, which is the #450 defect showing
+  up in the measurement. So the fix here is not "detect more": the syntax an
+  error rejoin needs is Mode 2's `merge`/`join` labels, reached by a different
+  route.
+
+Method and control, since a rule that never runs and a rule that finds nothing
+look identical: the scan was instrumented to report what it actually examined —
+`seen=599 loadfail=44 analysed=555 atrisk=257 branchingsplits=560 findings=44` —
+and the 44 load failures reconcile exactly with the catalog's 39 `NANOFLOW` + 5
+`RULE` rows, so all 555 microflows were genuinely walked. The discriminating
+control is a pair: `Administration.ManageMyAccount`, with **one** branching
+split, is flagged and warns on describe, while
+`Email_Connector.VAL_EmailTemplateRecipients`, with **ten**, is silent on both.
+The detector keys on branch *structure*, not on how much a microflow branches.
+
+### Files to modify/create
+
+| File | Change |
+|------|--------|
+| `mdl/executor/cmd_microflows_show.go` | `classifyBranchStructure()` — the detector, reusing `collectReachableDistances` |
+| `mdl/linter/rules/` | New rule `MDL-FLOW01`, reporting irreducible splits + classification (Phase 0) |
+| `mdl/executor/cmd_microflows_show.go` | Warning line when describing an irreducible graph, alongside `duplicateOutputVariableWarnings` (Phase 0) |
+| `mdl/grammar/domains/MDLMicroflow.g4` | `mergeStatement` / `joinStatement` rules (Phase 1) |
+| `mdl/ast/ast_microflow.go` | `MergeDeclaration`, `JoinStatement` nodes (Phase 1) |
+| `mdl/visitor/visitor_microflow_statements.go` | Parse-tree → AST (Phase 1) |
+| `mdl/executor/cmd_microflows_builder_flows.go` | Resolve label → target, wire arbitrary `SequenceFlow`s (Phase 1) |
+| `mdl/executor/cmd_microflows_show_helpers.go` | Emit the label form; retire `emitMergeAnnotation` for labelled output (Phase 1) |
+| `mdl/executor/validate_microflow_*.go` | Unresolved `join`, duplicate `merge` name, missing terminator (Phase 1) |
+| `mdl/executor/cmd_microflows_show.go` | `normalized` modifier + guard recombination (Phase 2) |
+| `cmd/mxcli/syntax/features_*.go` | `mxcli syntax microflow` entries for `merge`/`join` |
+| `docs-site/src/`, `.claude/skills/write-microflows.md` | User docs for the label form and when it appears |
+
+Phase 0 is independently shippable and is the fix for #923 on its own: it turns a
+silent semantic inversion into a named refusal. **Shipped**: `mdl/microflowgraph`
+(post-dominance, branch-body overlap, recombinable/interleaved classification),
+lint rule `MDL-FLOW01`, and a `-- WARNING:` line from `DESCRIBE MICROFLOW`.
+
+Two deviations from the plan above, both deliberate:
+
+- **The detector does not reuse `collectReachableDistances`.** Reusing the
+  describer's join search would have inherited whichever of its two
+  implementations is wrong on precisely the graphs being detected. Post-dominance
+  is self-contained, so a describer/detector disagreement is a signal. The
+  package also cannot live in `mdl/executor`, which already imports `mdl/linter`.
+- **The rule is not registered in `mxcli report`.** That report is a scored
+  best-practices grade; the model here is valid and builds cleanly, so docking a
+  project's score for an mxcli limitation would be wrong.
+
+Two more from Phase E, where the shipped syntax differs from the Mode 2 sketch
+above:
+
+- **`@position` goes BEFORE `merge <label>;`, not after it.** The sketch writes
+  `merge m1 @position(-200, 173);`. Every other MDL statement takes its
+  annotations on preceding lines, and the builder already moves the layout cursor
+  from `pendingAnnotations` before dispatching — so the prefix form needed no
+  special case and the suffix form would have needed one, in exchange for
+  breaking the pattern a reader has already learned.
+- **Fall-through into a `merge` is allowed, not an error.** The sketch requires
+  every path in a microflow containing any `merge` to end in `join`, `return` or
+  an end event. That was listed in Open Questions as the strict half of a choice,
+  and the permissive alternative is what shipped: `… ; merge m1; …` simply means
+  "and this path also arrives here", which is unambiguous because the inbound
+  edge is explicit in the text order. The rule that IS enforced is the one that
+  was actually a bug: a path that has already ended does not fall through into a
+  following `merge`, which was emitting a duplicate flow into it.
+
+### Phase E — error-handler rejoins
+
+The third caveat above is a separate population with its own phasing, because the
+detector cannot reach it and the failure mode is worse than the one Phase 0
+addresses. Where an irreducible split describes to MDL that is *unfaithful but
+visible* (the reader can see the structure was flattened), an error rejoin
+describes to MDL that is **wrong and indistinguishable from correct**.
+
+**The measurement.** Take `FeedbackModule.SUB_Feedback_SendToServer` and repoint
+its error edge from the tail merge to the merge just before the `AppId` split —
+i.e. from "on error, return empty" to "on error, re-enter the split". Two graphs,
+different behaviour. `DESCRIBE` emits **the same MDL for both**, differing only in
+a `@merge(230, 160)` layout annotation, with no warning; and executing that MDL
+produces the first graph in both cases. So the upstream rejoin is silently
+rewritten into a tail return, `mxcli check` is clean, the project opens and
+mxbuild is green. (The unmutated microflow round-trips correctly — error → merge →
+the same end event as the `else` branch — but by luck: the empty handler falls
+through to the enclosing branch's continuation, which happens to be that end
+event. That is also why #450's post-pass was enough to make it *buildable*.)
+
+**Shipped 2026-09-13.** E0 was subsumed rather than built: once DESCRIBE can
+*spell* the rejoin there is nothing to warn about, so the empty block became
+`join <label>` and the warning was not needed. E1 and E2 landed as described.
+Measured on the two fixtures above: the original and the repointed
+`SUB_Feedback_SendToServer` now describe **differently** (the `merge` declaration
+lands at (230, 160) and (-200, -50) respectively), each round-trips to its own
+graph — the repointed one keeps its loop back into the AppId split — and both are
+0 errors on mxbuild 11.14.0. describe → exec → describe is a fixed point for
+every error-handling form. What is NOT covered: a crossed-branch graph with no
+error handler, which is the general Mode 2 case and still warns.
+
+- **E0 — detect and warn (independently shippable).** Ask, of each custom error
+  handler, whether the node it reaches is reachable from the start over normal
+  edges only. If it is, the handler cannot be spelled: emit the `-- WARNING:` line
+  beside the #923 one, and a lint finding. The reachability query is on a graph
+  the describer already has in hand — `collectErrorHandlerStatements` computes
+  `firstReachableErrorHandlerMerge` today and then silently returns an empty
+  block. This turns a silent rewrite into a named refusal, the same move Phase 0
+  made for irreducible splits, and it is worth doing whether or not Mode 2 ships.
+- **E1 — spell it, as part of Mode 2's Phase 1.** `join <label>` inside an
+  `on error … { }` block, resolving to a `merge <label>` in the enclosing flow.
+  This needs no new syntax — only the scoping statement that the label namespace
+  is per-microflow rather than per-block, which the Mode 2 section should say
+  explicitly. Builder side, `newErrorHandlerFlow` already creates the edge; the
+  change is that its destination comes from label resolution instead of the
+  branch-continuation heuristic. Describe side, emit `join` when the handler's
+  first node is reachable from the start, and declare the merge at its stored
+  position.
+- **E2 — the round-trip test, on the mutated graph.** Describe → exec → describe
+  must be a fixed point *and* must preserve the error edge's destination. The
+  control is the experiment above: against E0/E1-less code the second describe
+  differs from the first in behaviour while matching it in text, which is exactly
+  what no existing test catches. `mergeOverConnectedEndEvents()` (#450) stays as
+  the safety net for hand-written MDL, but becomes a no-op on described output,
+  since a labelled join lands on a named merge and never over-connects.
+
+**What not to do:** include error edges in `successors()`. Post-dominance there
+treats every successor as a branch of a split's condition, which an error edge is
+not; folding them in would move the 5.8 % by reclassifying graphs, not by
+discovering any. Rejoin detection is a separate query over the same graph.
+
+**Recommendation:** do E0 now — it is small and closes a silent-behaviour-change
+class — and fold E1 into Mode 2's Phase 1 rather than scheduling it as its own
+feature.
+
+## Version Compatibility
+
+**No Mendix version gate.** `ExclusiveMerge` and arbitrary sequence flows exist in
+every supported version; this is a describe/parse-side concern. No entry in
+`sdk/versions/mendix-*.yaml` is needed.
+
+## Test Plan
+
+- **Unit, describer** — hand-built graphs via the existing
+  `mkID`/`mkObj`/`mkFlow`/`mkBranchFlow` harness (`cmd_microflows_unpaired_merge_test.go`
+  is the pattern). The reporter's exact graph is already reconstructed and
+  reproduces their output verbatim; it becomes the regression fixture.
+- **Control** — the same tests against the unfixed describer must show the
+  inversion (`log` unreachable). A detector that only passes on fixed code has not
+  been shown to detect anything.
+- **Negative control** — properly nested graphs, including an inner split whose
+  join *is* the outer's, must not be flagged and must describe byte-identically to
+  today. This is the regression risk of the whole proposal.
+- **Round-trip (Phase 1)** — describe → exec → describe on an irreducible graph
+  must be a fixpoint, and the second exec must not write (ADR-0008 elision), with
+  the `MXCLI_ALWAYS_WRITE=1` control run.
+- **`mx check`** — every generated form at 0 errors.
+- **Runtime (Phase 2 only)** — the short-circuit question above, settled by
+  booting an app and observing whether an erroring right operand is evaluated.
+  **Done** (2026-09-13): both operators short-circuit. Any such runtime probe
+  needs the positive control that forces the right operand to be reached —
+  otherwise a pass is explained just as well by the probe never throwing.
+- **Fixtures** — `mdl-examples/bug-tests/923-irreducible-microflow-graph.mdl`;
+  `923-short-circuit-semantics{,.test}.mdl` (shipped).
+
+## Open Questions
+
+None outstanding.
+
+### Settled
+
+- **`normalized` as an MDL modifier vs a CLI flag** (was Q3) — shipped as the
+  **modifier**, `DESCRIBE MICROFLOW Module.Name NORMALIZED`. It keeps the option
+  in the language, so it works in the REPL and in a script, and it is what this
+  proposal's own examples were written as. `NORMALIZED` is registered in
+  `keyword` as well as the lexer, so an element called "normalized" still
+  parses — the same treatment `MERGE` needed.
+
+- **Short-circuit semantics of `and`/`or`** (was Q1, blocked Mode 3) — **both
+  short-circuit**, so folding a guard does not introduce an evaluation the
+  original avoided and **Mode 3 is unblocked**. Measured on Mendix 11.14.0 on a
+  local runtime, 2026-09-13; fixtures
+  `mdl-examples/bug-tests/923-short-circuit-semantics{,.test}.mdl`.
+
+  The probe is integer division by zero in the right operand — the only
+  observable an expression can have, Mendix expressions being pure. What makes
+  it a measurement rather than an assumption is the pair of **positive
+  controls**: two tests that force the right operand to be reached and therefore
+  must throw. Without them, the short-circuit tests passing is equally well
+  explained by `1 div 0` being harmless, which would say nothing about
+  evaluation order. Both operands read microflow *parameters*, not literals, so
+  mxbuild cannot constant-fold the expression and turn the measurement into one
+  of its own folding.
+
+  This removes the restriction the proposal contemplated ("if `or` turns out to
+  be eager, Mode 3 is restricted to conditions proven total, or dropped"). The
+  *purity and ordering* precondition is untouched and still applies: the region
+  being folded must contain only splits and merges.
+
+- **Fall-through into a `merge`** (was Q2) — settled **permissive** when Phase E
+  shipped: a path that has already ended (`return`, `throw`, `join`) does not
+  fall through into a following `merge`, but an ordinary path does. The
+  ambiguity the strict form guarded against turned out to sit elsewhere — a
+  *terminated* path emitting a duplicate edge into a following merge — and that
+  is what is enforced.
+
+- **`canon.TransplantIDs` on unnamed merges** (was Q4) — **IDs survive**;
+  positional matching does not churn them, and Phase E's output is genuinely
+  idempotent. Measured 2026-09-13 on Mendix 11.14.0 four ways, each stronger
+  than the last: re-exec of identical MDL (write elided, `Unchanged
+  microflow`); a **forced write** under `MXCLI_ALWAYS_WRITE=1` (`Replaced` — so
+  elision is bypassed and the transplant is what preserves the IDs); a
+  describe → exec round trip; and an edit inserting an activity *before* the
+  merges, shifting every position. The forced-write run is the load-bearing one:
+  without it a passing test only shows the write was skipped.
+
+- **Verb choice** (was Q5) — `join`, shipped in Phase E.
+
+- **Loops** (was Q6) — a retry loop is expressible as a **backward `join`** to a
+  `merge` declared earlier, which is what Phase E's forward-and-backward label
+  resolution is for. `merge`/`join` inside a `loop`/`while` *body* is refused
+  (MDL-FLOW04): a `LoopedActivity` owns its own object collection and a sequence
+  flow cannot leave it, so there is no graph to build.
+
+## Known limitation: a merge outside both described forms is dropped
+
+`labelRejoinMerges` labels only the merges an error handler reaches *and* the
+normal path also reaches. Every other merge is left to the nested describer,
+which represents an `if`/`else` join implicitly and **walks straight through a
+merge with a single incoming path without representing it at all**. Such a merge
+is therefore deleted by a describe → exec round trip, silently — no
+`MDL-FLOW01`, no warning on exec, just `Replaced microflow` one node lighter.
+
+Measured 2026-09-13: a microflow authored with two merges (one a 2-input error
+rejoin, one a 1-input pass-through) describes to **one** `merge`, and executing
+that output leaves the model with one. The ordinary `if`/`else` merge is
+unaffected and round-trips with its `$ID` intact and the write elided.
+
+This predates `merge`/`join` — `DESCRIBE` never emitted merges before, so a
+Studio Pro-authored 1-input merge has always been dropped — but Phase E makes it
+reachable from MDL, so a user can now write `MERGE done;` and have their own
+syntax disappear on the next round trip. It is behaviourally harmless (a 1-input
+merge is a no-op) and does **not** affect the Phase E fixpoint claim: describe →
+exec → describe converges after one step (verified D1 = D2 = D3). The loss is on
+the first step, from the *authored graph* to D1.
+
+Deleting a node the user drew is what guard-don't-drop exists to prevent, so the
+candidate remedies are a **describe-time warning** when an `ExclusiveMerge` is
+not represented in the output (cheap, no behaviour change, consistent with
+MDL-FLOW01 warning rather than silently flattening) or emitting a label for every
+unrepresented merge (more faithful, noisier on every describe of a real
+microflow). Undecided.

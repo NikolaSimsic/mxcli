@@ -3,11 +3,13 @@
 package executor
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
 	"github.com/mendixlabs/mxcli/mdl/backend/mock"
 	"github.com/mendixlabs/mxcli/mdl/types"
+	"github.com/mendixlabs/mxcli/mdl/visitor"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
@@ -211,7 +213,7 @@ func TestMoveNanoflow_Mock(t *testing.T) {
 	withContainer(h, nf.ContainerID, mod.ID)
 
 	ctx, _ := newMockCtx(t, withBackend(mb), withHierarchy(h))
-	assertNoError(t, moveNanoflow(ctx, ast.QualifiedName{Module: "MyModule", Name: "NF_Move"}, folderID))
+	assertNoError(t, moveNanoflow(ctx, ast.QualifiedName{Module: "MyModule", Name: "NF_Move"}, folderID, nil, false))
 
 	if movedNF == nil {
 		t.Fatal("Expected MoveNanoflow to be called")
@@ -349,6 +351,7 @@ func TestValidateNanoflowBody_DisallowedActions(t *testing.T) {
 		{"ShowHomePage", &ast.ShowHomePageStmt{}, "SHOW HOME PAGE"},
 		{"RestCall", &ast.RestCallStmt{}, "REST"},
 		{"SendRestRequest", &ast.SendRestRequestStmt{}, "REST"},
+		{"SendEmail", &ast.SendEmailStmt{}, "SEND EMAIL"},
 		{"ImportFromMapping", &ast.ImportFromMappingStmt{}, "import mapping"},
 		{"ExportToMapping", &ast.ExportToMappingStmt{}, "export mapping"},
 		{"TransformJson", &ast.TransformJsonStmt{}, "JSON transformation"},
@@ -594,7 +597,7 @@ func TestMoveNanoflow_Mock_NotFound(t *testing.T) {
 	}
 
 	ctx, _ := newMockCtx(t, withBackend(mb), withHierarchy(h))
-	err := moveNanoflow(ctx, ast.QualifiedName{Module: "MyModule", Name: "Missing"}, "some-folder-id")
+	err := moveNanoflow(ctx, ast.QualifiedName{Module: "MyModule", Name: "Missing"}, "some-folder-id", nil, false)
 	assertError(t, err)
 }
 
@@ -917,4 +920,183 @@ func TestDescribeNanoflow_Mock_Excluded(t *testing.T) {
 
 	out := buf.String()
 	assertContainsStr(t, out, "@excluded")
+}
+
+// ako/mxcli#705: DESCRIBE must print a nanoflow's return variable (`as $Var`)
+// the way it does a microflow's, or re-executing the output drops it. Both
+// describe paths are checked — describe and the source-mapped variant behind
+// diff-local — since they render the header separately.
+func TestDescribeNanoflow_PrintsReturnVariable(t *testing.T) {
+	mod := mkModule("MyModule")
+	nf := mkNanoflow(mod.ID, "NF_Get")
+	nf.ReturnType = &microflows.StringType{}
+	nf.ReturnVariableName = "Feedback"
+
+	h := mkHierarchy(mod)
+	withContainer(h, nf.ContainerID, mod.ID)
+	mb := &mock.MockBackend{
+		IsConnectedFunc:      func() bool { return true },
+		ListNanoflowsFunc:    func() ([]*microflows.Nanoflow, error) { return []*microflows.Nanoflow{nf}, nil },
+		ListMicroflowsFunc:   func() ([]*microflows.Microflow, error) { return nil, nil },
+		ListDomainModelsFunc: func() ([]*domainmodel.DomainModel, error) { return nil, nil },
+		ListModulesFunc:      func() ([]*model.Module, error) { return []*model.Module{mod}, nil },
+	}
+	ctx, buf := newMockCtx(t, withBackend(mb), withHierarchy(h))
+	name := ast.QualifiedName{Module: "MyModule", Name: "NF_Get"}
+	assertNoError(t, describeNanoflow(ctx, name))
+	assertContainsStr(t, buf.String(), "returns String as $Feedback")
+
+	mdl, _, err := describeNanoflowToString(ctx, name)
+	assertNoError(t, err)
+	assertContainsStr(t, mdl, "returns String as $Feedback")
+}
+
+// The rebuild takes the return variable from the statement, and carries
+// MarkAsUsed — which it hardcoded to false, clearing Studio Pro's "Mark as used"
+// on every rewrite.
+func TestBuildNanoflow_ReturnVariableAndMarkAsUsed(t *testing.T) {
+	mod := mkModule("MyModule")
+	stored := mkNanoflow(mod.ID, "NF_Get")
+	stored.MarkAsUsed = true
+
+	h := mkHierarchy(mod)
+	withContainer(h, stored.ContainerID, mod.ID)
+	mb := &mock.MockBackend{
+		IsConnectedFunc:      func() bool { return true },
+		ListNanoflowsFunc:    func() ([]*microflows.Nanoflow, error) { return []*microflows.Nanoflow{stored}, nil },
+		ListMicroflowsFunc:   func() ([]*microflows.Microflow, error) { return nil, nil },
+		ListDomainModelsFunc: func() ([]*domainmodel.DomainModel, error) { return nil, nil },
+		ListModulesFunc:      func() ([]*model.Module, error) { return []*model.Module{mod}, nil },
+	}
+	ctx, _ := newMockCtx(t, withBackend(mb), withHierarchy(h))
+
+	stmt := firstStatement[*ast.CreateNanoflowStmt](t, `create or modify nanoflow MyModule.NF_Get ()
+returns String as $Result
+begin
+  return 'x';
+end;`)
+	built, err := buildNanoflowFromStmt(ctx, stmt, buildFlowOpts{})
+	assertNoError(t, err)
+	if got := built.Nanoflow.ReturnVariableName; got != "Result" {
+		t.Errorf("ReturnVariableName = %q, want the authored Result", got)
+	}
+	if !built.Nanoflow.MarkAsUsed {
+		t.Error("MarkAsUsed = false — the stored true was cleared by the rewrite")
+	}
+}
+
+// mendixlabs/mxcli#1345: describe nanoflow printed no grant line, so a
+// describe -> exec round trip left the nanoflow with no allowed roles.
+// Parse the output rather than grep it: the round trip is what was lost.
+func TestDescribeNanoflow_Mock_EmitsGrantForAllowedRoles(t *testing.T) {
+	mod := mkModule("Shop")
+	nf := mkNanoflow(mod.ID, "NF_Checkout")
+	nf.AllowedModuleRoles = []model.ID{"Shop.User", "Shop.Admin"}
+
+	h := mkHierarchy(mod)
+	withContainer(h, nf.ContainerID, mod.ID)
+
+	mb := &mock.MockBackend{
+		IsConnectedFunc:      func() bool { return true },
+		ListNanoflowsFunc:    func() ([]*microflows.Nanoflow, error) { return []*microflows.Nanoflow{nf}, nil },
+		ListDomainModelsFunc: func() ([]*domainmodel.DomainModel, error) { return nil, nil },
+		ListModulesFunc:      func() ([]*model.Module, error) { return []*model.Module{mod}, nil },
+	}
+
+	ctx, buf := newMockCtx(t, withBackend(mb), withHierarchy(h))
+	assertNoError(t, describeNanoflow(ctx, ast.QualifiedName{Module: "Shop", Name: "NF_Checkout"}))
+
+	out := buf.String()
+	prog, errs := visitor.Build(out)
+	if len(errs) > 0 {
+		t.Fatalf("describe output does not parse: %v\n%s", errs, out)
+	}
+	var grant *ast.GrantNanoflowAccessStmt
+	for _, stmt := range prog.Statements {
+		if g, ok := stmt.(*ast.GrantNanoflowAccessStmt); ok {
+			grant = g
+		}
+	}
+	if grant == nil {
+		t.Fatalf("describe nanoflow emitted no grant execute statement:\n%s", out)
+	}
+	if grant.Nanoflow.String() != "Shop.NF_Checkout" {
+		t.Errorf("grant targets %s, want Shop.NF_Checkout", grant.Nanoflow.String())
+	}
+	var roles []string
+	for _, r := range grant.Roles {
+		roles = append(roles, r.String())
+	}
+	if got := strings.Join(roles, ", "); got != "Shop.User, Shop.Admin" {
+		t.Errorf("grant roles = %q, want %q", got, "Shop.User, Shop.Admin")
+	}
+}
+
+// mendixlabs/mxcli#1498 (follow-up): `export level api` on a nanoflow parsed
+// and passed check, and exec stored Hidden — the clause never left the parser.
+func TestCreateNanoflow_ExportLevelReachesTheWriter(t *testing.T) {
+	var written *microflows.Nanoflow
+	modID := model.ID("mod-shop")
+	mod := &model.Module{BaseElement: model.BaseElement{ID: modID}, Name: "Shop"}
+	mb := &mock.MockBackend{
+		IsConnectedFunc:     func() bool { return true },
+		ListModulesFunc:     func() ([]*model.Module, error) { return []*model.Module{mod}, nil },
+		GetModuleByNameFunc: func(string) (*model.Module, error) { return mod, nil },
+		ListMicroflowsFunc:  func() ([]*microflows.Microflow, error) { return nil, nil },
+		ListNanoflowsFunc:   func() ([]*microflows.Nanoflow, error) { return nil, nil },
+		CreateNanoflowFunc:  func(nf *microflows.Nanoflow) error { written = nf; return nil },
+	}
+	ctx, _ := newMockCtx(t, withBackend(mb))
+	for _, tc := range []struct{ clause, want string }{
+		{"export level api", types.ExportLevelAPI},
+		{"export level hidden", types.ExportLevelHidden},
+		// Control: no clause authors nothing, so the stored level is carried.
+		{"", ""},
+	} {
+		written = nil
+		stmt := firstStatement[*ast.CreateNanoflowStmt](t, "create nanoflow Shop.NF_IsOpen ()\n"+tc.clause+"\nbegin\nend;")
+		if err := execCreateNanoflow(ctx, stmt); err != nil {
+			t.Fatalf("%q: %v", tc.clause, err)
+		}
+		if written == nil || written.ExportLevel != tc.want {
+			t.Errorf("%q: written ExportLevel = %+v, want %q", tc.clause, written, tc.want)
+		}
+	}
+}
+
+// DESCRIBE prints the clause for an API nanoflow, and only that clause: the
+// microflow-only concurrency and URL lines have no nanoflow property. Both
+// renderers are checked — `describe nanoflow` and the one `create or modify`
+// compares against — because they are separate code and only one was fixed at
+// first.
+func TestDescribeNanoflow_EmitsExportLevel(t *testing.T) {
+	for _, tc := range []struct{ level, want string }{
+		{"API", "export level api"},
+		// Control: Hidden is the default and is not printed.
+		{"Hidden", ""},
+	} {
+		mod := mkModule("Shop")
+		nf := mkNanoflow(mod.ID, "NF_IsOpen")
+		nf.ExportLevel = tc.level
+		h := mkHierarchy(mod)
+		withContainer(h, nf.ContainerID, mod.ID)
+		mb := &mock.MockBackend{
+			IsConnectedFunc:      func() bool { return true },
+			ListNanoflowsFunc:    func() ([]*microflows.Nanoflow, error) { return []*microflows.Nanoflow{nf}, nil },
+			ListDomainModelsFunc: func() ([]*domainmodel.DomainModel, error) { return nil, nil },
+			ListModulesFunc:      func() ([]*model.Module, error) { return []*model.Module{mod}, nil },
+		}
+		ctx, buf := newMockCtx(t, withBackend(mb), withHierarchy(h))
+		qn := ast.QualifiedName{Module: "Shop", Name: "NF_IsOpen"}
+		assertNoError(t, describeNanoflow(ctx, qn))
+		rendered := renderMicroflowMDL(ctx, "nanoflow", nanoflowAsMicroflow(nf), qn, nil, nil, nil)
+		for label, out := range map[string]string{"describe nanoflow": buf.String(), "modify comparison": rendered} {
+			if got := strings.Contains(out, "export level"); got != (tc.want != "") || (tc.want != "" && !strings.Contains(out, tc.want)) {
+				t.Errorf("%s, stored %s: want %q in\n%s", label, tc.level, tc.want, out)
+			}
+			if strings.Contains(out, "concurrent") {
+				t.Errorf("%s prints a concurrency clause a nanoflow cannot hold:\n%s", label, out)
+			}
+		}
+	}
 }

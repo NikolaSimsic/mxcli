@@ -32,6 +32,10 @@ and provides the following features:
   - Semantic diagnostics on save (reference validation via mxcli check)
   - Context-aware code completion (keywords, snippets)
   - Hover information for qualified names (via mxcli describe)
+  - The document's language version, read from its mdl <n>; header:
+    deprecated spellings (MDL-DEPR*) and changes of meaning (MDL-V1-*)
+    reported where check reports them, hover showing mxcli help <code>,
+    and a quick fix running the fmt --upgrade rewrite where there is one
   - Go-to-definition for qualified names (opens virtual MDL document)
   - Document symbols (outline of CREATE/ALTER/DROP statements)
   - Folding ranges (BEGIN/END, IF/END IF, braces, parens, comments)
@@ -62,13 +66,31 @@ type mdlServer struct {
 	widgetCompletionsOnce sync.Once
 	widgetCompletionItems []protocol.CompletionItem
 	widgetRegistry        *executor.WidgetRegistry // populated by the same Once
+
+	// Design-property (theme) registry cache (lazily populated once per session,
+	// keeping design-property file I/O out of the per-keystroke path).
+	themeRegistryOnce sync.Once
+	themeRegistry     *executor.ThemeRegistry
+
+	// codeActions remembers the project's Java/JavaScript action return types
+	// between keystrokes, for the flow rules' void-call handling (#962).
+	codeActions *executor.CodeActionCache
+}
+
+// ensureThemeRegistry loads the project's design-property registry once per
+// server lifetime. Nil when there is no project/themesource metadata.
+func (s *mdlServer) ensureThemeRegistry() {
+	s.themeRegistryOnce.Do(func() {
+		s.themeRegistry = executor.LoadThemeRegistryForProject(s.mprPath)
+	})
 }
 
 func newMDLServer(client protocol.Client) *mdlServer {
 	return &mdlServer{
-		client: client,
-		docs:   make(map[uri.URI]string),
-		cache:  newLSPCache(),
+		client:      client,
+		docs:        make(map[uri.URI]string),
+		cache:       newLSPCache(),
+		codeActions: executor.NewCodeActionCache(),
 	}
 }
 
@@ -157,7 +179,10 @@ func (s *mdlServer) Initialize(ctx context.Context, params *protocol.InitializeP
 			DocumentSymbolProvider: true,
 			FoldingRangeProvider:   true,
 			HoverProvider:          true,
-			DefinitionProvider:     true,
+			CodeActionProvider: &protocol.CodeActionOptions{
+				CodeActionKinds: []protocol.CodeActionKind{protocol.QuickFix},
+			},
+			DefinitionProvider: true,
 		},
 		ServerInfo: &protocol.ServerInfo{
 			Name:    "mdl-language-server",

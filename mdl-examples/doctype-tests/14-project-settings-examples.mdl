@@ -1,3 +1,4 @@
+mdl 1;
 -- ============================================================================
 -- Project Settings Examples - Comprehensive Parser Feature Showcase
 -- ============================================================================
@@ -27,25 +28,121 @@ create microflow MyModule.ASU_Startup() returns boolean
 begin
   return true;
 end;
-/
 
 /**
  * Example 1.1: Set after-startup microflow
  */
-alter settings model AfterStartupMicroflow = 'MyModule.ASU_Startup';
+alter settings runtime ( AfterStartupMicroflow: 'MyModule.ASU_Startup' );
 
 /**
- * Example 1.2: Configure hash algorithm and Java version
+ * Example 1.2: Configure the hash algorithm
  */
-alter settings model HashAlgorithm = 'BCrypt', JavaVersion = 'Java21';
+alter settings runtime ( HashAlgorithm: 'BCrypt' );
+
+-- The Java version is a model setting from Mendix 10.8 (on 9.x the platform
+-- picks the JDK, and mxcli refuses the alter -- mendixlabs/mxcli#1438), so it is
+-- its own gated statement rather than part of Example 1.2.
+-- @version: 10.8+
+/**
+ * Example 1.2b: Configure the Java version
+ *
+ * Either spelling of the Java version is accepted -- 'Java21' or '21'. Mendix
+ * stores it as "JavaVersion" = "Java21" up to 11.6 and as "JavaMajorVersion" =
+ * "21" from 11.12; mxcli writes whichever dialect the project already uses.
+ */
+alter settings runtime ( JavaVersion: 'Java21' );
+-- @version: any
 
 /**
  * Example 1.3: Multiple model settings at once
  */
-alter settings model
-  RoundingMode = 'HalfUp',
-  BcryptCost = 12,
-  AllowUserMultipleSessions = true;
+alter settings runtime (
+  RoundingMode: 'HalfUp',
+  BcryptCost: 12,
+  AllowUserMultipleSessions: true
+);
+
+/**
+ * Example 1.4: Enable optimistic locking
+ *
+ * Studio Pro calls this App Settings -> Runtime -> "Optimistic locking". The
+ * runtime then tracks an MxObjectVersion per persistable entity, and a commit
+ * whose version no longer matches the database throws
+ * ConcurrentModificationRuntimeException.
+ *
+ * Turn it on when a microflow reads a value, decides on it, and writes it back
+ * -- "check the balance, then debit it". A microflow is one transaction, so each
+ * run is atomic, but that does not make two concurrent runs serialisable: both
+ * can pass the check and the second overwrites the first. With this on, the
+ * second commit fails and its microflow rolls back instead of overdrawing.
+ *
+ * It detects rather than retries -- the handler must catch, reload the object,
+ * re-apply and re-commit.
+ */
+alter settings runtime ( EnableDataStorageOptimisticLocking: true );
+
+/**
+ * Example 1.5: The remaining runtime model settings
+ *
+ * FirstDayOfWeek (Default, Monday..Sunday) and SslCertificateAlgorithm (PKIX,
+ * SunX509) are enumerations -- matched case-insensitively and stored in Mendix's
+ * own spelling. A non-member is refused rather than written through, because an
+ * enum value the metamodel cannot resolve is what makes Studio Pro throw
+ * "Sequence contains no matching element".
+ *
+ * Which of these a project stores depends on its Mendix version: a blank 9.24
+ * project stores 12 model settings, a blank 11.13 stores 17. An alter naming one
+ * this project does not store is refused rather than introducing it.
+ *
+ * That refusal covers the WHOLE statement, so a version-specific setting has to
+ * be its own alter -- naming it alongside portable ones takes them down with it.
+ * These two are stored by every version in the test matrix, 9.24 included.
+ */
+alter settings runtime (
+  FirstDayOfWeek: 'Monday',
+  DefaultTimeZoneCode: 'Europe/Amsterdam'
+);
+
+-- UseDatabaseForeignKeyConstraints (10.6), UseOQLVersion2 (10.11) and
+-- SslCertificateAlgorithm (10.21) are absent from a 9.24 project; measured on a
+-- blank 10.24, all three are present and each accepted on its own.
+-- @version: 10.21+
+/**
+ * Example 1.5b: Runtime model settings newer versions store
+ */
+alter settings runtime (
+  UseDatabaseForeignKeyConstraints: true,
+  UseOQLVersion2: true,
+  SslCertificateAlgorithm: 'PKIX'
+);
+-- @version: any
+
+-- The @version directive opens the gated section, and everything up to the next
+-- directive is removed on a version that does not match. The `/** */` block
+-- below therefore sits INSIDE the section, not above it: a doc comment binds to
+-- the statement that follows it, so gating the statement while leaving the
+-- comment outside orphans it and the script stops parsing ("no viable
+-- alternative at input '/**...'"). Line comments like this one are free-standing
+-- and safe either side of the directive.
+-- @version: 11.0+
+/**
+ * Example 1.6: A setting older versions do not store
+ *
+ * DecimalScale is the one model setting a blank 11.6.6 project stores that a
+ * blank 10.24 does not -- measured: 11 settings against 12, and the only
+ * difference. Ungated, this line failed the 10.24 nightly on both engines.
+ *
+ * mxcli refused it correctly: Studio Pro will not open a model carrying a
+ * property its version does not define, and mxbuild does not catch it. The
+ * refusal covers the whole statement, which is why this is its own alter rather
+ * than one more line in the block above.
+ */
+alter settings runtime ( DecimalScale: 8 );
+-- @version: any
+
+-- Note: UseSystemContextForBackgroundTasks is read and preserved but NOT
+-- writable -- Mendix withdrew it, and mx check on 11.13 rejects a project
+-- holding true with CE9436 "not supported anymore".
 
 -- MARK: Configuration Settings
 
@@ -56,13 +153,14 @@ alter settings model
 /**
  * Example 2.1: Configure PostgreSQL database connection
  */
-alter settings configuration 'Default'
-  DatabaseType = 'PostgreSql',
-  DatabaseUrl = 'localhost:5432',
-  DatabaseName = 'myapp',
-  DatabaseUserName = 'mendix',
-  DatabasePassword = 'mendix',
-  HttpPortNumber = 8080;
+alter settings configuration 'Default' (
+  DatabaseType: 'PostgreSql',
+  DatabaseUrl: 'localhost:5432',
+  DatabaseName: 'myapp',
+  DatabaseUserName: 'mendix',
+  DatabasePassword: 'mendix',
+  HttpPortNumber: 8080
+);
 
 -- MARK: Constant Overrides
 
@@ -73,22 +171,22 @@ alter settings configuration 'Default'
 /**
  * Example 3.1: Override a constant value in a specific configuration
  */
-create constant MyModule.ServerUrl type string default 'localhost:9092';
-alter settings constant 'MyModule.ServerUrl' value 'kafka:9092'
+create constant MyModule.ServerUrl ( Type: string, DefaultValue: 'localhost:9092' );
+alter settings constant @MyModule.ServerUrl value 'kafka:9092'
   in configuration 'Default';
 
 /**
  * Example 3.2: Remove a constant override (reset to default)
  */
-alter settings drop constant 'MyModule.ServerUrl' in configuration 'Default';
+alter settings drop constant @MyModule.ServerUrl in configuration 'Default';
 
 /**
  * Example 3.3: Alternative syntax for removing a constant override
  * (Re-set the value first so there is something to drop)
  */
-alter settings constant 'MyModule.ServerUrl' value 'kafka:9092'
+alter settings constant @MyModule.ServerUrl value 'kafka:9092'
   in configuration 'Default';
-alter settings constant 'MyModule.ServerUrl' drop in configuration 'Default';
+alter settings constant @MyModule.ServerUrl drop in configuration 'Default';
 
 -- MARK: Create / Drop Configuration
 
@@ -104,11 +202,12 @@ create configuration 'Staging';
 /**
  * Example 3B.2: Create a configuration with properties
  */
-create configuration 'Production'
-  DatabaseType = 'POSTGRESQL',
-  DatabaseUrl = 'prod-db:5432',
-  DatabaseName = 'myapp_prod',
-  HttpPortNumber = 8080;
+create configuration 'Production' (
+  DatabaseType: 'POSTGRESQL',
+  DatabaseUrl: 'prod-db:5432',
+  DatabaseName: 'myapp_prod',
+  HttpPortNumber: 8080
+);
 
 /**
  * Example 3B.3: Drop a configuration
@@ -124,12 +223,59 @@ drop configuration 'Staging';
 /**
  * Example 4.1: Set default language
  */
-alter settings language DefaultLanguageCode = 'en_US';
+alter settings language ( DefaultLanguageCode: 'en_US' );
 
 /**
  * Example 4.2: Configure workflow settings
  */
-alter settings workflows UserEntity = 'System.User';
+alter settings workflows ( UserEntity: 'System.User' );
+
+-- Workflow groups (Settings$WorkflowGroup) are 11.2+ metamodel; mxcli refuses
+-- them on an older project, so Examples 4.3-4.7 are gated. Ungated, they
+-- failed the 10.24 nightly.
+-- @version: 11.2+
+/**
+ * Example 4.3: Add a workflow group (App Settings > Workflows > Groups)
+ *
+ * The named buckets a user task's group targeting selects from. Description is
+ * the only option — a Settings$WorkflowGroup stores Name and Description and
+ * nothing else — and the NAME is the group's identity, which is how MODIFY and
+ * REMOVE address one. Needs Mendix 11.2+.
+ */
+alter settings workflows add group 'Approvers' (Description: 'Primary approval group');
+alter settings workflows add group 'Reviewers';
+
+/**
+ * Example 4.4: Change a group's description
+ *
+ * Only the options the statement names are touched, so this cannot blank a
+ * description somebody wrote in Studio Pro.
+ */
+alter settings workflows modify group 'Reviewers' (Description: 'Second-line review');
+
+/**
+ * Example 4.5: Add or modify — what DESCRIBE SETTINGS emits
+ *
+ * Adds the group when it is absent and changes it when it is there, so a
+ * described project re-executes against itself without an error.
+ */
+alter settings workflows add or modify group 'Approvers' (Description: 'Approves budget requests');
+
+/**
+ * Example 4.6: List the groups
+ */
+list workflow groups;
+
+/**
+ * Example 4.7: Remove a group
+ *
+ * The model has no reference to a settings group — a user task targets groups
+ * through a microflow or an XPath returning System.WorkflowGroup objects — so
+ * there is nothing to dangle. The coupling is at runtime, where Mendix
+ * materialises one System.WorkflowGroup row per entry.
+ */
+alter settings workflows drop group 'Reviewers';
+-- @version: any
 
 -- ============================================================================
 -- SUMMARY
@@ -144,6 +290,8 @@ alter settings workflows UserEntity = 'System.User';
 -- DROP CONFIGURATION
 -- ALTER SETTINGS LANGUAGE
 -- ALTER SETTINGS WORKFLOWS
+-- ALTER SETTINGS WORKFLOWS ADD [OR MODIFY] / MODIFY / REMOVE GROUP (11.2+)
+-- SHOW WORKFLOW GROUPS
 -- SHOW SETTINGS / DESCRIBE SETTINGS (read-only)
 -- SHOW LANGUAGES (lists language codes with string counts; requires refresh catalog full)
 --

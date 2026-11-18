@@ -1,0 +1,321 @@
+// SPDX-License-Identifier: Apache-2.0
+
+// Package executor - CREATE/DROP JAVASCRIPT ACTION command handlers.
+package executor
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/mendixlabs/mxcli/mdl/ast"
+	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
+	"github.com/mendixlabs/mxcli/mdl/types"
+	"github.com/mendixlabs/mxcli/model"
+)
+
+// execCreateJavaScriptAction handles CREATE JAVASCRIPT ACTION statements. It
+// mirrors execCreateJavaAction, building a *types.JavaScriptAction (with the
+// JavaScript $Type names and a Platform) and writing the .js stub.
+func execCreateJavaScriptAction(ctx *ExecContext, s *ast.CreateJavaScriptActionStmt) error {
+	if !ctx.ConnectedForWrite() {
+		return mdlerrors.NewNotConnectedWrite()
+	}
+	// A parameter named with a platform-reserved word is CE7247 (MDL-PARAM01,
+	// ako/mxcli#1651) — refused here too, so --no-check cannot write it.
+	if err := refuseReservedParameterNames(s); err != nil {
+		return err
+	}
+	// A text template is a Java action type only (MDL-JSA01).
+	if bad := unsupportedJavaScriptActionTypes(s); len(bad) > 0 {
+		return mdlerrors.NewValidationf("%s", strings.Join(bad, "\n"))
+	}
+
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return mdlerrors.NewBackend("build hierarchy", err)
+	}
+
+	modules, err := ctx.Backend.ListModules()
+	if err != nil {
+		return mdlerrors.NewBackend("get modules", err)
+	}
+	var containerID model.ID
+	var moduleName string
+	for _, mod := range modules {
+		if mod.Name == s.Name.Module {
+			containerID = mod.ID
+			moduleName = mod.Name
+			break
+		}
+	}
+	if containerID == "" {
+		return mdlerrors.NewNotFound("module", s.Name.Module)
+	}
+
+	// A bare Module.Name in the signature is an entity or an enumeration, which
+	// only the project can say (ako/mxcli#935).
+	params, returnType, err := settleCodeActionSignature(ctx, "javascript action "+s.Name.String(), s.Parameters, s.ReturnType)
+	if err != nil {
+		return err
+	}
+
+	// Detect an existing action of the same name (for CREATE OR MODIFY).
+	existing, err := ctx.Backend.ListJavaScriptActions()
+	if err != nil {
+		return mdlerrors.NewBackend("list javascript actions", err)
+	}
+	var existingID model.ID
+	var existingContainer model.ID
+	// Target the live action and carry its exclusion forward (#914).
+	existingExcluded := false
+	var existingActionInfo *types.MicroflowActionInfo
+	var existingJSDoc string
+	haveExistingJS := false
+	// A parameter's Category has no MDL spelling, and its Description is set
+	// only by a `/** … */` before it, so a rewrite carries both from the stored
+	// parameter of the same name unless the statement says otherwise, as the
+	// Java twin does (#731, mendixlabs/mxcli#1588).
+	storedParams := map[string]*types.JavaActionParameter{}
+	// The stored parameter names in order, for sourceUnchanged below.
+	var storedParamNames []string
+	// The export level has no MDL spelling and the return value's name is set
+	// only by `returns T as $Name`, so a rewrite carries them; the defaults are
+	// Studio Pro's. "Public", which this hardcoded, is not a member of
+	// JavaScriptActionsExportLevel (API | Hidden) — see the Java twin.
+	exportLevel, defaultReturnName := "Hidden", "ReturnValueName"
+	if ex, ok := pickLive(existing,
+		func(a *types.JavaScriptAction) bool {
+			return h.GetModuleName(h.FindModuleID(a.ContainerID)) == s.Name.Module && a.Name == s.Name.Name
+		},
+		func(a *types.JavaScriptAction) bool { return a.Excluded },
+	); ok {
+		if !s.CreateOrModify {
+			return mdlerrors.NewAlreadyExists("javascript action", s.Name.Module+"."+s.Name.Name)
+		}
+		existingID = ex.ID
+		existingExcluded = ex.Excluded
+		existingContainer = ex.ContainerID
+		// The toolbox entry's four PNG bitmaps are not expressible in MDL, so
+		// they have to be carried rather than rebuilt.
+		existingActionInfo = ex.MicroflowActionInfo
+		existingJSDoc = ex.Documentation
+		haveExistingJS = true
+		if ex.ExportLevel != "" {
+			exportLevel = ex.ExportLevel
+		}
+		defaultReturnName = ex.ActionDefaultReturnName
+		// The list read may not carry parameter details; the full read does.
+		full := ex
+		if r, err := ctx.Backend.ReadJavaScriptActionByName(s.Name.Module + "." + s.Name.Name); err == nil && r != nil {
+			full = r
+		}
+		for _, p := range full.Parameters {
+			if p != nil {
+				storedParams[p.Name] = p
+				storedParamNames = append(storedParamNames, p.Name)
+			}
+		}
+	}
+
+	moduleID := containerID
+	containerID, err = containerForDocument(ctx, moduleID, s.Folder, existingContainer)
+	if err != nil {
+		return err
+	}
+
+	newID := model.ID(types.GenerateID())
+	if existingID != "" {
+		newID = existingID
+	}
+
+	if s.ReturnName != "" {
+		defaultReturnName = s.ReturnName
+	}
+
+	jsa := &types.JavaScriptAction{
+		BaseElement:             model.BaseElement{ID: newID, TypeName: "JavaScriptActions$JavaScriptAction"},
+		ContainerID:             containerID,
+		Name:                    s.Name.Name,
+		Documentation:           s.Documentation,
+		Excluded:                existingExcluded,
+		ExportLevel:             exportLevel,
+		ActionDefaultReturnName: defaultReturnName,
+		Platform:                platformOrDefault(s.Platform),
+	}
+	// A rewrite that carried no doc comment keeps the stored one (#1018).
+	if haveExistingJS {
+		jsa.Documentation = carriedDocumentation(s.DocumentationSet, s.Documentation, existingJSDoc)
+	}
+
+	// Type parameter definitions (with IDs for BY_ID references).
+	typeParamNameToID := make(map[string]model.ID)
+	typeParamNames := make(map[string]bool)
+	for _, tpName := range s.TypeParameters {
+		tpDef := &types.TypeParameterDef{
+			BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
+			Name:        tpName,
+		}
+		jsa.TypeParameters = append(jsa.TypeParameters, tpDef)
+		typeParamNameToID[tpName] = tpDef.ID
+		typeParamNames[tpName] = true
+	}
+
+	for _, param := range params {
+		p := &types.JavaActionParameter{
+			BaseElement: model.BaseElement{
+				ID:       model.ID(types.GenerateID()),
+				TypeName: "JavaScriptActions$JavaScriptActionParameter",
+			},
+			Name:       param.Name,
+			IsRequired: param.IsRequired,
+		}
+		switch {
+		case param.Type.Kind == ast.TypeEntityTypeParam:
+			tpName := param.Type.TypeParamName
+			p.ParameterType = &types.EntityTypeParameterType{
+				BaseElement:       model.BaseElement{ID: model.ID(types.GenerateID())},
+				TypeParameterID:   typeParamNameToID[tpName],
+				TypeParameterName: tpName,
+			}
+		case isTypeParamRef(param.Type, typeParamNames):
+			tpName := getTypeParamRefName(param.Type)
+			p.ParameterType = &types.TypeParameter{
+				BaseElement:     model.BaseElement{ID: model.ID(types.GenerateID())},
+				TypeParameterID: typeParamNameToID[tpName],
+				TypeParameter:   tpName,
+			}
+		default:
+			// `list of T` for a declared type parameter T, as for Java (#1183).
+			if l := listOfTypeParameter(param.Type, typeParamNameToID); l != nil {
+				p.ParameterType = l
+			} else {
+				p.ParameterType = astDataTypeToJavaActionParamType(param.Type)
+			}
+		}
+		var storedDescription string
+		if sp := storedParams[param.Name]; sp != nil {
+			storedDescription = sp.Description
+			p.Category = sp.Category
+		}
+		p.Description = carriedDocumentation(param.DescriptionSet, param.Description, storedDescription)
+		jsa.Parameters = append(jsa.Parameters, p)
+	}
+
+	if isTypeParamRef(returnType, typeParamNames) {
+		tpName := getTypeParamRefName(returnType)
+		jsa.ReturnType = &types.TypeParameter{
+			BaseElement:     model.BaseElement{ID: model.ID(types.GenerateID())},
+			TypeParameterID: typeParamNameToID[tpName],
+			TypeParameter:   tpName,
+		}
+	} else if l := listOfTypeParameter(returnType, typeParamNameToID); l != nil {
+		// `returns list of T` — without this it became a list of the entity `.T`,
+		// the JavaScript twin of the Java action's #1183.
+		jsa.ReturnType = l
+	} else {
+		if jsa.ReturnType, err = astDataTypeToJavaActionReturnType(returnType); err != nil {
+			return mdlerrors.NewValidationf("javascript action %s: %v", s.Name.String(), err)
+		}
+	}
+
+	if jsa.MicroflowActionInfo, err = mergeMicroflowActionInfo(ctx,
+		existingActionInfo, s.ExposedCaption, s.ExposedCategory, s.NotExposed,
+		s.ExposedBitmaps, exposeWarner(ctx)); err != nil {
+		return err
+	}
+
+	if existingID != "" {
+		if err := ctx.Backend.UpdateJavaScriptAction(jsa); err != nil {
+			return mdlerrors.NewBackend("update javascript action", err)
+		}
+		if _, err := applyDocumentFolder(ctx, jsa.ID, existingContainer, containerID); err != nil {
+			return err
+		}
+	} else {
+		if err := ctx.Backend.CreateJavaScriptAction(jsa); err != nil {
+			return mdlerrors.NewBackend("create javascript action", err)
+		}
+	}
+
+	// The placeholder DESCRIBE prints when it could not read the source is not
+	// code: writing it would overwrite the real implementation, or add a stub
+	// file to a project that ships none. The statement says nothing about the
+	// code, so the file is left alone (#731; the Java twin is #637).
+	//
+	// Likewise when the statement restates the stored user code with the stored
+	// parameters, as unchanged describe output does: regenerating the file
+	// re-spells Studio Pro's signature, which MDL cannot print (#731). Any write
+	// that does happen keeps the file's import list and EXTRA CODE section —
+	// WriteJavaScriptSourceFile retains them (mendixlabs/mxcli#1429).
+	keep := strings.TrimSpace(s.JavaScriptCode) == jsSourceOmittedBody ||
+		(existingID != "" && jsSourceUnchanged(ctx, s, storedParamNames))
+	if !keep {
+		if err := ctx.Backend.WriteJavaScriptSourceFile(moduleName, s.Name.Name, s.JavaScriptCode, jsa.Parameters, jsa.ReturnType); err != nil {
+			return mdlerrors.NewBackend("write javascript source file", err)
+		}
+	}
+
+	ctx.InvalidateCache()
+	if existingID != "" {
+		ctx.ReportMutation("Modified", "javascript action: %s.%s", s.Name.Module, s.Name.Name)
+	} else {
+		fmt.Fprintf(ctx.Output, "Created javascript action: %s.%s\n", s.Name.Module, s.Name.Name)
+	}
+	return nil
+}
+
+// execDropJavaScriptAction handles DROP JAVASCRIPT ACTION statements.
+func execDropJavaScriptAction(ctx *ExecContext, s *ast.DropJavaScriptActionStmt) error {
+	if !ctx.ConnectedForWrite() {
+		return mdlerrors.NewNotConnectedWrite()
+	}
+
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return mdlerrors.NewBackend("build hierarchy", err)
+	}
+
+	actions, err := ctx.Backend.ListJavaScriptActions()
+	if err != nil {
+		return mdlerrors.NewBackend("list javascript actions", err)
+	}
+	for _, jsa := range actions {
+		modName := h.GetModuleName(h.FindModuleID(jsa.ContainerID))
+		if modName == s.Name.Module && jsa.Name == s.Name.Name {
+			if err := ctx.Backend.DeleteJavaScriptAction(jsa.ID); err != nil {
+				return mdlerrors.NewBackend("delete javascript action", err)
+			}
+			if err := ctx.Backend.DeleteJavaScriptSourceFile(modName, jsa.Name); err != nil {
+				return mdlerrors.NewBackend("delete javascript source file", err)
+			}
+			ctx.InvalidateCache()
+			fmt.Fprintf(ctx.Output, "Dropped javascript action: %s.%s\n", s.Name.Module, s.Name.Name)
+			return nil
+		}
+	}
+	return mdlerrors.NewNotFound("javascript action", s.Name.Module+"."+s.Name.Name)
+}
+
+// platformOrDefault returns the platform value, defaulting to Web.
+func platformOrDefault(p string) string {
+	if p == "" {
+		return "Web"
+	}
+	return p
+}
+
+// jsSourceUnchanged reports whether s restates the existing action's .js source:
+// the same user code (as DESCRIBE reads it) and the same parameter names in
+// order, so a regenerated file would differ only in what MDL cannot carry.
+func jsSourceUnchanged(ctx *ExecContext, s *ast.CreateJavaScriptActionStmt, storedParamNames []string) bool {
+	if len(s.Parameters) != len(storedParamNames) {
+		return false
+	}
+	for i, p := range s.Parameters {
+		if p.Name != storedParamNames[i] {
+			return false
+		}
+	}
+	stored, _ := readJavaScriptActionSource(ctx.MprPath, s.Name.Module, s.Name.Name)
+	return stored != "" && strings.TrimSpace(stored) == strings.TrimSpace(s.JavaScriptCode)
+}

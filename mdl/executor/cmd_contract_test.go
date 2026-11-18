@@ -2,7 +2,14 @@
 
 package executor
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/mendixlabs/mxcli/mdl/backend/mock"
+	"github.com/mendixlabs/mxcli/mdl/types"
+	"github.com/mendixlabs/mxcli/model"
+	"github.com/mendixlabs/mxcli/sdk/domainmodel"
+)
 
 // TestAttrNameForOData_ReservedWords verifies that Mendix-reserved attribute
 // names are prefixed with the entity name so Studio Pro does not reject them.
@@ -16,8 +23,6 @@ func TestAttrNameForOData_ReservedWords(t *testing.T) {
 		// Already-covered names
 		{"Id", "Photo", "PhotoId"},
 		{"id", "Photo", "Photoid"},
-		{"Name", "Airline", "AirlineName"},
-		{"name", "Airline", "Airlinename"},
 		// Newly-added reserved names (issue #526)
 		{"Owner", "Trip", "TripOwner"},
 		{"owner", "Trip", "Tripowner"},
@@ -31,7 +36,13 @@ func TestAttrNameForOData_ReservedWords(t *testing.T) {
 		{"changeddate", "Event", "Eventchangeddate"},
 		{"CreatedDate", "Event", "EventCreatedDate"},
 		{"createddate", "Event", "Eventcreateddate"},
-		// Non-reserved names must pass through unchanged
+		// Non-reserved names must pass through unchanged. `name` belongs here:
+		// it was on the reserved list and is not reserved — verified on 11.12.1
+		// by importing a contract with a property per listed name and prefixing
+		// disabled, which produced CE7247 for every other name and nothing for
+		// this one (mxcli-formula1 #28).
+		{"Name", "Airline", "Name"},
+		{"name", "Airline", "name"},
 		{"AirlineCode", "Airline", "AirlineCode"},
 		{"Concurrency", "Airline", "Concurrency"},
 		{"FirstName", "Person", "FirstName"},
@@ -42,5 +53,154 @@ func TestAttrNameForOData_ReservedWords(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("attrNameForOData(%q, %q) = %q; want %q", tc.prop, tc.entity, got, tc.want)
 		}
+	}
+}
+
+// TestApplyExternalEntityFields_ConservativeCapabilityDefault guards the OData
+// capability defaulting: an entity set with no InsertRestrictions/
+// DeleteRestrictions annotation must import as Creatable/Deletable = false,
+// matching Mendix's conservative read-only default. Verified against the
+// TripPin RESTier service (zero capability annotations, entities Creatable=False
+// per mx check). An earlier permissive default caused CE6630 regressions.
+func TestApplyExternalEntityFields_ConservativeCapabilityDefault(t *testing.T) {
+	ent := &domainmodel.Entity{}
+	et := &types.EdmEntityType{Name: "Person"}
+	// entitySet with no Insertable/Deletable annotation (nil) — the TripPin case.
+	es := &types.EdmEntitySet{Name: "People"}
+
+	applyExternalEntityFields(ent, et, true /*isTopLevel*/, "Svc.TripPin", es, nil, nil)
+
+	if ent.Creatable {
+		t.Error("Creatable = true, want false (absent InsertRestrictions ⇒ conservative read-only)")
+	}
+	if ent.Deletable {
+		t.Error("Deletable = true, want false (absent DeleteRestrictions ⇒ conservative read-only)")
+	}
+
+	// An explicit annotation must turn the capability on.
+	on := true
+	es2 := &types.EdmEntitySet{Name: "People", Insertable: &on}
+	ent2 := &domainmodel.Entity{}
+	applyExternalEntityFields(ent2, et, true, "Svc.TripPin", es2, nil, nil)
+	if !ent2.Creatable {
+		t.Error("Creatable = false, want true (explicit InsertRestrictions=true)")
+	}
+}
+
+// TestCreateNavigationAssociations_NoDuplicateOnReimport guards against the
+// re-import duplication where each OData nav property spawned a numerically-
+// suffixed copy (Friends, Friends2, Friends3 …) on every import. A nav property
+// that already has an association must be skipped.
+func TestCreateNavigationAssociations_NoDuplicateOnReimport(t *testing.T) {
+	person := &types.EdmEntityType{
+		Name: "Person",
+		NavigationProperties: []*types.EdmNavigationProperty{
+			{Name: "Friends", Type: "Collection(NS.Person)"},
+			{Name: "BestFriend", Type: "NS.Person"},
+		},
+	}
+	doc := &types.EdmxDocument{
+		Schemas:    []*types.EdmSchema{{Namespace: "NS", EntityTypes: []*types.EdmEntityType{person}}},
+		EntitySets: []*types.EdmEntitySet{{Name: "People", EntityType: "NS.Person"}},
+	}
+	people := &domainmodel.Entity{Name: "Person", Persistable: true}
+	people.ID = model.ID("ent-people")
+	dm := &domainmodel.DomainModel{Entities: []*domainmodel.Entity{people}}
+	dm.ID = model.ID("dm-1")
+
+	typeByQualified := map[string]*types.EdmEntityType{"NS.Person": person}
+	esMap := map[string]string{"NS.Person": "People"}
+
+	var created []*domainmodel.Association
+	mb := &mock.MockBackend{
+		CreateAssociationFunc: func(_ model.ID, a *domainmodel.Association) error {
+			created = append(created, a)
+			return nil
+		},
+	}
+	ctx, _ := newMockCtx(t, withBackend(mb))
+
+	// First import creates both nav associations.
+	if n := createNavigationAssociations(ctx, dm, doc, typeByQualified, esMap, "TripPin.Client"); n != 2 {
+		t.Fatalf("first import created %d associations, want 2", n)
+	}
+	// Persist them into the domain model, as a re-read between imports would.
+	dm.Associations = append(dm.Associations, created...)
+	countAfterFirst := len(created)
+
+	// Second import must create nothing — no Friends2 / BestFriend2 duplicates.
+	if n := createNavigationAssociations(ctx, dm, doc, typeByQualified, esMap, "TripPin.Client"); n != 0 {
+		t.Errorf("re-import created %d associations, want 0 (duplicates)", n)
+	}
+	if extra := len(created) - countAfterFirst; extra != 0 {
+		t.Errorf("re-import persisted %d new associations via the backend, want 0", extra)
+	}
+}
+
+// TestMendixAttrTypeToEdm guards the Mendix→EDM type mapping used to populate a
+// published attribute's EdmType. Without it Studio Pro reports CE5016
+// ("published as .").
+//
+// Every row is now adjudicated by mxbuild rather than assumed: one attribute of
+// each type published in one service on 11.12.1, then the CE5016s read off the
+// build. This test previously pinned Integer to Edm.Int32, which was an
+// unverified guess and wrong — Mendix publishes Integer as Int64, so every whole
+// number in a published service failed the build (mxcli-formula1 #16).
+func TestMendixAttrTypeToEdm(t *testing.T) {
+	cases := []struct {
+		typ  domainmodel.AttributeType
+		want string
+	}{
+		{&domainmodel.StringAttributeType{}, "Edm.String"},
+		{&domainmodel.HashedStringAttributeType{}, "Edm.String"},
+		{&domainmodel.IntegerAttributeType{}, "Edm.Int64"},
+		{&domainmodel.LongAttributeType{}, "Edm.Int64"},
+		{&domainmodel.AutoNumberAttributeType{}, "Edm.Int64"},
+		{&domainmodel.DecimalAttributeType{}, "Edm.Decimal"},
+		{&domainmodel.BooleanAttributeType{}, "Edm.Boolean"},
+		{&domainmodel.DateTimeAttributeType{}, "Edm.DateTimeOffset"},
+		{&domainmodel.BinaryAttributeType{}, "Edm.Binary"}, // never reachable: CE5013 forbids exposing Binary at all
+		{&domainmodel.EnumerationAttributeType{}, "Edm.String"},
+		{nil, ""},
+	}
+	for _, c := range cases {
+		if got := mendixAttrTypeToEdm(c.typ); got != c.want {
+			t.Errorf("mendixAttrTypeToEdm(%T) = %q, want %q", c.typ, got, c.want)
+		}
+	}
+}
+
+// TestApplyExternalEntityFields_PreservesCreateChangeLocally is the re-import half
+// of mendixlabs/mxcli#782: "Allow creating and changing objects locally" is a local
+// modelling choice, not something the OData contract describes, so a re-import must
+// not reset it. The capability flags, which the contract *does* describe, are still
+// refreshed from the metadata.
+func TestApplyExternalEntityFields_PreservesCreateChangeLocally(t *testing.T) {
+	et := &types.EdmEntityType{Name: "Product"}
+	es := &types.EdmEntitySet{Name: "Products"}
+
+	// An entity the user had switched the flag on for, being re-imported.
+	existing := &domainmodel.Entity{CreateChangeLocally: true, Creatable: true}
+	applyExternalEntityFields(existing, et, true /*isTopLevel*/, "Svc.Sample", es, nil, nil)
+	if !existing.CreateChangeLocally {
+		t.Error("CreateChangeLocally reset by re-import, want it preserved (#782)")
+	}
+	if existing.Creatable {
+		t.Error("Creatable not refreshed from the contract (no InsertRestrictions ⇒ false)")
+	}
+
+	// A newly-imported entity defaults to off, matching Mendix.
+	fresh := &domainmodel.Entity{}
+	applyExternalEntityFields(fresh, et, true, "Svc.Sample", es, nil, nil)
+	if fresh.CreateChangeLocally {
+		t.Error("a newly imported entity defaulted to CreateChangeLocally = true")
+	}
+
+	// A derived/entity-type source has no such field in storage; clear it so a
+	// re-import that reclassifies an entity does not leave a stale value behind.
+	derived := &domainmodel.Entity{CreateChangeLocally: true}
+	applyExternalEntityFields(derived, et, false /*isTopLevel*/, "Svc.Sample", nil, nil, nil)
+	if derived.CreateChangeLocally {
+		t.Error("entity-type source kept CreateChangeLocally, want it cleared")
 	}
 }

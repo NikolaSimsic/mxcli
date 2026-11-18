@@ -10,7 +10,16 @@ import (
 // DomainModel represents a module's domain model containing entities and associations.
 type DomainModel struct {
 	model.BaseElement
-	ContainerID       model.ID                  `json:"containerId"`
+	ContainerID model.ID `json:"containerId"`
+	// Documentation is the domain model's own documentation — Studio Pro's
+	// "Documentation" pane with nothing selected on the canvas. It belongs to the
+	// DomainModels$DomainModel unit, not to the module: a Mendix module has no
+	// documentation property of its own (see linter.documentableSources).
+	//
+	// Read-only here. The write paths load the stored unit and mutate it in place,
+	// so the stored value is carried by construction; nothing writes this field
+	// back, and a semantic model that leaves it empty does not blank it.
+	Documentation     string                    `json:"documentation,omitempty"`
 	Entities          []*Entity                 `json:"entities,omitempty"`
 	Associations      []*Association            `json:"associations,omitempty"`
 	CrossAssociations []*CrossModuleAssociation `json:"crossAssociations,omitempty"`
@@ -51,6 +60,14 @@ type Entity struct {
 	Location         model.Point    `json:"location"`
 	Generalization   Generalization `json:"generalization,omitempty"`
 	GeneralizationID model.ID       `json:"generalizationId,omitempty"`
+
+	// ExportLevel is "Hidden" or "API" (Studio Pro's "Usable"). It only means
+	// something in a Protected (add-on) module, where a Hidden entity may not be
+	// referenced from outside it (CE1406) nor exposed by a Usable microflow
+	// (CE5400). The writer writes a set level and, for "", keeps the stored one
+	// (Hidden on a new entity) — the same holds for Attribute, Association and
+	// CrossModuleAssociation (mendixlabs/mxcli#1498).
+	ExportLevel string `json:"exportLevel,omitempty"`
 
 	// Persistability
 	Persistable bool `json:"persistable"`
@@ -168,6 +185,8 @@ type Attribute struct {
 	Documentation string          `json:"documentation,omitempty"`
 	Type          AttributeType   `json:"type"`
 	Value         *AttributeValue `json:"value,omitempty"`
+	// ExportLevel: see Entity.ExportLevel.
+	ExportLevel string `json:"exportLevel,omitempty"`
 
 	// External entity attribute fields (for OData remote entities).
 	// When RemoteName is set on an attribute of an external entity, the writer
@@ -322,22 +341,31 @@ type AttributeValue struct {
 	DefaultValue  string   `json:"defaultValue,omitempty"`
 	MicroflowID   model.ID `json:"microflowId,omitempty"`
 	MicroflowName string   `json:"microflowName,omitempty"` // Qualified name (e.g. "Module.Microflow") — BSON stores ByNameReference as string
-	ViewReference string   `json:"viewReference,omitempty"` // OQL column reference for view entity attributes
+	// PassEntity is DomainModels$CalculatedValue.PassEntity: whether the
+	// calculation microflow receives the owning entity as its parameter (#917).
+	PassEntity    bool   `json:"passEntity,omitempty"`
+	ViewReference string `json:"viewReference,omitempty"` // OQL column reference for view entity attributes
 }
 
 // Association represents an association between entities.
 type Association struct {
 	model.BaseElement
-	ContainerID      model.ID                 `json:"containerId"`
-	Name             string                   `json:"name"`
-	Documentation    string                   `json:"documentation,omitempty"`
-	ParentID         model.ID                 `json:"parentId"`
-	ChildID          model.ID                 `json:"childId"`
-	Type             AssociationType          `json:"type"`
-	Owner            AssociationOwner         `json:"owner"`
-	StorageFormat    AssociationStorageFormat `json:"storageFormat,omitempty"`
-	ParentConnection model.Point              `json:"parentConnection,omitempty"`
-	ChildConnection  model.Point              `json:"childConnection,omitempty"`
+	ContainerID   model.ID                 `json:"containerId"`
+	Name          string                   `json:"name"`
+	Documentation string                   `json:"documentation,omitempty"`
+	ParentID      model.ID                 `json:"parentId"`
+	ChildID       model.ID                 `json:"childId"`
+	Type          AssociationType          `json:"type"`
+	Owner         AssociationOwner         `json:"owner"`
+	StorageFormat AssociationStorageFormat `json:"storageFormat,omitempty"`
+	// ExportLevel: see Entity.ExportLevel.
+	ExportLevel string `json:"exportLevel,omitempty"`
+	// Line anchors in the domain model editor. Pointers because the zero Point
+	// is a legitimate anchor (top-left corner), so it cannot double as "unset";
+	// nil means nothing was stored and the writer uses DefaultParentConnection /
+	// DefaultChildConnection. See connection.go. (issue #872)
+	ParentConnection *model.Point `json:"parentConnection,omitempty"`
+	ChildConnection  *model.Point `json:"childConnection,omitempty"`
 
 	// Delete behavior
 	ParentDeleteBehavior *DeleteBehavior `json:"parentDeleteBehavior,omitempty"`
@@ -347,7 +375,25 @@ type Association struct {
 	// external entities). When Source = "Rest$ODataRemoteAssociationSource",
 	// the writer emits a Source block carrying the OData navigation property
 	// names instead of leaving the association as a plain persistent one.
-	Source                         string `json:"source,omitempty"`
+	//
+	// A VIEW ENTITY's association to a persistent entity uses the same slot,
+	// with Source = "DomainModels$OqlViewAssociationSource" and
+	// ViewSourceReference naming the OQL select alias it comes from. Measured on
+	// 11.13.0: that one subdocument is the whole difference between a model
+	// mxbuild accepts and one it refuses with CE6771 "It is not possible to
+	// create associations to/from View Entities" — and it also clears the
+	// CE6770 the id column otherwise causes on the view entity itself.
+	Source string `json:"source,omitempty"`
+
+	// ViewSourceReference is the OQL select alias an OqlViewAssociationSource
+	// points at. It equals the association's own Name in everything Studio Pro
+	// writes, but it is stored separately and read back separately: they are two
+	// different things (a name and a column reference), and treating them as one
+	// would silently rename the reference whenever the association is renamed.
+	ViewSourceReference string `json:"viewSourceReference,omitempty"`
+
+	// (see OqlViewAssociationSource for the $Type this Source takes)
+
 	RemoteParentNavigationProperty string `json:"remoteParentNavigationProperty,omitempty"`
 	RemoteChildNavigationProperty  string `json:"remoteChildNavigationProperty,omitempty"`
 	CreatableFromParent            bool   `json:"creatableFromParent,omitempty"`
@@ -356,6 +402,24 @@ type Association struct {
 	UpdatableFromChild             bool   `json:"updatableFromChild,omitempty"`
 	Navigability2                  string `json:"navigability2,omitempty"` // "ParentToChild" or "BothDirections"
 }
+
+// OqlViewAssociationSource is the Source $Type that makes an association to a
+// VIEW ENTITY legal, and the one thing that distinguishes it from an ordinary
+// persistent association.
+//
+// Measured on Mendix 11.13.0: adding exactly this subdocument — three keys,
+// $ID / $Type / Reference — takes a project from
+//
+//	[CE6771] "It is not possible to create associations to/from View Entities."
+//	[CE6770] "View Entity is out of sync with the OQL Query."
+//
+// to 0 errors. One field clears both, because the association is also what makes
+// the OQL's `<alias>.ID` select column legal on the view entity.
+//
+// It lives here, in the semantic model, rather than in either backend: both
+// engines write it and both read it, and a second copy of the string is how the
+// two would come to disagree.
+const OqlViewAssociationSource = "DomainModels$OqlViewAssociationSource"
 
 // GetName returns the association's name.
 func (a *Association) GetName() string {
@@ -395,6 +459,25 @@ const (
 type DeleteBehavior struct {
 	model.BaseElement
 	Type DeleteBehaviorType `json:"type"`
+	// ErrorMessage is the text the user sees when a DeleteMeIfNoReferences
+	// delete is refused — Studio Pro's "Error message if 'X' object cannot be
+	// deleted", which the dialog only shows once that behaviour is selected.
+	//
+	// It is stored as a Texts$Text, so it is translatable like any caption. Its
+	// absence is not cosmetic: an association with DeleteMeIfNoReferences and a
+	// null message stops the RUNTIME STARTING, which is a worse failure than a
+	// build error and names nothing about the model (CapTrackV2 §1).
+	ErrorMessage string `json:"errorMessage,omitempty"`
+	// ErrorMessageLanguage is the LanguageCode a write stores ErrorMessage
+	// under. The executor sets the project's default language, as for every
+	// other text it authors (mendixlabs/mxcli#970, #1344); empty means
+	// model.AuthoringLanguage, which is en_US until a project's settings are read.
+	ErrorMessageLanguage string `json:"errorMessageLanguage,omitempty"`
+	// ErrorMessageTranslations holds every translation the stored message
+	// carries, keyed by LanguageCode. Read side only: ErrorMessage alone cannot
+	// say which language it came from, so DESCRIBE could not pick the project's
+	// default language out of a text that has several.
+	ErrorMessageTranslations map[string]string `json:"-"`
 }
 
 // DeleteBehaviorType represents the type of delete behavior.
@@ -430,6 +513,17 @@ type IndexAttribute struct {
 	model.BaseElement
 	AttributeID model.ID `json:"attributeId"`
 	Ascending   bool     `json:"ascending"`
+	// Type is the segment kind Studio Pro stores (DomainModels$IndexedAttribute
+	// Type): "" or "Normal" for an attribute, "CreatedDate" / "ChangedDate" for
+	// the system member of that name, which is not an attribute of the entity
+	// and so has nothing behind AttributeID (mendixlabs/mxcli#1401).
+	Type string `json:"type,omitempty"`
+}
+
+// IsSystemMember reports whether the segment indexes a system date member
+// (createdDate / changedDate) rather than an attribute.
+func (ia *IndexAttribute) IsSystemMember() bool {
+	return ia.Type == "CreatedDate" || ia.Type == "ChangedDate"
 }
 
 // AccessRule represents an access rule for an entity.
@@ -492,20 +586,33 @@ type ValidationRuleInfo interface {
 }
 
 // RangeValidationRuleInfo represents a range validation.
+//
+// A bound is either a literal (MinValue/MaxValue) or another attribute of the
+// same entity (MinAttributeQualifiedName/MaxAttributeQualifiedName) — Mendix
+// stores both, and a reader that carried only the literals would silently drop
+// an attribute-bounded rule on the next rewrite. MDL can only author literal
+// bounds; the attribute fields exist so a stored rule survives a round trip.
 type RangeValidationRuleInfo struct {
 	model.BaseElement
-	MinValue    *string `json:"minValue,omitempty"`
-	MaxValue    *string `json:"maxValue,omitempty"`
-	UseMinValue bool    `json:"useMinValue"`
-	UseMaxValue bool    `json:"useMaxValue"`
+	MinValue                  *string `json:"minValue,omitempty"`
+	MaxValue                  *string `json:"maxValue,omitempty"`
+	UseMinValue               bool    `json:"useMinValue"`
+	UseMaxValue               bool    `json:"useMaxValue"`
+	MinAttributeQualifiedName string  `json:"minAttribute,omitempty"`
+	MaxAttributeQualifiedName string  `json:"maxAttribute,omitempty"`
 }
 
 func (RangeValidationRuleInfo) isValidationRuleInfo() {}
 
 // RegexValidationRuleInfo represents a regex validation.
+//
+// The rule points at a RegularExpressions$RegularExpression document by
+// QUALIFIED NAME, not by ID — Mendix stores it as a by-name reference under the
+// key "RegExIdentifier". (This field used to be a model.ID, which no reader
+// ever populated.)
 type RegexValidationRuleInfo struct {
 	model.BaseElement
-	RegularExpressionID model.ID `json:"regularExpressionId"`
+	RegularExpressionQualifiedName string `json:"regularExpression"`
 }
 
 func (RegexValidationRuleInfo) isValidationRuleInfo() {}
@@ -594,6 +701,17 @@ type CrossModuleAssociation struct {
 	StorageFormat        AssociationStorageFormat `json:"storageFormat,omitempty"`
 	ParentDeleteBehavior *DeleteBehavior          `json:"parentDeleteBehavior,omitempty"`
 	ChildDeleteBehavior  *DeleteBehavior          `json:"childDeleteBehavior,omitempty"`
+	// ExportLevel: see Entity.ExportLevel.
+	ExportLevel string `json:"exportLevel,omitempty"`
+
+	// Source / ViewSourceReference carry a view entity's OqlViewAssociationSource,
+	// exactly as on Association. A view entity's association is cross-module
+	// whenever the entity it points at lives elsewhere, which is the shape
+	// ako/view-entity-examples reported it in — so the two association types have
+	// to grow the field together or the fix works for one project layout and not
+	// the other.
+	Source              string `json:"source,omitempty"`
+	ViewSourceReference string `json:"viewSourceReference,omitempty"`
 }
 
 // GetName returns the cross-module association's name.

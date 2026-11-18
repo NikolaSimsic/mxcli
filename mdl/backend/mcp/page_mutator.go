@@ -14,7 +14,7 @@ import (
 
 // ALTER PAGE over MCP is a read-modify-write on pg's high-level content tree:
 // pg_read_page loads the current widget tree, the mutator edits it in memory, and
-// Save() writes it back with pg_write_page. This file implements the structural
+// Save() writes it back with pg_patch_page (a root-replace patch). This file implements the structural
 // operations (INSERT / DROP / REPLACE widget, SET DataSource, SET Layout) plus the
 // introspection the executor needs to build inserted widgets. Property-name
 // translation (SET <widget> (Prop: value)) and the column/design/pluggable/
@@ -35,26 +35,29 @@ func (b *Backend) OpenPageForMutation(unitID model.ID) (backend.PageMutator, err
 
 // resolvePageUnit maps a page unit ID to its module and page name (needed for the
 // pg_* tools, which are name-addressed). Saved pages come from the local reader;
-// pages created over MCP this session come from sessionPages.
+// pages created over MCP this session come from sessionPages. A page's ContainerID
+// is its immediate parent — usually a folder, not the module — so the module is
+// found by walking up the folder chain (mendixlabs/mxcli#1593).
 func (b *Backend) resolvePageUnit(unitID model.ID) (moduleName, pageName string, err error) {
-	for _, p := range b.sessionPages {
-		if p.ID == unitID {
-			mod, e := b.reader.GetModule(p.ContainerID)
-			if e != nil {
-				return "", "", e
-			}
-			return mod.Name, p.Name, nil
+	var p *pages.Page
+	for _, sp := range b.sessionPages {
+		if sp.ID == unitID {
+			p = sp
+			break
 		}
 	}
-	p, e := b.reader.GetPage(unitID)
-	if e != nil {
-		return "", "", fmt.Errorf("resolve page %s for mutation: %w", unitID, e)
+	if p == nil {
+		saved, e := b.reader.GetPage(unitID)
+		if e != nil {
+			return "", "", fmt.Errorf("resolve page %s for mutation: %w", unitID, e)
+		}
+		p = saved
 	}
-	mod, e := b.reader.GetModule(p.ContainerID)
+	mod, e := b.moduleNameForContainer(p.ContainerID)
 	if e != nil {
-		return "", "", e
+		return "", "", fmt.Errorf("resolve module of page %s: %w", p.Name, e)
 	}
-	return mod.Name, p.Name, nil
+	return mod, p.Name, nil
 }
 
 type mcpPageMutator struct {
@@ -194,6 +197,14 @@ func (m *mcpPageMutator) EnclosingEntityForChildren(widgetRef string) string {
 	return widgetEntity(w)
 }
 
+// EnclosingDataSourceFlow is a no-op for the MCP/PED backend: its model resolves
+// datasource entities directly via widgetEntity, so there is no flow-return
+// indirection to unwind. Returns "","" so the executor keeps the entity that
+// EnclosingEntity[ForChildren] already produced.
+func (m *mcpPageMutator) EnclosingDataSourceFlow(widgetRef string, forChildren bool) (string, string) {
+	return "", ""
+}
+
 // EnclosingEntity returns the entity context that surrounds a widget — the source
 // entity of the nearest data-bearing ancestor.
 func (m *mcpPageMutator) EnclosingEntity(widgetRef string) string {
@@ -228,6 +239,22 @@ func (m *mcpPageMutator) EnclosingEntity(widgetRef string) string {
 
 // --- structural mutations ---
 
+// SetWidgetAction is refused rather than approximated: the pg LightPage does not
+// expose a widget's on-click action, so there is nothing here to write it to.
+// Guard-don't-drop (ADR-0005) — an op the storage cannot express is an error,
+// not a silent no-op that reports success.
+func (m *mcpPageMutator) SetWidgetAction(widgetRef string, action pages.ClientAction) error {
+	return fmt.Errorf("setting a widget action is not supported by the MCP backend "+
+		"(the pg LightPage does not expose widget actions) — widget %q", widgetRef)
+}
+
+// SetWidgetNamedAction is refused for the same reason SetWidgetAction is: the
+// pg LightPage exposes no widget actions to write into.
+func (m *mcpPageMutator) SetWidgetNamedAction(widgetRef, propertyKey string, action pages.ClientAction) error {
+	return fmt.Errorf("setting a widget action is not supported by the MCP backend "+
+		"(the pg LightPage does not expose widget actions) — widget %q, slot %q", widgetRef, propertyKey)
+}
+
 func (m *mcpPageMutator) SetWidgetDataSource(widgetRef string, ds pages.DataSource) error {
 	_, _, _, w, ok := findWidget(m.content, widgetRef)
 	if !ok {
@@ -260,13 +287,23 @@ func (m *mcpPageMutator) InsertWidget(widgetRef string, columnRef string, positi
 	if columnRef != "" {
 		return fmt.Errorf("inserting into a column (%s.%s) is not yet supported by the MCP backend", widgetRef, columnRef)
 	}
-	parent, key, idx, _, ok := findWidget(m.content, widgetRef)
+	parent, key, idx, widget, ok := findWidget(m.content, widgetRef)
 	if !ok {
 		return fmt.Errorf("widget %q not found", widgetRef)
 	}
 	mapped, err := m.backend.mapPageWidgets(widgets)
 	if err != nil {
 		return err
+	}
+	// INSERT INTO: append as children of the target container itself.
+	if strings.EqualFold(string(position), "into") {
+		if _, hasChildren := widget["widgets"]; !hasChildren {
+			return fmt.Errorf("cannot INSERT INTO %q (%v): it has no direct child list — "+
+				"use INSERT BEFORE/AFTER a widget inside the target column or tab instead", widgetRef, widget["$Type"])
+		}
+		children, _ := widget["widgets"].([]any)
+		widget["widgets"] = append(append([]any{}, children...), mapped...)
+		return nil
 	}
 	arr, _ := parent[key].([]any)
 	at := idx
@@ -297,6 +334,12 @@ func (m *mcpPageMutator) DropWidget(refs []backend.WidgetRef) error {
 	return nil
 }
 
+// MoveWidget is not supported over MCP: Studio Pro's editor API offers no move
+// of an existing widget.
+func (m *mcpPageMutator) MoveWidget(widgetRef, destRef string, position backend.InsertPosition) error {
+	return fmt.Errorf("move/wrap of an existing widget is not yet supported by the MCP backend")
+}
+
 func (m *mcpPageMutator) ReplaceWidget(widgetRef string, columnRef string, widgets []pages.Widget) error {
 	if columnRef != "" {
 		return fmt.Errorf("replacing a column (%s.%s) is not yet supported by the MCP backend", widgetRef, columnRef)
@@ -323,6 +366,15 @@ func (m *mcpPageMutator) SetLayout(newLayout string, _ map[string]string) error 
 	return nil
 }
 
+// BoundPlaceholders returns nothing over MCP: the PED representation names the
+// layout but not the placeholder each widget group binds to, so there is no set
+// to report. Returning nil means the caller's repoint check has nothing to
+// verify and lets the statement through — the honest answer, since a wrong
+// non-empty list would refuse valid repoints.
+func (m *mcpPageMutator) BoundPlaceholders() []string {
+	return nil
+}
+
 func (m *mcpPageMutator) Save() error {
 	return m.backend.pgWritePage(m.moduleName, m.pageName, m.content)
 }
@@ -336,6 +388,12 @@ func (m *mcpPageMutator) Save() error {
 // ButtonStyle is normalized to pg's enum; Visible becomes a conditional-visibility
 // expression. Values arrive unquoted and typed (string / number / bool).
 func (m *mcpPageMutator) SetWidgetProperty(widgetRef, prop string, value any) error {
+	if widgetRef == "" {
+		// Page-level SET (no ON clause): Title, Url, PopupWidth/PopupHeight/
+		// PopupResizable, etc. These map onto the pg page object itself, not a
+		// widget.
+		return m.setPageLevelProperty(prop, value)
+	}
 	_, _, _, w, ok := findWidget(m.content, widgetRef)
 	if !ok {
 		return fmt.Errorf("widget %q not found", widgetRef)
@@ -381,6 +439,34 @@ func (m *mcpPageMutator) SetWidgetProperty(widgetRef, prop string, value any) er
 	return nil
 }
 
+// setPageLevelProperty applies a page-level SET (no widget target) onto the pg
+// LightPage content tree. Pages go through the pg_* protocol, not PED, so the
+// only page-level fields that can be set are the ones the LightPage exposes.
+//
+// The LightPage carries the page title as a plain top-level "title" string (the
+// same key CreatePage writes and pg_read_page returns). Url and the pop-up
+// settings (PopupWidth/Height/Resizable/CloseAction) are NOT part of the
+// LightPage shape — its schema is additionalProperties:false, so injecting those
+// keys would make pg_patch_page reject the whole root-replace patch (taking any
+// bundled Title change down with it). They are rejected here, before Save(), so
+// they never poison the content tree; set them in Studio Pro. (If a future pg
+// server exposes them on the LightPage, add the mapping here.)
+func (m *mcpPageMutator) setPageLevelProperty(prop string, value any) error {
+	switch strings.ToLower(prop) {
+	case "title":
+		s, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("page Title must be a string, got %T", value)
+		}
+		m.content["title"] = s
+		return nil
+	default:
+		return fmt.Errorf("setting page-level property %q is not supported by the MCP backend "+
+			"(pages go through the pg_* tools, not PED; the pg LightPage exposes only the page Title at page level — "+
+			"set Url and pop-up settings in Studio Pro)", prop)
+	}
+}
+
 func toStr(v any) string {
 	if s, ok := v.(string); ok {
 		return s
@@ -419,6 +505,31 @@ func (m *mcpPageMutator) SetColumnProperty(gridRef, columnRef, prop string, _ an
 
 func (m *mcpPageMutator) InsertColumns(gridRef, afterColumnRef string, _ backend.InsertPosition, _ []*backend.DataGridColumnSpec) error {
 	return fmt.Errorf("inserting columns into %s is not yet supported by the MCP backend", gridRef)
+}
+
+func (m *mcpPageMutator) InsertListViewTemplates(listViewRef string, _ []*pages.ListViewTemplate) error {
+	return fmt.Errorf("adding specialization templates to %s is not yet supported by the MCP backend", listViewRef)
+}
+
+func (m *mcpPageMutator) InsertTabPages(targetRef string, _ backend.InsertPosition, _ []*pages.TabPage) error {
+	return fmt.Errorf("adding tab pages at %s is not yet supported by the MCP backend", targetRef)
+}
+
+func (m *mcpPageMutator) InsertLayoutGridRows(gridRef string, _ []*pages.LayoutGridRow) error {
+	return fmt.Errorf("adding layout grid rows to %s is not yet supported by the MCP backend", gridRef)
+}
+
+func (m *mcpPageMutator) InsertNavigationListItems(targetRef string, _ backend.InsertPosition, _ []*pages.NavigationListItem) error {
+	return fmt.Errorf("adding navigation list items at %s is not yet supported by the MCP backend", targetRef)
+}
+
+func (m *mcpPageMutator) ReplaceNavigationListItem(targetRef string, _ []*pages.NavigationListItem) error {
+	return fmt.Errorf("replacing navigation list item %s is not yet supported by the MCP backend", targetRef)
+}
+
+func (m *mcpPageMutator) DropListViewTemplate(listViewRef, specialization string) error {
+	return fmt.Errorf("dropping the %s template from %s is not yet supported by the MCP backend",
+		specialization, listViewRef)
 }
 
 func (m *mcpPageMutator) ReplaceColumn(gridRef, columnRef string, _ []*backend.DataGridColumnSpec) error {
@@ -504,4 +615,31 @@ func (m *mcpPageMutator) AddVariable(name, _, _ string) error {
 
 func (m *mcpPageMutator) DropVariable(name string) error {
 	return fmt.Errorf("dropping page variable %q is not yet supported by the MCP backend", name)
+}
+
+func (m *mcpPageMutator) AddParameter(param backend.PageParameterSpec) error {
+	return fmt.Errorf("adding page parameter %q is not yet supported by the MCP backend", param.Name)
+}
+
+func (m *mcpPageMutator) DropParameter(name string) error {
+	return fmt.Errorf("dropping page parameter %q is not yet supported by the MCP backend", name)
+}
+
+// ResolveAlterTarget is the MCP page mutator's backend.AlterTargetResolver.
+// It addresses what this backend can edit — a widget by name — and says so
+// explicitly for a dotted `grid.Column` / `container.region` address, which no
+// operation over MCP supports yet, rather than letting each operation fail
+// differently.
+func (m *mcpPageMutator) ResolveAlterTarget(t backend.AlterTarget) (backend.AlterTargetMatch, error) {
+	if err := backend.CheckPageAlterTarget(t); err != nil {
+		return backend.AlterTargetMatch{}, err
+	}
+	if len(t.Path) == 2 {
+		return backend.AlterTargetMatch{}, fmt.Errorf(
+			"alter target %s: addressing a column or region is not yet supported by the MCP backend", t)
+	}
+	if _, _, _, _, ok := findWidget(m.content, t.Path[0]); !ok {
+		return backend.AlterTargetMatch{}, fmt.Errorf("widget %q not found", t.Path[0])
+	}
+	return backend.AlterTargetMatch{Kind: "widget", Name: t.Path[0]}, nil
 }

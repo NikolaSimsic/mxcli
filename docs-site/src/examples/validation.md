@@ -43,7 +43,7 @@ BEGIN
 
   RETURN $IsValid;
 END;
-/
+
 ```
 
 ## The Action Microflow
@@ -54,7 +54,7 @@ The action microflow calls validation, and only saves if it passes:
 CREATE MICROFLOW Sales.ACT_Order_Save ($Order: Sales.Order)
 RETURNS Boolean AS $IsValid
 BEGIN
-  $IsValid = CALL MICROFLOW Sales.VAL_Order($param = $Order);
+  $IsValid = CALL MICROFLOW Sales.VAL_Order(param = $Order);
 
   IF $IsValid THEN
     COMMIT $Order;
@@ -63,7 +63,7 @@ BEGIN
 
   RETURN $IsValid;
 END;
-/
+
 ```
 
 ## Wiring It Up
@@ -72,30 +72,30 @@ The page's Save button calls the action microflow (not the validation microflow 
 
 ```sql
 CREATE PAGE Sales.Order_Edit (
-  Params: { $Order: Sales.Order },
+  Params: ( $Order: Sales.Order ),
   Title: 'Order',
   Layout: Atlas_Core.PopupLayout
 ) {
   LAYOUTGRID mainGrid {
-    ROW row1 {
-      COLUMN col1 (DesktopWidth: AutoFill) {
+    ROW {
+      COLUMN (DesktopWidth: AutoFill) {
         DATAVIEW dv (DataSource: $Order) {
           TEXTBOX txtOrderNumber (Label: 'Order Number', Attribute: OrderNumber)
           DATEPICKER dpDelivery (Label: 'Delivery Date', Attribute: DeliveryDate)
           TEXTBOX txtQuantity (Label: 'Quantity', Attribute: Quantity)
           TEXTBOX txtDiscount (Label: 'Discount %', Attribute: DiscountPercent)
-          FOOTER footer1 {
+          FOOTER {
             ACTIONBUTTON btnSave (
               Caption: 'Save',
-              Action: CALL Sales.ACT_Order_Save,
+              Action: CALL MICROFLOW Sales.ACT_Order_Save,
               ButtonStyle: Success
             )
-            ACTIONBUTTON btnCancel (Caption: 'Cancel', Action: CANCEL_CHANGES)
+            ACTIONBUTTON btnCancel (Caption: 'Cancel', Action: CANCEL CHANGES)
           }
         }
       }
     }
   }
 };
-/
+
 ```

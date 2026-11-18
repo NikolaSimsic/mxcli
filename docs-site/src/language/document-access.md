@@ -1,6 +1,8 @@
 # Microflow, Page, and Nanoflow Access
 
-Document-level access controls which module roles can execute microflows and nanoflows or view pages. Without an explicit grant, a document is inaccessible to all roles.
+Document-level access controls which module roles can execute microflows and nanoflows or view pages. GRANT adds roles and REVOKE removes them; neither replaces the list.
+
+A new page, microflow or nanoflow has no allowed roles until you grant some, in every module: mxcli never creates a module role on its own. In a module with no module roles yet, create one first (`create module role <Module>.User;`) and map it into a user role. See [GRANT](../reference/security/grant.md#default-access-of-a-new-page-microflow-or-nanoflow).
 
 ## Microflow Access
 
@@ -13,6 +15,7 @@ GRANT EXECUTE ON MICROFLOW <Module>.<Name> TO <Module>.<Role> [, ...];
 Examples:
 
 ```sql
+mdl 1;
 -- Single role
 GRANT EXECUTE ON MICROFLOW Shop.ACT_ProcessOrder TO Shop.Admin;
 
@@ -43,6 +46,7 @@ GRANT VIEW ON PAGE <Module>.<Name> TO <Module>.<Role> [, ...];
 Examples:
 
 ```sql
+mdl 1;
 GRANT VIEW ON PAGE Shop.Order_Overview TO Shop.User, Shop.Admin;
 GRANT VIEW ON PAGE Shop.Admin_Dashboard TO Shop.Admin;
 ```
@@ -64,6 +68,7 @@ REVOKE VIEW ON PAGE Shop.Admin_Dashboard FROM Shop.User;
 Nanoflow access uses the same syntax as microflow access:
 
 ```sql
+mdl 1;
 GRANT EXECUTE ON NANOFLOW Shop.NAV_Filter TO Shop.User, Shop.Admin;
 REVOKE EXECUTE ON NANOFLOW Shop.NAV_Filter FROM Shop.User;
 ```
@@ -71,8 +76,8 @@ REVOKE EXECUTE ON NANOFLOW Shop.NAV_Filter FROM Shop.User;
 ## Viewing Document Access
 
 ```sql
-SHOW ACCESS ON MICROFLOW Shop.ACT_ProcessOrder;
-SHOW ACCESS ON PAGE Shop.Order_Overview;
+LIST ACCESS ON MICROFLOW Shop.ACT_ProcessOrder;
+LIST ACCESS ON PAGE Shop.Order_Overview;
 ```
 
 ## Typical Pattern
@@ -94,7 +99,7 @@ GRANT EXECUTE ON MICROFLOW Shop.ACT_CreateOrder TO Shop.User, Shop.Admin;
 
 -- Create the page
 CREATE PAGE Shop.Order_Edit (
-  Params: { $Order: Shop.Order },
+  Params: ( $Order: Shop.Order ),
   Title: 'Edit Order',
   Layout: Atlas_Core.PopupLayout
 ) { ... }

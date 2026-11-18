@@ -1,3 +1,8 @@
+---
+description: Check the project for naming, security and best-practice issues
+argument-hint: [--format json|sarif]
+---
+
 # Lint Project
 
 Check a Mendix project for common issues like naming convention violations, security gaps, and best practice deviations.
@@ -22,6 +27,10 @@ mxcli lint -p app.mpr --list-rules
 
 # Exclude modules
 mxcli lint -p app.mpr --exclude System --exclude Administration
+
+# Only findings not in a recorded baseline (record it once with --update-baseline)
+mxcli lint -p app.mpr --baseline lint-baseline.json --update-baseline
+mxcli lint -p app.mpr --baseline lint-baseline.json
 ```
 
 ## Built-in Go Rules
@@ -34,14 +43,23 @@ mxcli lint -p app.mpr --exclude System --exclude Administration
 | MPR004 | quality | ValidationFeedback - Validation feedback with empty message |
 | MPR005 | quality | ImageSource - IMAGE widgets with no source configured |
 | MPR006 | quality | EmptyContainer - Empty layout containers |
-| MPR007 | security | PageNavigationSecurity - Navigation pages need allowed roles (CE0557) |
+| MPR007 | security | PageNavigationSecurity - Navigation pages need allowed roles (CE0557); every user role must be able to open its home page (at Production security, else CE2729 per widget) |
+| MPR012 | correctness | ReactUnsupportedWidget - static/dynamic image, drop-down, legacy data grid and reference selector are unsupported by the React client (CE0582; info on the classic client) |
+| MPR013 | correctness | SnippetCallAppearance - Class/Style/DynamicClasses/design properties on a snippet call never reach the page (it renders no element) |
+| MPR014 | correctness | AgentWithoutSelectedModel - an agent with no selected model, which Agent Editor 2.2+ refuses at startup, stopping the import of every agent (not reported for AgentEditorCommons before 2.2) |
+| MPR015 | correctness | ConsumedMCPServiceWithoutEndpoint - a consumed MCP service with no endpoint constant, which Agent Editor skips at startup |
 | SEC001 | security | NoEntityAccessRules - Persistent entities need access rules |
 | SEC002 | security | WeakPasswordPolicy - Password minimum length should be 8+ |
 | SEC003 | security | DemoUsersActive - Demo users should be off at Production security |
-| CONV011 | performance | NoCommitInLoop - Commit actions inside loops cause N+1 issues |
+| SEC010 | security | PageEntityNotReadable - A page data widget lists an entity the user roles that open the page cannot read; at Production it renders empty, silently (info when only row-scoped) |
+| SEC011 | security | XPathAssociationNotReadable - A page data source's XPath crosses an association a role that opens the page may not read; at Production the page fails to open ("No access rights for …") |
+| SEC012 | security | ReachablePageNotReadable - A page a user role can reach shows an attribute or lists an entity the role may not read (mxbuild CE2729), found before a build |
+| CONV011 | performance | NoCommitInLoop - Commits inside loops (commit actions, or create/change with commit) cause N+1 issues |
 | CONV012 | quality | ExclusiveSplitCaption - Exclusive splits need meaningful captions |
 | CONV013 | quality | ErrorHandlingOnCalls - External calls (REST/WS/Java) need custom error handling |
 | CONV014 | quality | NoContinueErrorHandling - Don't silently swallow errors with Continue |
+| CONV020 | quality | CreatedObjectNeverPersisted - A microflow creates a persistent object without commit and never commits, returns or passes it on, so it is discarded |
+| CONV021 | quality | CreateChangeThenCommit - A create/change without commit directly followed by a Commit of the same object; set Commit on the create/change instead |
 
 ## Bundled Starlark Rules
 

@@ -1,3 +1,4 @@
+mdl 1;
 -- Bug test: SHOW_PAGE inside a widget action must not produce null PageParameterMapping.Variable.
 -- Issue #295: buttons calling SHOW_PAGE with a variable argument serialized
 -- Variable: null in BSON (Forms$PageParameterMapping), causing Studio Pro to throw:
@@ -14,15 +15,17 @@ create persistent entity bug295.Product (
   /** Auto-incrementing product ID */
   ProductId: autonumber default 1,
   /** Product name (required) */
-  Name: string(200) not null error 'Product name is required'
+  Name: string(200) not null error message 'Product name is required'
 );
 
 -- Target page that accepts an entity parameter.
 CREATE PAGE bug295.Product_Detail (
   Title: 'Product Detail',
-  Url: 'Product_Detail',
+  -- The URL needs a segment per page parameter or MxBuild reports CE5601
+  -- (flagged by MDL-PAGE20); this page takes $Product.
+  Url: 'Product_Detail/{Product}',
   layout: Atlas_Core.Atlas_Default,
-  Params: { $Product: bug295.Product }
+  Params: ( $Product: bug295.Product )
 ) {
   DATAVIEW dv1 (DataSource: $Product) {
     DYNAMICTEXT txt1 (Content: '$Product/Name')
@@ -41,11 +44,11 @@ CREATE PAGE bug295.Product_Overview (
     DataSource: bug295.Product,
     Caption: 'Products'
   ) {
-    COLUMN colName (Attribute: Name, Caption: 'Name')
-    COLUMN colActions (Caption: 'Actions') {
+    COLUMN (Attribute: Name, Caption: 'Name')
+    COLUMN (Caption: 'Actions') {
       ACTIONBUTTON btnDetail (
         Caption: 'Detail',
-        Action: SHOW_PAGE bug295.Product_Detail (Product: $currentObject)
+        Action: SHOW PAGE bug295.Product_Detail (Product = $currentObject)
       )
     }
   }

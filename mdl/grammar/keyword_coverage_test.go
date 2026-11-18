@@ -27,7 +27,7 @@ func TestKeywordRuleCoverage(t *testing.T) {
 		// Literals
 		"STRING_LITERAL": true, "DOLLAR_STRING": true, "NUMBER_LITERAL": true, "MENDIX_TOKEN": true,
 		// Punctuation
-		"SEMICOLON": true, "COMMA": true, "DOT": true,
+		"SEMICOLON": true, "COMMA": true, "TRAILING_COMMA": true, "DOT": true,
 		"LPAREN": true, "RPAREN": true,
 		"LBRACE": true, "RBRACE": true,
 		"LBRACKET": true, "RBRACKET": true,
@@ -39,6 +39,8 @@ func TestKeywordRuleCoverage(t *testing.T) {
 		"PLUS": true, "MINUS": true, "STAR": true, "SLASH": true, "PERCENT": true,
 		// Version marker (not an identifier)
 		"V3": true,
+		// `<unbound>` template-parameter placeholder (not an identifier)
+		"UNBOUND_PARAM": true,
 	}
 
 	// Tokens missing from keyword rule (in lexer but not in keyword).

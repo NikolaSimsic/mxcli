@@ -8,14 +8,43 @@
 
 ## Description
 
-Moves a document to a different folder or module. Supported document types are `PAGE`, `MICROFLOW`, `NANOFLOW`, `SNIPPET`, `ENUMERATION`, and `ENTITY`. When moving to a folder, missing intermediate folders are created automatically. Cross-module moves change the qualified name of the document, which may break by-name references elsewhere in the project.
+Moves a document to a different folder or module. Every top-level document type is supported, spelled the way `DESCRIBE` spells it. When moving to a folder, missing intermediate folders are created automatically. Cross-module moves change the qualified name of the document, which may break by-name references elsewhere in the project.
 
 Entity moves only support moving to a module (not to a folder), because entities are embedded in domain model documents.
+
+A Java or JavaScript action keeps its source in a directory named after its module
+(`javasource/<module>/actions/`, `javascriptsource/<module>/actions/`). A
+cross-module move takes the source file along, and rewrites a Java source's
+`package` line the way mxbuild would, so the action keeps its code. A source left
+behind builds without error, but the app then calls a generated stub that throws
+"not implemented". If the target module's directory already holds a source file
+of that name, the move is refused before anything changes. A move within the
+module, into a folder, leaves the source where it is.
+
+A `FOLDER` clause on `CREATE OR MODIFY` moves an existing document as well, so a
+script that already creates a document does not need a separate `MOVE` to place
+it.
 
 ## Parameters
 
 **document_type**
-: The type of document to move. One of: `PAGE`, `MICROFLOW`, `NANOFLOW`, `SNIPPET`, `ENUMERATION`, `ENTITY`.
+: The type of document to move:
+
+| Group | Types |
+|-------|-------|
+| Pages | `PAGE`, `SNIPPET`, `BUILDING BLOCK`, `LAYOUT`, `MENU` |
+| Logic | `MICROFLOW`, `NANOFLOW`, `WORKFLOW`, `TASK QUEUE`, `SCHEDULED EVENT` |
+| Domain | `ENUMERATION`, `CONSTANT`, `REGULAR EXPRESSION`, `ENTITY` |
+| Mappings | `JSON STRUCTURE`, `IMPORT MAPPING`, `EXPORT MAPPING` |
+| Code | `JAVA ACTION`, `JAVASCRIPT ACTION`, `DATABASE CONNECTION`, `DATA TRANSFORMER` |
+| Resources | `IMAGE COLLECTION`, `ICON COLLECTION` |
+| Integration | `CONSUMED REST SERVICE`, `PUBLISHED REST SERVICE`, `CONSUMED ODATA SERVICE`, `PUBLISHED ODATA SERVICE`, `BUSINESS EVENT SERVICE` |
+| AI | `MODEL`, `AGENT`, `KNOWLEDGE BASE`, `CONSUMED MCP SERVICE` |
+
+`FOLDER` moves a folder rather than a document — see the example below.
+
+If the named document turns out to be a different type, the statement is refused
+and the error names what it actually is.
 
 **qualified_name**
 : The current `Module.Name` of the document to move.
@@ -58,10 +87,52 @@ MOVE ENTITY OldModule.Customer TO NewModule;
 MOVE PAGE OldModule.CustomerPage TO FOLDER 'Screens' IN NewModule;
 ```
 
+### Move a mapping or JSON structure
+
+```sql
+mdl 1;
+MOVE IMPORT MAPPING MyModule.IMM_Order TO FOLDER 'Private/Import mappings';
+MOVE EXPORT MAPPING MyModule.EXM_Order TO FOLDER 'Private/Export mappings';
+MOVE JSON STRUCTURE MyModule.JSON_Order TO FOLDER 'Private/JSON structures';
+```
+
+### Place a document while creating it
+
+Every document type takes a `FOLDER` clause on `CREATE`, so a document can be
+placed by the statement that creates it. On microflows and nanoflows it follows
+the signature, before `BEGIN`; on everything else, pages and snippets included, it
+follows the qualified name straight away. The `Folder: 'path'` property that pages,
+snippets and REST/OData services also take is a deprecated alias (`MDL-DEPR105`):
+
+```sql
+mdl 1;
+CREATE OR MODIFY JSON STRUCTURE MyModule.JSON_Order
+  FOLDER 'Private/JSON structures'
+  SAMPLE '{"id": 1}';
+
+CREATE TASK QUEUE MyModule.Q_Orders FOLDER 'Private/Queues' ( Parallelism: 3 );
+
+CREATE JAVA ACTION MyModule.JA_Sync FOLDER 'Private/Java' ()
+  RETURNS String AS $$return null;$$;
+```
+
+The clause applies to an existing document too, so re-running a script that
+gained one files the document rather than leaving it where it was. Omitting the
+clause leaves the document where it is; it never returns it to the module root.
+
+`DESCRIBE` emits the clause, so a description replays into the same folder.
+
+### Move a folder
+
+```sql
+MOVE FOLDER MyModule.OldName TO FOLDER 'Archive';
+```
+
 ### Check impact before a cross-module move
 
 ```sql
-SHOW IMPACT OF OldModule.Customer;
+mdl 1;
+LIST IMPACT OF OldModule.Customer;
 MOVE ENTITY OldModule.Customer TO NewModule;
 ```
 

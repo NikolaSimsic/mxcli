@@ -40,6 +40,16 @@ func (unsupportedBackend) AddModuleRole(_ model.ID, _ string, _ string) (err0 er
 	return
 }
 
+func (unsupportedBackend) AddNavigationProfile(_ model.ID, _ string) (err0 error) {
+	err0 = errUnsupported("AddNavigationProfile")
+	return
+}
+
+func (unsupportedBackend) AddRawUnit(_ string, _ string, _ string, _ string, _ []uint8) (err0 error) {
+	err0 = errUnsupported("AddRawUnit")
+	return
+}
+
 func (unsupportedBackend) AddUserRole(_ model.ID, _ string, _ []string, _ bool) (err0 error) {
 	err0 = errUnsupported("AddUserRole")
 	return
@@ -91,6 +101,11 @@ func (unsupportedBackend) CreateAgentEditorKnowledgeBase(_ *agenteditor.Knowledg
 
 func (unsupportedBackend) CreateAgentEditorModel(_ *agenteditor.Model) (err0 error) {
 	err0 = errUnsupported("CreateAgentEditorModel")
+	return
+}
+
+func (unsupportedBackend) CreateAgentEditorPublishedMCPService(_ *agenteditor.PublishedMCPService) (err0 error) {
+	err0 = errUnsupported("CreateAgentEditorPublishedMCPService")
 	return
 }
 
@@ -169,6 +184,11 @@ func (unsupportedBackend) CreateJavaAction(_ *javaactions.JavaAction) (err0 erro
 	return
 }
 
+func (unsupportedBackend) CreateJavaScriptAction(_ *types.JavaScriptAction) (err0 error) {
+	err0 = errUnsupported("CreateJavaScriptAction")
+	return
+}
+
 func (unsupportedBackend) CreateJsonStructure(_ *types.JsonStructure) (err0 error) {
 	err0 = errUnsupported("CreateJsonStructure")
 	return
@@ -176,6 +196,21 @@ func (unsupportedBackend) CreateJsonStructure(_ *types.JsonStructure) (err0 erro
 
 func (unsupportedBackend) CreateLayout(_ *pages.Layout) (err0 error) {
 	err0 = errUnsupported("CreateLayout")
+	return
+}
+
+func (unsupportedBackend) CreateMenuDocument(_ *types.MenuDocument) (err0 error) {
+	err0 = errUnsupported("CreateMenuDocument")
+	return
+}
+
+func (unsupportedBackend) CreateMessageDefinitionCollection(_ *model.MessageDefinitionCollection) (err0 error) {
+	err0 = errUnsupported("CreateMessageDefinitionCollection")
+	return
+}
+
+func (unsupportedBackend) CreateMessageDefinitionDocument(_ *model.MessageDefinitionDocument) (err0 error) {
+	err0 = errUnsupported("CreateMessageDefinitionDocument")
 	return
 }
 
@@ -206,6 +241,26 @@ func (unsupportedBackend) CreatePublishedODataService(_ *model.PublishedODataSer
 
 func (unsupportedBackend) CreatePublishedRestService(_ *model.PublishedRestService) (err0 error) {
 	err0 = errUnsupported("CreatePublishedRestService")
+	return
+}
+
+func (unsupportedBackend) CreateQueue(_ *types.Queue) (err0 error) {
+	err0 = errUnsupported("CreateQueue")
+	return
+}
+
+func (unsupportedBackend) CreateRegularExpression(_ *model.RegularExpression) (err0 error) {
+	err0 = errUnsupported("CreateRegularExpression")
+	return
+}
+
+func (unsupportedBackend) CreateRule(_ *microflows.Rule) (err0 error) {
+	err0 = errUnsupported("CreateRule")
+	return
+}
+
+func (unsupportedBackend) CreateScheduledEvent(_ *model.ScheduledEvent) (err0 error) {
+	err0 = errUnsupported("CreateScheduledEvent")
 	return
 }
 
@@ -241,6 +296,11 @@ func (unsupportedBackend) DeleteAgentEditorKnowledgeBase(_ string) (err0 error) 
 
 func (unsupportedBackend) DeleteAgentEditorModel(_ string) (err0 error) {
 	err0 = errUnsupported("DeleteAgentEditorModel")
+	return
+}
+
+func (unsupportedBackend) DeleteAgentEditorPublishedMCPService(_ string) (err0 error) {
+	err0 = errUnsupported("DeleteAgentEditorPublishedMCPService")
 	return
 }
 
@@ -324,6 +384,16 @@ func (unsupportedBackend) DeleteJavaAction(_ model.ID) (err0 error) {
 	return
 }
 
+func (unsupportedBackend) DeleteJavaScriptAction(_ model.ID) (err0 error) {
+	err0 = errUnsupported("DeleteJavaScriptAction")
+	return
+}
+
+func (unsupportedBackend) DeleteJavaScriptSourceFile(_ string, _ string) (err0 error) {
+	err0 = errUnsupported("DeleteJavaScriptSourceFile")
+	return
+}
+
 func (unsupportedBackend) DeleteJavaSourceFile(_ string, _ string) (err0 error) {
 	err0 = errUnsupported("DeleteJavaSourceFile")
 	return
@@ -336,6 +406,21 @@ func (unsupportedBackend) DeleteJsonStructure(_ string) (err0 error) {
 
 func (unsupportedBackend) DeleteLayout(_ model.ID) (err0 error) {
 	err0 = errUnsupported("DeleteLayout")
+	return
+}
+
+func (unsupportedBackend) DeleteMenuDocument(_ model.ID) (err0 error) {
+	err0 = errUnsupported("DeleteMenuDocument")
+	return
+}
+
+func (unsupportedBackend) DeleteMessageDefinitionCollection(_ string) (err0 error) {
+	err0 = errUnsupported("DeleteMessageDefinitionCollection")
+	return
+}
+
+func (unsupportedBackend) DeleteMessageDefinitionDocument(_ string) (err0 error) {
+	err0 = errUnsupported("DeleteMessageDefinitionDocument")
 	return
 }
 
@@ -374,6 +459,26 @@ func (unsupportedBackend) DeletePublishedRestService(_ model.ID) (err0 error) {
 	return
 }
 
+func (unsupportedBackend) DeleteQueue(_ string) (err0 error) {
+	err0 = errUnsupported("DeleteQueue")
+	return
+}
+
+func (unsupportedBackend) DeleteRegularExpression(_ string) (err0 error) {
+	err0 = errUnsupported("DeleteRegularExpression")
+	return
+}
+
+func (unsupportedBackend) DeleteRule(_ model.ID) (err0 error) {
+	err0 = errUnsupported("DeleteRule")
+	return
+}
+
+func (unsupportedBackend) DeleteScheduledEvent(_ string) (err0 error) {
+	err0 = errUnsupported("DeleteScheduledEvent")
+	return
+}
+
 func (unsupportedBackend) DeleteSnippet(_ model.ID) (err0 error) {
 	err0 = errUnsupported("DeleteSnippet")
 	return
@@ -399,6 +504,11 @@ func (unsupportedBackend) Disconnect() (err0 error) {
 	return
 }
 
+func (unsupportedBackend) EditConsumedRestService(_ model.ID, _ *backend.ConsumedRestServiceEdit) (err0 error) {
+	err0 = errUnsupported("EditConsumedRestService")
+	return
+}
+
 func (unsupportedBackend) ExportJSON() (r0 []uint8, err1 error) {
 	err1 = errUnsupported("ExportJSON")
 	return
@@ -416,6 +526,16 @@ func (unsupportedBackend) FindAllViewEntitySourceDocumentIDs(_ string, _ string)
 
 func (unsupportedBackend) FindCustomWidgetType(_ string) (r0 *types.RawCustomWidgetType, err1 error) {
 	err1 = errUnsupported("FindCustomWidgetType")
+	return
+}
+
+func (unsupportedBackend) FindDocumentUnit(_ string, _ string) (r0 *types.DocumentUnit, err1 error) {
+	err1 = errUnsupported("FindDocumentUnit")
+	return
+}
+
+func (unsupportedBackend) FindDocumentUnits(_ string, _ string) (r0 []*types.DocumentUnit, err1 error) {
+	err1 = errUnsupported("FindDocumentUnits")
 	return
 }
 
@@ -466,6 +586,11 @@ func (unsupportedBackend) GetLayout(_ model.ID) (r0 *pages.Layout, err1 error) {
 
 func (unsupportedBackend) GetMendixVersion() (r0 string, err1 error) {
 	err1 = errUnsupported("GetMendixVersion")
+	return
+}
+
+func (unsupportedBackend) GetMenuDocumentByQualifiedName(_ string, _ string) (r0 *types.MenuDocument, err1 error) {
+	err1 = errUnsupported("GetMenuDocumentByQualifiedName")
 	return
 }
 
@@ -544,13 +669,13 @@ func (unsupportedBackend) GetRawUnitBytes(_ model.ID) (r0 []uint8, err1 error) {
 	return
 }
 
-func (unsupportedBackend) GetScheduledEvent(_ model.ID) (r0 *model.ScheduledEvent, err1 error) {
-	err1 = errUnsupported("GetScheduledEvent")
+func (unsupportedBackend) GetRule(_ model.ID) (r0 *microflows.Rule, err1 error) {
+	err1 = errUnsupported("GetRule")
 	return
 }
 
-func (unsupportedBackend) GetUnitTypes() (r0 map[string]int, err1 error) {
-	err1 = errUnsupported("GetUnitTypes")
+func (unsupportedBackend) GetScheduledEvent(_ model.ID) (r0 *model.ScheduledEvent, err1 error) {
+	err1 = errUnsupported("GetScheduledEvent")
 	return
 }
 
@@ -572,6 +697,11 @@ func (unsupportedBackend) IsRule(_ string) (r0 bool, err1 error) {
 	return
 }
 
+func (unsupportedBackend) LayoutPlaceholders(_ model.ID) (r0 []string, err1 error) {
+	err1 = errUnsupported("LayoutPlaceholders")
+	return
+}
+
 func (unsupportedBackend) ListAgentEditorAgents() (r0 []*agenteditor.Agent, err1 error) {
 	err1 = errUnsupported("ListAgentEditorAgents")
 	return
@@ -589,6 +719,11 @@ func (unsupportedBackend) ListAgentEditorKnowledgeBases() (r0 []*agenteditor.Kno
 
 func (unsupportedBackend) ListAgentEditorModels() (r0 []*agenteditor.Model, err1 error) {
 	err1 = errUnsupported("ListAgentEditorModels")
+	return
+}
+
+func (unsupportedBackend) ListAgentEditorPublishedMCPServices() (r0 []*agenteditor.PublishedMCPService, err1 error) {
+	err1 = errUnsupported("ListAgentEditorPublishedMCPServices")
 	return
 }
 
@@ -632,6 +767,11 @@ func (unsupportedBackend) ListDatabaseConnections() (r0 []*model.DatabaseConnect
 	return
 }
 
+func (unsupportedBackend) ListDocumentUnits() (r0 []*types.DocumentUnit, err1 error) {
+	err1 = errUnsupported("ListDocumentUnits")
+	return
+}
+
 func (unsupportedBackend) ListDomainModels() (r0 []*domainmodel.DomainModel, err1 error) {
 	err1 = errUnsupported("ListDomainModels")
 	return
@@ -649,6 +789,11 @@ func (unsupportedBackend) ListExportMappings() (r0 []*model.ExportMapping, err1 
 
 func (unsupportedBackend) ListFolders() (r0 []*types.FolderInfo, err1 error) {
 	err1 = errUnsupported("ListFolders")
+	return
+}
+
+func (unsupportedBackend) ListIconCollections() (r0 []*types.IconCollection, err1 error) {
+	err1 = errUnsupported("ListIconCollections")
 	return
 }
 
@@ -684,6 +829,21 @@ func (unsupportedBackend) ListJsonStructures() (r0 []*types.JsonStructure, err1 
 
 func (unsupportedBackend) ListLayouts() (r0 []*pages.Layout, err1 error) {
 	err1 = errUnsupported("ListLayouts")
+	return
+}
+
+func (unsupportedBackend) ListMenuDocuments() (r0 []*types.MenuDocument, err1 error) {
+	err1 = errUnsupported("ListMenuDocuments")
+	return
+}
+
+func (unsupportedBackend) ListMessageDefinitionCollections() (r0 []*model.MessageDefinitionCollection, err1 error) {
+	err1 = errUnsupported("ListMessageDefinitionCollections")
+	return
+}
+
+func (unsupportedBackend) ListMessageDefinitionDocuments() (r0 []*model.MessageDefinitionDocument, err1 error) {
+	err1 = errUnsupported("ListMessageDefinitionDocuments")
 	return
 }
 
@@ -737,6 +897,11 @@ func (unsupportedBackend) ListPublishedRestServices() (r0 []*model.PublishedRest
 	return
 }
 
+func (unsupportedBackend) ListQueues() (r0 []*types.Queue, err1 error) {
+	err1 = errUnsupported("ListQueues")
+	return
+}
+
 func (unsupportedBackend) ListRawUnits(_ string) (r0 []*types.RawUnitInfo, err1 error) {
 	err1 = errUnsupported("ListRawUnits")
 	return
@@ -744,6 +909,16 @@ func (unsupportedBackend) ListRawUnits(_ string) (r0 []*types.RawUnitInfo, err1 
 
 func (unsupportedBackend) ListRawUnitsByType(_ string) (r0 []*types.RawUnit, err1 error) {
 	err1 = errUnsupported("ListRawUnitsByType")
+	return
+}
+
+func (unsupportedBackend) ListRegularExpressions() (r0 []*model.RegularExpression, err1 error) {
+	err1 = errUnsupported("ListRegularExpressions")
+	return
+}
+
+func (unsupportedBackend) ListRules() (r0 []*microflows.Rule, err1 error) {
+	err1 = errUnsupported("ListRules")
 	return
 }
 
@@ -767,6 +942,11 @@ func (unsupportedBackend) ListWorkflows() (r0 []*workflows.Workflow, err1 error)
 	return
 }
 
+func (unsupportedBackend) ListXmlSchemas() (r0 []*types.XmlSchema, err1 error) {
+	err1 = errUnsupported("ListXmlSchemas")
+	return
+}
+
 func (unsupportedBackend) LoadWidgetTemplate(_ string, _ string) (r0 backend.WidgetObjectBuilder, err1 error) {
 	err1 = errUnsupported("LoadWidgetTemplate")
 	return
@@ -782,7 +962,12 @@ func (unsupportedBackend) MoveDatabaseConnection(_ *model.DatabaseConnection) (e
 	return
 }
 
-func (unsupportedBackend) MoveEntity(_ *domainmodel.Entity, _ model.ID, _ model.ID, _ string, _ string) (r0 []string, err1 error) {
+func (unsupportedBackend) MoveDocument(_ model.ID, _ model.ID) (err0 error) {
+	err0 = errUnsupported("MoveDocument")
+	return
+}
+
+func (unsupportedBackend) MoveEntity(_ *domainmodel.Entity, _ model.ID, _ model.ID, _ string, _ string) (r0 []types.MovedAssociation, err1 error) {
 	err1 = errUnsupported("MoveEntity")
 	return
 }
@@ -807,6 +992,21 @@ func (unsupportedBackend) MoveImportMapping(_ *model.ImportMapping) (err0 error)
 	return
 }
 
+func (unsupportedBackend) MoveJavaAction(_ *javaactions.JavaAction) (err0 error) {
+	err0 = errUnsupported("MoveJavaAction")
+	return
+}
+
+func (unsupportedBackend) MoveJavaScriptSourceFile(_ string, _ string, _ string) (r0 string, err1 error) {
+	err1 = errUnsupported("MoveJavaScriptSourceFile")
+	return
+}
+
+func (unsupportedBackend) MoveJavaSourceFile(_ string, _ string, _ string) (r0 string, err1 error) {
+	err1 = errUnsupported("MoveJavaSourceFile")
+	return
+}
+
 func (unsupportedBackend) MoveMicroflow(_ *microflows.Microflow) (err0 error) {
 	err0 = errUnsupported("MoveMicroflow")
 	return
@@ -822,6 +1022,16 @@ func (unsupportedBackend) MovePage(_ *pages.Page) (err0 error) {
 	return
 }
 
+func (unsupportedBackend) MovePublishedODataService(_ *model.PublishedODataService) (err0 error) {
+	err0 = errUnsupported("MovePublishedODataService")
+	return
+}
+
+func (unsupportedBackend) MoveRule(_ *microflows.Rule) (err0 error) {
+	err0 = errUnsupported("MoveRule")
+	return
+}
+
 func (unsupportedBackend) MoveSnippet(_ *pages.Snippet) (err0 error) {
 	err0 = errUnsupported("MoveSnippet")
 	return
@@ -829,6 +1039,21 @@ func (unsupportedBackend) MoveSnippet(_ *pages.Snippet) (err0 error) {
 
 func (unsupportedBackend) MoveViewEntitySourceDocument(_ string, _ model.ID, _ string) (err0 error) {
 	err0 = errUnsupported("MoveViewEntitySourceDocument")
+	return
+}
+
+func (unsupportedBackend) OpenMenuDocumentForMutation(_ model.ID) (r0 backend.MenuMutator, err1 error) {
+	err1 = errUnsupported("OpenMenuDocumentForMutation")
+	return
+}
+
+func (unsupportedBackend) OpenMicroflowForMutation(_ model.ID) (r0 backend.MicroflowMutator, err1 error) {
+	err1 = errUnsupported("OpenMicroflowForMutation")
+	return
+}
+
+func (unsupportedBackend) OpenNavigationProfileForMutation(_ string) (r0 backend.NavigationProfileMutator, err1 error) {
+	err1 = errUnsupported("OpenNavigationProfileForMutation")
 	return
 }
 
@@ -842,6 +1067,16 @@ func (unsupportedBackend) OpenWorkflowForMutation(_ model.ID) (r0 backend.Workfl
 	return
 }
 
+func (unsupportedBackend) PageLayoutName(_ model.ID) (r0 string, err1 error) {
+	err1 = errUnsupported("PageLayoutName")
+	return
+}
+
+func (unsupportedBackend) ParseDomainModelFromRaw(_ map[string]any, _ model.ID, _ model.ID) (r0 *domainmodel.DomainModel, err1 error) {
+	err1 = errUnsupported("ParseDomainModelFromRaw")
+	return
+}
+
 func (unsupportedBackend) ParseMicroflowBSON(_ []uint8, _ model.ID, _ model.ID) (r0 *microflows.Microflow, err1 error) {
 	err1 = errUnsupported("ParseMicroflowBSON")
 	return
@@ -851,11 +1086,30 @@ func (unsupportedBackend) ParseMicroflowFromRaw(_ map[string]any, _ model.ID, _ 
 	return
 }
 
+func (unsupportedBackend) ParseNanoflowFromRaw(_ map[string]any, _ model.ID, _ model.ID) (r0 *microflows.Nanoflow) {
+	return
+}
+
+func (unsupportedBackend) ParseProjectSettingsFromRaw(_ map[string]any) (r0 *model.ProjectSettings, err1 error) {
+	err1 = errUnsupported("ParseProjectSettingsFromRaw")
+	return
+}
+
 func (unsupportedBackend) Path() (r0 string) {
 	return
 }
 
 func (unsupportedBackend) ProjectVersion() (r0 *types.ProjectVersion) {
+	return
+}
+
+func (unsupportedBackend) ReadBackMicroflow(_ *microflows.Microflow) (r0 *microflows.Microflow, err1 error) {
+	err1 = errUnsupported("ReadBackMicroflow")
+	return
+}
+
+func (unsupportedBackend) ReadBackNanoflow(_ *microflows.Nanoflow) (r0 *microflows.Nanoflow, err1 error) {
+	err1 = errUnsupported("ReadBackNanoflow")
 	return
 }
 
@@ -914,8 +1168,13 @@ func (unsupportedBackend) RemoveUserRole(_ model.ID, _ string) (err0 error) {
 	return
 }
 
-func (unsupportedBackend) RenameDocumentByName(_ string, _ string, _ string) (err0 error) {
-	err0 = errUnsupported("RenameDocumentByName")
+func (unsupportedBackend) RenameDocument(_ model.ID, _ string, _ string) (err0 error) {
+	err0 = errUnsupported("RenameDocument")
+	return
+}
+
+func (unsupportedBackend) RenameJavaScriptSourceFile(_ string, _ string, _ string) (err0 error) {
+	err0 = errUnsupported("RenameJavaScriptSourceFile")
 	return
 }
 
@@ -929,18 +1188,13 @@ func (unsupportedBackend) RenameReferences(_ string, _ string, _ bool) (r0 []typ
 	return
 }
 
+func (unsupportedBackend) RenameViewEntitySourceDocument(_ string, _ string, _ string) (err0 error) {
+	err0 = errUnsupported("RenameViewEntitySourceDocument")
+	return
+}
+
 func (unsupportedBackend) RevokeEntityMemberAccess(_ model.ID, _ string, _ []string, _ types.EntityAccessRevocation) (r0 int, err1 error) {
 	err1 = errUnsupported("RevokeEntityMemberAccess")
-	return
-}
-
-func (unsupportedBackend) SerializeClientAction(_ pages.ClientAction) (r0 any, err1 error) {
-	err1 = errUnsupported("SerializeClientAction")
-	return
-}
-
-func (unsupportedBackend) SerializeDataSource(_ pages.DataSource) (r0 any, err1 error) {
-	err1 = errUnsupported("SerializeDataSource")
 	return
 }
 
@@ -948,17 +1202,37 @@ func (unsupportedBackend) SerializeDataSourceToOpaque(_ pages.DataSource) (r0 an
 	return
 }
 
-func (unsupportedBackend) SerializeWidget(_ pages.Widget) (r0 any, err1 error) {
-	err1 = errUnsupported("SerializeWidget")
-	return
-}
-
 func (unsupportedBackend) SerializeWidgetToOpaque(_ pages.Widget) (r0 any) {
 	return
 }
 
-func (unsupportedBackend) SerializeWorkflowActivity(_ workflows.WorkflowActivity) (r0 any, err1 error) {
-	err1 = errUnsupported("SerializeWorkflowActivity")
+func (unsupportedBackend) SetDomainModelAnnotations(_ model.ID, _ []*domainmodel.Annotation) (err0 error) {
+	err0 = errUnsupported("SetDomainModelAnnotations")
+	return
+}
+
+func (unsupportedBackend) SetDomainModelDocumentation(_ model.ID, _ string) (err0 error) {
+	err0 = errUnsupported("SetDomainModelDocumentation")
+	return
+}
+
+func (unsupportedBackend) SetModuleUIResources(_ model.ID, _ bool) (err0 error) {
+	err0 = errUnsupported("SetModuleUIResources")
+	return
+}
+
+func (unsupportedBackend) SetProjectAdminPassword(_ model.ID, _ string) (err0 error) {
+	err0 = errUnsupported("SetProjectAdminPassword")
+	return
+}
+
+func (unsupportedBackend) SetProjectAdminUserName(_ model.ID, _ string) (err0 error) {
+	err0 = errUnsupported("SetProjectAdminUserName")
+	return
+}
+
+func (unsupportedBackend) SetProjectAdminUserRole(_ model.ID, _ string) (err0 error) {
+	err0 = errUnsupported("SetProjectAdminUserRole")
 	return
 }
 
@@ -967,8 +1241,23 @@ func (unsupportedBackend) SetProjectDemoUsersEnabled(_ model.ID, _ bool) (err0 e
 	return
 }
 
+func (unsupportedBackend) SetProjectGuestAccess(_ model.ID, _ bool, _ string) (err0 error) {
+	err0 = errUnsupported("SetProjectGuestAccess")
+	return
+}
+
 func (unsupportedBackend) SetProjectSecurityLevel(_ model.ID, _ string) (err0 error) {
 	err0 = errUnsupported("SetProjectSecurityLevel")
+	return
+}
+
+func (unsupportedBackend) SetProjectStrictMode(_ model.ID, _ bool) (err0 error) {
+	err0 = errUnsupported("SetProjectStrictMode")
+	return
+}
+
+func (unsupportedBackend) SetUserRoleProperties(_ model.ID, _ string, _ backend.UserRoleProperties) (err0 error) {
+	err0 = errUnsupported("SetUserRoleProperties")
 	return
 }
 
@@ -989,6 +1278,11 @@ func (unsupportedBackend) UpdateAgentEditorKnowledgeBase(_ *agenteditor.Knowledg
 
 func (unsupportedBackend) UpdateAgentEditorModel(_ *agenteditor.Model) (err0 error) {
 	err0 = errUnsupported("UpdateAgentEditorModel")
+	return
+}
+
+func (unsupportedBackend) UpdateAgentEditorPublishedMCPService(_ *agenteditor.PublishedMCPService) (err0 error) {
+	err0 = errUnsupported("UpdateAgentEditorPublishedMCPService")
 	return
 }
 
@@ -1072,6 +1366,11 @@ func (unsupportedBackend) UpdateJavaAction(_ *javaactions.JavaAction) (err0 erro
 	return
 }
 
+func (unsupportedBackend) UpdateJavaScriptAction(_ *types.JavaScriptAction) (err0 error) {
+	err0 = errUnsupported("UpdateJavaScriptAction")
+	return
+}
+
 func (unsupportedBackend) UpdateJsonStructure(_ *types.JsonStructure) (err0 error) {
 	err0 = errUnsupported("UpdateJsonStructure")
 	return
@@ -1079,6 +1378,21 @@ func (unsupportedBackend) UpdateJsonStructure(_ *types.JsonStructure) (err0 erro
 
 func (unsupportedBackend) UpdateLayout(_ *pages.Layout) (err0 error) {
 	err0 = errUnsupported("UpdateLayout")
+	return
+}
+
+func (unsupportedBackend) UpdateMenuDocument(_ *types.MenuDocument) (err0 error) {
+	err0 = errUnsupported("UpdateMenuDocument")
+	return
+}
+
+func (unsupportedBackend) UpdateMessageDefinitionCollection(_ *model.MessageDefinitionCollection) (err0 error) {
+	err0 = errUnsupported("UpdateMessageDefinitionCollection")
+	return
+}
+
+func (unsupportedBackend) UpdateMessageDefinitionDocument(_ *model.MessageDefinitionDocument) (err0 error) {
+	err0 = errUnsupported("UpdateMessageDefinitionDocument")
 	return
 }
 
@@ -1142,8 +1456,38 @@ func (unsupportedBackend) UpdateQualifiedNameInAllUnits(_ string, _ string) (r0 
 	return
 }
 
+func (unsupportedBackend) UpdateQueue(_ *types.Queue) (err0 error) {
+	err0 = errUnsupported("UpdateQueue")
+	return
+}
+
 func (unsupportedBackend) UpdateRawUnit(_ string, _ []uint8) (err0 error) {
 	err0 = errUnsupported("UpdateRawUnit")
+	return
+}
+
+func (unsupportedBackend) UpdateRawUnitOwningStorageGUIDs(_ string, _ []uint8) (err0 error) {
+	err0 = errUnsupported("UpdateRawUnitOwningStorageGUIDs")
+	return
+}
+
+func (unsupportedBackend) UpdateRawUnitOwningTranslations(_ string, _ []uint8) (err0 error) {
+	err0 = errUnsupported("UpdateRawUnitOwningTranslations")
+	return
+}
+
+func (unsupportedBackend) UpdateRegularExpression(_ *model.RegularExpression) (err0 error) {
+	err0 = errUnsupported("UpdateRegularExpression")
+	return
+}
+
+func (unsupportedBackend) UpdateRule(_ *microflows.Rule) (err0 error) {
+	err0 = errUnsupported("UpdateRule")
+	return
+}
+
+func (unsupportedBackend) UpdateScheduledEvent(_ *model.ScheduledEvent) (err0 error) {
+	err0 = errUnsupported("UpdateScheduledEvent")
 	return
 }
 
@@ -1161,7 +1505,17 @@ func (unsupportedBackend) Version() (r0 types.MPRVersion) {
 	return
 }
 
-func (unsupportedBackend) WriteJavaSourceFile(_ string, _ string, _ string, _ []*javaactions.JavaActionParameter, _ javaactions.CodeActionReturnType, _ []string, _ string) (err0 error) {
+func (unsupportedBackend) WriteJavaScriptSourceFile(_ string, _ string, _ string, _ []*types.JavaActionParameter, _ types.CodeActionReturnType) (err0 error) {
+	err0 = errUnsupported("WriteJavaScriptSourceFile")
+	return
+}
+
+func (unsupportedBackend) WriteJavaSourceFile(_ string, _ string, _ string, _ []*types.JavaActionParameter, _ types.CodeActionReturnType, _ []string, _ *string, _ string) (err0 error) {
 	err0 = errUnsupported("WriteJavaSourceFile")
+	return
+}
+
+func (unsupportedBackend) WriteViewEntitySourceDocument(_ model.ID, _ string, _ string, _ string, _ string) (r0 model.ID, err1 error) {
+	err1 = errUnsupported("WriteViewEntitySourceDocument")
 	return
 }

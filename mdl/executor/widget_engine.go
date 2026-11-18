@@ -4,12 +4,14 @@ package executor
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
 	"github.com/mendixlabs/mxcli/mdl/backend"
 	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
+	"github.com/mendixlabs/mxcli/mdl/langver"
 	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/pages"
@@ -39,7 +41,71 @@ const defaultSlotContainer = "template"
 //	    TextTemplate nulling, #574)
 //	4 — v0.12.0: DataGrid column `width` ← `ColumnWidth` alias (dgDyn CE0463
 //	    regression from the keyword-path consolidation)
-const WidgetDefGeneratorVersion = 4
+//	5 — bundled multi-widget .mpk support: a def is now emitted for every
+//	    widget in a package (e.g. Charts.mpk → BarChart/PieChart/…), not just
+//	    the first. Bump forces existing projects to regenerate and pick up the
+//	    previously-missing widgets (#679).
+//	6 — DataGrid column `columnClass` ← `DynamicCellClass` alias. Bump forces
+//	    existing projects to regenerate so the per-cell dynamic class is no
+//	    longer silently dropped on write (Bug 10a).
+//	7 — object-list ItemProperties now record their widget.xml `dataSource`
+//	    binding, so the engine can emit an empty Forms$ClientTemplate for a
+//	    VISIBLE texttemplate sub-property (chart series staticName / active
+//	    static·/dynamic· names) instead of a null that trips CE0463 (Bug 9a).
+//	8 — object-list ItemProperties record their enumeration member keys
+//	    (enumValues), so `check` can flag an invalid enum value (MDL-WIDGET08)
+//	    instead of Studio Pro silently defaulting it (e.g. a Maps marker
+//	    locationType outside {address, latlng}).
+//	9 — HeatMap scaleColors `colour` ← `ColorValue` alias. Bump forces existing
+//	    projects to regenerate so a scale colour is no longer silently dropped
+//	    on write (Bug 10a class).
+//	10 — widget-level named-property aliases + emitted `seriesName` texttemplate
+//	    for PieChart/HeatMap (item 1b): `ValueAttribute`→`seriesValueAttribute`,
+//	    `SeriesName`→`seriesName`. Bump forces regeneration to carry the aliases.
+//	11 — emit a texttemplate PropertyMapping for EVERY top-level texttemplate
+//	    property (not just hand-aliased ones), so captions like Badge `value`,
+//	    TreeNode `headerCaption`, and Timeline `title`/`description` are authorable
+//	    instead of being silently dropped (MDL-WIDGET01). Bump forces existing
+//	    projects to regenerate their widget defs with the new mappings.
+//	12 — merge the hand-authored property-visibility fallback with the
+//	    editorConfig-extracted rules instead of overwriting, so compound/ternary
+//	    guards the static extractor skips (e.g. Timeline title/description hidden
+//	    when customVisualization) still null their hidden textTemplates (CE0463).
+//	13 — emit an `action` PropertyMapping for `type="action"` properties that MDL
+//	    can author (`onClick`→the widget Action, `onChange`→OnChange). Previously
+//	    no action operation was ever generated, so the writer had no mapping and
+//	    silently dropped a widget-level action (e.g. DataGrid2 `onClick`). Bump
+//	    forces existing projects to regenerate their defs with the action mapping.
+//	14 — populate KnownProperties with every declared property that has no mapping
+//	    in the generated def, so the checker warns "recognized but not persisted"
+//	    instead of silently dropping or falsely rejecting it (general guard for the
+//	    ledger #67 class). Bump forces regeneration to carry the new field.
+//	15 — match an action slot after stripping one `Event`/`Action` suffix, so
+//	    Mendix's own suffixed slots map (Combobox `onChangeEvent`). Version 13
+//	    matched the bare keys only, so `OnChange:` on a combobox emitted no
+//	    mapping and was dropped with no error (FINDINGS #14). Bump forces
+//	    regeneration so existing projects pick up the suffixed slots.
+//	16 — lift the object-list-nested hide rules from editorConfig.js, and fix the
+//	    polarity of a comparison guard read from a `||` connector or a ternary's
+//	    else branch (it was recorded as `eq` where the code means `ne`). Without
+//	    the nested rules an Accordion group's `initialCollapsedState` could be set
+//	    to a value the widget hides, which mxbuild rejects with CE0463 and which
+//	    makes `mx create-module-package` refuse the module (upstream #931). Bump
+//	    forces existing projects to regenerate their defs with both.
+//	18 — DataGrid column `visible` ← `VisibleIf` alias. Every expression
+//	    spelling of a column's `Visible:` is lowered to VisibleIf, so without it
+//	    the column was written always visible. Bump forces existing projects to
+//	    regenerate so the alias reaches their datagrid def.
+//	19 — a top-level `expression` property gets a mapping, by its own key (and
+//	    `editable:` when the package declares no Editability); before, it was
+//	    known-but-unmapped and the Calendar's `editable` could not be written
+//	    (mendixlabs/mxcli#1578).
+//	20 — lift editorConfig hides in a `switch` arm, and a guard bounded by the
+//	    head of a `switch(`/`if(` statement (terser folds earlier statements
+//	    into it). Timeline went from 2 to 6 of 6 rules, so its hidden
+//	    enumerations are refused with MDL-WIDGET10 rather than reaching mx check
+//	    as CE0463 (ako/mxcli#1762). Bump forces existing projects to regenerate.
+const WidgetDefGeneratorVersion = 20
 
 // WidgetDefinition describes how to construct a pluggable widget from MDL syntax.
 // Loaded from embedded JSON definition files (*.def.json).
@@ -55,6 +121,21 @@ type WidgetDefinition struct {
 	ObjectLists        []ObjectListMapping          `json:"objectLists,omitempty"`
 	PropertyVisibility []types.WidgetVisibilityRule `json:"propertyVisibility,omitempty"`
 	Modes              []WidgetMode                 `json:"modes,omitempty"`
+	// KnownProperties lists real widget properties that the .def.json does not
+	// (yet) map to a write path. `check` recognizes them so they aren't flagged
+	// as unknown, but the engine does not persist them — setting a non-default
+	// value yields an MDL-WIDGET04 warning rather than a false MDL-WIDGET01
+	// error. Validation-only; never written to BSON. See issue #643.
+	KnownProperties []string `json:"knownProperties,omitempty"`
+
+	// declaredKeys is every property key (lower-cased) the project's INSTALLED
+	// package declares, system ones included; nil when unknown — no project,
+	// or no package for the widget. Validation-only (mendixlabs/mxcli#1618).
+	declaredKeys map[string]bool
+	// enumKeys maps each enumeration property's key (lower-cased) to the keys
+	// the project's INSTALLED package declares for it; nil when unknown.
+	// Validation-only (ako/mxcli#854) — exec reads them from the Type it writes.
+	enumKeys map[string][]string
 }
 
 // PropertyMapping maps an MDL source (attribute, association, literal, etc.)
@@ -70,6 +151,14 @@ type PropertyMapping struct {
 	// the LSP on property hover. Optional — older .def.json files without
 	// this field still load fine.
 	Description string `json:"description,omitempty"`
+	// MdlAliases lists alternative MDL property names that resolve to this
+	// widget-level property. Used for named attribute/texttemplate properties
+	// where the friendly MDL keyword differs from the schema key (e.g. a
+	// PieChart's `ValueAttribute:` fills `seriesValueAttribute`). Without an
+	// alias, a widget with several attribute-typed properties can't route the
+	// right MDL value to each — the generic single `Attribute:` keyword is
+	// ambiguous. Mirrors ItemPropertyMapping.MdlAliases.
+	MdlAliases []string `json:"mdlAliases,omitempty"`
 }
 
 // WidgetMode defines a conditional configuration variant for a widget.
@@ -90,6 +179,25 @@ type ChildSlotMapping struct {
 	PropertyKey  string `json:"propertyKey"`
 	MDLContainer string `json:"mdlContainer"`
 	Operation    string `json:"operation"`
+	// Switch is the enumeration that shows the slot, for a slot the widget
+	// renders only while it is on — a combo box's custom content and its
+	// …CustomContentType. See slotSwitchProblem.
+	Switch *SlotSwitch `json:"switch,omitempty"`
+}
+
+// SlotSwitch names the enumeration property that shows a child slot.
+//
+// While the switch is on, the widget requires content in the slot — a combo
+// box with optionsSourceAssociationCustomContentType 'yes' and no content is
+// CE0642 "Property 'Custom content' is required." — and while it is Off the
+// editor hides the slot, so content there is stored and never shown (CE0463).
+// Content written with the switch left out sets it to On (ako/mxcli#1744).
+type SlotSwitch struct {
+	PropertyKey string `json:"propertyKey"`
+	Off         string `json:"off"`
+	On          string `json:"on"`
+	// Caption is the slot's caption, as Mendix names it in CE0642.
+	Caption string `json:"caption,omitempty"`
 }
 
 // ObjectListMapping maps an MDL child block keyword (e.g., GROUP, ITEM, SERIES)
@@ -123,6 +231,18 @@ type ItemPropertyMapping struct {
 	Default     string   `json:"default,omitempty"`
 	Description string   `json:"description,omitempty"`
 	MdlAliases  []string `json:"mdlAliases,omitempty"`
+	// EnumValues lists the valid member keys for an enumeration sub-property
+	// (e.g. a Maps marker `locationType` accepts address/latlng). `check` flags
+	// a value outside this set (MDL-WIDGET08) — Studio Pro silently defaults an
+	// invalid enum value, which is why chart/Maps sub-properties fail quietly.
+	EnumValues []string `json:"enumValues,omitempty"`
+	// DataSource is the widget.xml `dataSource="..."` binding, if any (e.g. a
+	// chart series `staticTooltipHoverText` is bound to `staticDataSource`). It
+	// drives object-list-item visibility: a texttemplate sub-property is
+	// "visible" — and must serialize an empty Forms$ClientTemplate rather than a
+	// null (else CE0463) — when it has no dataSource binding OR its bound
+	// datasource is configured on the item. Chart series (9a).
+	DataSource string `json:"dataSource,omitempty"`
 }
 
 // ItemSlotMapping maps a widget child slot inside one object-list item
@@ -150,7 +270,25 @@ type BuildContext struct {
 	PrimitiveVal   string
 	DataSource     pages.DataSource
 	Action         pages.ClientAction // Domain-typed client action
-	pageBuilder    *pageBuilder
+	// ClientParams carries the `contentparams:` bindings for a `{1}`-style
+	// template, resolved while the AST widget is still in hand. applyOperation
+	// does not receive the AST, and a numeric placeholder written without its
+	// parameters is CE0720 (#928).
+	ClientParams []*pages.ClientTemplateParameter
+	// SourceVariable names the parameter an attribute or association binding
+	// reads (`$Param.Attr`); nil for one read from the enclosing object.
+	SourceVariable *pages.WidgetVariable
+	// AttributeSteps are the association hops of a rooted attribute path,
+	// `$Name/Assoc/Attr`, stored as the AttributeRef's EntityRef beside
+	// SourceVariable (ako/mxcli#2107).
+	AttributeSteps []pages.AttributeRefStep
+	// ImageEntity is the entity an image-typed property binds to when it was
+	// written `$currentObject` rather than as a collection entry (#1476).
+	ImageEntity string
+	// Icon is the icon element an icon-typed property holds, read from the
+	// widget's `Icon:` with the kind the author wrote (ako/mxcli#2174).
+	Icon        *pages.Icon
+	pageBuilder *pageBuilder
 }
 
 // =============================================================================
@@ -161,6 +299,56 @@ type BuildContext struct {
 type PluggableWidgetEngine struct {
 	backend     backend.WidgetBuilderBackend
 	pageBuilder *pageBuilder
+
+	// outerEntityContext is the entity context as it stood when the current
+	// widget's Build started, before any of its own DataSource mappings moved
+	// pageBuilder.entityContext to the widget's own data (e.g. a ComboBox's
+	// option list). A property that names something on the *containing* data —
+	// an association the widget binds — must be qualified against this, not
+	// against the widget's own datasource entity. (issuetracker #19)
+	outerEntityContext string
+	// inBuild says outerEntityContext was set by Build, so "" in it means the
+	// widget sits where no entity is in scope rather than "not recorded" (a
+	// mapping resolved on its own, as the engine tests do).
+	inBuild bool
+
+	// currentDef is the widget definition of the build in progress. resolveMapping
+	// consults it to tell the widget's PRIMARY attribute property from its others
+	// (#238); nil outside a build.
+	currentDef *WidgetDefinition
+
+	// currentPropertyTypeIDs is the loaded template's property metadata for the
+	// build in progress. Its DataSourceProperty is the WIDGET'S OWN statement of
+	// which of its datasources each dependent property binds against — read from
+	// widget.xml's `dataSource="…"`, so it is the vendor's answer rather than
+	// ours. nil outside a build.
+	currentPropertyTypeIDs map[string]pages.PropertyTypeIDEntry
+
+	// dataSourceEntities maps a datasource property's KEY to the entity that
+	// property's value resolved to, for the build in progress.
+	//
+	// pageBuilder.entityContext holds only ONE entity — whichever datasource
+	// mapping ran last — so on a widget with several datasources a dependent
+	// property bound to whatever happened to be applied before it. That is
+	// correct only while the .def.json interleaves each datasource with its own
+	// dependents, which is a convention nothing enforces and which a regenerated
+	// definition can silently break. Keyed per datasource, the binding is a
+	// property of the widget's schema rather than of its mapping order.
+	//
+	// Reset per Build and restored for nested widgets, like the fields above.
+	dataSourceEntities map[string]string
+
+	// currentDataSourceKeys lists, in definition order, the property keys of the
+	// selected mode's datasource mappings. One key (or none) means the generic
+	// `datasource:` clause is unambiguous and stays the convenience form it has
+	// always been; more than one means it names nothing in particular, and the
+	// keys here are what the refusal offers instead. nil outside a build.
+	currentDataSourceKeys []string
+
+	// enumReported records the undeclared enumeration values already reported
+	// under mdl 0, by widget, key and value, so one is warned about once
+	// (widget_enum_value.go).
+	enumReported map[string]bool
 }
 
 // NewPluggableWidgetEngine creates a new engine with the given backend and page builder.
@@ -175,7 +363,28 @@ func NewPluggableWidgetEngine(b backend.WidgetBuilderBackend, pb *pageBuilder) *
 func (e *PluggableWidgetEngine) Build(def *WidgetDefinition, w *ast.WidgetV3) (*pages.CustomWidget, error) {
 	// Save and restore entity context (DataSource mappings may change it)
 	oldEntityContext := e.pageBuilder.entityContext
-	defer func() { e.pageBuilder.entityContext = oldEntityContext }()
+	oldArgCtx := e.pageBuilder.argCtx
+	e.pageBuilder.enterOuterEntityContext(oldEntityContext)
+	defer func() {
+		e.pageBuilder.leaveOuterEntityContext()
+		e.pageBuilder.entityContext = oldEntityContext
+		e.pageBuilder.argCtx = oldArgCtx
+	}()
+
+	// Remember the containing context for properties that name members of it
+	// rather than of this widget's own data. Saved/restored for nested widgets.
+	oldOuterEntityContext := e.outerEntityContext
+	oldInBuild := e.inBuild
+	e.outerEntityContext = oldEntityContext
+	e.inBuild = true
+	defer func() { e.outerEntityContext, e.inBuild = oldOuterEntityContext, oldInBuild }()
+
+	// The definition being built, for mapping decisions that need to see the
+	// widget's OTHER mappings (which attribute property a bare `Attribute:`
+	// fills). Saved/restored like the context above, for nested widgets.
+	oldDef := e.currentDef
+	e.currentDef = def
+	defer func() { e.currentDef = oldDef }()
 
 	// 1. Load template via backend
 	builder, err := e.backend.LoadWidgetTemplate(def.WidgetID, e.pageBuilder.getProjectPath())
@@ -188,22 +397,107 @@ func (e *PluggableWidgetEngine) Build(def *WidgetDefinition, w *ast.WidgetV3) (*
 
 	propertyTypeIDs := builder.PropertyTypeIDs()
 
+	// The template's per-property datasource links, and the per-datasource
+	// entities the mappings below will fill in. Saved/restored like currentDef,
+	// so a nested widget cannot see its parent's.
+	oldPropertyTypeIDs := e.currentPropertyTypeIDs
+	oldDataSourceEntities := e.dataSourceEntities
+	oldDataSourceKeys := e.currentDataSourceKeys
+	e.currentPropertyTypeIDs = propertyTypeIDs
+	e.dataSourceEntities = nil
+	e.currentDataSourceKeys = nil
+	defer func() {
+		e.currentPropertyTypeIDs = oldPropertyTypeIDs
+		e.dataSourceEntities = oldDataSourceEntities
+		e.currentDataSourceKeys = oldDataSourceKeys
+	}()
+
 	// 2. Select mode and get mappings/slots
 	mappings, slots, err := e.selectMappings(def, w)
 	if err != nil {
 		return nil, err
 	}
+	// An `onClick:`/`OnChange:` no selected mapping reads: resolveMapping reads
+	// those keywords only for a mapping sourced from them, so without one the
+	// engine writes the widget without the action (#842 — a Gallery's row
+	// click). Refused under mdl 1, dropped with the MDL-V1-ACTIONSLOT warning
+	// under mdl 0 — the same gate `check` applies, here for `exec --no-check`.
+	if err := e.refuseUnroutedActionKeywords(def, mappings, w); err != nil {
+		return nil, err
+	}
+	e.currentDataSourceKeys = dataSourceMappingKeys(mappings)
+	if err := refuseLinkedDataSourceMapping(def, mappings, propertyTypeIDs); err != nil {
+		return nil, err
+	}
+	if err := refuseAmbiguousGenericDataSource(def, w, e.currentDataSourceKeys); err != nil {
+		return nil, err
+	}
 
-	// 3. Apply property mappings
+	// 3. Apply property mappings.
+	//
+	// A property the widget's editorConfig hides under the current configuration
+	// is written at its DECLARED DEFAULT. Measured on a Studio Pro-authored File
+	// Uploader 2.5.0: all 34 declared properties are stored, the hidden ones at
+	// their default, so "hidden" means default-valued, not absent.
+	//
+	// Writing the default rather than merely skipping the mapping is the whole
+	// point: skipping leaves the widget TEMPLATE's captured value, and a template
+	// holds whatever the widget it was extracted from was set to. Image's is
+	// width/height 48 against a declared default of 100, which made every Image
+	// mxcli authored fail with CE0463 — see hiddenUnnamedProperties. Where no
+	// default can be looked up (a datasource has none) the mapping is skipped,
+	// exactly as before.
+	//
+	// This only ever fires for a property the script did NOT name — an MDL
+	// keyword shared by several properties (File Uploader routes both
+	// `associatedFiles` and `associatedImages` from `DataSource:`, gated on
+	// `uploadMode`). Naming a hidden property outright is still an error, raised
+	// by MDL-WIDGET10 at check time rather than silently dropped here (#956).
+	//
+	// builder.PrimitiveValues() is read HERE, before any mapping is applied, so
+	// it is the template's captured configuration — the values an unmapped
+	// property will actually be stored with. A rule keyed on one of those has to
+	// be evaluated against them; see hiddenUnnamedProperties.
+	hiddenSkip := e.hiddenUnnamedProperties(def, w,
+		widgetPropertyDefaults(e.pageBuilder.getProjectPath(), def.WidgetID),
+		builder.PrimitiveValues())
 	for _, mapping := range mappings {
+		if reset, hidden := hiddenSkip[strings.ToLower(mapping.PropertyKey)]; hidden {
+			if reset != "" && mapping.Operation == "primitive" {
+				resetToDeclaredDefault(builder, propertyTypeIDs, mapping.PropertyKey, reset)
+			}
+			continue
+		}
 		ctx, err := e.resolveMapping(mapping, w)
 		if err != nil {
 			return nil, mdlerrors.NewBackend("resolve mapping for "+mapping.PropertyKey, err)
+		}
+		if err := refuseUndeclaredMappedKey(builder, def, mapping, ctx, w); err != nil {
+			return nil, err
+		}
+		// An enumeration takes one of its declared keys, written as the key
+		// (ako/mxcli#854) — see widget_enum_value.go.
+		if mapping.Operation == "primitive" {
+			if ctx.PrimitiveVal, err = e.enumerationValue(builder, def, w, mapping.PropertyKey, ctx.PrimitiveVal); err != nil {
+				return nil, err
+			}
 		}
 
 		if err := e.applyOperation(builder, mapping.Operation, mapping.PropertyKey, ctx); err != nil {
 			return nil, err
 		}
+	}
+	// A hidden property that MDL cannot name gets its declared default too. The
+	// loop above visits property MAPPINGS — which is what gives a property an MDL
+	// keyword — so it reached `width` and `height` and never `maxHeight`, whose
+	// value stayed at whatever the template captured. That single field is the
+	// whole of the CE0463 on a copied Atlas layout: one line differing in 1480,
+	// mxcli's 0 against the package's declared 250 (mxcli-ledger §142).
+	//
+	// The set of properties that must be default-valued is the widget's to decide,
+	// not mxcli's; making it a subset of what MDL has words for was the mistake.
+	for propKey, reset := range unmappedHiddenResets(mappings, e.visibilityRules(def), hiddenSkip) {
+		resetToDeclaredDefault(builder, propertyTypeIDs, propKey, reset)
 	}
 
 	// 4. Auto datasource: map AST DataSource to first DataSource-type property.
@@ -218,20 +512,45 @@ func (e *PluggableWidgetEngine) Build(def *WidgetDefinition, w *ast.WidgetV3) (*
 	}
 	if !dsHandledByMapping {
 		if ds := w.GetDataSource(); ds != nil {
-			for propKey, entry := range propertyTypeIDs {
-				if entry.ValueType == "DataSource" {
-					dataSource, entityName, err := e.pageBuilder.buildDataSourceV3(ds)
-					if err != nil {
-						return nil, mdlerrors.NewBackend("auto datasource for "+propKey, err)
-					}
-					builder.SetDataSource(propKey, dataSource)
-					if entityName != "" {
-						e.pageBuilder.entityContext = entityName
-					}
-					break
+			// The template's datasource-typed properties, sorted — propertyTypeIDs
+			// is a map, and this used to take the first one Go's randomised
+			// iteration happened to yield, then break. On a widget declaring two
+			// (a DatagridDropdownFilter's linkedDs and refOptions) that made the
+			// clause land somewhere different from run to run: the same script
+			// produced different documents, with no error either way.
+			dsProps := dataSourceTypedTemplateKeys(propertyTypeIDs)
+			if len(dsProps) > 1 {
+				return nil, mdlerrors.NewValidationf(
+					"widget `%s` (%s) declares %d datasource properties, so a generic `datasource:` clause "+
+						"is ambiguous — name the one you mean: %s",
+					w.Name, def.MDLName, len(dsProps), strings.Join(dsProps, ", "))
+			}
+			for _, propKey := range dsProps {
+				dataSource, entityName, err := e.pageBuilder.buildPluggableDataSourceV3(ds, w.Name)
+				if err != nil {
+					return nil, mdlerrors.NewBackend("auto datasource for "+propKey, err)
+				}
+				builder.SetDataSource(propKey, dataSource)
+				e.recordDataSourceEntity(propKey, entityName)
+				if entityName != "" {
+					e.pageBuilder.entityContext = entityName
+					e.pageBuilder.argCtx = enteringDataWidgetOf(w, ds, entityName)
 				}
 			}
 		}
+	}
+
+	// 4.0 Refuse a child none of the passes below can place. Each of them skips
+	// what it does not recognise, so without this the child is built and thrown
+	// away — a page that writes, builds and renders without the widget the
+	// author put there. See widget_unrouted_children.go.
+	if err := refuseUnroutedChildren(def, w); err != nil {
+		return nil, err
+	}
+	// 4.0b A switched slot whose switch contradicts its content: on with none
+	// (CE0642) or off with some (hidden, CE0463). See widget_slot_switch.go.
+	if msg := slotSwitchProblem(def, w); msg != "" {
+		return nil, mdlerrors.NewValidation(msg)
 	}
 
 	// 4.1 Apply child slots (.def.json) — skip children whose keyword belongs
@@ -242,6 +561,11 @@ func (e *PluggableWidgetEngine) Build(def *WidgetDefinition, w *ast.WidgetV3) (*
 	}
 	if err := e.applyChildSlots(builder, slots, w, propertyTypeIDs, objectListContainers); err != nil {
 		return nil, err
+	}
+	// Content written with its switch left out turns the switch on: the
+	// template stores it off, which hides the content just written (CE0463).
+	for _, sw := range switchedSlotsToTurnOn(def, w) {
+		builder.SetPrimitive(sw.PropertyKey, sw.On)
 	}
 
 	// 4.1b Apply object-list child blocks (.def.json `objectLists`).
@@ -334,21 +658,55 @@ func (e *PluggableWidgetEngine) Build(def *WidgetDefinition, w *ast.WidgetV3) (*
 
 	// 4.6 Apply explicit properties (not covered by .def.json mappings)
 	mappedKeys := make(map[string]bool)
+	selectionKeys := make(map[string]bool) // lower-cased: read like lookupProperty, in any case
 	for _, m := range mappings {
 		if m.Source != "" {
 			mappedKeys[m.Source] = true
+		}
+		// A selection is read by its key as well as by `Selection:`
+		// (selectionMappingValue), so this pass must not write it a second
+		// time — as a PrimitiveValue, which is where `itemSelection: Single`
+		// used to end up (mendixlabs/mxcli#1618).
+		if m.Operation == "selection" {
+			for _, k := range append([]string{m.PropertyKey}, m.MdlAliases...) {
+				selectionKeys[strings.ToLower(k)] = true
+			}
 		}
 	}
 	for _, s := range slots {
 		mappedKeys[s.MDLContainer] = true
 	}
-	for propName, propVal := range w.Properties {
-		if mappedKeys[propName] || isBuiltinPropName(propName) {
+	// Sorted: two spellings of one key (`Adjustable:` and `adjustable:`) now
+	// resolve to the same property, and which one lands must not depend on Go's
+	// map order.
+	authoredNames := make([]string, 0, len(w.Properties))
+	for name := range w.Properties {
+		authoredNames = append(authoredNames, name)
+	}
+	sort.Strings(authoredNames)
+	for _, authored := range authoredNames {
+		propVal := w.Properties[authored]
+		if mappedKeys[authored] || selectionKeys[strings.ToLower(authored)] {
 			continue
 		}
-		entry, ok := propertyTypeIDs[propName]
+		// A core name is skipped — unless the widget declares it as a key of its
+		// own, which is then all it can mean (ako/mxcli#2180): a PDS Button's
+		// string `caption` has no mapping to write it, so this pass is its only
+		// route.
+		if isBuiltinPropName(authored) && !templateOwnsCoreName(propertyTypeIDs, authored) {
+			continue
+		}
+		// The template's own spelling of the key the author named, in any case
+		// (ako/mxcli#1652). Everything below writes and scopes by that key.
+		propName, entry, ok := explicitPropertyKey(propertyTypeIDs, authored)
 		if !ok {
 			continue // not a known widget property key
+		}
+		// A widgets property holds widgets, written in its block; a scalar
+		// under its key went into the value's PrimitiveValue, which a widgets
+		// value never stores. MDL-WIDGET06 names the block (ako/mxcli#1744).
+		if entry.ValueType == "Widgets" {
+			continue
 		}
 		// Convert non-string values (bool, int, float) to string for property setting
 		var strVal string
@@ -362,7 +720,22 @@ func (e *PluggableWidgetEngine) Build(def *WidgetDefinition, w *ast.WidgetV3) (*
 		case float64:
 			strVal = fmt.Sprintf("%g", v)
 		default:
-			continue
+			// An expression — written as one, or a bare `$var/Attr` that
+			// parsed as a data source — is an Expression property's text and
+			// an error for every other scalar kind. Anything else is a shape
+			// this pass does not write (a data source, an action, a list).
+			op := operationForValueType(entry.ValueType)
+			if op == "" {
+				continue
+			}
+			text, err := scalarPropertyText(w, propName, propVal, op)
+			if err != nil {
+				return nil, err
+			}
+			if text == "" {
+				continue
+			}
+			strVal = text
 		}
 
 		// Route by ValueType when available
@@ -370,22 +743,101 @@ func (e *PluggableWidgetEngine) Build(def *WidgetDefinition, w *ast.WidgetV3) (*
 		case "Expression":
 			builder.SetExpression(propName, strVal)
 		case "TextTemplate":
-			entityCtx := e.pageBuilder.entityContext
-			builder.SetTextTemplateWithParams(propName, strVal, entityCtx)
+			// `<propName>Params:` — or, failing that, the widget-wide
+			// `contentparams:` — supplies the parameters for a `{1}`-style
+			// template. Without this branch the numeric spelling had no route on a
+			// pluggable widget — the template was written with an empty parameter
+			// list and mxbuild answered CE0720. The named `{AttrName}` spelling
+			// keeps its own path, which derives parameters from the entity
+			// context. (#928, #575)
+			if params := e.textTemplateParams(w, propName); len(params) > 0 &&
+				numericTemplatePlaceholderRe.MatchString(strVal) {
+				builder.SetTextTemplateWithClientParams(propName, strVal, params)
+				break
+			}
+			builder.SetTextTemplateWithParams(propName, strVal, e.entityContextFor(propName))
 		case "Attribute":
+			// The property's own scope, as the mapping pass uses — this pass
+			// re-applies a property authored by its schema key AFTER every
+			// datasource has run, so the shared context here is always the LAST
+			// datasource's entity, which is what #647 wrote for every name.
+			if _, _, rooted := rootedAssociationPath(strVal); rooted {
+				// `$Name/Assoc/Attr`: an association path read from a named
+				// object (ako/mxcli#833, #2107).
+				wv, finalQN, steps, err := e.rootedAttributeBinding(w, propName, strVal)
+				if err != nil {
+					return nil, err
+				}
+				builder.SetAttributeWithSteps(propName, finalQN, steps)
+				builder.SetSourceVariable(propName, &wv)
+				break
+			}
+			if name, rest, named := namedObjectBinding(strVal); named {
+				// `$Param.Attr`: the attribute of a page or snippet parameter,
+				// whatever encloses the widget — the AttributeRef plus a
+				// SourceVariable naming the parameter, as on a mapped key.
+				// Written as the qualified name alone it is CE7247
+				// (mendixlabs/mxcli#1591).
+				wv, entity, err := e.parameterBinding(w, propName, strVal, name)
+				if err != nil {
+					return nil, err
+				}
+				where := fmt.Sprintf("widget `%s` property `%s`", w.Name, propName)
+				if err := e.pageBuilder.rejectAssociationAsAttributeOn(w, name, rest, entity, where); err != nil {
+					return nil, err
+				}
+				builder.SetAttribute(propName, e.pageBuilder.resolveAttributePathForEntity(rest, entity))
+				builder.SetSourceVariable(propName, &wv)
+				break
+			}
 			attrPath := ""
+			scope := e.bindingScopeFor(propName)
+			if _, isPath := contextAssociationAttributePath(strVal); isPath {
+				// `Assoc/Attr` from the context object (ako/mxcli#2279).
+				finalQN, steps, err := e.contextAssociationAttributeBinding(w, propName, strVal, scope)
+				if err != nil {
+					return nil, err
+				}
+				builder.SetAttributeWithSteps(propName, finalQN, steps)
+				break
+			}
 			if strings.Count(strVal, ".") >= 2 {
+				// Qualified: stored as written, so an attribute of an entity
+				// other than the bound one is refused (CE7247).
+				if err := e.refuseMisboundAttribute(w, propName, strVal, scope); err != nil {
+					return nil, err
+				}
 				attrPath = strVal
-			} else if e.pageBuilder.entityContext != "" {
-				attrPath = e.pageBuilder.resolveAttributePath(strVal)
+			} else if scope.Entity != "" {
+				if err := e.refuseMisboundAttribute(w, propName, strVal, scope); err != nil {
+					return nil, err
+				}
+				attrPath = e.pageBuilder.resolveAttributePathForEntity(strVal, scope.Entity)
 			}
 			if attrPath != "" {
 				builder.SetAttribute(propName, attrPath)
 			}
+		case "Selection":
+			// A selection lives in the value's Selection field, never in
+			// PrimitiveValue, where the primitive fallback below put a combo
+			// box's `optionsSourceDatabaseItemSelection: 'Single'`
+			// (mendixlabs/mxcli#1583). A selection the definition maps is read
+			// in the mapping pass instead (mendixlabs/mxcli#1618); this is one
+			// it does not.
+			canonical, err := checkedSelectionValue(w, propName, strVal)
+			if err != nil {
+				return nil, err
+			}
+			builder.SetSelection(propName, canonical)
 		default:
-			// Known non-attribute types: always use primitive
+			// Known non-attribute types: always use primitive — an enumeration
+			// as the declared key it names (ako/mxcli#854).
 			if entry.ValueType != "" && entry.ValueType != "Attribute" {
-				builder.SetPrimitive(propName, strVal)
+				value, err := e.enumerationValue(builder, def, w, propName, strVal)
+				if err != nil {
+					return nil, err
+				}
+				builder.SetPrimitive(propName, value)
 				continue
 			}
 			// Legacy routing for properties without ValueType info
@@ -405,13 +857,32 @@ func (e *PluggableWidgetEngine) Build(def *WidgetDefinition, w *ast.WidgetV3) (*
 	// 4.10 Apply property-visibility rules: a TextTemplate property that the
 	// widget's editorConfig.js hides under the current configuration must emit
 	// TextTemplate: null, not the template's populated default (CE0463, #574).
-	if len(def.PropertyVisibility) > 0 {
-		builder.ApplyPropertyVisibility(def.PropertyVisibility)
+	// Rules come from the .def.json (hand-authored/generated); when it carries
+	// none — as for built-in widgets like DataGrid2, which the .def.json
+	// generator skips — lift them on the fly from the installed .mpk's
+	// editorConfig.js (#574 Phase 2), so version-specific applicability is
+	// honoured without a hand-maintained table.
+	visibility := def.PropertyVisibility
+	if len(visibility) == 0 {
+		visibility = resolveWidgetVisibilityRules(e.pageBuilder.getProjectPath(), def.WidgetID)
 	}
+	if len(visibility) > 0 {
+		builder.ApplyPropertyVisibility(visibility)
+	}
+	// 4.11 A TextTemplate bound to an optional data source the statement does
+	// not set is null, as Studio Pro stores it (ako/mxcli#1967, CE0463).
+	builder.NullTemplatesOfUnsetDataSources()
 
 	// 5. Build CustomWidget
 	widgetID := model.ID(types.GenerateID())
-	cw := builder.Finalize(widgetID, w.Name, w.GetLabel(), def.DefaultEditable)
+	// `label:` on a widget that declares a `label` of its own (a PDS Form
+	// label, the Badge button) is that key, written above by its mapping — not
+	// also a widget-level LabelTemplate beside it (ako/mxcli#2180).
+	label := w.GetLabel()
+	if templateOwnsCoreName(propertyTypeIDs, "label") {
+		label = ""
+	}
+	cw := builder.Finalize(widgetID, w.Name, label, def.DefaultEditable)
 
 	if err := e.pageBuilder.registerWidgetName(w.Name, cw.ID); err != nil {
 		return nil, err
@@ -420,25 +891,285 @@ func (e *PluggableWidgetEngine) Build(def *WidgetDefinition, w *ast.WidgetV3) (*
 	return cw, nil
 }
 
+// isPrimaryAttributeMapping reports whether mapping is the one a bare
+// `Attribute:` should fill: the FIRST attribute-typed mapping in the definition,
+// which is the widget's primary attribute (GenerateDefJSON preserves the widget
+// XML's property order, and a widget declares its main attribute first —
+// verified on Slider, RangeSlider, StarRating and ComboBox).
+//
+// A widget with exactly one attribute property is unaffected, which is the case
+// the bare keyword was written for.
+func (e *PluggableWidgetEngine) isPrimaryAttributeMapping(mapping PropertyMapping) bool {
+	def := e.currentDef
+	if def == nil {
+		return true // no definition to compare against — behave as before
+	}
+	for _, m := range def.PropertyMappings {
+		if m.Operation == "attribute" || m.Source == "Attribute" {
+			return m.PropertyKey == mapping.PropertyKey
+		}
+	}
+	return true
+}
+
+// hiddenUnnamedProperties returns the widget properties that are hidden under
+// the widget's current configuration AND were not named by the script — i.e.
+// reached only through an MDL keyword that several properties share. Writing
+// into one of those is CE0463; writing into a hidden property the script named
+// explicitly is reported by MDL-WIDGET10 instead, so it is deliberately not
+// included here.
+//
+// The KEY's presence means "hidden". The VALUE is the property's DECLARED
+// default, which the caller must write, or "" when no default could be looked
+// up — mxcli does not invent one.
+//
+// Skipping the property instead leaves the widget TEMPLATE's captured value in
+// place, and a template captures whatever the widget it was extracted from
+// happened to be set to. For the Image widget that is width/height 48 against a
+// declared default of 100, so every Image mxcli authored failed the build with
+// CE0463 — while mxcli's own MDL-WIDGET10 said, in as many words, that a hidden
+// `width` must be "100" (mxcli-formula1 FINDINGS §69/§142). The invariant is
+// default-VALUED, not skipped; the two only coincide when the template is
+// already at the default.
+//
+// defaults is the declared-default map from widgetPropertyDefaults — the same
+// source MDL-WIDGET10 reads, so the writer and the checker cannot disagree about
+// what a default is, which is how this shipped.
+//
+// stored is the TEMPLATE's captured configuration, read before any mapping was
+// applied. It is what answers a rule keyed on a property MDL cannot name; see
+// the fallback chain below.
+//
+// Rules come from the .def.json, falling back to a live lift from the installed
+// .mpk (the same two sources the visibility application uses).
+func (e *PluggableWidgetEngine) hiddenUnnamedProperties(def *WidgetDefinition, w *ast.WidgetV3, defaults, stored map[string]string) map[string]string {
+	rules := e.visibilityRules(def)
+	if len(rules) == 0 {
+		return nil
+	}
+	values, explicit := widgetValueMap(w, def)
+	out := map[string]string{}
+	for _, rule := range rules {
+		if rule.Nested() || rule.HiddenWhen == nil {
+			continue
+		}
+		key := strings.ToLower(rule.PropertyKey)
+		if explicit[key] {
+			continue // named by the script — MDL-WIDGET10's business, not ours
+		}
+		condKey := strings.ToLower(rule.HiddenWhen.PropertyKey)
+		condVal, known := values[condKey]
+		if !known || condVal == "" {
+			// widgetValueMap only knows properties the definition MAPS, because a
+			// mapping is what gives a property an MDL keyword. A rule whose
+			// condition is an UNMAPPED property was therefore always
+			// indeterminable and never fired — which is how `maxHeight` (hidden
+			// when `maxHeightUnit` is "none") kept the template's value and
+			// produced the one differing field in 1480 on a copied Atlas layout
+			// (mxcli-ledger §142).
+			//
+			// The TEMPLATE's captured value is the answer, and the declared
+			// default is NOT: the question is whether the property will be hidden
+			// in the document about to be WRITTEN, and an unmapped property is
+			// written with whatever the template holds. The two differ exactly
+			// where it matters — Image declares `maxHeightUnit` "pixels" and the
+			// template captured "none", so reading the default concluded
+			// "visible" and left `maxHeight` at the template's 0 against a
+			// declared 250, which is the whole of §142's CE0463. Both are
+			// fallbacks and not preferences: a value the script set, or a
+			// mapping's own default, still wins above.
+			if v, ok := stored[rule.HiddenWhen.PropertyKey]; ok && v != "" {
+				condVal, known = v, true
+			} else {
+				condVal, known = defaults[defaultsKey("", rule.HiddenWhen.PropertyKey)]
+			}
+			if !known || condVal == "" {
+				continue // still indeterminable — never guess
+			}
+		}
+		if firesUnder(rule, condVal, values, stored, defaults) {
+			out[key] = defaults[defaultsKey("", rule.PropertyKey)]
+		}
+	}
+	return out
+}
+
+// firesUnder evaluates every term of a rule's conjunction, resolving each the
+// same way the first term was resolved above: the widget's mapped values, then
+// the stored template, then the declared default. firstVal is the already
+// resolved value of the first term, so that work is not repeated.
+//
+// A term that stays indeterminable makes the whole rule not fire — the
+// serializer never guesses, which is why an unresolvable condition leaves the
+// template's value alone.
+func firesUnder(rule types.WidgetVisibilityRule, firstVal string, values, stored, defaults map[string]string) bool {
+	first := true
+	fires, determinable := rule.Fires(func(c types.WidgetVisibilityCondition) (string, bool) {
+		if first {
+			first = false
+			return firstVal, true
+		}
+		if v, ok := values[c.PropertyKey]; ok && v != "" {
+			return v, true
+		}
+		if v, ok := stored[c.PropertyKey]; ok && v != "" {
+			return v, true
+		}
+		v, ok := defaults[defaultsKey("", c.PropertyKey)]
+		if !ok || v == "" {
+			return "", false
+		}
+		return v, true
+	})
+	return determinable && fires
+}
+
+// visibilityRules is the widget's editorConfig visibility rules: from the
+// .def.json when it carries them, otherwise a live lift from the installed .mpk.
+// Both consumers must use the same list — reading the .def.json field directly
+// gets an EMPTY one for every widget whose rules are lifted, which is most of
+// them, and a lookup keyed on it then silently finds nothing.
+func (e *PluggableWidgetEngine) visibilityRules(def *WidgetDefinition) []types.WidgetVisibilityRule {
+	if len(def.PropertyVisibility) > 0 {
+		return def.PropertyVisibility
+	}
+	return resolveWidgetVisibilityRules(e.pageBuilder.getProjectPath(), def.WidgetID)
+}
+
+// unmappedHiddenResets returns the hidden properties that the property-mapping
+// loop will not reach, keyed by the property key as the widget declares it (the
+// hidden map is lower-cased; a builder needs the real spelling, which is what
+// rules carries).
+//
+// Only properties with a declared default are returned — where none could be
+// looked up there is nothing to write, and mxcli does not invent one. That is
+// also what keeps #956's File Uploader datasource pruning unchanged: a
+// datasource has no default.
+//
+// The mapped ones are excluded rather than merged: the loop already writes them,
+// and writing a second value for one property is its own defect. "Mapped" means
+// in mappings — the mode the widget is built in, which is all the loop visits.
+// Counting every mode's mappings left a property that only ANOTHER mode maps
+// unwritten by either: a database-mode Combo box kept the template's
+// `optionsSourceType` "enumeration", hidden there, against a declared
+// "association" — CE0463 (mendixlabs/mxcli#1583).
+func unmappedHiddenResets(mappings []PropertyMapping, rules []types.WidgetVisibilityRule, hidden map[string]string) map[string]string {
+	if len(hidden) == 0 {
+		return nil
+	}
+	mapped := make(map[string]bool, len(mappings))
+	for _, m := range mappings {
+		mapped[strings.ToLower(m.PropertyKey)] = true
+	}
+	out := map[string]string{}
+	for _, rule := range rules {
+		key := strings.ToLower(rule.PropertyKey)
+		if mapped[key] {
+			continue
+		}
+		reset, isHidden := hidden[key]
+		if !isHidden || reset == "" {
+			continue
+		}
+		out[rule.PropertyKey] = reset
+	}
+	return out
+}
+
+// resetToDeclaredDefault writes a hidden property's declared default into the
+// slot its value type keeps it in. An Expression property keeps it in
+// Expression, with PrimitiveValue left empty: that is how Studio Pro stores
+// every one of the 939 Expression-typed values across ako/TestApp and PedApp,
+// and the primitive setter this used to call put a combo box's hidden
+// customEditabilityExpression default in both (ako/mxcli#548). Every other type
+// a reset reaches is a primitive.
+func resetToDeclaredDefault(builder backend.WidgetObjectBuilder, ids map[string]pages.PropertyTypeIDEntry, key, value string) {
+	if ids[key].ValueType == "Expression" {
+		builder.SetExpression(key, value)
+		return
+	}
+	builder.SetPrimitive(key, value)
+}
+
+// templateAttrPlaceholderRe matches `{AttrName}` placeholders in a text
+// template. Numeric parameter references (`{1}`) don't match and pass through
+// verbatim.
+var templateAttrPlaceholderRe = regexp.MustCompile(`\{[A-Za-z][A-Za-z0-9_]*\}`)
+
 // applyOperation dispatches a named operation to the corresponding builder method.
 func (e *PluggableWidgetEngine) applyOperation(builder backend.WidgetObjectBuilder, opName string, propKey string, ctx *BuildContext) error {
 	switch opName {
 	case "attribute":
-		builder.SetAttribute(propKey, ctx.AttributePath)
+		if len(ctx.AttributeSteps) > 0 {
+			builder.SetAttributeWithSteps(propKey, ctx.AttributePath, ctx.AttributeSteps)
+		} else {
+			builder.SetAttribute(propKey, ctx.AttributePath)
+		}
+		if ctx.SourceVariable != nil && ctx.AttributePath != "" {
+			builder.SetSourceVariable(propKey, ctx.SourceVariable)
+		}
 	case "association":
 		builder.SetAssociation(propKey, ctx.AssocPath, ctx.EntityName)
+		if ctx.SourceVariable != nil && ctx.AssocPath != "" {
+			builder.SetSourceVariable(propKey, ctx.SourceVariable)
+		}
 	case "primitive":
 		builder.SetPrimitive(propKey, ctx.PrimitiveVal)
 	case "selection":
 		builder.SetSelection(propKey, ctx.PrimitiveVal)
+	case "image":
+		// An image collection entry, by its three-part qualified name. The
+		// value arrives through the generic source branch, so it is in
+		// PrimitiveVal like any other scalar — only the key it lands on differs.
+		if ctx.ImageEntity != "" {
+			builder.SetImageEntity(propKey, ctx.ImageEntity)
+		} else {
+			builder.SetImage(propKey, ctx.PrimitiveVal)
+		}
+	case "icon":
+		if ctx.Icon != nil {
+			builder.SetIcon(propKey, ctx.Icon)
+		}
 	case "expression":
+		// No MDL value: keep the template's default expression rather than
+		// writing an empty one over it — an empty required expression is CE0642.
+		if ctx.PrimitiveVal == "" {
+			return nil
+		}
 		builder.SetExpression(propKey, ctx.PrimitiveVal)
 	case "datasource":
 		builder.SetDataSource(propKey, ctx.DataSource)
 	case "widgets":
 		// ctx doesn't carry child widgets for this path — handled by applyChildSlots
 	case "texttemplate":
-		builder.SetTextTemplate(propKey, ctx.PrimitiveVal)
+		// No MDL value provided: keep the template's default ClientTemplate
+		// (the widget's shipped caption, or null where the widget's editorConfig
+		// hides it) rather than overwriting it with an empty template. This lets
+		// GenerateDefJSON emit a mapping for every texttemplate property (so any
+		// caption is authorable) without nulling the defaults of the ones the user
+		// leaves unset.
+		if ctx.PrimitiveVal == "" {
+			return nil
+		}
+		// A `{AttrName}` placeholder needs ClientTemplate parameters resolved
+		// against the entity context — plain SetTextTemplate would emit the
+		// braces literally, which Studio Pro's translatable-text parser rejects
+		// ("Brace should be followed by a number of digits"). Placeholder-less
+		// text keeps the SetTextTemplate path so backend output is unchanged.
+		// `contentparams:` supplies the parameters for a `{1}`-style template.
+		// The explicit-property pass has routed this since #928; the MAPPING pass
+		// did not, so the same text authored through a mapped property key was
+		// written with an empty parameter list and mxbuild answered CE0720. The
+		// gap was unreachable while such text was being dropped altogether
+		// (#254) — fixing the drop is what exposes it.
+		switch {
+		case len(ctx.ClientParams) > 0 && numericTemplatePlaceholderRe.MatchString(ctx.PrimitiveVal):
+			builder.SetTextTemplateWithClientParams(propKey, ctx.PrimitiveVal, ctx.ClientParams)
+		case templateAttrPlaceholderRe.MatchString(ctx.PrimitiveVal):
+			builder.SetTextTemplateWithParams(propKey, ctx.PrimitiveVal, e.entityContextFor(propKey))
+		default:
+			builder.SetTextTemplate(propKey, ctx.PrimitiveVal)
+		}
 	case "action":
 		builder.SetAction(propKey, ctx.Action)
 	case "attributeObjects":
@@ -449,12 +1180,90 @@ func (e *PluggableWidgetEngine) applyOperation(builder backend.WidgetObjectBuild
 	return nil
 }
 
+// singleAttributeOverflow finds the mapping, in the mode the widget builds in,
+// that feeds the `attributes:` list into ONE attribute property — and reports
+// whether the script listed more than one. Shared by exec and check (#1519).
+func singleAttributeOverflow(def *WidgetDefinition, w *ast.WidgetV3) (PropertyMapping, []string, bool) {
+	attrs := w.GetAttributes()
+	if def == nil || len(attrs) < 2 {
+		return PropertyMapping{}, nil, false
+	}
+	mappings, _, err := (&PluggableWidgetEngine{}).selectMappings(def, w)
+	if err != nil {
+		return PropertyMapping{}, nil, false
+	}
+	for _, m := range mappings {
+		if m.Source == "Attributes" && m.Operation == "attribute" {
+			return m, attrs, true
+		}
+	}
+	return PropertyMapping{}, nil, false
+}
+
+func singleAttributeOverflowMessage(w *ast.WidgetV3, m PropertyMapping, attrs []string) string {
+	return fmt.Sprintf("widget `%s` (%s) filters on one attribute, stored on `%s`, but `attributes:` lists %d (%s) — "+
+		"name one, or use a textfilter, which takes several",
+		w.Name, w.Type, m.PropertyKey, len(attrs), strings.Join(attrs, ", "))
+}
+
+// refuseUndeclaredMappedKey fails the build when a mapping carries a value the
+// SCRIPT authored to a key the loaded widget does not declare. Every builder
+// operation skips an unknown key without a word, so the value was dropped while
+// check, exec and mx check all stayed clean — #1519's drop-down filter, whose
+// attribute went to the text filter's `attributes` key. A mapping's own constant
+// (`value` in the .def.json) is not checked: it is the definition's default, not
+// the user's data, and an older widget version lacking the key is not the
+// script's fault.
+//
+// A constant the script overrides by the property's own key is the script's
+// value, though: Gallery 3.4.0 declares no `advanced`, which the hand-written
+// definition maps to false, and `advanced: true` was discarded
+// (mendixlabs/mxcli#1618).
+func refuseUndeclaredMappedKey(builder backend.WidgetObjectBuilder, def *WidgetDefinition, mapping PropertyMapping, ctx *BuildContext, w *ast.WidgetV3) error {
+	if !ctx.carriesValue() {
+		return nil
+	}
+	if _, authored := lookupProperty(w.Properties, mapping.PropertyKey); mapping.Value != "" && !authored {
+		return nil
+	}
+	declarer, ok := builder.(backend.WidgetPropertyDeclarer)
+	if !ok || declarer.DeclaresProperty(mapping.PropertyKey) {
+		return nil
+	}
+	return mdlerrors.NewValidationf(
+		"widget `%s` (%s): its definition maps `%s` to property `%s`, which the installed widget %s does not declare — "+
+			"the value would be dropped. The definition does not match this widget version",
+		w.Name, def.MDLName, mappingSourceLabel(mapping), mapping.PropertyKey, def.WidgetID)
+}
+
+func mappingSourceLabel(m PropertyMapping) string {
+	if m.Source != "" {
+		return m.Source
+	}
+	return m.PropertyKey
+}
+
+// carriesValue reports whether resolving a mapping produced anything to write.
+func (c *BuildContext) carriesValue() bool {
+	return c.AttributePath != "" || len(c.AttributePaths) > 0 || c.AssocPath != "" ||
+		c.PrimitiveVal != "" || c.DataSource != nil || c.Action != nil || c.ImageEntity != ""
+}
+
 // selectMappings selects the active PropertyMappings and ChildSlotMappings based on mode.
 func (e *PluggableWidgetEngine) selectMappings(def *WidgetDefinition, w *ast.WidgetV3) ([]PropertyMapping, []ChildSlotMapping, error) {
 	if len(def.Modes) == 0 {
 		return def.PropertyMappings, def.ChildSlots, nil
 	}
+	mode, err := e.selectMode(def, w)
+	if err != nil {
+		return nil, nil, err
+	}
+	return mode.PropertyMappings, mode.ChildSlots, nil
+}
 
+// selectMode returns the mode a widget builds in: the first whose condition
+// holds, else the single unconditioned one. A definition without modes has none.
+func (e *PluggableWidgetEngine) selectMode(def *WidgetDefinition, w *ast.WidgetV3) (*WidgetMode, error) {
 	var fallback *WidgetMode
 	var fallbackCount int
 	for i := range def.Modes {
@@ -466,34 +1275,510 @@ func (e *PluggableWidgetEngine) selectMappings(def *WidgetDefinition, w *ast.Wid
 			}
 			continue
 		}
-		if e.evaluateCondition(mode.Condition, w) {
-			return mode.PropertyMappings, mode.ChildSlots, nil
+		if e.evaluateCondition(mode.Condition, w, mode.PropertyMappings) {
+			return mode, nil
 		}
 	}
 
 	if fallback != nil {
 		if fallbackCount > 1 {
-			return nil, nil, mdlerrors.NewValidationf("widget %s has %d modes without conditions; only one default mode is allowed", def.MDLName, fallbackCount)
+			return nil, mdlerrors.NewValidationf("widget %s has %d modes without conditions; only one default mode is allowed", def.MDLName, fallbackCount)
 		}
-		return fallback.PropertyMappings, fallback.ChildSlots, nil
+		return fallback, nil
 	}
 
-	return nil, nil, mdlerrors.NewValidationf("no matching mode for widget %s", def.MDLName)
+	return nil, mdlerrors.NewValidationf("no matching mode for widget %s", def.MDLName)
 }
 
 // evaluateCondition checks a built-in condition string against the AST widget.
-func (e *PluggableWidgetEngine) evaluateCondition(condition string, w *ast.WidgetV3) bool {
+//
+// mappings are the candidate mode's own PropertyMappings, which the datasource
+// conditions need: a mode gated on a datasource must be selected by the
+// datasource THAT MODE owns, not by any datasource-shaped value on the widget.
+func (e *PluggableWidgetEngine) evaluateCondition(condition string, w *ast.WidgetV3, mappings []PropertyMapping) bool {
 	switch {
+	case strings.HasPrefix(condition, "hasDataSource:"):
+		// One named datasource selects the mode. This is the legible form for a
+		// widget whose modes are mutually exclusive by WHICH datasource is set —
+		// a ComboBox's association vs database — because the def.json then says
+		// which one, instead of leaving it to mode order.
+		key := strings.TrimPrefix(condition, "hasDataSource:")
+		return namedDataSourceValue(dataSourceMappingFor(mappings, key), w) != nil
 	case condition == "hasDataSource":
-		return w.GetDataSource() != nil
+		if w.GetDataSource() != nil {
+			return true
+		}
+		// A mode whose datasource was given by name must still activate. Only
+		// the mode's DATASOURCE mappings are consulted: a microflow action and a
+		// microflow datasource parse to the same AST shape, so scanning every
+		// property would let an `OnChange:` select a datasource mode.
+		for _, m := range mappings {
+			if m.Operation == "datasource" && namedDataSourceValue(m, w) != nil {
+				return true
+			}
+		}
+		return false
 	case condition == "hasAttribute":
 		return w.GetAttribute() != ""
+	case condition == "hasAttributes":
+		// `attributes: [A, …]` — a drop-down filter's custom attribute, which
+		// selects attrChoice "linked" rather than the column's own (#1519).
+		return len(w.GetAttributes()) > 0
 	case strings.HasPrefix(condition, "hasProp:"):
 		propName := strings.TrimPrefix(condition, "hasProp:")
 		return w.GetStringProp(propName) != ""
 	default:
 		return false
 	}
+}
+
+// dataSourceMappingFor returns the mode's datasource mapping with the given
+// property key, so the condition resolves the value under that mapping's aliases
+// too. A key the mode does not declare yields a bare mapping, which still matches
+// the property written under that exact name — a condition naming a key with no
+// mapping is a definition bug, not a reason to ignore what the script wrote.
+func dataSourceMappingFor(mappings []PropertyMapping, key string) PropertyMapping {
+	for _, m := range mappings {
+		if strings.EqualFold(m.PropertyKey, key) {
+			return m
+		}
+	}
+	return PropertyMapping{PropertyKey: key}
+}
+
+// namedPropValue returns the MDL value written for a mapping's property, matched
+// by its PropertyKey or any registered MdlAlias (case-insensitive, via
+// lookupProperty). Returns "" when the user didn't set it. Used to route several
+// same-typed widget-level properties (e.g. a chart's ValueAttribute vs
+// SortAttribute) to the right MDL keyword.
+func namedPropValue(mapping PropertyMapping, w *ast.WidgetV3) string {
+	if v, ok := lookupProperty(w.Properties, mapping.PropertyKey); ok {
+		return stringifyAny(v)
+	}
+	for _, alias := range mapping.MdlAliases {
+		if v, ok := lookupProperty(w.Properties, alias); ok {
+			return stringifyAny(v)
+		}
+	}
+	return ""
+}
+
+// namedPropRaw is the unstringified value of a mapping's property, under its
+// key or an alias, with the name it was found under.
+func namedPropRaw(mapping PropertyMapping, w *ast.WidgetV3) (any, string, bool) {
+	if v, ok := lookupProperty(w.Properties, mapping.PropertyKey); ok {
+		return v, mapping.PropertyKey, true
+	}
+	for _, alias := range mapping.MdlAliases {
+		if v, ok := lookupProperty(w.Properties, alias); ok {
+			return v, alias, true
+		}
+	}
+	return nil, "", false
+}
+
+// namedPropValueWithKey is namedPropValue plus the NAME the value was found
+// under. A text-template property's parameters live beside it under that same
+// name + "Params", and the script may have written either the schema key or one
+// of the MDL aliases — so the companion cannot be looked up until it is known
+// which one was used.
+func namedPropValueWithKey(mapping PropertyMapping, w *ast.WidgetV3) (string, string) {
+	if v, ok := lookupProperty(w.Properties, mapping.PropertyKey); ok {
+		return stringifyAny(v), mapping.PropertyKey
+	}
+	for _, alias := range mapping.MdlAliases {
+		if v, ok := lookupProperty(w.Properties, alias); ok {
+			return stringifyAny(v), alias
+		}
+	}
+	return "", ""
+}
+
+// templateParamNames lists the names a text-template mapping's `<Name>Params`
+// companion may be written under, most specific first: the name the template
+// text itself was authored under, then the schema key, then the aliases. An
+// alias-authored caption keeps working when the companion is written with the
+// schema key and vice versa.
+func templateParamNames(mapping PropertyMapping, matched string) []string {
+	names := make([]string, 0, len(mapping.MdlAliases)+2)
+	if matched != "" {
+		names = append(names, matched)
+	}
+	if mapping.PropertyKey != "" && mapping.PropertyKey != matched {
+		names = append(names, mapping.PropertyKey)
+	}
+	for _, a := range mapping.MdlAliases {
+		if a != "" && a != matched && a != mapping.PropertyKey {
+			names = append(names, a)
+		}
+	}
+	return names
+}
+
+// textTemplateParams resolves the ClientTemplateParameters bound to ONE
+// text-template property: its own `<Name>Params` companion, falling back to the
+// widget-wide `contentparams:`.
+//
+// The companion is the same convention an object-list item already used (#956).
+// Stopping it at the item boundary left a widget-level textTemplate — a TreeNode
+// `headerCaption`, a Timeline `title`/`description`/`timeIndication` — with one
+// shared parameter list for every template on the widget, which cannot express
+// "this caption binds Name and that one binds Remarks". A literal was the only
+// thing left that worked, so every row rendered the same string (#575).
+func (e *PluggableWidgetEngine) textTemplateParams(w *ast.WidgetV3, names ...string) []*pages.ClientTemplateParameter {
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		raw, ok := lookupProperty(w.Properties, name+"Params")
+		if !ok {
+			continue
+		}
+		astParams, ok := raw.([]ast.ParamAssignmentV3)
+		if !ok || len(astParams) == 0 {
+			continue
+		}
+		return e.pageBuilder.buildClientTemplateParams(astParams)
+	}
+	return e.pageBuilder.buildClientTemplateParams(w.GetContentParams())
+}
+
+// namedDataSourceValue returns the datasource a script authored under a
+// mapping's own schema key (or one of its aliases):
+//
+//	optionsSourceAssociationDataSource: database from Sales.Customer
+//
+// Deliberately separate from namedPropValue: that one goes through stringifyAny,
+// which would flatten the structured AST into text and lose the source kind, its
+// arguments and its constraint. Returns nil when the property is absent or holds
+// something that is not a datasource — a scalar there is MDL-WIDGET05's business,
+// not this function's.
+func namedDataSourceValue(mapping PropertyMapping, w *ast.WidgetV3) *ast.DataSourceV3 {
+	names := append([]string{mapping.PropertyKey}, mapping.MdlAliases...)
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		if v, ok := lookupProperty(w.Properties, name); ok {
+			if ds, ok := v.(*ast.DataSourceV3); ok {
+				return ds
+			}
+		}
+	}
+	return nil
+}
+
+// dataSourceTypedTemplateKeys returns the template's datasource-typed property
+// keys, sorted. Sorted rather than in template order because propertyTypeIDs is a
+// map and carries no order; the only caller refuses the ambiguous case anyway, so
+// the order decides nothing but the wording of its message.
+func dataSourceTypedTemplateKeys(propertyTypeIDs map[string]pages.PropertyTypeIDEntry) []string {
+	var keys []string
+	for propKey, entry := range propertyTypeIDs {
+		if entry.ValueType == "DataSource" {
+			keys = append(keys, propKey)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// dataSourceMappingKeys returns the property keys of a mode's datasource
+// mappings, in definition order.
+func dataSourceMappingKeys(mappings []PropertyMapping) []string {
+	var keys []string
+	for _, m := range mappings {
+		if m.Source == "DataSource" && m.PropertyKey != "" {
+			keys = append(keys, m.PropertyKey)
+		}
+	}
+	return keys
+}
+
+// refuseLinkedDataSourceMapping rejects a definition that maps a datasource the
+// PLATFORM owns.
+//
+// A widget.xml `isLinked="true"` datasource is filled from the containing
+// widget: a Data Grid 2 column filter's `linkedDs` ("Datasource to Filter")
+// comes from the grid it sits in. Measured on Mendix 11.6.6 — five Studio
+// Pro-authored drop-down filters store it EMPTY, a filter written without it
+// passes `mx check` at 0 errors, and a filter written WITH it still fails
+// CE0642 "Property 'Datasource to Filter' is required", because mxbuild resolves
+// the property from the parent rather than reading what is stored.
+//
+// So writing one is not merely useless, it is authoring what the model does not
+// own (ADR-0005, the same reasoning as a constant's shared/private choice).
+// Refused rather than skipped: a .def.json naming it is a mistake to report, and
+// a silently ignored mapping is how the author concludes mxcli wrote it.
+func refuseLinkedDataSourceMapping(def *WidgetDefinition, mappings []PropertyMapping, propertyTypeIDs map[string]pages.PropertyTypeIDEntry) error {
+	for _, m := range mappings {
+		if m.Operation != "datasource" || m.PropertyKey == "" {
+			continue
+		}
+		if propertyTypeIDs[m.PropertyKey].IsLinked {
+			return mdlerrors.NewValidationf(
+				"widget %s definition maps `%s`, which the widget declares as a LINKED datasource — "+
+					"it is filled from the containing widget (a Data Grid 2 supplies its column filter's), "+
+					"not from MDL, and a value written there does not satisfy it. Remove the mapping",
+				def.MDLName, m.PropertyKey)
+		}
+	}
+	return nil
+}
+
+// refuseAmbiguousGenericDataSource rejects the generic `datasource:` clause on a
+// widget that exposes more than one.
+//
+// The clause is the single-source convenience form: it says "the datasource"
+// where the widget has several, so there is no answer to give. Guessing one has
+// been tried both ways and neither is defensible — feeding it to every mapping
+// duplicates one binding across unrelated slots, and feeding it to the first
+// leaves the others unset, which mxbuild reports as CE0642 against a property the
+// author never mentioned. Name the schema key instead; the message lists them.
+func refuseAmbiguousGenericDataSource(def *WidgetDefinition, w *ast.WidgetV3, dsKeys []string) error {
+	if len(dsKeys) < 2 || w.GetDataSource() == nil {
+		return nil
+	}
+	return mdlerrors.NewValidationf(
+		"widget `%s` (%s) exposes %d datasources, so a generic `datasource:` clause is ambiguous — "+
+			"name the one you mean: %s",
+		w.Name, def.MDLName, len(dsKeys), strings.Join(dsKeys, ", "))
+}
+
+// parameterBinding resolves the `$name` of a `$name.Attr` binding on a pluggable
+// widget property to the object it names: a page or snippet parameter, or an
+// enclosing data view — the data-view pair Studio Pro stores on a markdown
+// viewer in an inner data view (FactoryManagement ConversationalUI
+// Span_*_SlideIn, ako/mxcli#2107) as on the built-in inputs (#826). It returns
+// the SourceVariable to store beside the reference and the object's entity.
+// Any other name is refused: it would be written as a binding that reads
+// nothing.
+func (e *PluggableWidgetEngine) parameterBinding(w *ast.WidgetV3, propertyKey, attr, name string) (pages.WidgetVariable, string, error) {
+	wv, entity, ok := e.pageBuilder.namedObjectVariable(name)
+	if !ok {
+		return pages.WidgetVariable{}, "", notAParameterError(
+			fmt.Sprintf("%s `%s` property `%s`", strings.ToLower(w.Type), w.Name, propertyKey),
+			attr, name, e.pageBuilder.documentKind())
+	}
+	return wv, entity, nil
+}
+
+// rootedAttributeBinding resolves `$Name/Assoc/Attr` on a pluggable widget's
+// attribute property — an association path read from a parameter or an
+// enclosing data view, the shape Studio Pro stores as the AttributeRef's
+// steps beside a SourceVariable naming the object (FactoryManagement
+// ConversationalUI.Span_TextGeneration_SlideIn, ako/mxcli#2107).
+func (e *PluggableWidgetEngine) rootedAttributeBinding(w *ast.WidgetV3, propertyKey, attr string) (pages.WidgetVariable, string, []pages.AttributeRefStep, error) {
+	wv, finalQN, steps, ok := e.pageBuilder.resolveRootedAssociationPath(attr)
+	if !ok {
+		root, _, _ := rootedAssociationPath(attr)
+		return pages.WidgetVariable{}, "", nil, mdlerrors.NewValidationf(
+			"%s `%s` property `%s`: `%s` — `$%s/…` reads an association path from a parameter of this %s or an "+
+				"enclosing data view, and `$%s` is neither, or the path does not resolve from it",
+			strings.ToLower(w.Type), w.Name, propertyKey, attr, root, e.pageBuilder.documentKind(), root)
+	}
+	return wv, finalQN, steps, nil
+}
+
+// contextAssociationAttributePath reports whether attr is a context-relative
+// association path — `Assoc/…/Attr`, `$currentObject/Assoc/…/Attr`, or either
+// fully qualified — rather than a plain attribute name or a `$Root/…` path.
+func contextAssociationAttributePath(attr string) (path string, ok bool) {
+	path = strings.TrimPrefix(strings.TrimSpace(attr), "$currentObject/")
+	if path == "" || strings.HasPrefix(path, "$") || !strings.Contains(path, "/") {
+		return "", false
+	}
+	return path, true
+}
+
+// contextAssociationAttributeBinding resolves a context-relative association
+// path on a pluggable widget's attribute property against the entity the
+// property binds to. See pageBuilder.pluggableAssociationAttributePath.
+func (e *PluggableWidgetEngine) contextAssociationAttributeBinding(w *ast.WidgetV3, propertyKey, attr string, scope bindingScope) (string, []pages.AttributeRefStep, error) {
+	return e.pageBuilder.pluggableAssociationAttributePath(w, propertyKey, attr, scope.Entity,
+		singleValueAttributeProperty(e.currentPropertyTypeIDs, propertyKey))
+}
+
+// singleValueAttributeProperty reports whether the template declares
+// propertyKey as an attribute property linked to no datasource: one value of
+// the context object (the widget gets an EditableValue), as opposed to a
+// per-item value of a datasource it is linked to (a ListAttributeValue).
+func singleValueAttributeProperty(ids map[string]pages.PropertyTypeIDEntry, propertyKey string) bool {
+	entry, declared := ids[propertyKey]
+	return declared && entry.DataSourceProperty == ""
+}
+
+// pluggableAssociationAttributePath resolves `Assoc/…/Attr` on a pluggable
+// widget's attribute property, read from entity, into the final attribute and
+// the hops Studio Pro stores as the AttributeRef's IndirectEntityRef (PedApp
+// Administration.Account_Overview: a Data grid 2 column over System.UserRoles,
+// a CustomWidgets$WidgetValue whose AttributeRef carries an EntityRef of
+// EntityRefSteps). The qualified spellings normalise to the same steps, as on
+// the built-in inputs (#2255, #2277). Shared by exec and check, so the two
+// refuse the same paths with the same words.
+//
+// Which paths a property takes is decided by its link, not by a path flag:
+// pluggable widget XML has no per-property path declaration, and the
+// WidgetValueType's IsPath / PathType — a legacy custom-widget field — are
+// "No" / "None" on every template and on that Studio Pro-authored column,
+// which stores a path all the same. Measured on mxbuild 11.16.0:
+//
+//   - linked to no datasource (singleValue): every hop must be a Reference
+//     followed from its owner — a reference set is CE7247 "Association … should
+//     be of type 'Reference'", a reference followed backwards CE7247 "Entity …
+//     has no association …". A reference with owner Both is followed either way.
+//   - linked to a datasource: a reference set is what the Studio Pro column
+//     above follows, so no hop rule is applied.
+//
+// A path that does not resolve is refused too: written as it stood it was one
+// flat attribute name the entity does not have, CE1613 (ako/mxcli#2279).
+func (pb *pageBuilder) pluggableAssociationAttributePath(w *ast.WidgetV3, propertyKey, attr, entity string, singleValue bool) (string, []pages.AttributeRefStep, error) {
+	where := fmt.Sprintf("%s `%s` property `%s`", strings.ToLower(w.Type), w.Name, propertyKey)
+	return pb.pluggableAssociationAttributePathAt(where, attr, entity, singleValue)
+}
+
+// pluggableAssociationAttributePathAt is pluggableAssociationAttributePath for
+// a caller that names the property itself: ALTER … SET, which holds the stored
+// widget rather than its AST (ako/mxcli#2283).
+func (pb *pageBuilder) pluggableAssociationAttributePathAt(where, attr, entity string, singleValue bool) (string, []pages.AttributeRefStep, error) {
+	if entity == "" {
+		return "", nil, mdlerrors.NewValidationf(
+			"%s: `%s` is an association path, which is read from the object of an enclosing data container, "+
+				"and this widget has none. Place it in a data view, or read it from a parameter with `$Param/Assoc/Attr`",
+			where, attr)
+	}
+	path, _ := contextAssociationAttributePath(attr)
+	finalQN, steps, ok := pb.resolveAssociationPathFrom(path, entity)
+	if !ok {
+		return "", nil, mdlerrors.NewValidationf(
+			"%s: `%s` does not resolve from %s, the entity this property binds to — each step before the "+
+				"attribute must be an association of the entity the step before arrives at, and the last an "+
+				"attribute of the entity the path ends at. Written as it stands it would be one flat attribute "+
+				"name %s does not have: CE1613 \"The selected attribute no longer exists\"",
+			where, attr, entity, entity)
+	}
+	if singleValue {
+		if err := pb.singleObjectHopsError(where, attr, entity, steps); err != nil {
+			return "", nil, err
+		}
+	}
+	return finalQN, steps, nil
+}
+
+// singleObjectHopsError refuses a hop that does not arrive at ONE object: a
+// reference set, or a reference followed from the end that does not own it.
+// An association no domain model declares (System.owner, System.changedBy) is
+// a plain reference and passes.
+func (pb *pageBuilder) singleObjectHopsError(where, attr, start string, steps []pages.AttributeRefStep) error {
+	cur := start
+	for _, s := range steps {
+		refSet, ownerBoth, known := pb.associationKind(s.Association)
+		if known {
+			if refSet {
+				return mdlerrors.NewValidationf(
+					"%s: `%s` follows %s, a reference set, and this property holds one value of the context object "+
+						"— mxbuild reports CE7247 \"Association '%s' should be of type 'Reference'\". Show the "+
+						"associated objects in a list view or data grid over that association instead",
+					where, attr, s.Association, s.Association)
+			}
+			if from, _, ok := pb.associationEndpoints(s.Association); ok && !ownerBoth && !pb.entityIsOrDescendsFrom(cur, from) {
+				return mdlerrors.NewValidationf(
+					"%s: `%s` follows %s from %s, the end that does not own it — that direction reaches a list of "+
+						"%s objects, not one, and mxbuild reports CE7247 \"Entity '%s' has no association '%s'\". "+
+						"Read the attribute from %s's side, or list the objects with a data source over the association",
+					where, attr, s.Association, cur, from, cur, s.Association, from)
+			}
+		}
+		cur = s.DestinationEntity
+	}
+	return nil
+}
+
+// notAParameterError refuses a `$name.Attr` binding whose name is no page or
+// snippet parameter. where names the widget property, for the message.
+func notAParameterError(where, attr, name, documentKind string) error {
+	return mdlerrors.NewValidationf(
+		"%s: `%s` — `$%s` is not a parameter of this %s or an enclosing data view; `$Param.Attr` reads an "+
+			"attribute of a page or snippet parameter, `$dataView1.Attr` one of a data view the widget is inside. "+
+			"For the nearest data container's object, name the attribute bare",
+		where, attr, name, documentKind)
+}
+
+// entityContextFor returns the entity that propertyKey's value binds against.
+// See bindingScopeFor.
+func (e *PluggableWidgetEngine) entityContextFor(propertyKey string) string {
+	return e.bindingScopeFor(propertyKey).Entity
+}
+
+// bindingScopeFor applies the widget's own binding rule (resolveBindingScope,
+// shared with check) to one of its properties.
+//
+// The template says which datasource a property belongs to when it declares a
+// DataSourceProperty (widget.xml `dataSource="…"`): a DatagridDropdownFilter's
+// `refCaption` names an attribute of `refOptions`' entity, never of `linkedDs`'.
+// A property the template declares WITHOUT one binds to the context object —
+// the enclosing data container, which is what the build started in — not to
+// whichever of the widget's own datasources was applied last (#647). A key the
+// template does not declare, or a build with no enclosing context, falls back to
+// the one shared entityContext, as before.
+func (e *PluggableWidgetEngine) bindingScopeFor(propertyKey string) bindingScope {
+	entry, declared := e.currentPropertyTypeIDs[propertyKey]
+	return resolveBindingScope(entry.DataSourceProperty, declared, e.outerEntityContext,
+		e.dataSourceEntities, e.pageBuilder.entityContext)
+}
+
+// associationTargetFor returns the entity an association property leads to: its
+// linked datasource's entity when the template declares one, else the widget's
+// own (last-applied) datasource entity — the pre-#647 answer, which is right for
+// an association, whose far end is the option list rather than the context.
+func (e *PluggableWidgetEngine) associationTargetFor(propertyKey string) string {
+	if key := e.currentPropertyTypeIDs[propertyKey].DataSourceProperty; key != "" {
+		if entity := e.dataSourceEntities[key]; entity != "" {
+			return entity
+		}
+	}
+	return e.pageBuilder.entityContext
+}
+
+// refuseMisboundAttribute is the executor's half of misboundAttributeError: the
+// same refusal check makes, over the engine's live state.
+func (e *PluggableWidgetEngine) refuseMisboundAttribute(w *ast.WidgetV3, propertyKey, attr string, scope bindingScope) error {
+	if scope.Kind == scopeShared {
+		return nil
+	}
+	return misboundAttributeError(
+		fmt.Sprintf("widget `%s` property `%s`", w.Name, propertyKey),
+		attr, scope, e.outerEntityContext, e.dataSourceEntities, e.pageBuilder.attributeIndex())
+}
+
+// itemEntityContextFor returns the entity an object-list item property binds
+// against: the one its own datasource resolved to when the widget declares that
+// link, and the item's shared context otherwise.
+//
+// The item twin of entityContextFor. Same fallback, so a series configuring one
+// datasource — which is every series in every mode, since `dataSet` selects
+// static or dynamic — resolves exactly as before.
+func (e *PluggableWidgetEngine) itemEntityContextFor(ip ItemPropertyMapping, prebuiltEntities map[string]string) string {
+	if ip.DataSource != "" {
+		if entity := prebuiltEntities[ip.DataSource]; entity != "" {
+			return entity
+		}
+	}
+	return e.pageBuilder.entityContext
+}
+
+// recordDataSourceEntity remembers the entity a datasource property resolved to,
+// so the properties declaring it as their DataSourceProperty can bind against it.
+// Lazily allocated: resolveMapping is also called directly by unit tests, which
+// never go through Build.
+func (e *PluggableWidgetEngine) recordDataSourceEntity(propertyKey, entityName string) {
+	if propertyKey == "" || entityName == "" {
+		return
+	}
+	if e.dataSourceEntities == nil {
+		e.dataSourceEntities = make(map[string]string)
+	}
+	e.dataSourceEntities[propertyKey] = entityName
 }
 
 // resolveMapping resolves a PropertyMapping's source into a BuildContext.
@@ -507,40 +1792,207 @@ func (e *PluggableWidgetEngine) resolveMapping(mapping PropertyMapping, w *ast.W
 		// schema default ("20"). Without this, user-set primitive properties
 		// silently fall back to defaults.
 		if astVal, ok := lookupProperty(w.Properties, mapping.PropertyKey); ok {
-			ctx.PrimitiveVal = stringifyAny(astVal)
+			val, err := scalarPropertyText(w, mapping.PropertyKey, astVal, mapping.Operation)
+			if err != nil {
+				return nil, err
+			}
+			ctx.PrimitiveVal = val
 		}
+		return ctx, nil
+	}
+
+	// An icon-typed property takes the widget's `Icon:` in the same three
+	// spellings a button's does — collection, `image`, `glyph` — and is built
+	// into the same element, so the kind the author wrote is the $Type stored
+	// (ako/mxcli#2174). Read before the generic scalar path, which has no shape
+	// for a typed icon value.
+	if mapping.Operation == "icon" {
+		icon, err := buildWidgetIcon(w)
+		if err != nil {
+			return nil, err
+		}
+		ctx.Icon = icon
 		return ctx, nil
 	}
 
 	source := mapping.Source
 	if source == "" {
+		// A named action slot: no Source, addressed by the widget's own property
+		// key. This is how every action slot but the click and change ones is
+		// authored — `createFileAction: microflow M.ACT_CreateFile` (#956).
+		if mapping.Operation == "action" {
+			act, err := namedActionSlotValue(w, mapping.PropertyKey)
+			if err != nil {
+				return nil, err
+			}
+			if act != nil {
+				built, err := e.pageBuilder.buildClientActionV3(act)
+				if err != nil {
+					return nil, mdlerrors.NewBackend("build action for "+mapping.PropertyKey, err)
+				}
+				ctx.Action = built
+			}
+		}
+		// A top-level expression property, by its own key or an alias
+		// (mendixlabs/mxcli#1578). The value's shape decides nothing here: a
+		// quoted, a bare and a bracketed expression are all its text.
+		if mapping.Operation == "expression" {
+			if raw, key, ok := namedPropRaw(mapping, w); ok {
+				text, err := scalarPropertyText(w, key, raw, "expression")
+				if err != nil {
+					return nil, err
+				}
+				ctx.PrimitiveVal = text
+			}
+		}
 		return ctx, nil
 	}
 
 	switch source {
 	case "Attribute":
-		if attr := w.GetAttribute(); attr != "" {
-			ctx.AttributePath = e.pageBuilder.resolveAttributePath(attr)
+		// Named widget-level attribute (e.g. PieChart `ValueAttribute` →
+		// `seriesValueAttribute`): look up by the property's own name/aliases so
+		// several attribute properties route correctly, and resolve against the
+		// widget datasource entity (set by the DataSource mapping, which
+		// GenerateDefJSON orders first). Fall back to the generic single
+		// `Attribute:` keyword for single-attribute widgets (ComboBox, filters).
+		attr := namedPropValue(mapping, w)
+		if raw, _, ok := namedPropRaw(mapping, w); ok && attr == "" {
+			attr, _ = parameterAttributeValue(raw)
+		}
+		if attr == "" && e.isPrimaryAttributeMapping(mapping) {
+			// The bare `Attribute:` keyword names ONE attribute — the widget's
+			// primary one. Applying it to every attribute-typed mapping wrote the
+			// same AttributeRef into all of them: a Slider's `Attribute: Score`
+			// landed on valueAttribute AND minAttribute, maxAttribute and
+			// stepAttribute, which Studio Pro leaves unset unless the matching
+			// *ValueType is "attribute" — and a value in a pruned slot is CE0463
+			// (issue #238).
+			//
+			// The Slider is where this surfaced because its editorConfig computes
+			// the hidden list from lookup tables —
+			// `hidePropertiesIn(t,e,[].concat(n(v[e.minValueType]), …))` — with no
+			// string literal to lift, so the visibility extractor produces NO rule
+			// for those three and the hidden-property guard cannot catch it.
+			// Not writing them in the first place does not depend on that data.
+			attr = w.GetAttribute()
+			// Bound against the enclosing object rather than a source of the
+			// widget's own: with none, the binding is written empty (a combo
+			// box's CE0642 "Property 'Attribute' is required").
+			if scope := e.bindingScopeFor(mapping.PropertyKey); scope.Kind != scopeDataSource {
+				if err := e.pageBuilder.checkInputBinding(w, scope.Entity); err != nil {
+					return nil, err
+				}
+			}
+		}
+		if _, _, rooted := rootedAssociationPath(attr); rooted {
+			// `$Name/Assoc/Attr` (ako/mxcli#833, #2107).
+			wv, finalQN, steps, err := e.rootedAttributeBinding(w, mapping.PropertyKey, attr)
+			if err != nil {
+				return nil, err
+			}
+			ctx.AttributePath, ctx.AttributeSteps, ctx.SourceVariable = finalQN, steps, &wv
+		} else if name, rest, named := namedObjectBinding(attr); named {
+			// `$Param.Attr`: read from a page or snippet parameter, whatever
+			// encloses the widget (see cmd_pages_parameter_binding.go).
+			wv, entity, err := e.parameterBinding(w, mapping.PropertyKey, attr, name)
+			if err != nil {
+				return nil, err
+			}
+			if err := e.pageBuilder.rejectAssociationAsAttributeOn(
+				w, name, rest, entity,
+				fmt.Sprintf("widget `%s` property `%s`", w.Name, mapping.PropertyKey),
+			); err != nil {
+				return nil, err
+			}
+			ctx.AttributePath = e.pageBuilder.resolveAttributePathForEntity(rest, entity)
+			ctx.SourceVariable = &wv
+		} else if attr != "" {
+			// Against THIS property's scope: its own datasource's entity when the
+			// template links it to one, the enclosing object when it links it to
+			// none (#647).
+			scope := e.bindingScopeFor(mapping.PropertyKey)
+			entity := scope.Entity
+			if _, isPath := contextAssociationAttributePath(attr); isPath {
+				// `Assoc/Attr` read from the context object: the final attribute
+				// plus the association steps, as a built-in input stores it.
+				// Resolved as one name, it was written as the flat attribute
+				// `Entity.Assoc/Attr` (ako/mxcli#2279).
+				finalQN, steps, err := e.contextAssociationAttributeBinding(w, mapping.PropertyKey, attr, scope)
+				if err != nil {
+					return nil, err
+				}
+				ctx.AttributePath, ctx.AttributeSteps = finalQN, steps
+				break
+			}
+			// An association named where an attribute belongs cannot be stored;
+			// refuse it here rather than writing a dangling AttributeRef (#830).
+			if err := e.pageBuilder.rejectAssociationAsAttributeOn(
+				w, "", attr, entity,
+				fmt.Sprintf("widget `%s` property `%s`", w.Name, mapping.PropertyKey),
+			); err != nil {
+				return nil, err
+			}
+			if err := e.refuseMisboundAttribute(w, mapping.PropertyKey, attr, scope); err != nil {
+				return nil, err
+			}
+			ctx.AttributePath = e.pageBuilder.resolveAttributePathForEntity(attr, entity)
+		}
+
+	case "TextTemplate":
+		// A required widget-level caption authored by a named MDL property
+		// (e.g. PieChart `SeriesName: '...'` → `seriesName`). applyOperation
+		// "texttemplate" writes ctx.PrimitiveVal as the ClientTemplate text.
+		if v, matched := namedPropValueWithKey(mapping, w); v != "" {
+			ctx.PrimitiveVal = v
+			if numericTemplatePlaceholderRe.MatchString(v) {
+				ctx.ClientParams = e.textTemplateParams(w, templateParamNames(mapping, matched)...)
+			}
 		}
 
 	case "Attributes":
 		if attrs := w.GetAttributes(); len(attrs) > 0 {
+			entity := e.entityContextFor(mapping.PropertyKey)
+			if mapping.Operation == "attribute" {
+				// The list keyword feeding a SINGLE attribute property — a
+				// drop-down filter's `attr` (#1519). Keeping the first and
+				// discarding the rest would be the same silent drop as before.
+				if len(attrs) > 1 {
+					return nil, mdlerrors.NewValidation(singleAttributeOverflowMessage(w, mapping, attrs))
+				}
+				ctx.AttributePath = e.pageBuilder.resolveAttributePathForEntity(attrs[0], entity)
+				break
+			}
 			ctx.AttributePaths = make([]string, 0, len(attrs))
 			for _, attr := range attrs {
-				ctx.AttributePaths = append(ctx.AttributePaths, e.pageBuilder.resolveAttributePath(attr))
+				ctx.AttributePaths = append(ctx.AttributePaths,
+					e.pageBuilder.resolveAttributePathForEntity(attr, entity))
 			}
 		}
 
 	case "DataSource":
-		if ds := w.GetDataSource(); ds != nil {
-			dataSource, entityName, err := e.pageBuilder.buildDataSourceV3(ds)
+		// Prefer the datasource authored under THIS mapping's own key, so a
+		// widget with several can be given each of them. The generic clause
+		// remains the fallback for the single-datasource widgets it was built
+		// for; on a multi-datasource one it never reaches here, having been
+		// refused in Build with the keys to use instead.
+		ds := namedDataSourceValue(mapping, w)
+		if ds == nil && len(e.currentDataSourceKeys) <= 1 {
+			ds = w.GetDataSource()
+		}
+		if ds != nil {
+			dataSource, entityName, err := e.pageBuilder.buildPluggableDataSourceV3(ds, w.Name)
 			if err != nil {
 				return nil, mdlerrors.NewBackend("build datasource", err)
 			}
 			ctx.DataSource = dataSource
 			ctx.EntityName = entityName
+			// Keyed by THIS datasource's property, for the dependents that name
+			// it, as well as into the shared context for everything else.
+			e.recordDataSourceEntity(mapping.PropertyKey, entityName)
 			if entityName != "" {
 				e.pageBuilder.entityContext = entityName
+				e.pageBuilder.argCtx = enteringDataWidgetOf(w, ds, entityName)
 				if w.Name != "" {
 					e.pageBuilder.paramEntityNames[w.Name] = entityName
 				}
@@ -548,7 +2000,10 @@ func (e *PluggableWidgetEngine) resolveMapping(mapping PropertyMapping, w *ast.W
 		}
 
 	case "Selection":
-		val := w.GetSelection()
+		val, err := selectionMappingValue(mapping, w)
+		if err != nil {
+			return nil, err
+		}
 		if val == "" && mapping.Default != "" {
 			val = mapping.Default
 		}
@@ -556,17 +2011,63 @@ func (e *PluggableWidgetEngine) resolveMapping(mapping PropertyMapping, w *ast.W
 
 	case "CaptionAttribute":
 		if captionAttr := w.GetStringProp("CaptionAttribute"); captionAttr != "" {
-			if !strings.Contains(captionAttr, ".") && e.pageBuilder.entityContext != "" {
-				captionAttr = e.pageBuilder.entityContext + "." + captionAttr
+			// Qualified with the entity that DECLARES the attribute, as every
+			// other attribute mapping is: an inherited caption qualified with
+			// the specialization is CE1613 at build time.
+			if entity := e.entityContextFor(mapping.PropertyKey); !strings.Contains(captionAttr, ".") && entity != "" {
+				captionAttr = e.pageBuilder.resolveAttributePathForEntity(captionAttr, entity)
 			}
 			ctx.AttributePath = captionAttr
 		}
 
 	case "Association":
-		if attr := w.GetAttribute(); attr != "" {
-			ctx.AssocPath = e.pageBuilder.resolveAssociationPath(attr)
+		// Accept either the explicit `Association:` keyword or the generic
+		// `attribute:` keyword for the reference the widget binds (e.g. a ComboBox
+		// in association mode). Before this, only `attribute:` was read, so a
+		// natural `combobox (Association: Mod.A_B, …)` silently dropped the binding
+		// and failed the build with CE0642. (traceops #23)
+		attr := w.GetStringProp("Association")
+		if attr == "" {
+			attr = w.GetAttribute()
 		}
-		ctx.EntityName = e.pageBuilder.entityContext
+		if name, rest, named := namedObjectBinding(attr); named {
+			// `$Param.Assoc`: the association starts at a page or snippet
+			// parameter (Snip_TaskDashboard_Header's referenceSelector5).
+			wv, entity, err := e.parameterBinding(w, mapping.PropertyKey, attr, name)
+			if err != nil {
+				return nil, err
+			}
+			ctx.AssocPath = e.pageBuilder.resolveAssociationPathIn(rest, entity)
+			ctx.SourceVariable = &wv
+		} else if attr != "" {
+			// With no enclosing object the association has nowhere to start:
+			// written anyway it has no SourceVariable and mxbuild reports
+			// CE7007 (mendixlabs/mxcli#1420). Check refuses the same widgets
+			// (combobox_association_object.go).
+			if e.inBuild && e.outerEntityContext == "" {
+				if key, binding, ok := comboBoxAssociationNeedingObject(w); ok {
+					return nil, mdlerrors.NewValidation(comboBoxAssociationObjectProblem(w, key, binding))
+				}
+			}
+			// The association belongs to the CONTAINING entity, not to this
+			// widget's option list. A `DataSource:` mapping listed before this
+			// one has already moved entityContext to the option entity, so
+			// qualifying a bare name against it produced a reference into the
+			// wrong module — `System.Issue_Assignee` for a ComboBox over
+			// `System.User`, which fails CE1613 "The selected association … no
+			// longer exists". (issuetracker #19)
+			outer := e.outerEntityContext
+			if outer == "" {
+				outer = e.pageBuilder.entityContext
+			}
+			ctx.AssocPath = e.pageBuilder.resolveAssociationPathIn(attr, outer)
+		}
+		// The entity the association LEADS TO — the widget's option list, i.e.
+		// its datasource — not the entity the property is bound on. The
+		// association starts at the enclosing object (outer, above), so the
+		// binding scope of #647 would name the wrong end: CE8812 "Association
+		// … does not lead to entity …".
+		ctx.EntityName = e.associationTargetFor(mapping.PropertyKey)
 		if ctx.AssocPath != "" && ctx.EntityName == "" {
 			return nil, mdlerrors.NewValidationf("association %q requires an entity context (add a DataSource mapping before Association)", ctx.AssocPath)
 		}
@@ -580,12 +2081,55 @@ func (e *PluggableWidgetEngine) resolveMapping(mapping PropertyMapping, w *ast.W
 			ctx.Action = act
 		}
 
+	case "OnChange":
+		if action := w.GetOnChange(); action != nil {
+			act, err := e.pageBuilder.buildClientActionV3(action)
+			if err != nil {
+				return nil, mdlerrors.NewBackend("build action", err)
+			}
+			ctx.Action = act
+		}
+
 	default:
 		val := w.GetStringProp(source)
+		if val == "" {
+			// Non-string AST values (e.g. `DesktopColumns: 3`, parsed as an int)
+			// are invisible to GetStringProp; read them generically so numeric
+			// properties aren't silently dropped to the schema default.
+			if astVal, ok := lookupProperty(w.Properties, source); ok {
+				// `Image: $currentObject` binds the object in context; it is the
+				// one variable an image-typed property takes (#1476).
+				if mapping.Operation == "image" {
+					if ref, isRef := imageObjectReference(w, source, astVal); isRef {
+						entity, err := e.resolveImageObject(w, mapping.PropertyKey, source, ref)
+						if err != nil {
+							return nil, err
+						}
+						ctx.ImageEntity = entity
+						return ctx, nil
+					}
+				}
+				text, err := scalarPropertyText(w, source, astVal, mapping.Operation)
+				if err != nil {
+					return nil, err
+				}
+				val = text
+			}
+		}
 		if val == "" && mapping.Default != "" {
 			val = mapping.Default
 		}
 		ctx.PrimitiveVal = val
+		// A text-template mapping addressed by its SOURCE name — an Image's
+		// `ImageUrl:`, whose schema key is `imageUrl` — lands here rather than in
+		// the "TextTemplate" case above, and reached applyOperation with no
+		// parameters at all: neither its own `<Name>Params` companion nor the
+		// widget-wide `contentparams:` (#575, and the half of #928 that spelling
+		// never got).
+		if mapping.Operation == "texttemplate" && numericTemplatePlaceholderRe.MatchString(val) {
+			ctx.ClientParams = e.textTemplateParams(w,
+				append([]string{source}, templateParamNames(mapping, "")...)...)
+		}
 	}
 
 	return ctx, nil
@@ -634,12 +2178,183 @@ func (e *PluggableWidgetEngine) applyObjectLists(builder backend.WidgetObjectBui
 // { ... }`) into an ObjectListItemSpec by:
 //   - matching widget properties against ItemProperties (scalar dispatch)
 //   - matching nested AST children against ItemSlots (widgets-typed slots)
+//
+// isChartSeriesContainer reports whether an object-list container keyword is a
+// Mendix Charts series (SERIES for Bar/Column/Area/Pie; LINE for Line/Bubble/
+// TimeSeries). Only these carry the static·/dynamic· dataSet-gated texttemplate
+// sub-properties whose empty-ClientTemplate-when-visible rule differs from other
+// object lists (Accordion groups, DataGrid columns). Chart series (9a).
+func isChartSeriesContainer(container string) bool {
+	switch strings.ToUpper(container) {
+	case "SERIES", "LINE":
+		return true
+	}
+	return false
+}
+
+// chartSeriesTextTemplateVisible reports whether a chart series' texttemplate
+// sub-property is visible for the item's current dataSet mode + configured
+// datasources, mirroring the widget's editorConfig `hideNestedPropertiesIn`
+// gate. A visible-but-unset texttemplate must serialize an empty ClientTemplate
+// (not null) or Studio Pro flags CE0463:
+//   - the property's mode (static·/dynamic· name prefix) must match dataSet;
+//   - a datasource-bound property (e.g. staticTooltipHoverText → staticDataSource)
+//     is visible only when that datasource is configured on the item.
+//
+// An unbound property (e.g. staticName) is visible whenever its mode matches.
+func chartSeriesTextTemplateVisible(ip ItemPropertyMapping, dataSetMode string, configuredDataSources map[string]pages.DataSource) bool {
+	mode := "static"
+	if strings.HasPrefix(strings.ToLower(ip.PropertyKey), "dynamic") {
+		mode = "dynamic"
+	}
+	if dataSetMode == "" {
+		dataSetMode = "static"
+	}
+	if !strings.EqualFold(dataSetMode, mode) {
+		return false // hidden by the dataSet gate
+	}
+	if ip.DataSource != "" {
+		_, configured := configuredDataSources[ip.DataSource]
+		return configured
+	}
+	return true
+}
+
+// chartSeriesTextTemplateHiddenByItemConfig reports whether a chart-series
+// textTemplate sub-property is hidden by the widget's editorConfig based on OTHER
+// item-level property values (beyond the dataSet gate). These mirror the
+// `hideNestedPropertiesIn` rules in the chart editorConfig.js:
+//
+//	markerColor  visible only when lineStyle == "lineWithMarkers"  (default "line")
+//	fillColor    visible only when enableFillArea is truthy          (default true)
+//
+// Without this, a hidden sub-property's empty-ClientTemplate default (which
+// chartSeriesTextTemplateVisible would otherwise emit) trips CE0463 — e.g.
+// markerColor on a default "line" TimeSeries/LineChart series. Absent keys use the
+// schema default.
+func chartSeriesTextTemplateHiddenByItemConfig(propertyKey string, itemConfig map[string]string) bool {
+	switch propertyKey {
+	case "markerColor":
+		lineStyle := itemConfig["lineStyle"]
+		if lineStyle == "" {
+			lineStyle = "line"
+		}
+		return lineStyle != "lineWithMarkers"
+	case "fillColor":
+		enableFillArea := itemConfig["enableFillArea"]
+		if enableFillArea == "" {
+			enableFillArea = "true" // schema default
+		}
+		return !isTruthyPrimitive(enableFillArea)
+	}
+	return false
+}
+
+// isTruthyPrimitive reports whether a primitive string value is truthy (non-empty,
+// not "false"/"0"). Mirrors the editorConfig's boolean gate semantics.
+func isTruthyPrimitive(v string) bool {
+	return v != "" && v != "false" && v != "0"
+}
+
+// seriesDataSourceMatchesMode reports whether a chart-series datasource property
+// key (staticDataSource / dynamicDataSource) is the one active for the given
+// dataSet mode — used to route the friendly `DataSource:` alias. Chart series (9a).
+func seriesDataSourceMatchesMode(propertyKey, dataSetMode string) bool {
+	if dataSetMode == "" {
+		dataSetMode = "static"
+	}
+	mode := "static"
+	if strings.HasPrefix(strings.ToLower(propertyKey), "dynamic") {
+		mode = "dynamic"
+	}
+	return strings.EqualFold(dataSetMode, mode)
+}
+
 func (e *PluggableWidgetEngine) buildObjectListItem(mapping *ObjectListMapping, child *ast.WidgetV3) (backend.ObjectListItemSpec, error) {
 	spec := backend.ObjectListItemSpec{}
 	// Track whether the user explicitly set Sortable / ShowContentAs in MDL —
 	// drives the attribute-less and custom-content fallbacks below.
 	_, sortableExplicit := lookupProperty(child.Properties, "Sortable")
 	_, showContentAsExplicit := lookupProperty(child.Properties, "ShowContentAs")
+
+	// Save/restore the page builder's entity context: an object-list item may
+	// bring its OWN datasource (e.g. a chart `series`' staticDataSource), against
+	// which the item's attribute sub-properties (staticXAttribute / staticY…)
+	// must resolve — not the parent widget's context. Chart series (9a).
+	savedEntityContext := e.pageBuilder.entityContext
+	defer func() { e.pageBuilder.entityContext = savedEntityContext }()
+
+	// A chart series' texttemplate visibility (and the DataSource: alias below)
+	// depend on its dataSet mode (static/dynamic); default to static when unset,
+	// matching the schema.
+	itemDataSetMode := "static"
+	if v, ok := lookupProperty(child.Properties, "dataSet"); ok {
+		if s := stringifyAny(v); s != "" {
+			itemDataSetMode = s
+		}
+	}
+
+	// itemConfig holds the user-set item-level values that gate the visibility of
+	// OTHER sub-properties in the widget's editorConfig (chart series: lineStyle
+	// gates markerColor, enableFillArea gates fillColor). Absent keys fall back to
+	// the schema default inside chartSeriesTextTemplateHiddenByItemConfig.
+	itemConfig := map[string]string{}
+	for _, key := range []string{"lineStyle", "enableFillArea"} {
+		if v, ok := lookupProperty(child.Properties, key); ok {
+			itemConfig[key] = stringifyAny(v)
+		}
+	}
+
+	// Pre-resolve any datasource-typed sub-property the MDL set, so attribute
+	// sub-properties later in the loop resolve against the item's own entity
+	// regardless of schema property order. The built DataSource is emitted in
+	// the main loop's "datasource" case.
+	prebuiltDataSources := make(map[string]pages.DataSource)
+	// The entity each of those datasources resolved to, keyed by its property.
+	// pageBuilder.entityContext holds only the LAST one, which is wrong the
+	// moment an item configures two — a chart series given both a static and a
+	// dynamic datasource bound its STATIC x/y attributes against the dynamic
+	// one's entity and wrote CH.Forecast.Region, a reference to an attribute
+	// that entity does not have (CE1613). The widget states the link per
+	// property (widget.xml `dataSource="…"`, carried as ItemPropertyMapping's
+	// DataSource), so it is read rather than inferred from order.
+	prebuiltEntities := make(map[string]string)
+	for _, ip := range mapping.ItemProperties {
+		if ip.Operation != "datasource" {
+			continue
+		}
+		raw, ok := lookupProperty(child.Properties, ip.PropertyKey)
+		if !ok {
+			for _, alias := range ip.MdlAliases {
+				if raw, ok = lookupProperty(child.Properties, alias); ok {
+					break
+				}
+			}
+		}
+		// Friendly `DataSource:` alias inside a chart series routes to the
+		// mode-appropriate datasource property (staticDataSource when
+		// dataSet=static, dynamicDataSource when dynamic) — matching how the
+		// top-level widget datasource is written. Chart series (9a).
+		if !ok && isChartSeriesContainer(mapping.MDLContainer) && seriesDataSourceMatchesMode(ip.PropertyKey, itemDataSetMode) {
+			raw, ok = lookupProperty(child.Properties, "DataSource")
+		}
+		if !ok {
+			continue
+		}
+		ds, ok := raw.(*ast.DataSourceV3)
+		if !ok {
+			continue
+		}
+		dataSource, entityName, err := e.pageBuilder.buildDataSourceV3(ds)
+		if err != nil {
+			return spec, mdlerrors.NewBackend("datasource for object-list item property "+ip.PropertyKey, err)
+		}
+		prebuiltDataSources[ip.PropertyKey] = dataSource
+		if entityName != "" {
+			prebuiltEntities[ip.PropertyKey] = entityName
+			e.pageBuilder.entityContext = entityName
+		}
+	}
 
 	// Scalar item properties: ItemProperties carries the operation kind per
 	// sub-property key. Look up the value in the AST child's properties bag.
@@ -672,9 +2387,36 @@ func (e *PluggableWidgetEngine) buildObjectListItem(mapping *ObjectListMapping, 
 					PrimitiveVal: ip.Value,
 				})
 			}
+			// A datasource resolved in the pre-pass via the friendly `DataSource:`
+			// alias has no direct child.Properties[<schemaKey>] entry, so emit it
+			// here from the pre-built map. Chart series (9a).
+			if ds, dsOK := prebuiltDataSources[ip.PropertyKey]; dsOK && ds != nil {
+				spec.Properties = append(spec.Properties, backend.ObjectListItemProperty{
+					PropertyKey: ip.PropertyKey,
+					Operation:   "datasource",
+					DataSource:  ds,
+				})
+			}
+			// A VISIBLE-but-unset texttemplate sub-property of a chart series must
+			// serialize as an empty Forms$ClientTemplate, not null, or Studio Pro
+			// flags CE0463. Visibility follows the widget's editorConfig dataSet
+			// gate + dataSource binding. Scoped to chart series so non-chart
+			// object lists (Accordion groups, DataGrid columns) are untouched. (9a)
+			if ip.Operation == "texttemplate" && isChartSeriesContainer(mapping.MDLContainer) &&
+				chartSeriesTextTemplateVisible(ip, itemDataSetMode, prebuiltDataSources) &&
+				!chartSeriesTextTemplateHiddenByItemConfig(ip.PropertyKey, itemConfig) {
+				spec.Properties = append(spec.Properties, backend.ObjectListItemProperty{
+					PropertyKey:   ip.PropertyKey,
+					Operation:     "texttemplate",
+					EmptyTemplate: true,
+				})
+			}
 			continue
 		}
-		strVal := stringifyAny(raw)
+		strVal, err := scalarPropertyText(child, matchedAlias, raw, ip.Operation)
+		if err != nil {
+			return spec, err
+		}
 		prop := backend.ObjectListItemProperty{
 			PropertyKey: ip.PropertyKey,
 			Operation:   ip.Operation,
@@ -686,38 +2428,110 @@ func (e *PluggableWidgetEngine) buildObjectListItem(mapping *ObjectListMapping, 
 			prop.Expression = strVal
 		case "texttemplate":
 			prop.TextTemplate = strVal
-			prop.EntityContext = e.pageBuilder.entityContext
+			prop.EntityContext = e.itemEntityContextFor(ip, prebuiltEntities)
 			// Look up the matching params companion in the AST. Convention:
 			// when MDL writes `Caption: '{1}'` it pairs with `CaptionParams:
 			// [{1} = attr]`. The companion key is the matched name (alias or
 			// schema name) + "Params".
-			if paramsRaw, ok := child.Properties[matchedAlias+"Params"]; ok {
+			// lookupProperty, not a direct index: MDL property names are
+			// case-insensitive everywhere else, and matchedAlias is the SCHEMA
+			// key (`buttonCaption`) while the script — and DESCRIBE — write the
+			// widget's own casing (`ButtonCaptionParams`). A direct index found
+			// the companion only when the two happened to agree, which is why
+			// this worked for a DataGrid column's `CaptionParams` and silently
+			// dropped a File Uploader custom button's, leaving a `{1}` with no
+			// parameter and failing the build with CE0720 (#956).
+			if paramsRaw, ok := lookupProperty(child.Properties, matchedAlias+"Params"); ok {
 				if astParams, ok := paramsRaw.([]ast.ParamAssignmentV3); ok && len(astParams) > 0 {
 					prop.Parameters = e.pageBuilder.buildClientTemplateParams(astParams)
 				}
 			}
 		case "attribute":
-			if e.pageBuilder.entityContext != "" {
-				prop.AttributePath = e.pageBuilder.resolveAttributePath(strVal)
+			// An attribute navigated over associations (e.g. Order_Customer/Name)
+			// resolves to a final attribute + association steps (AttributeRef.EntityRef);
+			// a flat path is left as-is. Mirrors the DynamicText contentparam path.
+			// Against THIS property's own datasource, which is the item's shared
+			// context unless the widget links it to a specific one.
+			entity := e.itemEntityContextFor(ip, prebuiltEntities)
+			if finalQN, steps, ok := e.pageBuilder.resolveAssociationAttributePath(strVal); ok {
+				prop.AttributePath = finalQN
+				prop.AttributeRefSteps = steps
+			} else if entity != "" {
+				// A bare ASSOCIATION name here is not representable — it would be
+				// written as an AttributeRef and fail CE1613 (issue #830).
+				if err := e.pageBuilder.rejectAssociationAsAttribute(
+					strVal, entity,
+					fmt.Sprintf("%s `%s` property `%s`", mapping.MDLContainer, child.Name, ip.PropertyKey),
+				); err != nil {
+					return spec, err
+				}
+				prop.AttributePath = e.pageBuilder.resolveAttributePathForEntity(strVal, entity)
 			} else {
 				prop.AttributePath = strVal
 			}
+		case "datasource":
+			// Emit the datasource pre-resolved above (which also set the item's
+			// entity context for the attribute sub-props). Chart series (9a).
+			ds, ok := prebuiltDataSources[ip.PropertyKey]
+			if !ok || ds == nil {
+				continue
+			}
+			prop.DataSource = ds
+		case "action":
+			// An action on an object-list ITEM: a chart series'
+			// staticOnClickAction, a popupmenu item's action, a maps marker's
+			// onClick, an accordion group's onToggleCollapsed (#956).
+			//
+			// Read it through namedActionSlotValue — the same reader the
+			// top-level named slots use — rather than off the AST's fixed Action
+			// slot. `microflow M.X` in a property position parses as a
+			// *DataSourceV3 (dataSourceExprV3 wins in widgetPropertyV3), so a
+			// direct read would miss the form people actually write, and would
+			// take the datasource branch of this very switch on the way past.
+			//
+			// matchedAlias, not ip.PropertyKey: the outer lookup already fell
+			// back to an MDL alias, and re-reading under the schema key would
+			// find nothing.
+			act, err := namedActionSlotValue(child, matchedAlias)
+			if err != nil {
+				return spec, err
+			}
+			if act == nil {
+				continue
+			}
+			built, err := e.pageBuilder.buildClientActionV3(act)
+			if err != nil {
+				return spec, mdlerrors.NewBackend(
+					"build action for object-list item property "+ip.PropertyKey, err)
+			}
+			if built == nil {
+				// An unset slot must stay unset: writing a NoAction over it
+				// would clear whatever the widget had.
+				continue
+			}
+			prop.Action = built
 		default:
-			// Unsupported sub-property kinds (datasource, action) — skipped here
-			// because they need richer AST context than the child's property bag.
-			// TODO(#538 follow-up): grammar + visitor support for datasource and
-			// action expressions inside object-list item property positions.
+			// Remaining unsupported sub-property kinds still need richer AST
+			// context than the child's property bag.
 			continue
 		}
 		spec.Properties = append(spec.Properties, prop)
 	}
 
-	// DataGrid column header convention: when the user provides no Caption
-	// but does bind an Attribute, fall back to the attribute name as the
-	// header text. Mirrors buildDataGrid2ColumnObject in datagrid_builder.go
-	// (line 491-494). Without this, an attribute column with no Caption
-	// emits an empty header that Studio Pro flags as definition drift.
-	applyColumnHeaderFallback(&spec)
+	// DataGrid column header convention: when the user provides no Caption,
+	// fall back to the bound attribute name — or, for a custom-content column
+	// with no attribute, an empty header. Mirrors the keyword path
+	// (datagrid_column.go). Only applies to items whose template has a `header`
+	// slot (datagrid columns), never to header-less object-list items like chart
+	// series.
+	hasHeaderSlot := false
+	for _, ip := range mapping.ItemProperties {
+		if strings.EqualFold(ip.PropertyKey, "header") {
+			hasHeaderSlot = true
+			break
+		}
+	}
+	applyColumnHeaderFallback(&spec, hasHeaderSlot)
 
 	// DataGrid column sortable convention: attribute-less columns (typical
 	// "Actions" custom-content columns) default to sortable=false, since
@@ -806,35 +2620,83 @@ func (e *PluggableWidgetEngine) buildObjectListItem(mapping *ObjectListMapping, 
 // item: the slot keyed "content" if present, otherwise the first slot.
 // Returns "" if there are no widgets-typed slots.
 // applyColumnHeaderFallback synthesizes a texttemplate spec for the `header`
-// property when the spec has an attribute binding but no header text. Mirrors
-// the keyword path's `if caption == "" { caption = col.Attribute }` fallback
-// in datagrid_builder.go. The check is conservative: only fires when the
-// header slot is genuinely empty, so it's safe to call for any object-list
-// item kind.
-func applyColumnHeaderFallback(spec *backend.ObjectListItemSpec) {
-	var hasHeader bool
+// property when the spec has no header text: the bound attribute's leaf name, or
+// — for a column with no attribute — an empty header. Mirrors the keyword path's
+// `if caption == "" { caption = col.Attribute }` in datagrid_column.go. The check
+// is conservative: only fires when the header slot is genuinely empty, so it's
+// safe to call for any object-list item kind.
+//
+// A custom-content column used to fall back to the column's own NAME (ledger
+// #54 round 2), on the belief that an empty header is CE0463. It is not: the
+// CE0463 was a null TextTemplate, and the empty Forms$ClientTemplate that
+// update-widgets writes builds clean (ChipCoV8 #11; 0 errors on 11.15.0, where
+// the keyword path writes exactly that). The name, meanwhile, is one Mendix
+// does not store for a column, and Data grid 2 renders the header text as is —
+// so `Caption: ”` showed end users "colTriage" (ako/mxcli#535).
+func applyColumnHeaderFallback(spec *backend.ObjectListItemSpec, hasHeaderSlot bool) {
+	// Only items whose template has a `header` slot (datagrid columns) get a
+	// header fallback; header-less object-list items (chart series, accordion
+	// groups) are left untouched.
+	if !hasHeaderSlot {
+		return
+	}
+	headerIdx := -1
+	headerEmpty := false
 	var attrPath string
-	for _, p := range spec.Properties {
+	for i, p := range spec.Properties {
 		switch p.PropertyKey {
 		case "header":
-			hasHeader = true
+			headerIdx = i
+			// An explicit `Caption: ''` reaches here as a texttemplate with no
+			// text and no params; treat it like an absent header.
+			headerEmpty = p.Operation == "texttemplate" && p.TextTemplate == "" && len(p.Parameters) == 0
 		case "attribute":
 			attrPath = p.AttributePath
 		}
 	}
-	if hasHeader || attrPath == "" {
+	// A present, non-empty header needs nothing.
+	if headerIdx >= 0 && !headerEmpty {
 		return
 	}
-	// Extract the leaf attribute name from a fully-qualified path
+	// Fallback header text: the bound attribute's leaf name
 	// (Module.Entity.Attr → Attr).
-	attrName := attrPath
-	if idx := strings.LastIndex(attrName, "."); idx >= 0 {
-		attrName = attrName[idx+1:]
+	fallback := attrPath
+	if idx := strings.LastIndex(fallback, "."); idx >= 0 {
+		fallback = fallback[idx+1:]
+	}
+	if fallback == "" {
+		// No attribute to name the column after: an empty header, which Data
+		// grid 2 renders blank. It must not serialize as TextTemplate: null —
+		// `mx update-widgets` writes an empty Forms$ClientTemplate for the
+		// header, so null is CE0463 (ChipCoV8 #11). It is written as ONE empty
+		// translation (EmptyText), not none: a text with no translation reads to
+		// `create or replace` as one MDL could not express, and the stored
+		// caption was carried back, so `Caption: ''` could not clear one. Scoped
+		// by the hasHeaderSlot gate above to datagrid columns, never to other
+		// texttemplates.
+		if headerIdx >= 0 {
+			spec.Properties[headerIdx].Operation = "texttemplate"
+			spec.Properties[headerIdx].EmptyText = true
+			return
+		}
+		spec.Properties = append(spec.Properties, backend.ObjectListItemProperty{
+			PropertyKey: "header",
+			Operation:   "texttemplate",
+			EmptyText:   true,
+		})
+		return
+	}
+	if headerIdx >= 0 {
+		// Fill the empty header in place rather than appending a duplicate.
+		spec.Properties[headerIdx].Operation = "texttemplate"
+		spec.Properties[headerIdx].TextTemplate = fallback
+		spec.Properties[headerIdx].EntityContext = ""
+		return
 	}
 	spec.Properties = append(spec.Properties, backend.ObjectListItemProperty{
 		PropertyKey:   "header",
 		Operation:     "texttemplate",
-		TextTemplate:  attrName,
+		TextTemplate:  fallback,
 		EntityContext: "", // literal text — no template params to resolve
 	})
 }
@@ -905,16 +2767,15 @@ func applyColumnSortableFallback(spec *backend.ObjectListItemSpec, sortableExpli
 }
 
 func defaultItemSlotKey(mapping *ObjectListMapping) string {
-	if len(mapping.ItemSlots) == 0 {
-		return ""
-	}
+	keys := make([]string, 0, len(mapping.ItemSlots))
 	for _, s := range mapping.ItemSlots {
-		if s.PropertyKey == "content" {
-			return s.PropertyKey
-		}
+		keys = append(keys, s.PropertyKey)
 	}
-	return mapping.ItemSlots[0].PropertyKey
+	return bodyItemSlotKey(keys)
 }
+
+// bodyItemSlotKey is types.BodyItemSlotKey, which the page mutator reads too.
+func bodyItemSlotKey(keys []string) string { return types.BodyItemSlotKey(keys) }
 
 // lookupProperty does a case-insensitive lookup against an AST property map.
 // MDL property names ignore case (e.g. `HeaderText` and `headerText` both match).
@@ -931,6 +2792,49 @@ func lookupProperty(props map[string]any, key string) (any, bool) {
 	return nil, false
 }
 
+// explicitPropertyKey resolves a property name the author wrote to the widget
+// template's own key, for the explicit-property pass (Build, step 4.6) — the
+// reverse direction of lookupProperty, and with the same answer.
+//
+// That pass used to look the authored name up byte-for-byte, while everything
+// that judges or edits the same key folds case: check's allow-list and its
+// "persisted by the explicit pass" verdict (validate_widget_explicit_writable.go),
+// the mapping pass's lookupProperty, and ALTER's setter since #1069. So
+// `Adjustable: false` on a text filter checked clean and was dropped on create,
+// and `Placeholder:` — a grammar keyword the visitor always lowers to
+// "Placeholder" — was dropped in every spelling, including the `placeholder:`
+// DESCRIBE prints (ako/mxcli#1652, mendixlabs/mxcli#1643).
+//
+// An exact match wins. A match by case alone must be unique — no shipped template
+// has two keys differing only in case (TestPluggablePropertyKeysAreUniqueIgnoringCase),
+// but a project's own package is not covered by that — and must be of a kind this
+// pass writes correctly, the set check calls persisted (explicitPassWritableTypes).
+// A key of any other kind (an icon, an image, a list of objects) would be stored
+// as a meaningless PrimitiveValue, and check already warns it is dropped.
+func explicitPropertyKey(propertyTypeIDs map[string]pages.PropertyTypeIDEntry, name string) (string, pages.PropertyTypeIDEntry, bool) {
+	if entry, ok := propertyTypeIDs[name]; ok {
+		return name, entry, true
+	}
+	match := ""
+	for key := range propertyTypeIDs {
+		if !strings.EqualFold(key, name) {
+			continue
+		}
+		if match != "" {
+			return "", pages.PropertyTypeIDEntry{}, false // ambiguous by case
+		}
+		match = key
+	}
+	if match == "" {
+		return "", pages.PropertyTypeIDEntry{}, false
+	}
+	entry := propertyTypeIDs[match]
+	if !explicitPassWritableTypes[strings.ToLower(entry.ValueType)] {
+		return "", pages.PropertyTypeIDEntry{}, false
+	}
+	return match, entry, true
+}
+
 // stringifyAny converts a property value of arbitrary type to its string form
 // for use in Set* methods. Returns "" for unknown types.
 func stringifyAny(v any) string {
@@ -943,6 +2847,18 @@ func stringifyAny(v any) string {
 		return fmt.Sprintf("%d", x)
 	case float64:
 		return fmt.Sprintf("%g", x)
+	case *ast.WidgetIcon:
+		// `icon: 'bookmark'` — the visitor types every `icon:` as a core icon,
+		// but on a pluggable widget it reaches here only for the widget's own
+		// key (a PDS Button's string `icon`), whose value is the quoted text.
+		// Returning "" dropped it from create page and from a building block
+		// copied through describe (ako/mxcli#2180). A glyph or an image icon
+		// has no text form a plain property could hold.
+		if x != nil && x.Kind == types.MenuIconCollection {
+			return x.Name
+		}
+	case ast.WidgetIcon:
+		return stringifyAny(&x)
 	}
 	return ""
 }
@@ -970,16 +2886,36 @@ func (e *PluggableWidgetEngine) applyChildSlots(builder backend.WidgetObjectBuil
 			continue
 		}
 		lowerType := strings.ToLower(child.Type)
-		if slot, ok := slotContainers[lowerType]; ok {
+		slot, ok := slotContainers[lowerType]
+		if !ok && lowerType == "container" {
+			// Support the natural `container <slotName> { ... }` authoring form
+			// (e.g. TreeNode `container children`, Timeline `container customTitle`)
+			// by routing the container to the slot whose keyword matches its NAME.
+			// The bare-keyword form (`children { ... }`, gallery `template tpl1 { ... }`)
+			// still matches by Type above. This mirrors the object-list item-slot
+			// matcher, which already routes by the container's name.
+			slot, ok = slotContainers[strings.ToLower(child.Name)]
+		}
+		if ok {
+			// The slot's children are built here, not through the slot's own
+			// node, so the context it gives them is applied here: a control
+			// bar holds its grid's selection (mendixlabs/mxcli#122), the same
+			// rule the check-time walk applies.
+			outerArgCtx := e.pageBuilder.argCtx
+			if lowerType == "controlbar" {
+				e.pageBuilder.argCtx = argContextForChildren(child, outerArgCtx)
+			}
 			for _, slotChild := range child.Children {
 				widget, err := e.pageBuilder.buildWidgetV3(slotChild)
 				if err != nil {
+					e.pageBuilder.argCtx = outerArgCtx
 					return err
 				}
 				if widget != nil {
 					slotWidgets[slot.PropertyKey] = append(slotWidgets[slot.PropertyKey], widget)
 				}
 			}
+			e.pageBuilder.argCtx = outerArgCtx
 		} else {
 			widget, err := e.pageBuilder.buildWidgetV3(child)
 			if err != nil {
@@ -1018,10 +2954,25 @@ func (e *PluggableWidgetEngine) applyChildSlots(builder backend.WidgetObjectBuil
 // isBuiltinPropName returns true for property names that are handled by
 // dedicated MDL keywords (DataSource, Attribute, etc.) rather than by
 // the explicit property pass.
+// numericTemplatePlaceholderRe matches Mendix's own `{1}` placeholder form, the
+// one that needs explicit ClientTemplate parameters. `{AttrName}` is mxcli's
+// convenience spelling and is resolved separately against the entity context.
+var numericTemplatePlaceholderRe = regexp.MustCompile(`\{[0-9]+\}`)
+
 func isBuiltinPropName(name string) bool {
 	switch name {
-	case "DataSource", "Attribute", "Label", "Caption", "Action",
-		"Selection", "Class", "Style", "Editable", "Visible",
+	// OnChange belongs beside Action: both are dedicated MDL keywords resolved
+	// by resolveMapping, neither is a widget storage key. Its absence meant
+	// `OnChange:` fell through to the storage-name check and collided with the
+	// widgets whose slot is spelled exactly `onChange` — Slider, RangeSlider and
+	// StarRating — which were told to "use `OnChange:` instead" of `OnChange:`,
+	// and could not have their only action slot authored at all (#956).
+	case "DataSource", "Attribute", "Label", "Caption", "Action", "OnChange",
+		"Selection", "Class", "Style", "DynamicClasses", "Editable", "Visible",
+		// The expression and attribute forms of the two above, as the visitor
+		// lowers them. Stored on the CustomWidget itself, never in its Object;
+		// MDL-WIDGET41 refuses them where the package declares no such setting.
+		"EditableIf", "EditableWhen", "VisibleIf", "VisibleWhen", "VisibleRoles",
 		"WidgetType", "DesignProperties", "Association", "CaptionAttribute",
 		"Content", "RenderMode", "ContentParams", "CaptionParams",
 		"ButtonStyle", "DesktopWidth", "DesktopColumns", "TabletColumns",
@@ -1031,4 +2982,46 @@ func isBuiltinPropName(name string) bool {
 		return true
 	}
 	return false
+}
+
+// refuseUnroutedActionKeywords handles a widget that carries an action under
+// MDL's `onClick:` or `OnChange:` keyword when none of the selected mappings
+// reads that keyword: an error under mdl 1, a warning under mdl 0 (the action
+// is then dropped, as it always was). See validatePluggableWidgetProperties
+// for the check-time twin.
+func (e *PluggableWidgetEngine) refuseUnroutedActionKeywords(def *WidgetDefinition, mappings []PropertyMapping, w *ast.WidgetV3) error {
+	var ctx *ExecContext
+	if e.pageBuilder != nil {
+		ctx = e.pageBuilder.ctx
+	}
+	return refuseUnroutedActionKeywords(ctx, def, mappings, w)
+}
+
+func refuseUnroutedActionKeywords(ctx *ExecContext, def *WidgetDefinition, mappings []PropertyMapping, w *ast.WidgetV3) error {
+	version := langver.V0
+	if ctx != nil {
+		version = ctx.LanguageVersion
+	}
+	for _, c := range []struct {
+		src string
+		set bool
+	}{
+		{"OnClick", w.GetAction() != nil},
+		{"OnChange", w.GetOnChange() != nil},
+	} {
+		if !c.set || mappingsRouteActionSource(mappings, c.src) {
+			continue
+		}
+		what := fmt.Sprintf("%s %s has no action slot `%s:` writes to",
+			strings.ToLower(def.MDLName), w.Name, actionKeywordSpelling(c.src))
+		if actionSlotRefused.Applies(version) {
+			return mdlerrors.NewValidationf("%s — the action would be dropped on write, so nothing was written "+
+				"[MDL-WIDGET37]", what)
+		}
+		if ctx != nil {
+			fmt.Fprintf(ctx.progress(), "Warning [%s]: %s; the action is not written. %s\n",
+				actionSlotRefused.Code, what, actionSlotRefused.Warning(version))
+		}
+	}
+	return nil
 }

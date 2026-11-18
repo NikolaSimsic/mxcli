@@ -3,6 +3,8 @@
 package mock
 
 import (
+	"errors"
+
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/pages"
 )
@@ -74,7 +76,7 @@ func (m *MockBackend) UpdateLayout(layout *pages.Layout) error {
 	if m.UpdateLayoutFunc != nil {
 		return m.UpdateLayoutFunc(layout)
 	}
-	return nil
+	return errors.New("MockBackend.UpdateLayout not configured")
 }
 
 func (m *MockBackend) DeleteLayout(id model.ID) error {
@@ -131,4 +133,26 @@ func (m *MockBackend) ListPageTemplates() ([]*pages.PageTemplate, error) {
 		return m.ListPageTemplatesFunc()
 	}
 	return nil, nil
+}
+
+func (m *MockBackend) LayoutPlaceholders(id model.ID) ([]string, error) {
+	if m.LayoutPlaceholdersFunc != nil {
+		return m.LayoutPlaceholdersFunc(id)
+	}
+	return nil, errors.New("MockBackend.LayoutPlaceholders not configured")
+}
+
+func (m *MockBackend) PageLayoutName(id model.ID) (string, error) {
+	if m.PageLayoutNameFunc != nil {
+		return m.PageLayoutNameFunc(id)
+	}
+	return "", errors.New("MockBackend.PageLayoutName not configured")
+}
+
+// AddNavigationProfile stub.
+func (m *MockBackend) AddNavigationProfile(navDocID model.ID, name string) error {
+	if m.AddNavigationProfileFunc != nil {
+		return m.AddNavigationProfileFunc(navDocID, name)
+	}
+	return errors.New("MockBackend.AddNavigationProfile not configured")
 }

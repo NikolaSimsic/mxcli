@@ -4,7 +4,11 @@ package linter
 
 import (
 	"database/sql"
+	"fmt"
 	"iter"
+	"sort"
+	"strings"
+	"sync"
 
 	"github.com/mendixlabs/mxcli/mdl/catalog"
 	"github.com/mendixlabs/mxcli/mdl/types"
@@ -18,12 +22,15 @@ import (
 // Implemented by MprBackend (and any backend satisfying these signatures).
 type LintReader interface {
 	GetMicroflow(id model.ID) (*microflows.Microflow, error)
+	ListMicroflows() ([]*microflows.Microflow, error)
 	GetProjectSecurity() (*security.ProjectSecurity, error)
+	GetProjectSettings() (*model.ProjectSettings, error)
 	GetNavigation() (*types.NavigationDocument, error)
 	ListPages() ([]*pages.Page, error)
 	ListModules() ([]*model.Module, error)
 	ListFolders() ([]*types.FolderInfo, error)
 	GetRawUnit(id model.ID) (map[string]any, error)
+	ListScheduledEvents() ([]*model.ScheduledEvent, error)
 }
 
 // LintContext wraps a catalog and provides rule-friendly APIs.
@@ -31,7 +38,60 @@ type LintContext struct {
 	catalog  *catalog.Catalog
 	db       catalog.CatalogDB
 	excluded map[string]bool
-	reader   LintReader
+	included map[string]bool // the module allowlist; see includeActive
+	// includeActive distinguishes "no module allowlist" from "an allowlist that
+	// matched nothing". Without it an empty `included` map means the former, so
+	// `--modules A --documents B.C` — which names an empty set — would lint the
+	// WHOLE project instead of nothing. Caught by its own test.
+	includeActive bool
+	// documents is the --document allowlist, by QUALIFIED name. When non-empty
+	// the document iterators below return only these, so a rule that walks
+	// microflows stops paying for the ones nobody asked about (ako/mxcli#681).
+	documents map[string]bool
+	reader    LintReader
+
+	// fullMFCache memoizes every fully-parsed microflow for the lifetime of the
+	// lint run (see FullMicroflow). Populated lazily on first FullMicroflow call.
+	fullMFCache  map[model.ID]*microflows.Microflow
+	fullMFErr    error
+	fullMFLoaded bool
+
+	// queryErrors collects catalog queries that failed, so an iterator that
+	// could not run is distinguishable from one that legitimately found
+	// nothing. See QueryError.
+	queryErrors []QueryError
+	queryErrMu  sync.Mutex
+}
+
+// FullMicroflow returns the fully-parsed microflow (with its object collection)
+// for id, or nil if absent. It loads and caches ALL microflows once on the first
+// call and serves subsequent lookups from the cache.
+//
+// Rules that inspect microflow bodies MUST use this instead of calling
+// Reader().GetMicroflow(id) inside a `for … range ctx.Microflows()` loop: on the
+// modelsdk backend GetMicroflow re-lists and re-BSON-decodes EVERY microflow unit
+// on each call, so per-microflow calls are O(N^2) full decodes. On a large project
+// that made `mxcli report` appear to hang for many minutes (issue #720). The cache
+// is safe because the lint run is read-only and short-lived.
+func (ctx *LintContext) FullMicroflow(id model.ID) (*microflows.Microflow, error) {
+	if !ctx.fullMFLoaded {
+		ctx.fullMFLoaded = true
+		if ctx.reader != nil {
+			mfs, err := ctx.reader.ListMicroflows()
+			if err != nil {
+				ctx.fullMFErr = err
+			} else {
+				ctx.fullMFCache = make(map[model.ID]*microflows.Microflow, len(mfs))
+				for _, mf := range mfs {
+					ctx.fullMFCache[mf.ID] = mf
+				}
+			}
+		}
+	}
+	if ctx.fullMFErr != nil {
+		return nil, ctx.fullMFErr
+	}
+	return ctx.fullMFCache[id], nil
 }
 
 // Reader returns the LintReader, or nil if not set.
@@ -67,9 +127,92 @@ func (ctx *LintContext) SetExcludedModules(modules []string) {
 	}
 }
 
-// IsExcluded returns true if the module should be excluded from linting.
+// SetIncludedModules sets an allowlist of modules to lint. When non-empty,
+// only modules in this list are linted (modules not in the list are skipped).
+func (ctx *LintContext) SetIncludedModules(modules []string) {
+	if len(modules) == 0 {
+		return
+	}
+	ctx.included = make(map[string]bool)
+	ctx.includeActive = true
+	for _, m := range modules {
+		ctx.included[m] = true
+	}
+}
+
+// SetIncludedDocuments sets an allowlist of documents to lint, by qualified
+// name ("Sales.ACT_Order"). It also narrows the module allowlist to the modules
+// those documents live in: every rule already guards its expensive per-document
+// read with IsExcluded(moduleName), so the module implication is what makes a
+// scoped lint faster in rules this package does not otherwise narrow.
+func (ctx *LintContext) SetIncludedDocuments(docs []string) {
+	ctx.documents = make(map[string]bool)
+	mods := map[string]bool{}
+	for _, d := range docs {
+		ctx.documents[d] = true
+		if i := strings.LastIndex(d, "."); i > 0 {
+			mods[d[:i]] = true
+		}
+	}
+	if len(mods) == 0 {
+		return
+	}
+	// Intersect rather than replace: --modules A --documents B.C names an empty
+	// set and must lint nothing, not all of B. Replacing would silently widen an
+	// explicit filter, which is the direction that turns a scoped run into a
+	// project-wide one without saying so.
+	if !ctx.includeActive {
+		ctx.included = mods
+		ctx.includeActive = true
+		return
+	}
+	for m := range ctx.included {
+		if !mods[m] {
+			delete(ctx.included, m)
+		}
+	}
+}
+
+// IsDocumentExcluded reports whether a document is outside the --document
+// allowlist. With no allowlist nothing is excluded, so an unscoped lint is
+// unaffected.
+//
+// qualifiedName is "Module.Document". A caller holding the two halves separately
+// should join them; a caller holding only a short name cannot use this.
+func (ctx *LintContext) IsDocumentExcluded(qualifiedName string) bool {
+	return len(ctx.documents) > 0 && !ctx.documents[qualifiedName]
+}
+
+// documentFilterSQL returns a SQL predicate narrowing an iterator to the
+// --document allowlist, or "1=1" when there is none.
+//
+// It is applied in the QUERY rather than in each rule because that is the one
+// place it covers every rule at once: CONV011 and MPR002 both walk Microflows()
+// and both call FullMicroflow() per row, which is the read that makes lint scale
+// with project size.
+func (ctx *LintContext) documentFilterSQL(column string) string {
+	if len(ctx.documents) == 0 {
+		return "1=1"
+	}
+	quoted := make([]string, 0, len(ctx.documents))
+	for d := range ctx.documents {
+		quoted = append(quoted, "'"+strings.ReplaceAll(d, "'", "''")+"'")
+	}
+	sort.Strings(quoted) // deterministic SQL, so a failure is reproducible
+	return column + " IN (" + strings.Join(quoted, ", ") + ")"
+}
+
+// IsExcluded returns true if the module should be skipped during linting.
+// A module is skipped when it is explicitly excluded, or when an inclusion
+// filter is active and the module is not in it.
 func (ctx *LintContext) IsExcluded(moduleName string) bool {
-	return ctx.excluded[moduleName]
+	if ctx.excluded[moduleName] {
+		return true
+	}
+	if ctx.includeActive && !ctx.included[moduleName] {
+		return true
+	}
+	return false
 }
 
 // Catalog returns the underlying catalog.
@@ -102,12 +245,19 @@ type Entity struct {
 	ValidationRuleCount int
 	HasEventHandlers    bool
 	IsExternal          bool
+	// The four audit members. Mendix stores these as booleans on the entity's
+	// generalization node rather than as attributes, so they are not in
+	// AttributeCount and a rule cannot find them by walking Attributes().
+	HasCreatedDate bool
+	HasChangedDate bool
+	HasOwner       bool
+	HasChangedBy   bool
 }
 
 // Entities returns an iterator over all entities (excluding system modules).
 func (ctx *LintContext) Entities() iter.Seq[Entity] {
 	return func(yield func(Entity) bool) {
-		rows, err := ctx.db.Query(`
+		rows, err := ctx.db.Query(fmt.Sprintf(`
 			SELECT e.Id, e.Name, e.QualifiedName, e.ModuleName, e.Folder,
 			       CASE e.EntityType
 			           WHEN 'PERSISTENT' THEN 'Persistent'
@@ -117,13 +267,15 @@ func (ctx *LintContext) Entities() iter.Seq[Entity] {
 			       END,
 			       e.Description, e.Generalization, e.AttributeCount,
 			       e.AccessRuleCount, e.ValidationRuleCount,
-			       e.HasEventHandlers, e.IsExternal
+			       e.HasEventHandlers, e.IsExternal,
+			       e.HasCreatedDate, e.HasChangedDate, e.HasOwner, e.HasChangedBy
 			FROM entities e
 			LEFT JOIN modules m ON e.ModuleName = m.Name
-			WHERE COALESCE(m.Source, '') = ''
+			WHERE %s
 			ORDER BY e.ModuleName, e.Name
-		`)
+		`, notPlatformModule("m")))
 		if err != nil {
+			ctx.recordQueryError("Entities", err)
 			return
 		}
 		defer rows.Close()
@@ -132,11 +284,19 @@ func (ctx *LintContext) Entities() iter.Seq[Entity] {
 			var e Entity
 			var desc, gen, folder sql.NullString
 			var hasEventHandlers, isExternal int
+			// Nullable on purpose: a row written before these columns existed,
+			// or any fixture that does not name them, scans as NULL, and NULL
+			// into a plain int fails the whole query -- which the iterator
+			// reports as "no entities" and every rule then reads as "nothing
+			// to flag". A silent green run, not an error.
+			var hasCreatedDate, hasChangedDate, hasOwner, hasChangedBy sql.NullInt64
 			err := rows.Scan(&e.ID, &e.Name, &e.QualifiedName, &e.ModuleName, &folder,
 				&e.EntityType, &desc, &gen, &e.AttributeCount,
 				&e.AccessRuleCount, &e.ValidationRuleCount,
-				&hasEventHandlers, &isExternal)
+				&hasEventHandlers, &isExternal,
+				&hasCreatedDate, &hasChangedDate, &hasOwner, &hasChangedBy)
 			if err != nil {
+				ctx.recordQueryError("Entities (row scan)", err)
 				continue
 			}
 			e.Folder = folder.String
@@ -144,8 +304,12 @@ func (ctx *LintContext) Entities() iter.Seq[Entity] {
 			e.Generalization = gen.String
 			e.HasEventHandlers = hasEventHandlers == 1
 			e.IsExternal = isExternal == 1
+			e.HasCreatedDate = hasCreatedDate.Int64 == 1
+			e.HasChangedDate = hasChangedDate.Int64 == 1
+			e.HasOwner = hasOwner.Int64 == 1
+			e.HasChangedBy = hasChangedBy.Int64 == 1
 
-			if ctx.excluded[e.ModuleName] {
+			if ctx.IsExcluded(e.ModuleName) {
 				continue
 			}
 
@@ -184,6 +348,7 @@ func (ctx *LintContext) AttributesFor(entityQualifiedName string) iter.Seq[Attri
 			ORDER BY Name
 		`, entityQualifiedName)
 		if err != nil {
+			ctx.recordQueryError("AttributesFor", err)
 			return
 		}
 		defer rows.Close()
@@ -197,6 +362,7 @@ func (ctx *LintContext) AttributesFor(entityQualifiedName string) iter.Seq[Attri
 				&a.ModuleName, &dataType, &length, &isUnique, &isRequired, &defaultVal,
 				&isCalculated, &desc)
 			if err != nil {
+				ctx.recordQueryError("AttributesFor (row scan)", err)
 				continue
 			}
 			a.DataType = dataType.String
@@ -223,18 +389,30 @@ type Permission struct {
 	MemberName      string // populated for MEMBER_READ/MEMBER_WRITE, empty for entity-level
 	XPathConstraint string // empty means unconstrained
 	IsConstrained   bool   // convenience: XPathConstraint != ""
+	// DefaultMemberAccessRights is the rule's "default rights for new members"
+	// setting: None, ReadOnly or ReadWrite. Empty when not applicable.
+	DefaultMemberAccessRights string
+	// AccessRuleID is the $ID of the entity access rule this row comes from,
+	// and AccessRuleIndex that rule's position on the entity (from 0): rows
+	// sharing them are one rule (ako/mxcli#1437). "" and -1 for a row no access
+	// rule produces.
+	AccessRuleID    string
+	AccessRuleIndex int
 }
 
 // PermissionsFor returns an iterator over all permissions for a given entity.
 func (ctx *LintContext) PermissionsFor(entityQualifiedName string) iter.Seq[Permission] {
 	return func(yield func(Permission) bool) {
 		rows, err := ctx.db.Query(`
-			SELECT ModuleRoleName, ElementName, MemberName, AccessType, XPathConstraint, ModuleName
+			SELECT ModuleRoleName, ElementName, MemberName, AccessType, XPathConstraint,
+			       COALESCE(DefaultMemberAccessRights, ''), ModuleName,
+			       COALESCE(AccessRuleId, ''), COALESCE(AccessRuleIndex, -1)
 			FROM permissions
 			WHERE ElementType = 'ENTITY' AND ElementName = ?
 			ORDER BY ModuleRoleName, AccessType
 		`, entityQualifiedName)
 		if err != nil {
+			ctx.recordQueryError("PermissionsFor", err)
 			return
 		}
 		defer rows.Close()
@@ -242,8 +420,10 @@ func (ctx *LintContext) PermissionsFor(entityQualifiedName string) iter.Seq[Perm
 		for rows.Next() {
 			var p Permission
 			var memberName, xpathConstraint, moduleName sql.NullString
-			err := rows.Scan(&p.ModuleRoleName, &p.EntityName, &memberName, &p.AccessType, &xpathConstraint, &moduleName)
+			err := rows.Scan(&p.ModuleRoleName, &p.EntityName, &memberName, &p.AccessType, &xpathConstraint,
+				&p.DefaultMemberAccessRights, &moduleName, &p.AccessRuleID, &p.AccessRuleIndex)
 			if err != nil {
+				ctx.recordQueryError("PermissionsFor (row scan)", err)
 				continue
 			}
 			p.MemberName = memberName.String
@@ -261,13 +441,22 @@ func (ctx *LintContext) PermissionsFor(entityQualifiedName string) iter.Seq[Perm
 // AllPermission represents a permission from the catalog covering all element types.
 type AllPermission struct {
 	ModuleRoleName  string
-	ElementType     string // ENTITY, MICROFLOW, PAGE, ODATA_SERVICE
+	ElementType     string // ENTITY, MICROFLOW, NANOFLOW, PAGE, ODATA_SERVICE
 	ElementName     string // qualified name of the element
 	MemberName      string // populated for MEMBER_READ/MEMBER_WRITE
 	AccessType      string // CREATE, READ, WRITE, DELETE, EXECUTE, VIEW, ACCESS, MEMBER_READ, MEMBER_WRITE
 	XPathConstraint string
 	IsConstrained   bool
 	ModuleName      string
+	// DefaultMemberAccessRights is the rule's "default rights for new members"
+	// setting: None, ReadOnly or ReadWrite. Empty for non-entity permissions.
+	DefaultMemberAccessRights string
+	// AccessRuleID is the $ID of the entity access rule this row comes from,
+	// and AccessRuleIndex that rule's position on the entity (from 0): rows
+	// sharing them are one rule (ako/mxcli#1437). "" and -1 for a row no access
+	// rule produces.
+	AccessRuleID    string
+	AccessRuleIndex int
 }
 
 // Permissions returns an iterator over all permissions in the catalog.
@@ -279,11 +468,14 @@ func (ctx *LintContext) Permissions() iter.Seq[AllPermission] {
 		rows, err := ctx.db.Query(`
 			SELECT ModuleRoleName, ElementType, ElementName,
 				COALESCE(MemberName, ''), AccessType,
-				COALESCE(XPathConstraint, ''), COALESCE(ModuleName, '')
+				COALESCE(XPathConstraint, ''), COALESCE(DefaultMemberAccessRights, ''),
+				COALESCE(ModuleName, ''),
+				COALESCE(AccessRuleId, ''), COALESCE(AccessRuleIndex, -1)
 			FROM permissions
 			ORDER BY ElementType, ElementName, ModuleRoleName, AccessType
 		`)
 		if err != nil {
+			ctx.recordQueryError("Permissions", err)
 			return
 		}
 		defer rows.Close()
@@ -291,7 +483,8 @@ func (ctx *LintContext) Permissions() iter.Seq[AllPermission] {
 		for rows.Next() {
 			var p AllPermission
 			if err := rows.Scan(&p.ModuleRoleName, &p.ElementType, &p.ElementName,
-				&p.MemberName, &p.AccessType, &p.XPathConstraint, &p.ModuleName); err != nil {
+				&p.MemberName, &p.AccessType, &p.XPathConstraint,
+				&p.DefaultMemberAccessRights, &p.ModuleName, &p.AccessRuleID, &p.AccessRuleIndex); err != nil {
 				continue
 			}
 			p.IsConstrained = p.XPathConstraint != ""
@@ -305,8 +498,19 @@ func (ctx *LintContext) Permissions() iter.Seq[AllPermission] {
 // UserRoleInfo represents a user role from project security.
 type UserRoleInfo struct {
 	Name        string
+	Description string
 	IsAnonymous bool
 	ModuleRoles []string
+	// CheckSecurity is Studio Pro's per-role "Check security" flag. With it on,
+	// the Modeler verifies that the role's access rules actually grant what its
+	// pages and microflows need — the setting a rule of the form "security
+	// should be checked for each project role" asserts.
+	CheckSecurity bool
+	// ManageAllRoles, ManageUsersWithoutRoles and ManageableRoles are the
+	// user-management grants: which other roles this role may hand out.
+	ManageAllRoles          bool
+	ManageUsersWithoutRoles bool
+	ManageableRoles         []string
 }
 
 // UserRoles returns the user roles from project security.
@@ -323,9 +527,14 @@ func (ctx *LintContext) UserRoles() []UserRoleInfo {
 	var roles []UserRoleInfo
 	for _, ur := range ps.UserRoles {
 		roles = append(roles, UserRoleInfo{
-			Name:        ur.Name,
-			IsAnonymous: ur.Name == ps.GuestUserRole,
-			ModuleRoles: ur.ModuleRoles,
+			Name:                    ur.Name,
+			Description:             ur.Description,
+			IsAnonymous:             ur.Name == ps.GuestUserRole,
+			ModuleRoles:             ur.ModuleRoles,
+			CheckSecurity:           ur.CheckSecurity,
+			ManageAllRoles:          ur.ManageAllRoles,
+			ManageUsersWithoutRoles: ur.ManageUsersWithoutRoles,
+			ManageableRoles:         ur.ManageableRoles,
 		})
 	}
 	return roles
@@ -350,12 +559,17 @@ func (ctx *LintContext) RoleMappings() iter.Seq[RoleMappingInfo] {
 			ORDER BY UserRoleName, ModuleRoleName
 		`)
 		if err != nil {
+			ctx.recordQueryError("RoleMappings", err)
 			return
 		}
 		defer rows.Close()
 		for rows.Next() {
 			var rm RoleMappingInfo
 			if err := rows.Scan(&rm.UserRoleName, &rm.ModuleRoleName, &rm.ModuleName); err != nil {
+				ctx.recordQueryError("RoleMappings (row scan)", err)
+				continue
+			}
+			if ctx.IsExcluded(rm.ModuleName) {
 				continue
 			}
 			if !yield(rm) {
@@ -385,12 +599,17 @@ func (ctx *LintContext) ModuleRoles() iter.Seq[ModuleRoleInfo] {
 			ORDER BY ModuleName, ModuleRoleName
 		`)
 		if err != nil {
+			ctx.recordQueryError("ModuleRoles", err)
 			return
 		}
 		defer rows.Close()
 		for rows.Next() {
 			var mr ModuleRoleInfo
 			if err := rows.Scan(&mr.Name, &mr.ModuleName); err != nil {
+				ctx.recordQueryError("ModuleRoles (row scan)", err)
+				continue
+			}
+			if ctx.IsExcluded(mr.ModuleName) {
 				continue
 			}
 			if !yield(mr) {
@@ -407,27 +626,65 @@ type Microflow struct {
 	QualifiedName  string
 	ModuleName     string
 	Folder         string
-	MicroflowType  string // "Microflow", "Nanoflow"
+	MicroflowType  string // "MICROFLOW", "NANOFLOW", "RULE" (as stored by the catalog)
 	Description    string
 	ReturnType     string
 	ParameterCount int
-	ActivityCount  int
-	Complexity     int // McCabe cyclomatic complexity
+	ActivityCount  int // top level only; a loop counts as one
+	// TotalActivityCount is ActivityCount plus every activity inside a loop,
+	// at any depth (mendixlabs/mxcli#1266).
+	TotalActivityCount int
+	Complexity         int // McCabe cyclomatic complexity
+	// Excluded is "Exclude from project": the flow is not built or run, so a
+	// guideline rule usually skips it (ako/mxcli#1453).
+	Excluded bool
+	// ApplyEntityAccess is the flow's "Apply entity access" setting. Always
+	// false for a nanoflow, which has no such setting.
+	ApplyEntityAccess bool
+}
+
+// DocumentNoun is what to call this document in a lint message and in
+// Location.DocumentType.
+//
+// Microflows() yields all three flow flavours, because they share one catalog
+// table — so a rule that hardcodes "microflow" reports a nanoflow or a rule
+// under the wrong doctype. That is how MPR002 came to say "Microflow 'Rule1'
+// has no activities" about a rule, and the same about a nanoflow.
+//
+// An unrecognised type falls back to "microflow": a lint finding is worth more
+// with an imprecise noun than not at all.
+func (m Microflow) DocumentNoun() string {
+	switch m.MicroflowType {
+	case catalog.MicroflowTypeNanoflow:
+		return "nanoflow"
+	case catalog.MicroflowTypeRule:
+		return "rule"
+	default:
+		return "microflow"
+	}
+}
+
+// DocumentNounTitle is DocumentNoun capitalised, for a message that opens with it.
+func (m Microflow) DocumentNounTitle() string {
+	n := m.DocumentNoun()
+	return strings.ToUpper(n[:1]) + n[1:]
 }
 
 // Microflows returns an iterator over all microflows (excluding system modules).
 func (ctx *LintContext) Microflows() iter.Seq[Microflow] {
 	return func(yield func(Microflow) bool) {
-		rows, err := ctx.db.Query(`
+		rows, err := ctx.db.Query(fmt.Sprintf(`
 			SELECT mf.Id, mf.Name, mf.QualifiedName, mf.ModuleName, mf.Folder,
 			       mf.MicroflowType, mf.Description, mf.ReturnType,
-			       mf.ParameterCount, mf.ActivityCount, mf.Complexity
+			       mf.ParameterCount, mf.ActivityCount, mf.TotalActivityCount, mf.Complexity,
+			       COALESCE(mf.Excluded, 0), COALESCE(mf.ApplyEntityAccess, 0)
 			FROM microflows mf
 			LEFT JOIN modules m ON mf.ModuleName = m.Name
-			WHERE COALESCE(m.Source, '') = ''
+			WHERE %s AND %s
 			ORDER BY mf.ModuleName, mf.Name
-		`)
+		`, notPlatformModule("m"), ctx.documentFilterSQL("mf.QualifiedName")))
 		if err != nil {
+			ctx.recordQueryError("Microflows", err)
 			return
 		}
 		defer rows.Close()
@@ -436,15 +693,17 @@ func (ctx *LintContext) Microflows() iter.Seq[Microflow] {
 			var mf Microflow
 			var desc, retType, folder sql.NullString
 			err := rows.Scan(&mf.ID, &mf.Name, &mf.QualifiedName, &mf.ModuleName, &folder,
-				&mf.MicroflowType, &desc, &retType, &mf.ParameterCount, &mf.ActivityCount, &mf.Complexity)
+				&mf.MicroflowType, &desc, &retType, &mf.ParameterCount, &mf.ActivityCount, &mf.TotalActivityCount, &mf.Complexity,
+				&mf.Excluded, &mf.ApplyEntityAccess)
 			if err != nil {
+				ctx.recordQueryError("Microflows (row scan)", err)
 				continue
 			}
 			mf.Folder = folder.String
 			mf.Description = desc.String
 			mf.ReturnType = retType.String
 
-			if ctx.excluded[mf.ModuleName] {
+			if ctx.IsExcluded(mf.ModuleName) {
 				continue
 			}
 
@@ -466,20 +725,26 @@ type Page struct {
 	URL           string
 	Description   string
 	WidgetCount   int
+	// The page's own Appearance (full catalog only, like WidgetCount).
+	Class          string
+	Style          string
+	DynamicClasses string
 }
 
 // Pages returns an iterator over all pages (excluding system modules).
 func (ctx *LintContext) Pages() iter.Seq[Page] {
 	return func(yield func(Page) bool) {
-		rows, err := ctx.db.Query(`
+		rows, err := ctx.db.Query(fmt.Sprintf(`
 			SELECT p.Id, p.Name, p.QualifiedName, p.ModuleName, p.Folder,
-			       p.Title, p.URL, p.Description, p.WidgetCount
+			       p.Title, p.URL, p.Description, p.WidgetCount,
+			       COALESCE(p.Class, ''), COALESCE(p.Style, ''), COALESCE(p.DynamicClasses, '')
 			FROM pages p
 			LEFT JOIN modules m ON p.ModuleName = m.Name
-			WHERE COALESCE(m.Source, '') = ''
+			WHERE %s AND %s
 			ORDER BY p.ModuleName, p.Name
-		`)
+		`, notPlatformModule("m"), ctx.documentFilterSQL("p.QualifiedName")))
 		if err != nil {
+			ctx.recordQueryError("Pages", err)
 			return
 		}
 		defer rows.Close()
@@ -489,8 +754,9 @@ func (ctx *LintContext) Pages() iter.Seq[Page] {
 			var title, url, desc, folder sql.NullString
 			var widgetCount sql.NullInt64
 			err := rows.Scan(&pg.ID, &pg.Name, &pg.QualifiedName, &pg.ModuleName, &folder,
-				&title, &url, &desc, &widgetCount)
+				&title, &url, &desc, &widgetCount, &pg.Class, &pg.Style, &pg.DynamicClasses)
 			if err != nil {
+				ctx.recordQueryError("Pages (row scan)", err)
 				continue
 			}
 			pg.Folder = folder.String
@@ -499,7 +765,7 @@ func (ctx *LintContext) Pages() iter.Seq[Page] {
 			pg.Description = desc.String
 			pg.WidgetCount = int(widgetCount.Int64)
 
-			if ctx.excluded[pg.ModuleName] {
+			if ctx.IsExcluded(pg.ModuleName) {
 				continue
 			}
 
@@ -519,20 +785,64 @@ type Enumeration struct {
 	Folder        string
 	Description   string
 	ValueCount    int
+	// Values in ordinal order. Without them a rule could not resolve
+	// getCaption(Module.Enum.Value) (mendixlabs/mxcli#1310, ako/mxcli#1453).
+	Values []EnumerationValue
+}
+
+// EnumerationValue is one value of an enumeration, with its caption in the
+// project's default language.
+type EnumerationValue struct {
+	// ID is the value's $ID: the element_id of its captions in strings(), one
+	// row per language (ako/mxcli#1301).
+	ID            string
+	Name          string
+	QualifiedName string // Module.Enumeration.Value, as refs_from() names it
+	Caption       string
+	Ordinal       int
+}
+
+// enumerationValues reads every enumeration's values in one query, keyed by
+// the enumeration's qualified name. Read before Enumerations iterates, so no
+// second query runs while its rows are open.
+func (ctx *LintContext) enumerationValues() map[string][]EnumerationValue {
+	out := map[string][]EnumerationValue{}
+	rows, err := ctx.db.Query(`
+		SELECT EnumerationQualifiedName, COALESCE(Id, ''), Name, COALESCE(Caption, ''), COALESCE(Ordinal, 0)
+		FROM enumeration_values
+		ORDER BY EnumerationQualifiedName, Ordinal, Name`)
+	if err != nil {
+		ctx.recordQueryError("EnumerationValues", err)
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var enum string
+		var v EnumerationValue
+		if err := rows.Scan(&enum, &v.ID, &v.Name, &v.Caption, &v.Ordinal); err != nil {
+			ctx.recordQueryError("EnumerationValues (row scan)", err)
+			continue
+		}
+		v.QualifiedName = enum + "." + v.Name
+		out[enum] = append(out[enum], v)
+	}
+	return out
 }
 
 // Enumerations returns an iterator over all enumerations (excluding system modules).
 func (ctx *LintContext) Enumerations() iter.Seq[Enumeration] {
 	return func(yield func(Enumeration) bool) {
-		rows, err := ctx.db.Query(`
+		values := ctx.enumerationValues()
+		rows, err := ctx.db.Query(fmt.Sprintf(`
 			SELECT en.Id, en.Name, en.QualifiedName, en.ModuleName, en.Folder,
 			       en.Description, en.ValueCount
 			FROM enumerations en
 			LEFT JOIN modules m ON en.ModuleName = m.Name
-			WHERE COALESCE(m.Source, '') = ''
+			WHERE %s
 			ORDER BY en.ModuleName, en.Name
-		`)
+		`, notPlatformModule("m")))
 		if err != nil {
+			ctx.recordQueryError("Enumerations", err)
 			return
 		}
 		defer rows.Close()
@@ -543,16 +853,73 @@ func (ctx *LintContext) Enumerations() iter.Seq[Enumeration] {
 			err := rows.Scan(&en.ID, &en.Name, &en.QualifiedName, &en.ModuleName, &folder,
 				&desc, &en.ValueCount)
 			if err != nil {
+				ctx.recordQueryError("Enumerations (row scan)", err)
 				continue
 			}
 			en.Folder = folder.String
 			en.Description = desc.String
+			en.Values = values[en.QualifiedName]
 
-			if ctx.excluded[en.ModuleName] {
+			if ctx.IsExcluded(en.ModuleName) {
 				continue
 			}
 
 			if !yield(en) {
+				return
+			}
+		}
+	}
+}
+
+// LintConstant represents a constant from the catalog.
+type LintConstant struct {
+	ID              string
+	Name            string
+	QualifiedName   string
+	ModuleName      string
+	Folder          string
+	Description     string
+	DefaultValue    string
+	ExposedToClient bool
+}
+
+// Constants returns an iterator over all constants (excluding system modules).
+func (ctx *LintContext) Constants() iter.Seq[LintConstant] {
+	return func(yield func(LintConstant) bool) {
+		rows, err := ctx.db.Query(fmt.Sprintf(`
+			SELECT c.Id, c.Name, c.QualifiedName, c.ModuleName, c.Folder,
+			       c.Description, c.DefaultValue, c.ExposedToClient
+			FROM constants c
+			LEFT JOIN modules m ON c.ModuleName = m.Name
+			WHERE %s
+			ORDER BY c.ModuleName, c.Name
+		`, notPlatformModule("m")))
+		if err != nil {
+			ctx.recordQueryError("Constants", err)
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var c LintConstant
+			var folder, desc, defaultVal sql.NullString
+			var exposedToClient int
+			err := rows.Scan(&c.ID, &c.Name, &c.QualifiedName, &c.ModuleName,
+				&folder, &desc, &defaultVal, &exposedToClient)
+			if err != nil {
+				ctx.recordQueryError("Constants (row scan)", err)
+				continue
+			}
+			c.Folder = folder.String
+			c.Description = desc.String
+			c.DefaultValue = defaultVal.String
+			c.ExposedToClient = exposedToClient == 1
+
+			if ctx.excluded[c.ModuleName] {
+				continue
+			}
+
+			if !yield(c) {
 				return
 			}
 		}
@@ -570,30 +937,56 @@ type Widget struct {
 	ModuleName             string
 	EntityRef              string // Qualified name of referenced entity (e.g., "OtherModule.Customer")
 	AttributeRef           string
+	MicroflowRef           string // Qualified name of an action/datasource microflow, if any
+	NanoflowRef            string // Qualified name of an action/datasource nanoflow, if any
+	PageRef                string // Qualified name of the page the widget's action opens, if any
+	SnippetRef             string // Qualified name of the snippet a snippet call places, if any
+
+	// Tree position and appearance (mendixlabs/mxcli#1268); see
+	// catalog.rawWidgetInfo for the exact semantics.
+	ParentWidgetID  string // nearest catalogued ancestor; "" at the root
+	Depth           int    // 0 at the page or snippet root
+	Class           string
+	Style           string
+	DynamicClasses  string
+	ActionType      string // stored $Type of the primary action, e.g. "Forms$DeleteClientAction"
+	HasConfirmation bool   // only microflow / nanoflow / workflow calls can have one
+	// Caption and Tooltip in the project's default language (ako/mxcli#1303).
+	// Other languages: strings() rows whose widget_id is this widget's ID.
+	Caption string
+	Tooltip string
 }
 
 // Widgets returns an iterator over all widgets (excluding system modules).
 func (ctx *LintContext) Widgets() iter.Seq[Widget] {
 	return func(yield func(Widget) bool) {
-		rows, err := ctx.db.Query(`
+		rows, err := ctx.db.Query(fmt.Sprintf(`
 			SELECT w.Id, w.Name, w.WidgetType, w.ContainerId, w.ContainerQualifiedName,
-			       w.ContainerType, w.ModuleName, w.EntityRef, w.AttributeRef
+			       w.ContainerType, w.ModuleName, w.EntityRef, w.AttributeRef,
+			       w.MicroflowRef, w.NanoflowRef, w.PageRef, w.SnippetRef,
+			       w.ParentWidgetId, w.Depth, w.Class, w.Style, w.DynamicClasses,
+			       w.ActionType, w.HasConfirmation, w.Caption, w.Tooltip
 			FROM widgets w
 			LEFT JOIN modules m ON w.ModuleName = m.Name
-			WHERE COALESCE(m.Source, '') = ''
+			WHERE %s AND %s
 			ORDER BY w.ModuleName, w.ContainerQualifiedName, w.Name
-		`)
+		`, notPlatformModule("m"), ctx.documentFilterSQL("w.ContainerQualifiedName")))
 		if err != nil {
+			ctx.recordQueryError("Widgets", err)
 			return
 		}
 		defer rows.Close()
 
 		for rows.Next() {
 			var w Widget
-			var containerID, containerQName, containerType, entityRef, attrRef sql.NullString
+			var containerID, containerQName, containerType, entityRef, attrRef, mfRef, nfRef, pageRef, snippetRef sql.NullString
+			var parentID, class, style, dynClasses, actionType, caption, tooltip sql.NullString
+			var depth, hasConfirmation sql.NullInt64
 			err := rows.Scan(&w.ID, &w.Name, &w.WidgetType, &containerID, &containerQName,
-				&containerType, &w.ModuleName, &entityRef, &attrRef)
+				&containerType, &w.ModuleName, &entityRef, &attrRef, &mfRef, &nfRef, &pageRef, &snippetRef,
+				&parentID, &depth, &class, &style, &dynClasses, &actionType, &hasConfirmation, &caption, &tooltip)
 			if err != nil {
+				ctx.recordQueryError("Widgets (row scan)", err)
 				continue
 			}
 			w.ContainerID = containerID.String
@@ -601,8 +994,21 @@ func (ctx *LintContext) Widgets() iter.Seq[Widget] {
 			w.ContainerType = containerType.String
 			w.EntityRef = entityRef.String
 			w.AttributeRef = attrRef.String
+			w.MicroflowRef = mfRef.String
+			w.NanoflowRef = nfRef.String
+			w.PageRef = pageRef.String
+			w.SnippetRef = snippetRef.String
+			w.ParentWidgetID = parentID.String
+			w.Depth = int(depth.Int64)
+			w.Class = class.String
+			w.Style = style.String
+			w.DynamicClasses = dynClasses.String
+			w.ActionType = actionType.String
+			w.HasConfirmation = hasConfirmation.Int64 != 0
+			w.Caption = caption.String
+			w.Tooltip = tooltip.String
 
-			if ctx.excluded[w.ModuleName] {
+			if ctx.IsExcluded(w.ModuleName) {
 				continue
 			}
 
@@ -626,14 +1032,15 @@ type Snippet struct {
 // Snippets returns an iterator over all snippets (excluding system modules).
 func (ctx *LintContext) Snippets() iter.Seq[Snippet] {
 	return func(yield func(Snippet) bool) {
-		rows, err := ctx.db.Query(`
+		rows, err := ctx.db.Query(fmt.Sprintf(`
 			SELECT s.Id, s.Name, s.QualifiedName, s.ModuleName, s.Folder, s.WidgetCount
 			FROM snippets s
 			LEFT JOIN modules m ON s.ModuleName = m.Name
-			WHERE COALESCE(m.Source, '') = ''
+			WHERE %s
 			ORDER BY s.ModuleName, s.Name
-		`)
+		`, notPlatformModule("m")))
 		if err != nil {
+			ctx.recordQueryError("Snippets", err)
 			return
 		}
 		defer rows.Close()
@@ -644,16 +1051,258 @@ func (ctx *LintContext) Snippets() iter.Seq[Snippet] {
 			var widgetCount sql.NullInt64
 			err := rows.Scan(&s.ID, &s.Name, &s.QualifiedName, &s.ModuleName, &folder, &widgetCount)
 			if err != nil {
+				ctx.recordQueryError("Snippets (row scan)", err)
 				continue
 			}
 			s.Folder = folder.String
 			s.WidgetCount = int(widgetCount.Int64)
 
-			if ctx.excluded[s.ModuleName] {
+			if ctx.IsExcluded(s.ModuleName) {
 				continue
 			}
 
 			if !yield(s) {
+				return
+			}
+		}
+	}
+}
+
+// ScheduledEvent represents a scheduled event document.
+type ScheduledEvent struct {
+	Name          string
+	QualifiedName string
+	ModuleName    string
+	MicroflowName string // qualified name of the microflow to execute
+	// IntervalSeconds is how often the event fires, derived from the Schedule
+	// child — NOT from the stored Interval/IntervalType pair, which Studio Pro
+	// writes and does not keep in sync with Schedule. Workflow Commons ships an
+	// event storing 0/"Minute" beside a DaySchedule of 01:00, so a rule keyed on
+	// the legacy pair would read it as "fires every 0 seconds".
+	IntervalSeconds int
+	// Repeat is the schedule variant (Minute, Hour, Day, Week, MonthDate,
+	// MonthWeekday, YearDate, YearWeekday); empty when the event has no
+	// Schedule child.
+	Repeat string
+	// OnOverlap is DelayNext or SkipNext — the event's own concurrency control.
+	OnOverlap string
+	TimeZone  string
+	Enabled   bool
+}
+
+// scheduleSeconds is the gap between runs implied by a schedule.
+//
+// The month and year figures are averages (30 and 365 days): the value is for
+// thresholds and ordering ("anything that fires more often than a minute"), not
+// for calendar arithmetic.
+func scheduleSeconds(s *model.Schedule) int {
+	if s == nil {
+		return 0
+	}
+	mult := s.Multiplier
+	if mult < 1 {
+		mult = 1
+	}
+	const day = 86400
+	switch s.Kind {
+	case model.ScheduleMinute:
+		return mult * 60
+	case model.ScheduleHour:
+		return mult * 3600
+	case model.ScheduleDay:
+		return day
+	case model.ScheduleWeek:
+		n := 0
+		for _, on := range s.Weekdays {
+			if on {
+				n++
+			}
+		}
+		if n == 0 {
+			return 7 * day
+		}
+		return (7 * day) / n
+	case model.ScheduleMonthDate, model.ScheduleMonthWeekday:
+		return mult * 30 * day
+	case model.ScheduleYearDate, model.ScheduleYearWeekday:
+		return 365 * day
+	}
+	return 0
+}
+
+// Queue represents a task queue document.
+type Queue struct {
+	Name          string
+	QualifiedName string
+	ModuleName    string
+	// Parallelism is an EXPRESSION, not a number — Mendix stores it as a string,
+	// so a rule must not assume it parses as an integer.
+	Parallelism string
+	ClusterWide bool
+}
+
+// ScheduledEvents returns an iterator over all scheduled events (excluding system modules).
+// Returns an empty iterator if no reader is available.
+func (ctx *LintContext) ScheduledEvents() iter.Seq[ScheduledEvent] {
+	return func(yield func(ScheduledEvent) bool) {
+		if ctx.reader == nil {
+			return
+		}
+
+		// Build module ID → name map from catalog.
+		moduleNames := map[model.ID]string{}
+		// Build microflow UUID → qualified name map from catalog.
+		// Falls back to the raw UUID when the catalog has not been built yet.
+		microflowNames := map[string]string{}
+		if ctx.db != nil {
+			if rows, err := ctx.db.Query(`SELECT Id, Name FROM modules`); err == nil {
+				defer rows.Close()
+				for rows.Next() {
+					var id, name string
+					if rows.Scan(&id, &name) == nil {
+						moduleNames[model.ID(id)] = name
+					}
+				}
+			}
+			if rows, err := ctx.db.Query(`SELECT Id, QualifiedName FROM microflows`); err == nil {
+				defer rows.Close()
+				for rows.Next() {
+					var id, qname string
+					if rows.Scan(&id, &qname) == nil {
+						microflowNames[id] = qname
+					}
+				}
+			}
+		}
+
+		events, err := ctx.reader.ListScheduledEvents()
+		if err != nil {
+			ctx.recordQueryError("ScheduledEvents", err)
+			return
+		}
+
+		// An event's container is a folder whenever it is not at the module
+		// root — every Marketplace module keeps its events that way — so walk
+		// up the folder chain to the module (ako/mxcli#1452).
+		folderParent := map[model.ID]model.ID{}
+		if folders, err := ctx.reader.ListFolders(); err == nil {
+			for _, f := range folders {
+				folderParent[f.ID] = f.ContainerID
+			}
+		} else {
+			ctx.recordQueryError("ScheduledEvents (folders)", err)
+		}
+		moduleOf := func(container model.ID) string {
+			for range len(folderParent) + 1 {
+				if name, ok := moduleNames[container]; ok {
+					return name
+				}
+				parent, ok := folderParent[container]
+				if !ok {
+					return ""
+				}
+				container = parent
+			}
+			return ""
+		}
+
+		for _, e := range events {
+			moduleName := moduleOf(e.ContainerID)
+			if ctx.IsExcluded(moduleName) {
+				continue
+			}
+			mfName := microflowNames[string(e.MicroflowID)]
+			if mfName == "" {
+				mfName = string(e.MicroflowID)
+			}
+			repeat := ""
+			if e.Schedule != nil {
+				repeat = string(e.Schedule.Kind)
+			}
+			se := ScheduledEvent{
+				Name:            e.Name,
+				QualifiedName:   moduleName + "." + e.Name,
+				ModuleName:      moduleName,
+				MicroflowName:   mfName,
+				IntervalSeconds: scheduleSeconds(e.Schedule),
+				Repeat:          repeat,
+				OnOverlap:       e.OnOverlap,
+				TimeZone:        e.TimeZone,
+				Enabled:         e.Enabled,
+			}
+			if !yield(se) {
+				return
+			}
+		}
+	}
+}
+
+// XPathExpressionEntry represents an XPath constraint expression from the catalog.
+type XPathExpressionEntry struct {
+	ID                    string
+	DocumentType          string // MICROFLOW, NANOFLOW, DOMAIN_MODEL, PAGE, SNIPPET
+	DocumentID            string
+	DocumentQualifiedName string
+	ComponentType         string // RETRIEVE_ACTION, ACCESS_RULE, WIDGET
+	ComponentID           string
+	ComponentName         string
+	XPathExpression       string // raw XPath string, may include outer [ ]
+	TargetEntity          string // qualified name of entity being queried
+	ReferencedEntities    string // comma-separated qualified names
+	IsParameterized       bool   // true when XPath contains $variable references
+	UsageType             string // RETRIEVE, SECURITY, DATASOURCE
+	ModuleName            string
+	// WidgetID and WidgetName name the widget a page or snippet data source
+	// belongs to, by the id the widgets table records (ako/mxcli#1879); empty
+	// for flows and access rules.
+	WidgetID   string
+	WidgetName string
+}
+
+// XPathExpressions returns an iterator over all XPath expression entries in the catalog.
+func (ctx *LintContext) XPathExpressions() iter.Seq[XPathExpressionEntry] {
+	return func(yield func(XPathExpressionEntry) bool) {
+		rows, err := ctx.db.Query(`
+			SELECT Id, DocumentType, DocumentId, DocumentQualifiedName,
+			       ComponentType, ComponentId, ComponentName,
+			       XPathExpression, TargetEntity, ReferencedEntities,
+			       IsParameterized, UsageType, ModuleName,
+			       COALESCE(WidgetId, ''), COALESCE(WidgetName, '')
+			FROM xpath_expressions
+			ORDER BY ModuleName, DocumentQualifiedName
+		`)
+		if err != nil {
+			ctx.recordQueryError("XPathExpressions", err)
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var e XPathExpressionEntry
+			var componentName, targetEntity, refEntities, moduleName sql.NullString
+			var isParam int
+			err := rows.Scan(
+				&e.ID, &e.DocumentType, &e.DocumentID, &e.DocumentQualifiedName,
+				&e.ComponentType, &e.ComponentID, &componentName,
+				&e.XPathExpression, &targetEntity, &refEntities,
+				&isParam, &e.UsageType, &moduleName,
+				&e.WidgetID, &e.WidgetName,
+			)
+			if err != nil {
+				ctx.recordQueryError("XPathExpressions (row scan)", err)
+				continue
+			}
+			e.ComponentName = componentName.String
+			e.TargetEntity = targetEntity.String
+			e.ReferencedEntities = refEntities.String
+			e.ModuleName = moduleName.String
+			e.IsParameterized = isParam == 1
+
+			if ctx.IsExcluded(e.ModuleName) {
+				continue
+			}
+
+			if !yield(e) {
 				return
 			}
 		}
@@ -672,17 +1321,55 @@ type DatabaseConnection struct {
 }
 
 // DatabaseConnections returns an iterator over all database connections (excluding system modules).
+// Queues returns an iterator over all task queues (excluding platform modules).
+//
+// Backed by the catalog rather than the reader, so no LintReader change is
+// needed; the catalog is already built whenever rules run.
+func (ctx *LintContext) Queues() iter.Seq[Queue] {
+	return func(yield func(Queue) bool) {
+		rows, err := ctx.db.Query(fmt.Sprintf(`
+			SELECT q.Name, q.QualifiedName, q.ModuleName, q.Parallelism, q.ClusterWide
+			FROM task_queues q
+			LEFT JOIN modules m ON q.ModuleName = m.Name
+			WHERE %s
+			ORDER BY q.ModuleName, q.Name
+		`, notPlatformModule("m")))
+		if err != nil {
+			ctx.recordQueryError("Queues", err)
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var q Queue
+			var clusterWide int
+			if err := rows.Scan(&q.Name, &q.QualifiedName, &q.ModuleName, &q.Parallelism, &clusterWide); err != nil {
+				ctx.recordQueryError("Queues (row scan)", err)
+				continue
+			}
+			q.ClusterWide = clusterWide != 0
+			if ctx.IsExcluded(q.ModuleName) {
+				continue
+			}
+			if !yield(q) {
+				return
+			}
+		}
+	}
+}
+
 func (ctx *LintContext) DatabaseConnections() iter.Seq[DatabaseConnection] {
 	return func(yield func(DatabaseConnection) bool) {
-		rows, err := ctx.db.Query(`
+		rows, err := ctx.db.Query(fmt.Sprintf(`
 			SELECT dc.Id, dc.Name, dc.QualifiedName, dc.ModuleName, dc.Folder,
 			       dc.DatabaseType, dc.QueryCount
 			FROM database_connections dc
 			LEFT JOIN modules m ON dc.ModuleName = m.Name
-			WHERE COALESCE(m.Source, '') = ''
+			WHERE %s
 			ORDER BY dc.ModuleName, dc.Name
-		`)
+		`, notPlatformModule("m")))
 		if err != nil {
+			ctx.recordQueryError("DatabaseConnections", err)
 			return
 		}
 		defer rows.Close()
@@ -693,11 +1380,12 @@ func (ctx *LintContext) DatabaseConnections() iter.Seq[DatabaseConnection] {
 			err := rows.Scan(&dc.ID, &dc.Name, &dc.QualifiedName, &dc.ModuleName, &folder,
 				&dc.DatabaseType, &dc.QueryCount)
 			if err != nil {
+				ctx.recordQueryError("DatabaseConnections (row scan)", err)
 				continue
 			}
 			dc.Folder = folder.String
 
-			if ctx.excluded[dc.ModuleName] {
+			if ctx.IsExcluded(dc.ModuleName) {
 				continue
 			}
 
@@ -708,30 +1396,224 @@ func (ctx *LintContext) DatabaseConnections() iter.Seq[DatabaseConnection] {
 	}
 }
 
+// RestClient represents a consumed REST service document from the
+// rest_clients table.
+type RestClient struct {
+	ID             string
+	Name           string
+	QualifiedName  string
+	ModuleName     string
+	Folder         string
+	BaseUrl        string
+	AuthScheme     string
+	OperationCount int
+	Documentation  string
+}
+
+// RestClients returns an iterator over all consumed REST services
+// (excluding platform modules).
+//
+// Backed by the catalog rather than the reader, like DatabaseConnections.
+func (ctx *LintContext) RestClients() iter.Seq[RestClient] {
+	return func(yield func(RestClient) bool) {
+		rows, err := ctx.db.Query(fmt.Sprintf(`
+			SELECT rc.Id, rc.Name, rc.QualifiedName, rc.ModuleName, rc.Folder,
+			       rc.BaseUrl, rc.AuthScheme, rc.OperationCount, rc.Documentation
+			FROM consumed_rest_services rc
+			LEFT JOIN modules m ON rc.ModuleName = m.Name
+			WHERE %s
+			ORDER BY rc.ModuleName, rc.Name
+		`, notPlatformModule("m")))
+		if err != nil {
+			ctx.recordQueryError("RestClients", err)
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var rc RestClient
+			var folder, baseURL, authScheme, documentation sql.NullString
+			err := rows.Scan(&rc.ID, &rc.Name, &rc.QualifiedName, &rc.ModuleName, &folder,
+				&baseURL, &authScheme, &rc.OperationCount, &documentation)
+			if err != nil {
+				ctx.recordQueryError("RestClients (row scan)", err)
+				continue
+			}
+			rc.Folder = folder.String
+			rc.BaseUrl = baseURL.String
+			rc.AuthScheme = authScheme.String
+			rc.Documentation = documentation.String
+
+			if ctx.IsExcluded(rc.ModuleName) {
+				continue
+			}
+
+			if !yield(rc) {
+				return
+			}
+		}
+	}
+}
+
+// RestOperation represents one operation on a consumed REST service.
+type RestOperation struct {
+	ID                   string
+	ServiceID            string
+	ServiceQualifiedName string
+	Name                 string
+	HttpMethod           string
+	Path                 string
+	ParameterCount       int
+	HasBody              bool
+	ResponseType         string
+	// Timeout is the configured timeout in milliseconds; 0 when none is set.
+	Timeout    int
+	ModuleName string
+}
+
+// RestOperations returns an iterator over all consumed REST operations
+// (excluding platform modules).
+func (ctx *LintContext) RestOperations() iter.Seq[RestOperation] {
+	return func(yield func(RestOperation) bool) {
+		rows, err := ctx.db.Query(fmt.Sprintf(`
+			SELECT ro.Id, ro.ServiceId, ro.ServiceQualifiedName, ro.Name,
+			       ro.HttpMethod, ro.Path, ro.ParameterCount, ro.HasBody,
+			       ro.ResponseType, ro.Timeout, ro.ModuleName
+			FROM consumed_rest_operations ro
+			LEFT JOIN modules m ON ro.ModuleName = m.Name
+			WHERE %s
+			ORDER BY ro.ServiceQualifiedName, ro.Name
+		`, notPlatformModule("m")))
+		if err != nil {
+			ctx.recordQueryError("RestOperations", err)
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var ro RestOperation
+			var hasBody int
+			var httpMethod, path, responseType sql.NullString
+			err := rows.Scan(&ro.ID, &ro.ServiceID, &ro.ServiceQualifiedName, &ro.Name,
+				&httpMethod, &path, &ro.ParameterCount, &hasBody,
+				&responseType, &ro.Timeout, &ro.ModuleName)
+			if err != nil {
+				ctx.recordQueryError("RestOperations (row scan)", err)
+				continue
+			}
+			ro.HttpMethod = httpMethod.String
+			ro.Path = path.String
+			ro.ResponseType = responseType.String
+			ro.HasBody = hasBody != 0
+
+			if ctx.IsExcluded(ro.ModuleName) {
+				continue
+			}
+
+			if !yield(ro) {
+				return
+			}
+		}
+	}
+}
+
 // Activity represents an activity from the activities table (FULL catalog mode).
 type Activity struct {
-	ID                     string
+	ID string
+	// Name is the action type for an action activity and the activity type
+	// otherwise. Caption is the stored caption: an activity's, a split's, or an
+	// annotation's text; empty for objects Mendix stores none for (events,
+	// merges, loops). For an activity with AutoGenerateCaption it is Studio
+	// Pro's stored placeholder (often "Activity"), not the generated text.
 	Name                   string
 	Caption                string
+	AutoGenerateCaption    bool
+	Description            string
 	ActivityType           string
 	ActionType             string
 	MicroflowID            string
 	MicroflowQualifiedName string
 	ModuleName             string
 	EntityRef              string
+	// ServiceRef is the called service document (REST/web service/OData
+	// client); ActionRef the operation or action within it — or, for a
+	// microflow, nanoflow, Java or JavaScript action call, the called
+	// document itself (ServiceRef then empty). Both are empty for activities
+	// that call nothing.
+	ServiceRef string
+	ActionRef  string
+	// UseRequestTimeout mirrors "Use a timeout" on a Call REST service or
+	// Call web service activity; TimeoutExpression is the number of seconds,
+	// which Studio Pro stores as an expression string (e.g. "300"). Both are
+	// zero for other action types.
+	UseRequestTimeout bool
+	TimeoutExpression string
+	// ParentLoopID is the enclosing loop's activity ID ("" at the top level)
+	// and LoopDepth the number of enclosing loops (mendixlabs/mxcli#1266).
+	ParentLoopID string
+	LoopDepth    int
+	// ConditionExpression is an exclusive split's expression; ConditionRule
+	// the rule a rule-based split calls.
+	ConditionExpression string
+	ConditionRule       string
+	// The stored values, in Mendix's spelling (mendixlabs/mxcli#1267):
+	// ErrorHandlingType Rollback/Custom/CustomWithoutRollBack/Continue/Abort,
+	// LogLevel Trace..Critical, CommitType Yes/YesWithoutEvents/No,
+	// RetrieveSource database/association.
+	ErrorHandlingType string
+	LogLevel          string
+	LogNodeExpression string
+	LogMessage        string
+	CommitType        string
+	WithEvents        bool
+	RetrieveSource    string
+	// QueueRef is the task queue a microflow or Java action call runs in
+	// ("" when it runs in the caller's transaction). A queued call runs
+	// asynchronously, so a loop-scoped rule should not follow it
+	// (mendixlabs/mxcli#1305).
+	QueueRef string
+	// X / Y is the object's stored middle point on the canvas (describe's
+	// @position) and Width / Height its size (ako/mxcli#1299). Y grows
+	// downwards.
+	X, Y, Width, Height int
 }
 
-// ActivitiesFor returns an iterator over all activities for a given microflow.
+// ActivitiesFor returns an iterator over the top-level activities of a flow —
+// the objects inside a loop are left out, as they were before the catalog had
+// them. ActivitiesIn(name, true) includes them.
 func (ctx *LintContext) ActivitiesFor(microflowQualifiedName string) iter.Seq[Activity] {
+	return ctx.ActivitiesIn(microflowQualifiedName, false)
+}
+
+// ActivitiesIn returns an iterator over the activities of a flow, in pre-order
+// (a loop, then its body). With nested=false only the top level is returned:
+// the default of activities_for(), so the bundled rules keep their counts.
+//
+// Every column the catalog added after the table's first version goes through
+// COALESCE, so a row written without it scans as the zero value rather than
+// failing the whole query.
+func (ctx *LintContext) ActivitiesIn(microflowQualifiedName string, nested bool) iter.Seq[Activity] {
 	return func(yield func(Activity) bool) {
 		rows, err := ctx.db.Query(`
 			SELECT Id, Name, Caption, ActivityType, ActionType,
-			       MicroflowId, MicroflowQualifiedName, ModuleName, EntityRef
+			       MicroflowId, MicroflowQualifiedName, ModuleName, EntityRef,
+			       ServiceRef, ActionRef,
+			       COALESCE(UseRequestTimeout, 0), COALESCE(TimeoutExpression, ''),
+			       COALESCE(Description, ''), COALESCE(AutoGenerateCaption, 0),
+			       COALESCE(ParentLoopId, ''), COALESCE(LoopDepth, 0),
+			       COALESCE(ConditionExpression, ''), COALESCE(ConditionRule, ''),
+			       COALESCE(ErrorHandlingType, ''),
+			       COALESCE(LogLevel, ''), COALESCE(LogNodeExpression, ''), COALESCE(LogMessage, ''),
+			       COALESCE(CommitType, ''), COALESCE(WithEvents, 0), COALESCE(RetrieveSource, ''),
+			       COALESCE(QueueRef, ''),
+			       COALESCE(X, 0), COALESCE(Y, 0), COALESCE(Width, 0), COALESCE(Height, 0)
 			FROM activities
 			WHERE MicroflowQualifiedName = ?
+			  AND (? OR COALESCE(ParentLoopId, '') = '')
 			ORDER BY Sequence
-		`, microflowQualifiedName)
+		`, microflowQualifiedName, nested)
 		if err != nil {
+			ctx.recordQueryError("ActivitiesFor", err)
 			return
 		}
 		defer rows.Close()
@@ -739,17 +1621,89 @@ func (ctx *LintContext) ActivitiesFor(microflowQualifiedName string) iter.Seq[Ac
 		for rows.Next() {
 			var a Activity
 			var name, caption, actionType, entityRef sql.NullString
+			var serviceRef, actionRef sql.NullString
+			var useRequestTimeout, autoCaption, withEvents int
 			err := rows.Scan(&a.ID, &name, &caption, &a.ActivityType, &actionType,
-				&a.MicroflowID, &a.MicroflowQualifiedName, &a.ModuleName, &entityRef)
+				&a.MicroflowID, &a.MicroflowQualifiedName, &a.ModuleName, &entityRef,
+				&serviceRef, &actionRef,
+				&useRequestTimeout, &a.TimeoutExpression,
+				&a.Description, &autoCaption,
+				&a.ParentLoopID, &a.LoopDepth,
+				&a.ConditionExpression, &a.ConditionRule,
+				&a.ErrorHandlingType,
+				&a.LogLevel, &a.LogNodeExpression, &a.LogMessage,
+				&a.CommitType, &withEvents, &a.RetrieveSource,
+				&a.QueueRef,
+				&a.X, &a.Y, &a.Width, &a.Height)
 			if err != nil {
+				ctx.recordQueryError("ActivitiesFor (row scan)", err)
 				continue
 			}
 			a.Name = name.String
 			a.Caption = caption.String
 			a.ActionType = actionType.String
 			a.EntityRef = entityRef.String
+			a.ServiceRef = serviceRef.String
+			a.ActionRef = actionRef.String
+			a.UseRequestTimeout = useRequestTimeout != 0
+			a.AutoGenerateCaption = autoCaption != 0
+			a.WithEvents = withEvents != 0
 
 			if !yield(a) {
+				return
+			}
+		}
+	}
+}
+
+// Flow is one sequence flow or annotation flow of a microflow, nanoflow or
+// rule (ako/mxcli#1299). OriginID and DestinationID are Activity.ID values,
+// loop bodies included; an annotation flow runs from the note to the object
+// it annotates. CaseValue is the branch a split's flow takes ("true" /
+// "false", an enumeration value or "(empty)", an inheritance split's entity),
+// "" for an unconditional flow.
+type Flow struct {
+	ID                         string
+	FlowType                   string
+	MicroflowID                string
+	MicroflowQualifiedName     string
+	ModuleName                 string
+	OriginID                   string
+	DestinationID              string
+	IsErrorHandler             bool
+	CaseValue                  string
+	OriginConnectionIndex      int
+	DestinationConnectionIndex int
+}
+
+// FlowsFor returns the flows of a microflow, nanoflow or rule in stored
+// order, the sequence flows of each collection before its annotation flows.
+func (ctx *LintContext) FlowsFor(microflowQualifiedName string) iter.Seq[Flow] {
+	return func(yield func(Flow) bool) {
+		rows, err := ctx.db.Query(`
+			SELECT Id, FlowType, MicroflowId, MicroflowQualifiedName, ModuleName,
+			       OriginId, DestinationId, COALESCE(IsErrorHandler, 0), COALESCE(CaseValue, ''),
+			       COALESCE(OriginConnectionIndex, 0), COALESCE(DestinationConnectionIndex, 0)
+			FROM flows
+			WHERE MicroflowQualifiedName = ?
+			ORDER BY Sequence
+		`, microflowQualifiedName)
+		if err != nil {
+			ctx.recordQueryError("FlowsFor", err)
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var f Flow
+			var errHandler int
+			if err := rows.Scan(&f.ID, &f.FlowType, &f.MicroflowID, &f.MicroflowQualifiedName, &f.ModuleName,
+				&f.OriginID, &f.DestinationID, &errHandler, &f.CaseValue,
+				&f.OriginConnectionIndex, &f.DestinationConnectionIndex); err != nil {
+				ctx.recordQueryError("FlowsFor (row scan)", err)
+				continue
+			}
+			f.IsErrorHandler = errHandler != 0
+			if !yield(f) {
 				return
 			}
 		}
@@ -775,6 +1729,31 @@ func (ctx *LintContext) HasRefsTable() bool {
 	return err == nil && count > 0
 }
 
+// HasGraphTables reports whether the catalog carries the graph analysis data
+// populated by REFRESH CATALOG COMMUNITIES (needed by the graph_* Starlark
+// builtins). Like HasRefsTable, it returns false when the tables are absent or
+// empty.
+func (ctx *LintContext) HasGraphTables() bool {
+	var count int
+	err := ctx.db.QueryRow("SELECT COUNT(*) FROM graph_layers_data").Scan(&count)
+	return err == nil && count > 0
+}
+
+// SatisfiesCatalogMode reports whether the catalog carries the data a rule
+// declared it needs (mode). It is the safety net: even with auto-upgrade, a
+// reused fast catalog that can't be rebuilt, or a project with no refs/graph
+// rows, should surface a diagnostic rather than silently under-report.
+func (ctx *LintContext) SatisfiesCatalogMode(mode CatalogMode) bool {
+	switch mode {
+	case CatalogCommunities:
+		return ctx.HasGraphTables()
+	case CatalogFull:
+		return ctx.HasRefsTable()
+	default:
+		return true
+	}
+}
+
 // FindReferences finds all references to a given element.
 func (ctx *LintContext) FindReferences(targetName string) []Reference {
 	var refs []Reference
@@ -794,6 +1773,7 @@ func (ctx *LintContext) FindReferences(targetName string) []Reference {
 		err := rows.Scan(&r.SourceType, &srcID, &r.SourceName, &r.TargetType,
 			&tgtID, &r.TargetName, &r.RefKind, &r.ModuleName)
 		if err != nil {
+			ctx.recordQueryError("FindReferences (row scan)", err)
 			continue
 		}
 		r.SourceID = srcID.String
@@ -810,41 +1790,42 @@ func (ctx *LintContext) FindUnused(kind string) []string {
 	var query string
 	switch kind {
 	case "entity":
-		query = `
+		query = fmt.Sprintf(`
 			SELECT e.QualifiedName
 			FROM entities e
 			LEFT JOIN modules m ON e.ModuleName = m.Name
-			WHERE COALESCE(m.Source, '') = ''
+			WHERE %s
 			AND e.QualifiedName NOT IN (
 				SELECT DISTINCT TargetName FROM refs WHERE TargetType = 'ENTITY'
 			)
-		`
+		`, notPlatformModule("m"))
 	case "microflow":
-		query = `
+		query = fmt.Sprintf(`
 			SELECT mf.QualifiedName
 			FROM microflows mf
 			LEFT JOIN modules m ON mf.ModuleName = m.Name
-			WHERE COALESCE(m.Source, '') = ''
+			WHERE %s
 			AND mf.QualifiedName NOT IN (
 				SELECT DISTINCT TargetName FROM refs WHERE TargetType IN ('MICROFLOW', 'NANOFLOW')
 			)
-		`
+		`, notPlatformModule("m"))
 	case "page":
-		query = `
+		query = fmt.Sprintf(`
 			SELECT p.QualifiedName
 			FROM pages p
 			LEFT JOIN modules m ON p.ModuleName = m.Name
-			WHERE COALESCE(m.Source, '') = ''
+			WHERE %s
 			AND p.QualifiedName NOT IN (
 				SELECT DISTINCT TargetName FROM refs WHERE TargetType = 'PAGE'
 			)
-		`
+		`, notPlatformModule("m"))
 	default:
 		return unused
 	}
 
 	rows, err := ctx.db.Query(query)
 	if err != nil {
+		ctx.recordQueryError("FindUnused("+kind+")", err)
 		return unused
 	}
 	defer rows.Close()
@@ -899,4 +1880,427 @@ func (ctx *LintContext) ModuleDependencies() map[string][]string {
 	}
 
 	return deps
+}
+
+// JavaActionParameter represents one parameter of a Java action.
+type JavaActionParameter struct {
+	Name          string
+	Description   string
+	ParameterType string
+	IsRequired    bool
+}
+
+// JavaAction represents a Java action from the catalog, with its parameters.
+//
+// Parameters are carried on the action rather than offered as a separate
+// iterator: a rule that reports an undocumented parameter has to name the action
+// it belongs to, and pairing them here keeps a rule from having to join.
+type JavaAction struct {
+	ID            string
+	Name          string
+	QualifiedName string
+	ModuleName    string
+	Folder        string
+	Documentation string
+	ExportLevel   string
+	ReturnType    string
+	Parameters    []JavaActionParameter
+}
+
+// JavaActions returns an iterator over all Java actions (excluding system and
+// marketplace modules, as every other document iterator here does — a rule must
+// not report undocumented code the user did not write).
+func (ctx *LintContext) JavaActions() iter.Seq[JavaAction] {
+	return func(yield func(JavaAction) bool) {
+		params := ctx.javaActionParameters()
+
+		rows, err := ctx.db.Query(fmt.Sprintf(`
+			SELECT ja.Id, ja.Name, ja.QualifiedName, ja.ModuleName, ja.Folder,
+			       ja.Documentation, ja.ExportLevel, ja.ReturnType
+			FROM java_actions ja
+			LEFT JOIN modules m ON ja.ModuleName = m.Name
+			WHERE %s
+			ORDER BY ja.ModuleName, ja.Name
+		`, notPlatformModule("m")))
+		if err != nil {
+			ctx.recordQueryError("JavaActions", err)
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var ja JavaAction
+			var folder, doc, exportLevel, retType sql.NullString
+			if err := rows.Scan(&ja.ID, &ja.Name, &ja.QualifiedName, &ja.ModuleName,
+				&folder, &doc, &exportLevel, &retType); err != nil {
+				continue
+			}
+			ja.Folder = folder.String
+			ja.Documentation = doc.String
+			ja.ExportLevel = exportLevel.String
+			ja.ReturnType = retType.String
+			ja.Parameters = params[ja.ID]
+
+			if ctx.IsExcluded(ja.ModuleName) {
+				continue
+			}
+			if !yield(ja) {
+				return
+			}
+		}
+	}
+}
+
+// javaActionParameters indexes every parameter by its owning action's ID, in
+// declaration order.
+func (ctx *LintContext) javaActionParameters() map[string][]JavaActionParameter {
+	out := map[string][]JavaActionParameter{}
+	rows, err := ctx.db.Query(`
+		SELECT JavaActionId, Name, Description, ParameterType, IsRequired
+		FROM java_action_parameters
+		ORDER BY JavaActionId, Ordinal
+	`)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var actionID string
+		var p JavaActionParameter
+		var desc, ptype sql.NullString
+		var required int
+		if err := rows.Scan(&actionID, &p.Name, &desc, &ptype, &required); err != nil {
+			ctx.recordQueryError("javaActionParameters (row scan)", err)
+			continue
+		}
+		p.Description = desc.String
+		p.ParameterType = ptype.String
+		p.IsRequired = required != 0
+		out[actionID] = append(out[actionID], p)
+	}
+	return out
+}
+
+// QueryError records a catalog query that failed inside an iterator.
+//
+// The iterators return iter.Seq[T] with no error channel, so a failed query
+// used to be indistinguishable from an empty result: `if err != nil { return }`
+// yielded nothing and said nothing. That is the worst shape for a linter, whose
+// entire output is "here is what I found" — a broken query reads as a clean
+// project. Errors are collected here and surfaced by the runner instead.
+type QueryError struct {
+	Iterator string // the iterator that failed, e.g. "Entities"
+	Err      error
+}
+
+func (e QueryError) Error() string { return e.Iterator + ": " + e.Err.Error() }
+
+// recordQueryError notes a failed query. Iterators still degrade to "no rows"
+// so one broken query cannot take down the whole run, but the failure is no
+// longer silent.
+//
+// The mutex is not currently required (Linter.Run is sequential) but the Linter
+// carries a maxWorkers knob, so this stays safe if rules ever run in parallel.
+func (ctx *LintContext) recordQueryError(iterator string, err error) {
+	if err == nil {
+		return
+	}
+	ctx.queryErrMu.Lock()
+	defer ctx.queryErrMu.Unlock()
+	// Deduplicate: several rules iterate the same accessor, so one broken view
+	// would otherwise be reported once per rule. The fact matters, not how many
+	// rules tripped over it.
+	for _, existing := range ctx.queryErrors {
+		if existing.Iterator == iterator && existing.Err.Error() == err.Error() {
+			return
+		}
+	}
+	ctx.queryErrors = append(ctx.queryErrors, QueryError{Iterator: iterator, Err: err})
+}
+
+// QueryErrors returns every catalog query that failed during this lint run.
+// A non-empty result means the findings are incomplete.
+func (ctx *LintContext) QueryErrors() []QueryError {
+	ctx.queryErrMu.Lock()
+	defer ctx.queryErrMu.Unlock()
+	return append([]QueryError(nil), ctx.queryErrors...)
+}
+
+// systemModuleID is the fixed sentinel Mendix gives the built-in System module
+// (mirrors modelsdk/meta.SystemModuleID, not imported to keep the linter free of
+// an engine dependency).
+//
+// System is NOT distinguishable by modules.Source — that column carries
+// "Marketplace …" for downloaded modules and is empty for System exactly as it
+// is for the user's own modules. Filtering on Source alone therefore lets every
+// System element through, which is how QUAL002 came to report FileDocument,
+// HttpRequest and 35 other platform entities as undocumented.
+const systemModuleID = "00000000-0000-0000-0000-000000000001"
+
+// notPlatformModule is the WHERE fragment that keeps a query to modules the user
+// actually owns: not downloaded from the Marketplace, and not System.
+//
+// `alias` is the modules-table alias to test.
+func notPlatformModule(alias string) string {
+	return fmt.Sprintf(
+		`COALESCE(%[1]s.Source, '') = '' AND COALESCE(%[1]s.Id, '') <> '%[2]s'`,
+		alias, systemModuleID)
+}
+
+// Documentable is one model element that can carry documentation, projected
+// uniformly across catalog tables so a rule can sweep every document type
+// without a query per kind.
+type Documentable struct {
+	Kind          string // Mendix term: "Page", "Enumeration", "Workflow", …
+	Name          string
+	QualifiedName string
+	ModuleName    string
+	Description   string
+}
+
+// documentableSource maps a catalog table to the Mendix term for what it holds
+// and the column its documentation lives in.
+//
+// The doc column is NOT uniform — Mendix says "Documentation" for some element
+// types and "Description" for others, and the catalog faithfully mirrors that.
+// A sweep that assumes one spelling silently reports every element of the other
+// half as undocumented.
+type documentableSource struct {
+	Table  string
+	Kind   string
+	DocCol string
+}
+
+// documentableSources is every document type a user authors and can document.
+//
+// Deliberately absent, and why:
+//   - microflows, java_actions — swept by the rule separately, because they
+//     carry exemptions (activity thresholds) and children (parameters) that a
+//     uniform projection cannot express.
+//   - attributes, java_action_parameters — members of a document, not
+//     documents; the rule checks them under their own options.
+//   - activities, widgets, widget_definition_properties, xpath_expressions —
+//     sub-elements INSIDE a document. Mendix offers no documentation field for
+//     most of them, and flagging every widget would drown the rule.
+//   - contract_entities — generated from a remote service's $metadata. Not the
+//     user's text to write, so not the user's omission to report.
+//   - modules — a Mendix module HAS no documentation property, so the rule was
+//     asking for something no editor can supply. Measured three ways: the
+//     metamodel's ProjectsModule declares none, modelsdk/gen's Module offers no
+//     Documentation accessor, and none of a real project's stored
+//     Projects$ModuleImpl units contains the key. It reported every module of
+//     every project forever, which is what a report of 39 unanswerable warnings
+//     looks like from the inside (ako/CapTrackV4 R12).
+var documentableSources = []documentableSource{
+	{"entities", "Entity", "Description"},
+	{"associations", "Association", "Description"},
+	{"pages", "Page", "Description"},
+	{"snippets", "Snippet", "Description"},
+	{"building_blocks", "BuildingBlock", "Description"},
+	{"layouts", "Layout", "Description"},
+	{"enumerations", "Enumeration", "Description"},
+	{"javascript_actions", "JavaScriptAction", "Description"},
+	{"image_collections", "ImageCollection", "Description"},
+	{"data_transformers", "DataTransformer", "Description"},
+	{"workflows", "Workflow", "Description"},
+	{"business_event_services", "BusinessEventService", "Documentation"},
+	{"rest_clients", "RestClient", "Documentation"},
+	{"published_rest_services", "PublishedRestService", "Documentation"},
+	{"constants", "Constant", "Description"},
+	{"json_structures", "JsonStructure", "Documentation"},
+	{"import_mappings", "ImportMapping", "Documentation"},
+	{"export_mappings", "ExportMapping", "Documentation"},
+}
+
+// DocumentableKinds returns the Kind of every source, for tests and for the
+// `mxcli lint` help text to stay in step with the code.
+func DocumentableKinds() []string {
+	kinds := make([]string, 0, len(documentableSources))
+	for _, s := range documentableSources {
+		kinds = append(kinds, s.Kind)
+	}
+	return kinds
+}
+
+// DocumentableElements iterates every documentable element across all document
+// types, excluding System and Marketplace modules.
+//
+// Each source is queried separately rather than UNIONed so that a catalog
+// missing one table (an older cache, or a Mendix version without that document
+// type) loses only that kind instead of the whole sweep.
+func (ctx *LintContext) DocumentableElements() iter.Seq[Documentable] {
+	return func(yield func(Documentable) bool) {
+		for _, src := range documentableSources {
+			// The modules table has no module to join to — it IS the module
+			// list — so it filters on its own Source column.
+			query := fmt.Sprintf(`
+				SELECT t.Name, t.QualifiedName, t.ModuleName, COALESCE(t.%s, '')
+				FROM %s t
+				LEFT JOIN modules m ON t.ModuleName = m.Name
+				WHERE %s
+				ORDER BY t.ModuleName, t.Name
+			`, src.DocCol, src.Table, notPlatformModule("m"))
+			if src.Table == "modules" {
+				query = fmt.Sprintf(`
+					SELECT t.Name, t.QualifiedName, t.Name, COALESCE(t.%s, '')
+					FROM %s t
+					WHERE %s
+					ORDER BY t.Name
+				`, src.DocCol, src.Table, notPlatformModule("t"))
+			}
+
+			rows, err := ctx.db.Query(query)
+			if err != nil {
+				// Skip this kind only — one absent table must not take down the
+				// whole sweep — but say so, because "this document type has no
+				// undocumented elements" and "this document type could not be
+				// read" look identical in the output otherwise.
+				ctx.recordQueryError("DocumentableElements("+src.Table+")", err)
+				continue
+			}
+			for rows.Next() {
+				d := Documentable{Kind: src.Kind}
+				var qn, mod sql.NullString
+				if err := rows.Scan(&d.Name, &qn, &mod, &d.Description); err != nil {
+					ctx.recordQueryError("DocumentableElements("+src.Table+") row scan", err)
+					continue
+				}
+				d.QualifiedName = qn.String
+				d.ModuleName = mod.String
+				if d.QualifiedName == "" {
+					d.QualifiedName = d.Name
+				}
+				if ctx.IsExcluded(d.ModuleName) {
+					continue
+				}
+				if !yield(d) {
+					rows.Close()
+					return
+				}
+			}
+			rows.Close()
+		}
+	}
+}
+
+// NavigationTarget is one page a navigation profile sends a user to: the
+// profile's home page, a role-specific home page, or a menu item's target.
+type NavigationTarget struct {
+	Profile string // "Responsive", "Phone", "Tablet", …
+	Kind    string // "home", "role_home" or "menu"
+	Role    string // user role, for a role_home; "" otherwise
+	Caption string // menu item caption, for a menu target; "" otherwise
+	Page    string // qualified page name
+}
+
+// NavigationTargets iterates every page a navigation profile routes to.
+//
+// The login page and the not-found page are deliberately NOT targets: the
+// platform routes to those itself (/login.html, and the 404 handler), so they
+// are not screens a user navigates or links to.
+//
+// Microflow-valued menu items and home pages are skipped — the microflow decides
+// what to open, so there is no page here to say anything about. Targets in
+// System and Marketplace modules are not filtered here; a caller that joins to
+// Pages() gets that exclusion for free, and one that does not is asking about
+// navigation itself.
+func (ctx *LintContext) NavigationTargets() iter.Seq[NavigationTarget] {
+	return func(yield func(NavigationTarget) bool) {
+		rows, err := ctx.db.Query(`
+			SELECT ProfileName, 'home', '', '', HomePage
+			FROM navigation_profiles
+			WHERE HomePageType = 'PAGE' AND COALESCE(HomePage, '') <> ''
+			UNION ALL
+			SELECT ProfileName, 'role_home', UserRole, '', Page
+			FROM navigation_role_homes
+			WHERE COALESCE(Page, '') <> ''
+			UNION ALL
+			SELECT ProfileName, 'menu', '', COALESCE(Caption, ''), TargetPage
+			FROM navigation_menu_items
+			WHERE COALESCE(TargetPage, '') <> ''
+			ORDER BY 1, 2, 5
+		`)
+		if err != nil {
+			ctx.recordQueryError("NavigationTargets", err)
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var t NavigationTarget
+			if err := rows.Scan(&t.Profile, &t.Kind, &t.Role, &t.Caption, &t.Page); err != nil {
+				ctx.recordQueryError("NavigationTargets row scan", err)
+				continue
+			}
+			if !yield(t) {
+				return
+			}
+		}
+	}
+}
+
+// Document is one element of the App Explorer tree — what it is, which module
+// holds it, and the folder path it sits in ("" for the module root).
+//
+// Distinct from Documentable above, which projects only what can carry
+// DOCUMENTATION and therefore leaves out microflows and Java actions on
+// purpose. A rule asking where a document LIVES needs those two most of all:
+// they are what fills up an unorganised module.
+type Document struct {
+	Kind          string // catalog ObjectType: "MICROFLOW", "PAGE", "WORKFLOW", …
+	Name          string
+	QualifiedName string
+	ModuleName    string
+	Folder        string // "" = directly in the module root
+}
+
+// Documents iterates every element of the catalog's `objects` view that belongs
+// to a module, excluding System and Marketplace modules.
+//
+// It reads the view rather than a list of tables here, so a document type added
+// to the catalog is covered without a second list to keep in step — the mistake
+// behind #1036, where two keyword lists drifted with nothing comparing them.
+//
+// MODULE rows are skipped: a module is the container, not something inside one.
+// Every other kind is yielded as-is, including kinds the view hardcodes to an
+// empty Folder (associations, external entities). Deciding which kinds Studio
+// Pro actually lets you file in a folder is left to the caller, where it is
+// visible and editable, rather than baked into a second list in here.
+func (ctx *LintContext) Documents() iter.Seq[Document] {
+	return func(yield func(Document) bool) {
+		rows, err := ctx.db.Query(`
+			SELECT o.ObjectType, o.Name, o.QualifiedName, o.ModuleName, COALESCE(o.Folder, '')
+			FROM objects o
+			LEFT JOIN modules m ON o.ModuleName = m.Name
+			WHERE o.ObjectType <> 'MODULE'
+			  AND COALESCE(o.ModuleName, '') <> ''
+			  AND ` + notPlatformModule("m") + `
+			ORDER BY o.ModuleName, o.ObjectType, o.Name
+		`)
+		if err != nil {
+			ctx.recordQueryError("Documents(objects)", err)
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var d Document
+			var qn sql.NullString
+			if err := rows.Scan(&d.Kind, &d.Name, &qn, &d.ModuleName, &d.Folder); err != nil {
+				ctx.recordQueryError("Documents(objects) row scan", err)
+				continue
+			}
+			d.QualifiedName = qn.String
+			if d.QualifiedName == "" {
+				d.QualifiedName = d.Name
+			}
+			if ctx.IsExcluded(d.ModuleName) {
+				continue
+			}
+			if !yield(d) {
+				return
+			}
+		}
+	}
 }

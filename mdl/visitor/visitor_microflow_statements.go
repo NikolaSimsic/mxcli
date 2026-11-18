@@ -3,6 +3,7 @@
 package visitor
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/antlr4-go/antlr/v4"
@@ -64,6 +65,8 @@ func buildMicroflowStatement(ctx parser.IMicroflowStatementContext) ast.Microflo
 		stmt = buildDeleteObjectStatement(del)
 	} else if rollback := mfCtx.RollbackStatement(); rollback != nil {
 		stmt = buildRollbackStatement(rollback)
+	} else if ext := mfCtx.ExternalObjectStatement(); ext != nil {
+		stmt = buildExternalObjectStatement(ext)
 	} else if retr := mfCtx.RetrieveStatement(); retr != nil {
 		stmt = buildRetrieveStatement(retr)
 	} else if ifStmt := mfCtx.IfStatement(); ifStmt != nil {
@@ -96,28 +99,61 @@ func buildMicroflowStatement(ctx parser.IMicroflowStatementContext) ast.Microflo
 		stmt = &ast.BreakStmt{}
 	} else if mfCtx.ContinueStatement() != nil {
 		stmt = &ast.ContinueStmt{}
+	} else if merge := mfCtx.MergeStatement(); merge != nil {
+		stmt = &ast.MergeStmt{Label: mergeJoinLabel(merge.IDENTIFIER(), merge.QUOTED_IDENTIFIER())}
+	} else if join := mfCtx.JoinStatement(); join != nil {
+		stmt = &ast.JoinStmt{Label: mergeJoinLabel(join.IDENTIFIER(), join.QUOTED_IDENTIFIER())}
 	} else if listOp := mfCtx.ListOperationStatement(); listOp != nil {
-		stmt = buildListOperationStatement(listOp)
+		lo := buildListOperationStatement(listOp)
+		if errClause := listOp.OnErrorClause(); errClause != nil && lo != nil {
+			lo.ErrorHandling = buildOnErrorClause(errClause)
+		}
+		stmt = lo
 	} else if aggr := mfCtx.AggregateListStatement(); aggr != nil {
-		stmt = buildAggregateListStatement(aggr)
+		ag := buildAggregateListStatement(aggr)
+		if errClause := aggr.OnErrorClause(); errClause != nil && ag != nil {
+			ag.ErrorHandling = buildOnErrorClause(errClause)
+		}
+		stmt = ag
 	} else if addTo := mfCtx.AddToListStatement(); addTo != nil {
 		stmt = buildAddToListStatement(addTo)
 	} else if removeFrom := mfCtx.RemoveFromListStatement(); removeFrom != nil {
 		stmt = buildRemoveFromListStatement(removeFrom)
+	} else if clearList := mfCtx.ClearListStatement(); clearList != nil {
+		stmt = &ast.ClearListStmt{List: strings.TrimPrefix(clearList.VARIABLE().GetText(), "$")}
 	} else if showPage := mfCtx.ShowPageStatement(); showPage != nil {
 		stmt = buildShowPageStatement(showPage)
-	} else if mfCtx.ClosePageStatement() != nil {
-		stmt = &ast.ClosePageStmt{NumberOfPages: 1}
-	} else if mfCtx.ShowHomePageStatement() != nil {
-		stmt = &ast.ShowHomePageStmt{}
+	} else if closePage := mfCtx.ClosePageStatement(); closePage != nil {
+		close := &ast.ClosePageStmt{NumberOfPages: 1}
+		// `close page n`: a count that is not a positive whole number is
+		// refused by ExitClosePageStatement.
+		if num := closePage.NUMBER_LITERAL(); num != nil {
+			if n, err := strconv.Atoi(num.GetText()); err == nil && n >= 1 {
+				close.NumberOfPages = n
+			}
+		}
+		if errClause := closePage.OnErrorClause(); errClause != nil {
+			close.ErrorHandling = buildOnErrorClause(errClause)
+		}
+		stmt = close
+	} else if homePage := mfCtx.ShowHomePageStatement(); homePage != nil {
+		home := &ast.ShowHomePageStmt{}
+		if errClause := homePage.OnErrorClause(); errClause != nil {
+			home.ErrorHandling = buildOnErrorClause(errClause)
+		}
+		stmt = home
 	} else if showMsg := mfCtx.ShowMessageStatement(); showMsg != nil {
 		stmt = buildShowMessageStatement(showMsg)
 	} else if download := mfCtx.DownloadFileStatement(); download != nil {
 		stmt = buildDownloadFileStatement(download)
+	} else if sync := mfCtx.SynchronizeStatement(); sync != nil {
+		stmt = buildSynchronizeStatement(sync)
 	} else if valFeedback := mfCtx.ValidationFeedbackStatement(); valFeedback != nil {
 		stmt = buildValidationFeedbackStatement(valFeedback)
 	} else if restCall := mfCtx.RestCallStatement(); restCall != nil {
 		stmt = buildRestCallStatement(restCall)
+	} else if sendEmail := mfCtx.SendEmailStatement(); sendEmail != nil {
+		stmt = buildSendEmailStatement(sendEmail)
 	} else if sendRest := mfCtx.SendRestRequestStatement(); sendRest != nil {
 		stmt = buildSendRestRequestStatement(sendRest)
 	} else if importMapping := mfCtx.ImportFromMappingStatement(); importMapping != nil {
@@ -171,11 +207,14 @@ func buildCaseStatement(ctx parser.ICaseStatementContext) *ast.EnumSplitStmt {
 			stmt.Variable = strings.TrimPrefix(attr.GetText(), "$")
 		} else if variable := sourceCtx.VARIABLE(); variable != nil {
 			stmt.Variable = strings.TrimPrefix(variable.GetText(), "$")
+		} else if call := sourceCtx.FunctionCall(); call != nil {
+			// `case Mod.Rule(Param = $x)` — the rule call an `if` takes (#1414).
+			stmt.Condition = buildFunctionCall(call)
 		}
 	}
 
 	// Reconstruct per-WHEN groups from the flat child list.
-	// Grammar: (WHEN caseValue (, caseValue)* THEN microflowBody)+ (ELSE microflowBody)?
+	// Grammar: (WHEN caseValue (, caseValue)* THEN microflowBody)+ — no ELSE (#756).
 	// AllEnumSplitCaseValue() is flat across all WHEN clauses, so we walk children
 	// and bucket values by their nearest preceding WHEN token.
 	type whenGroup struct{ values []string }
@@ -205,10 +244,6 @@ func buildCaseStatement(ctx parser.ICaseStatementContext) *ast.EnumSplitStmt {
 			Values: g.values,
 			Body:   buildMicroflowBody(bodies[i]),
 		})
-	}
-
-	if caseCtx.ELSE() != nil && len(bodies) > len(groups) {
-		stmt.ElseBody = buildMicroflowBody(bodies[len(bodies)-1])
 	}
 
 	return stmt
@@ -256,10 +291,13 @@ func extractMicroflowAnnotations(annotations []parser.IAnnotationContext) *ast.A
 
 		case "caption":
 			// @caption 'text' — bare annotationValue
+			// An empty string is kept: `@caption ''` is a cleared caption, which
+			// describe prints so a decision does not come back captioned with its
+			// condition (#1254).
 			if valCtx := ann.AnnotationValue(); valCtx != nil {
-				text := extractAnnotationValueString(valCtx)
-				if text != "" {
+				if text, ok := annotationValueString(valCtx); ok {
 					result.Caption = text
+					result.CaptionSet = true
 					hasAny = true
 				}
 			}
@@ -277,17 +315,33 @@ func extractMicroflowAnnotations(annotations []parser.IAnnotationContext) *ast.A
 			seenActivityMetadata = true
 
 		case "annotation":
-			// @annotation 'text' — bare annotationValue
-			if valCtx := ann.AnnotationValue(); valCtx != nil {
-				text := extractAnnotationValueString(valCtx)
-				if text != "" {
-					if !seenActivityMetadata && hasLaterActivityAnnotation(annotations, i+1) {
-						result.FreeAnnotations = append(result.FreeAnnotations, text)
-					} else {
-						result.AnnotationText = text
-					}
-					hasAny = true
+			// Two forms. `@annotation 'text'` is the everyday one and is
+			// unchanged. `@annotation(id: n1, text: '…', position: (x, y),
+			// size: (w, h))` carries the note's identity and geometry, which the
+			// bare form cannot express (#1077).
+			//
+			// The annotation rule already accepted parenthesised params, so that
+			// form PARSED before this and was silently discarded. Two of the
+			// four keys still needed a grammar change: `text` and `position` are
+			// lexer keywords, and a keyword key does not fail the parse — it
+			// falls through to annotationParam's positional alternative — so
+			// they were being accepted and quietly ignored.
+			note, ok := parseNoteAnnotation(ann, result)
+			if ok {
+				// Free-floating only when nothing has claimed this statement
+				// yet AND an activity annotation follows: the note belongs to
+				// the canvas, not to the statement below it. A stored note
+				// named by `existing:` is on the canvas already, so the only
+				// thing the mention can mean is "attach it to this statement"
+				// (ako/mxcli#1695).
+				if note.Existing == "" && !seenActivityMetadata && hasLaterActivityAnnotation(annotations, i+1) {
+					result.FreeNotes = append(result.FreeNotes, note)
+				} else {
+					result.Notes = append(result.Notes, note)
 				}
+				hasAny = true
+			} else if len(result.InvalidNotes) > 0 {
+				hasAny = true
 			}
 
 		case "excluded":
@@ -307,6 +361,56 @@ func extractMicroflowAnnotations(annotations []parser.IAnnotationContext) *ast.A
 				hasAny = true
 			}
 			seenActivityMetadata = true
+
+		case "merge":
+			// @merge(x, y) — the implicit merge node that closes a split. Same
+			// positional shape as @position, which belongs to the split. (#884)
+			if params := ann.AnnotationParams(); params != nil {
+				allParams := params.(*parser.AnnotationParamsContext).AllAnnotationParam()
+				if len(allParams) >= 2 {
+					result.Merge = &ast.Position{
+						X: parseAnnotationParamInt(allParams[0]),
+						Y: parseAnnotationParamInt(allParams[1]),
+					}
+					hasAny = true
+				}
+			}
+			seenActivityMetadata = true
+
+		case "start":
+			// @start(x, y) — the StartEvent, the implicit node the flow begins
+			// at. Written on the FIRST statement, the one the start flows into;
+			// same positional shape and same reason as @merge, which positions
+			// the other node that has no statement of its own. (#951)
+			if params := ann.AnnotationParams(); params != nil {
+				allParams := params.(*parser.AnnotationParamsContext).AllAnnotationParam()
+				if len(allParams) >= 2 {
+					result.Start = &ast.Position{
+						X: parseAnnotationParamInt(allParams[0]),
+						Y: parseAnnotationParamInt(allParams[1]),
+					}
+					hasAny = true
+				}
+			}
+			seenActivityMetadata = true
+
+		case "curve":
+			// @curve(from: (40, -90), to: (-40, 90)) — the bezier control
+			// vectors of the flow LEAVING this statement. Needed no grammar
+			// change: `name: (x, y)` is already annotationParenValue, the same
+			// shape the association anchors use. (#884)
+			if params := ann.AnnotationParams(); params != nil {
+				parseCurveAnnotation(params.(*parser.AnnotationParamsContext), result)
+				hasAny = true
+			}
+			seenActivityMetadata = true
+
+		default:
+			// Record rather than drop. The grammar accepts any @name, so this
+			// arm catches both an annotation mxcli does not implement (@size)
+			// and — the reason it matters — a typo of one it does. (#884)
+			result.UnknownNames = append(result.UnknownNames, ann.AnnotationName().GetText())
+			hasAny = true
 		}
 	}
 
@@ -314,6 +418,90 @@ func extractMicroflowAnnotations(annotations []parser.IAnnotationContext) *ast.A
 		return nil
 	}
 	return result
+}
+
+// parseNoteAnnotation reads one `@annotation` into a MicroflowAnnotation.
+//
+// Anything it cannot use is recorded on result.InvalidNotes rather than
+// dropped, and makes the note itself invalid: a typo'd parameter would
+// otherwise cost the reader the whole note, or — worse for `id:` — turn a
+// reference to an existing note into a second, textless one. Validation refuses
+// them (MDL079); the visitor's job is only to not lose them.
+func parseNoteAnnotation(ann *parser.AnnotationContext, result *ast.ActivityAnnotations) (ast.MicroflowAnnotation, bool) {
+	var note ast.MicroflowAnnotation
+
+	// @annotation 'text' — the bare form.
+	if valCtx := ann.AnnotationValue(); valCtx != nil {
+		note.Text = extractAnnotationValueString(valCtx)
+		return note, note.Text != ""
+	}
+
+	params := ann.AnnotationParams()
+	if params == nil {
+		return note, false
+	}
+
+	for _, p := range params.(*parser.AnnotationParamsContext).AllAnnotationParam() {
+		pCtx := p.(*parser.AnnotationParamContext)
+		nameCtx := pCtx.AnnotationParamName()
+		if nameCtx == nil {
+			// Positional. Deliberately unsupported: `@annotation('a', 'b')`
+			// has no reading that is obviously right, and guessing one would
+			// silently mean something.
+			result.InvalidNotes = append(result.InvalidNotes, strings.TrimSpace(pCtx.GetText()))
+			continue
+		}
+		switch strings.ToLower(nameCtx.GetText()) {
+		case "id":
+			if v := pCtx.AnnotationValue(); v != nil {
+				note.Label = extractAnnotationValueIdentifier(v)
+			}
+			if note.Label == "" {
+				result.InvalidNotes = append(result.InvalidNotes, strings.TrimSpace(pCtx.GetText()))
+			}
+		case "text":
+			if v := pCtx.AnnotationValue(); v != nil {
+				note.Text = extractAnnotationValueString(v)
+			}
+			if note.Text == "" {
+				result.InvalidNotes = append(result.InvalidNotes, strings.TrimSpace(pCtx.GetText()))
+			}
+		case "existing":
+			// The text of a note already stored in the flow (ako/mxcli#1695).
+			// A key of its own, not `text:`, so a note that is attached can
+			// never be read as one that is created.
+			if v := pCtx.AnnotationValue(); v != nil {
+				note.Existing = extractAnnotationValueString(v)
+			}
+			if note.Existing == "" {
+				result.InvalidNotes = append(result.InvalidNotes, strings.TrimSpace(pCtx.GetText()))
+			}
+		case "position":
+			pt, ok := annotationPointValue(pCtx)
+			if !ok {
+				result.InvalidNotes = append(result.InvalidNotes, strings.TrimSpace(pCtx.GetText()))
+				continue
+			}
+			note.Position = pt
+		case "size":
+			pt, ok := annotationPointValue(pCtx)
+			if !ok {
+				result.InvalidNotes = append(result.InvalidNotes, strings.TrimSpace(pCtx.GetText()))
+				continue
+			}
+			note.Size = &ast.BoxSize{Width: pt.X, Height: pt.Y}
+		default:
+			result.InvalidNotes = append(result.InvalidNotes, strings.TrimSpace(pCtx.GetText()))
+		}
+	}
+
+	// A note needs text (a declaration), a label (a reference to one declared
+	// in the script) or a stored note's text (a reference to one in the flow).
+	if note.Text == "" && note.Label == "" && note.Existing == "" {
+		result.InvalidNotes = append(result.InvalidNotes, strings.TrimSpace(ann.GetText()))
+		return note, false
+	}
+	return note, true
 }
 
 func hasLaterActivityAnnotation(annotations []parser.IAnnotationContext, start int) bool {
@@ -329,45 +517,78 @@ func hasLaterActivityAnnotation(annotations []parser.IAnnotationContext, start i
 
 // parseAnchorAnnotation populates Anchor / TrueBranchAnchor / FalseBranchAnchor /
 // IteratorAnchor / BodyTailAnchor fields on result from the @anchor(...) params.
+// A parameter it cannot use is recorded in InvalidAnchors, never skipped: a
+// skipped one left the edge on its default sides with nothing said
+// (mendixlabs/mxcli#992).
 func parseAnchorAnnotation(params *parser.AnnotationParamsContext, result *ast.ActivityAnnotations) {
 	flat := &ast.FlowAnchors{From: ast.AnchorSideUnset, To: ast.AnchorSideUnset}
 	flatSet := false
+	invalid := func(pCtx *parser.AnnotationParamContext) {
+		result.InvalidAnchors = append(result.InvalidAnchors, strings.TrimSpace(pCtx.GetText()))
+	}
 
 	for _, p := range params.AllAnnotationParam() {
 		pCtx := p.(*parser.AnnotationParamContext)
 		nameCtx := pCtx.AnnotationParamName()
 		if nameCtx == nil {
-			continue // positional form not supported for @anchor
+			invalid(pCtx) // positional form not supported for @anchor
+			continue
 		}
 		key := strings.ToLower(nameCtx.GetText())
 
 		switch key {
-		case "from":
-			if side, ok := parseAnchorSideFromValue(pCtx.AnnotationValue()); ok {
+		case "from", "to":
+			side, ok := parseAnchorSideFromValue(pCtx.AnnotationValue())
+			if !ok {
+				invalid(pCtx)
+				continue
+			}
+			if key == "from" {
 				flat.From = side
-				flatSet = true
-			}
-		case "to":
-			if side, ok := parseAnchorSideFromValue(pCtx.AnnotationValue()); ok {
+			} else {
 				flat.To = side
-				flatSet = true
 			}
-		case "true":
-			if nested := pCtx.AnnotationParenValue(); nested != nil {
-				result.TrueBranchAnchor = parseNestedFlowAnchors(nested.(*parser.AnnotationParenValueContext))
+			flatSet = true
+		case "true", "false", "iterator", "tail":
+			nested := pCtx.AnnotationParenValue()
+			if nested == nil {
+				invalid(pCtx)
+				continue
 			}
-		case "false":
-			if nested := pCtx.AnnotationParenValue(); nested != nil {
-				result.FalseBranchAnchor = parseNestedFlowAnchors(nested.(*parser.AnnotationParenValueContext))
+			fa, ok := parseNestedFlowAnchors(nested.(*parser.AnnotationParenValueContext))
+			if !ok {
+				invalid(pCtx)
+				continue
 			}
-		case "iterator":
-			if nested := pCtx.AnnotationParenValue(); nested != nil {
-				result.IteratorAnchor = parseNestedFlowAnchors(nested.(*parser.AnnotationParenValueContext))
+			switch key {
+			case "true":
+				result.TrueBranchAnchor = fa
+			case "false":
+				result.FalseBranchAnchor = fa
+			case "iterator":
+				result.IteratorAnchor = fa
+			case "tail":
+				result.BodyTailAnchor = fa
 			}
-		case "tail":
-			if nested := pCtx.AnnotationParenValue(); nested != nil {
-				result.BodyTailAnchor = parseNestedFlowAnchors(nested.(*parser.AnnotationParenValueContext))
+		default:
+			// Anything else is a CASE outcome, keyed by its WHEN value, and
+			// takes the nested form. Validation refuses a key that is not a
+			// WHEN value of the statement it is written on.
+			nested := pCtx.AnnotationParenValue()
+			if nested == nil {
+				invalid(pCtx)
+				continue
 			}
+			fa, ok := parseNestedFlowAnchors(nested.(*parser.AnnotationParenValueContext))
+			if !ok {
+				invalid(pCtx)
+				continue
+			}
+			value := nameCtx.GetText()
+			if strings.EqualFold(value, "(empty)") {
+				value = "(empty)"
+			}
+			result.CaseAnchors = append(result.CaseAnchors, ast.CaseAnchor{Value: value, Anchors: fa})
 		}
 	}
 
@@ -376,11 +597,13 @@ func parseAnchorAnnotation(params *parser.AnnotationParamsContext, result *ast.A
 	}
 }
 
-// parseNestedFlowAnchors parses a `(from: X, to: Y)` sub-expression into FlowAnchors.
-func parseNestedFlowAnchors(p *parser.AnnotationParenValueContext) *ast.FlowAnchors {
+// parseNestedFlowAnchors parses a `(from: X, to: Y)` sub-expression into
+// FlowAnchors. Either side may be omitted; ok is false when the pair holds
+// anything else, or nothing.
+func parseNestedFlowAnchors(p *parser.AnnotationParenValueContext) (*ast.FlowAnchors, bool) {
 	inner := p.AnnotationParams()
 	if inner == nil {
-		return nil
+		return nil, false
 	}
 	fa := &ast.FlowAnchors{From: ast.AnchorSideUnset, To: ast.AnchorSideUnset}
 	set := false
@@ -388,26 +611,23 @@ func parseNestedFlowAnchors(p *parser.AnnotationParenValueContext) *ast.FlowAnch
 		ppCtx := pp.(*parser.AnnotationParamContext)
 		nameCtx := ppCtx.AnnotationParamName()
 		if nameCtx == nil {
-			continue
+			return nil, false
 		}
-		key := strings.ToLower(nameCtx.GetText())
 		side, ok := parseAnchorSideFromValue(ppCtx.AnnotationValue())
 		if !ok {
-			continue
+			return nil, false
 		}
-		switch key {
+		switch strings.ToLower(nameCtx.GetText()) {
 		case "from":
 			fa.From = side
-			set = true
 		case "to":
 			fa.To = side
-			set = true
+		default:
+			return nil, false
 		}
+		set = true
 	}
-	if !set {
-		return nil
-	}
-	return fa
+	return fa, set
 }
 
 // parseAnchorSideFromValue extracts a side keyword from an annotationValue.
@@ -447,21 +667,29 @@ func parseAnchorSideFromValue(val parser.IAnnotationValueContext) (ast.AnchorSid
 
 // extractAnnotationValueString extracts a string value from an annotationValue context.
 func extractAnnotationValueString(ctx parser.IAnnotationValueContext) string {
+	text, _ := annotationValueString(ctx)
+	return text
+}
+
+// annotationValueString is extractAnnotationValueString that also reports
+// whether the value was a string literal, so an empty string is told apart
+// from no string at all.
+func annotationValueString(ctx parser.IAnnotationValueContext) (string, bool) {
 	valCtx := ctx.(*parser.AnnotationValueContext)
 	if lit := valCtx.Literal(); lit != nil {
 		litCtx := lit.(*parser.LiteralContext)
 		if litCtx.STRING_LITERAL() != nil {
-			return unquoteString(litCtx.STRING_LITERAL().GetText())
+			return unquoteStringLit(litCtx.STRING_LITERAL()), true
 		}
 	}
 	// Also try expression — it might be a string literal parsed as expression
 	if expr := valCtx.Expression(); expr != nil {
 		text := expr.GetText()
 		if len(text) >= 2 && text[0] == '\'' && text[len(text)-1] == '\'' {
-			return unquoteString(text)
+			return unquoteStringLit(expr), true
 		}
 	}
-	return ""
+	return "", false
 }
 
 // extractAnnotationValueIdentifier extracts an identifier value from an annotationValue context.
@@ -482,87 +710,13 @@ func extractAnnotationValueIdentifier(ctx parser.IAnnotationValueContext) string
 	return ""
 }
 
-// setStatementAnnotations sets the Annotations field on a microflow statement via type switch.
+// setStatementAnnotations sets the Annotations field on a microflow statement.
+//
+// Reflective (ast.SetStatementAnnotations), not a type switch: the switch this
+// replaced had no case for any workflow or mapping statement, so their
+// @position was parsed and silently dropped.
 func setStatementAnnotations(stmt ast.MicroflowStatement, ann *ast.ActivityAnnotations) {
-	switch s := stmt.(type) {
-	case *ast.DeclareStmt:
-		s.Annotations = ann
-	case *ast.EnumSplitStmt:
-	case *ast.InheritanceSplitStmt:
-		s.Annotations = ann
-	case *ast.CastObjectStmt:
-		s.Annotations = ann
-	case *ast.MfSetStmt:
-		s.Annotations = ann
-	case *ast.ReturnStmt:
-		s.Annotations = ann
-	case *ast.RaiseErrorStmt:
-		s.Annotations = ann
-	case *ast.CreateObjectStmt:
-		s.Annotations = ann
-	case *ast.ChangeObjectStmt:
-		s.Annotations = ann
-	case *ast.MfCommitStmt:
-		s.Annotations = ann
-	case *ast.DeleteObjectStmt:
-		s.Annotations = ann
-	case *ast.RollbackStmt:
-		s.Annotations = ann
-	case *ast.RetrieveStmt:
-		s.Annotations = ann
-	case *ast.IfStmt:
-		s.Annotations = ann
-	case *ast.LoopStmt:
-		s.Annotations = ann
-	case *ast.WhileStmt:
-		s.Annotations = ann
-	case *ast.LogStmt:
-		s.Annotations = ann
-	case *ast.CallMicroflowStmt:
-		s.Annotations = ann
-	case *ast.CallNanoflowStmt:
-		s.Annotations = ann
-	case *ast.CallJavaActionStmt:
-		s.Annotations = ann
-	case *ast.CallJavaScriptActionStmt:
-		s.Annotations = ann
-	case *ast.CallWebServiceStmt:
-		s.Annotations = ann
-	case *ast.ExecuteDatabaseQueryStmt:
-		s.Annotations = ann
-	case *ast.CallExternalActionStmt:
-		s.Annotations = ann
-	case *ast.BreakStmt:
-		s.Annotations = ann
-	case *ast.ContinueStmt:
-		s.Annotations = ann
-	case *ast.ListOperationStmt:
-		s.Annotations = ann
-	case *ast.AggregateListStmt:
-		s.Annotations = ann
-	case *ast.CreateListStmt:
-		s.Annotations = ann
-	case *ast.AddToListStmt:
-		s.Annotations = ann
-	case *ast.RemoveFromListStmt:
-		s.Annotations = ann
-	case *ast.ShowPageStmt:
-		s.Annotations = ann
-	case *ast.ClosePageStmt:
-		s.Annotations = ann
-	case *ast.ShowHomePageStmt:
-		s.Annotations = ann
-	case *ast.ShowMessageStmt:
-		s.Annotations = ann
-	case *ast.DownloadFileStmt:
-		s.Annotations = ann
-	case *ast.ValidationFeedbackStmt:
-		s.Annotations = ann
-	case *ast.RestCallStmt:
-		s.Annotations = ann
-	case *ast.SendRestRequestStmt:
-		s.Annotations = ann
-	}
+	ast.SetStatementAnnotations(stmt, ann)
 }
 
 // buildOnErrorClause converts an OnErrorClauseContext to an ErrorHandlingClause.
@@ -575,10 +729,13 @@ func buildOnErrorClause(ctx parser.IOnErrorClauseContext) *ast.ErrorHandlingClau
 	if errCtx.CONTINUE() != nil {
 		return &ast.ErrorHandlingClause{Type: ast.ErrorHandlingContinue}
 	}
-	if errCtx.ROLLBACK() != nil && errCtx.LBRACE() == nil {
+	custom := errCtx.BEGIN() != nil || errCtx.LBRACE() != nil
+	if errCtx.ROLLBACK() != nil && !custom {
 		return &ast.ErrorHandlingClause{Type: ast.ErrorHandlingRollback}
 	}
-	if errCtx.LBRACE() != nil {
+	// `begin … end error` and its deprecated brace spelling (MDL-DEPR540,
+	// recorded by ExitOnErrorClause) build the same handler.
+	if custom {
 		body := buildMicroflowBody(errCtx.MicroflowBody())
 		if errCtx.WITHOUT() != nil {
 			return &ast.ErrorHandlingClause{Type: ast.ErrorHandlingCustomWithoutRollback, Body: body}
@@ -613,6 +770,11 @@ func buildDeclareStatement(ctx parser.IDeclareStatementContext) *ast.DeclareStmt
 		stmt.InitialValue = appendStatementExpressionTrailingWhitespace(expr, stmt.InitialValue)
 	}
 
+	// Check for ON ERROR clause
+	if errClause := declCtx.OnErrorClause(); errClause != nil {
+		stmt.ErrorHandling = buildOnErrorClause(errClause)
+	}
+
 	return stmt
 }
 
@@ -627,13 +789,22 @@ func buildInheritanceSplitStatement(ctx parser.IInheritanceSplitStatementContext
 	}
 	for _, caseCtx := range splitCtx.AllInheritanceSplitCase() {
 		c := caseCtx.(*parser.InheritanceSplitCaseContext)
+		// `case X <body>` and `when X then <body>` are the same branch; only
+		// the spelling differs, and it is recorded for MDL065.
+		if c.CASE() != nil {
+			stmt.LegacyCaseKeyword = true
+		}
 		stmt.Cases = append(stmt.Cases, ast.InheritanceSplitCase{
 			Entity: buildQualifiedName(c.QualifiedName()),
 			Body:   buildMicroflowBody(c.MicroflowBody()),
 		})
 	}
-	if splitCtx.ELSE() != nil {
-		stmt.ElseBody = buildMicroflowBody(splitCtx.MicroflowBody())
+	if elseCtx := splitCtx.InheritanceSplitElse(); elseCtx != nil {
+		e := elseCtx.(*parser.InheritanceSplitElseContext)
+		if e.ELSE() != nil {
+			stmt.LegacyElseKeyword = true
+		}
+		stmt.ElseBody = buildMicroflowBody(e.MicroflowBody())
 	}
 	return stmt
 }
@@ -644,6 +815,9 @@ func buildCastObjectStatement(ctx parser.ICastObjectStatementContext) *ast.CastO
 	}
 	castCtx := ctx.(*parser.CastObjectStatementContext)
 	stmt := &ast.CastObjectStmt{}
+	if errClause := castCtx.OnErrorClause(); errClause != nil {
+		stmt.ErrorHandling = buildOnErrorClause(errClause)
+	}
 	vars := castCtx.AllVARIABLE()
 	if len(vars) == 1 {
 		stmt.OutputVariable = strings.TrimPrefix(vars[0].GetText(), "$")
@@ -661,7 +835,33 @@ func buildCastObjectStatement(ctx parser.ICastObjectStatementContext) *ast.CastO
 // buildSetStatement converts SET statement context to MfSetStmt or specialized statement types.
 // When the expression is a list operation (HEAD, TAIL, etc.) or aggregate (COUNT, SUM, etc.),
 // this returns the specialized statement type instead of MfSetStmt.
+//
+// The ON ERROR clause is attached here rather than at each of the dozen return
+// points below. Every activity this can produce — Change variable, List
+// operation, Aggregate list — is a Microflows$MicroflowAction and carries an
+// ErrorHandlingType, so each node takes the clause (mendixlabs/mxcli#1252).
 func buildSetStatement(ctx parser.ISetStatementContext) ast.MicroflowStatement {
+	stmt := buildSetStatementNode(ctx)
+	if stmt == nil || ctx == nil {
+		return stmt
+	}
+	errClause := ctx.(*parser.SetStatementContext).OnErrorClause()
+	if errClause == nil {
+		return stmt
+	}
+	eh := buildOnErrorClause(errClause)
+	switch s := stmt.(type) {
+	case *ast.MfSetStmt:
+		s.ErrorHandling = eh
+	case *ast.ListOperationStmt:
+		s.ErrorHandling = eh
+	case *ast.AggregateListStmt:
+		s.ErrorHandling = eh
+	}
+	return stmt
+}
+
+func buildSetStatementNode(ctx parser.ISetStatementContext) ast.MicroflowStatement {
 	if ctx == nil {
 		return nil
 	}
@@ -672,7 +872,11 @@ func buildSetStatement(ctx parser.ISetStatementContext) ast.MicroflowStatement {
 	if v := setCtx.VARIABLE(); v != nil {
 		targetVar = strings.TrimPrefix(v.GetText(), "$")
 	} else if ap := setCtx.AttributePath(); ap != nil {
-		targetVar = ap.GetText()
+		// Rebuild the path from its structured segments (quotes stripped) rather
+		// than ap.GetText(): a quoted member/association name would otherwise be
+		// carried verbatim (with quotes) into the Change activity's member
+		// identifier, corrupting the .mpr. See buildAttributePathFromContext.
+		targetVar = attributePathTargetText(ap)
 	}
 
 	// Get value expression. Keep the structured expression for list/aggregate
@@ -684,134 +888,12 @@ func buildSetStatement(ctx parser.ISetStatementContext) ast.MicroflowStatement {
 		valueExpr = buildExpression(expr)
 	}
 
-	// Check if the expression is a list operation or aggregate function
-	if funcCall, ok := valueExpr.(*ast.FunctionCallExpr); ok {
-		funcName := strings.ToUpper(funcCall.Name)
-
-		// Check for list operations: HEAD, TAIL, FIND, FILTER, SORT, UNION, INTERSECT, SUBTRACT, CONTAINS, EQUALS
-		switch funcName {
-		case "HEAD":
-			return &ast.ListOperationStmt{
-				OutputVariable: targetVar,
-				Operation:      ast.ListOpHead,
-				InputVariable:  extractVariableName(funcCall.Arguments, 0),
-			}
-		case "TAIL":
-			return &ast.ListOperationStmt{
-				OutputVariable: targetVar,
-				Operation:      ast.ListOpTail,
-				InputVariable:  extractVariableName(funcCall.Arguments, 0),
-			}
-		case "FIND":
-			return &ast.ListOperationStmt{
-				OutputVariable: targetVar,
-				Operation:      ast.ListOpFind,
-				InputVariable:  extractVariableName(funcCall.Arguments, 0),
-				Condition:      getArgumentExpression(funcCall.Arguments, 1),
-			}
-		case "FILTER":
-			return &ast.ListOperationStmt{
-				OutputVariable: targetVar,
-				Operation:      ast.ListOpFilter,
-				InputVariable:  extractVariableName(funcCall.Arguments, 0),
-				Condition:      getArgumentExpression(funcCall.Arguments, 1),
-			}
-		case "SORT":
-			stmt := &ast.ListOperationStmt{
-				OutputVariable: targetVar,
-				Operation:      ast.ListOpSort,
-				InputVariable:  extractVariableName(funcCall.Arguments, 0),
-			}
-			// Parse sort specifications from remaining arguments
-			stmt.SortSpecs = extractSortSpecs(funcCall.Arguments[1:])
-			return stmt
-		case "UNION":
-			return &ast.ListOperationStmt{
-				OutputVariable: targetVar,
-				Operation:      ast.ListOpUnion,
-				InputVariable:  extractVariableName(funcCall.Arguments, 0),
-				SecondVariable: extractVariableName(funcCall.Arguments, 1),
-			}
-		case "INTERSECT":
-			return &ast.ListOperationStmt{
-				OutputVariable: targetVar,
-				Operation:      ast.ListOpIntersect,
-				InputVariable:  extractVariableName(funcCall.Arguments, 0),
-				SecondVariable: extractVariableName(funcCall.Arguments, 1),
-			}
-		case "SUBTRACT":
-			return &ast.ListOperationStmt{
-				OutputVariable: targetVar,
-				Operation:      ast.ListOpSubtract,
-				InputVariable:  extractVariableName(funcCall.Arguments, 0),
-				SecondVariable: extractVariableName(funcCall.Arguments, 1),
-			}
-		case "CONTAINS":
-			return &ast.ListOperationStmt{
-				OutputVariable: targetVar,
-				Operation:      ast.ListOpContains,
-				InputVariable:  extractVariableName(funcCall.Arguments, 0),
-				SecondVariable: extractVariableName(funcCall.Arguments, 1),
-			}
-		case "EQUALS":
-			return &ast.ListOperationStmt{
-				OutputVariable: targetVar,
-				Operation:      ast.ListOpEquals,
-				InputVariable:  extractVariableName(funcCall.Arguments, 0),
-				SecondVariable: extractVariableName(funcCall.Arguments, 1),
-			}
-		case "RANGE":
-			stmt := &ast.ListOperationStmt{
-				OutputVariable: targetVar,
-				Operation:      ast.ListOpRange,
-				InputVariable:  extractVariableName(funcCall.Arguments, 0),
-			}
-			if len(funcCall.Arguments) > 1 {
-				stmt.OffsetExpr = funcCall.Arguments[1]
-			}
-			if len(funcCall.Arguments) > 2 {
-				stmt.LimitExpr = funcCall.Arguments[2]
-			}
-			return stmt
-		// Check for aggregate operations: COUNT, SUM, AVERAGE, MINIMUM, MAXIMUM
-		case "COUNT":
-			return &ast.AggregateListStmt{
-				OutputVariable: targetVar,
-				Operation:      ast.AggregateCount,
-				InputVariable:  extractVariableName(funcCall.Arguments, 0),
-			}
-		case "SUM":
-			inputVar, attr := extractVariableAndAttribute(funcCall.Arguments, 0)
-			return &ast.AggregateListStmt{
-				OutputVariable: targetVar,
-				Operation:      ast.AggregateSum,
-				InputVariable:  inputVar,
-				Attribute:      attr,
-			}
-		case "AVERAGE":
-			inputVar, attr := extractVariableAndAttribute(funcCall.Arguments, 0)
-			return &ast.AggregateListStmt{
-				OutputVariable: targetVar,
-				Operation:      ast.AggregateAverage,
-				InputVariable:  inputVar,
-				Attribute:      attr,
-			}
-		case "MINIMUM":
-			inputVar, attr := extractVariableAndAttribute(funcCall.Arguments, 0)
-			return &ast.AggregateListStmt{
-				OutputVariable: targetVar,
-				Operation:      ast.AggregateMinimum,
-				InputVariable:  inputVar,
-				Attribute:      attr,
-			}
-		case "MAXIMUM":
-			inputVar, attr := extractVariableAndAttribute(funcCall.Arguments, 0)
-			return &ast.AggregateListStmt{
-				OutputVariable: targetVar,
-				Operation:      ast.AggregateMaximum,
-				InputVariable:  inputVar,
-				Attribute:      attr,
-			}
+	// Check if the expression is a list operation or aggregate function. Under
+	// mdl 1 `set` always assigns an expression: a list-operation call there is
+	// refused (ExitSetStatement), and find/contains are the string functions.
+	if funcCall, ok := valueExpr.(*ast.FunctionCallExpr); ok && !listCallForm.Applies(scriptLanguageVersion(setCtx)) {
+		if stmt := buildListOrAggregateStatement(targetVar, funcCall); stmt != nil {
+			return recordUnresolvedOperands(stmt, funcCall.Arguments)
 		}
 	}
 
@@ -825,6 +907,196 @@ func buildSetStatement(ctx parser.ISetStatementContext) ast.MicroflowStatement {
 		Target: targetVar,
 		Value:  valueExpr,
 	}
+}
+
+// buildListOrAggregateStatement converts a SET whose value is a list-operation
+// or aggregate call into the matching activity statement, or returns nil when
+// the call is not one of those (or is the string-function reading of an
+// overloaded name, which must stay a value expression).
+//
+// It is a separate function so that every arm funnels through one tail in the
+// caller — recordUnresolvedOperands. Doing the same bookkeeping inline in each
+// arm is how the list operand went missing in the first place; see the note on
+// buildSetAggregate about two conversions for one syntax.
+func buildListOrAggregateStatement(targetVar string, funcCall *ast.FunctionCallExpr) ast.MicroflowStatement {
+	funcName := strings.ToUpper(funcCall.Name)
+
+	// Check for list operations: HEAD, TAIL, FIND, FILTER, SORT, UNION, INTERSECT, SUBTRACT, CONTAINS, EQUALS
+	switch funcName {
+	case "HEAD":
+		return &ast.ListOperationStmt{
+			OutputVariable: targetVar,
+			Operation:      ast.ListOpHead,
+			InputVariable:  extractVariableName(funcCall.Arguments, 0),
+		}
+	case "TAIL":
+		return &ast.ListOperationStmt{
+			OutputVariable: targetVar,
+			Operation:      ast.ListOpTail,
+			InputVariable:  extractVariableName(funcCall.Arguments, 0),
+		}
+	case "FIND":
+		// `find` is overloaded: the LIST operation find(list, condition) — which
+		// filters a list by a boolean condition — and the STRING function
+		// find(haystack, needle) → the index of a substring. A STRING-LITERAL
+		// second argument is unambiguously the string function (you never filter
+		// a list by a bare string literal); it must stay a value expression, not
+		// a lossy List operation activity whose output variable collides
+		// (CE0111). Ledger #63. When both arguments are plain variables the kind
+		// is ambiguous here; the flow builder disambiguates String-typed inputs.
+		if !isStringLiteralArg(funcCall.Arguments, 1) {
+			cond := ast.MemberEqualityCondition(getArgumentExpression(funcCall.Arguments, 1))
+			return &ast.ListOperationStmt{
+				OutputVariable: targetVar,
+				Operation:      ast.ListOpFind,
+				InputVariable:  extractVariableName(funcCall.Arguments, 0),
+				Condition:      cond,
+				ByExpression:   !ast.IsMemberEquality(cond),
+			}
+		}
+		// Falls through to the default MfSetStmt (string find expression).
+	case "FILTER":
+		cond := ast.MemberEqualityCondition(getArgumentExpression(funcCall.Arguments, 1))
+		return &ast.ListOperationStmt{
+			OutputVariable: targetVar,
+			Operation:      ast.ListOpFilter,
+			InputVariable:  extractVariableName(funcCall.Arguments, 0),
+			Condition:      cond,
+			ByExpression:   !ast.IsMemberEquality(cond),
+		}
+	case "SORT":
+		stmt := &ast.ListOperationStmt{
+			OutputVariable: targetVar,
+			Operation:      ast.ListOpSort,
+			InputVariable:  extractVariableName(funcCall.Arguments, 0),
+		}
+		// Parse sort specifications from remaining arguments
+		stmt.SortSpecs = extractSortSpecs(funcCall.Arguments[1:])
+		return stmt
+	case "UNION":
+		return &ast.ListOperationStmt{
+			OutputVariable: targetVar,
+			Operation:      ast.ListOpUnion,
+			InputVariable:  extractVariableName(funcCall.Arguments, 0),
+			SecondVariable: extractVariableName(funcCall.Arguments, 1),
+		}
+	case "INTERSECT":
+		return &ast.ListOperationStmt{
+			OutputVariable: targetVar,
+			Operation:      ast.ListOpIntersect,
+			InputVariable:  extractVariableName(funcCall.Arguments, 0),
+			SecondVariable: extractVariableName(funcCall.Arguments, 1),
+		}
+	case "SUBTRACT":
+		return &ast.ListOperationStmt{
+			OutputVariable: targetVar,
+			Operation:      ast.ListOpSubtract,
+			InputVariable:  extractVariableName(funcCall.Arguments, 0),
+			SecondVariable: extractVariableName(funcCall.Arguments, 1),
+		}
+	case "CONTAINS":
+		// `contains` is overloaded: the LIST operation contains(list, object)
+		// and the STRING function contains(haystack, needle). A List operation
+		// activity requires two plain list/object variables; if either argument
+		// is a literal or a computed expression it is unambiguously the string
+		// function, which must stay a value expression (a Change Variable
+		// action) — serializing it as a List operation fails the build
+		// (CE0023/CE0097/CE0111). Ledger finding #53. When both arguments are
+		// plain variables the kind is still ambiguous here (no type info); the
+		// flow builder disambiguates String-typed inputs downstream.
+		if isPlainVariableArg(funcCall.Arguments, 0) && isPlainVariableArg(funcCall.Arguments, 1) {
+			return &ast.ListOperationStmt{
+				OutputVariable: targetVar,
+				Operation:      ast.ListOpContains,
+				InputVariable:  extractVariableName(funcCall.Arguments, 0),
+				SecondVariable: extractVariableName(funcCall.Arguments, 1),
+			}
+		}
+		// Falls through to the default MfSetStmt (string contains expression).
+	case "EQUALS":
+		return &ast.ListOperationStmt{
+			OutputVariable: targetVar,
+			Operation:      ast.ListOpEquals,
+			InputVariable:  extractVariableName(funcCall.Arguments, 0),
+			SecondVariable: extractVariableName(funcCall.Arguments, 1),
+		}
+	case "RANGE":
+		stmt := &ast.ListOperationStmt{
+			OutputVariable: targetVar,
+			Operation:      ast.ListOpRange,
+			InputVariable:  extractVariableName(funcCall.Arguments, 0),
+		}
+		if len(funcCall.Arguments) > 1 {
+			stmt.OffsetExpr = funcCall.Arguments[1]
+		}
+		if len(funcCall.Arguments) > 2 {
+			stmt.LimitExpr = funcCall.Arguments[2]
+		}
+		return stmt
+	// Check for aggregate operations: COUNT, SUM, AVERAGE, MINIMUM, MAXIMUM
+	case "COUNT":
+		return &ast.AggregateListStmt{
+			OutputVariable: targetVar,
+			Operation:      ast.AggregateCount,
+			InputVariable:  extractVariableName(funcCall.Arguments, 0),
+		}
+	case "SUM":
+		return buildSetAggregate(targetVar, ast.AggregateSum, funcCall.Arguments)
+	case "AVERAGE":
+		return buildSetAggregate(targetVar, ast.AggregateAverage, funcCall.Arguments)
+	case "MINIMUM":
+		return buildSetAggregate(targetVar, ast.AggregateMinimum, funcCall.Arguments)
+	case "MAXIMUM":
+		return buildSetAggregate(targetVar, ast.AggregateMaximum, funcCall.Arguments)
+	}
+	return nil
+}
+
+// recordUnresolvedOperands notes every list operand that did not reduce to a
+// variable name, so the validator can refuse the statement instead of writing an
+// activity with an empty List (mendixlabs/mxcli#1101).
+//
+// It keys on the RESULT of the conversion rather than on the argument's node
+// type, which is what makes it uniform across the arms: buildSetAggregate reads
+// an attribute path (`sum($List.Price)`) that extractVariableName cannot, so a
+// predicate written over node types would have to differ per arm and would drift
+// apart again. An empty InputVariable means the conversion found nothing to
+// store, whatever the reason.
+func recordUnresolvedOperands(stmt ast.MicroflowStatement, args []ast.Expression) ast.MicroflowStatement {
+	operand := func(index int) ast.UnresolvedOperand {
+		op := ast.UnresolvedOperand{Index: index}
+		if index < len(args) {
+			op.Expr = args[index]
+		}
+		return op
+	}
+	switch s := stmt.(type) {
+	case *ast.ListOperationStmt:
+		if s.InputVariable == "" {
+			s.UnresolvedOperands = append(s.UnresolvedOperands, operand(0))
+		}
+		if listOperationTakesSecondList(s.Operation) && s.SecondVariable == "" {
+			s.UnresolvedOperands = append(s.UnresolvedOperands, operand(1))
+		}
+	case *ast.AggregateListStmt:
+		if s.InputVariable == "" {
+			s.UnresolvedOperands = append(s.UnresolvedOperands, operand(0))
+		}
+	}
+	return stmt
+}
+
+// listOperationTakesSecondList reports whether the operation's SECOND argument is
+// another list. It is not "has a second argument": SORT's is a sort spec,
+// FILTER/FIND's is a predicate and RANGE's is an offset, none of which belong in
+// the list-operand check.
+func listOperationTakesSecondList(op ast.ListOperationType) bool {
+	switch op {
+	case ast.ListOpUnion, ast.ListOpIntersect, ast.ListOpSubtract,
+		ast.ListOpContains, ast.ListOpEquals:
+		return true
+	}
+	return false
 }
 
 // extractVariableName extracts a variable name from an argument at the given index.
@@ -842,6 +1114,32 @@ func extractVariableName(args []ast.Expression, index int) string {
 	return ""
 }
 
+// isPlainVariableArg reports whether the argument at the given index is a bare
+// variable reference (`$x` or an unquoted identifier) rather than a literal or a
+// computed expression. Used to distinguish the list-operation form of an
+// overloaded function (e.g. contains(list, object)) from its string form.
+func isPlainVariableArg(args []ast.Expression, index int) bool {
+	if index >= len(args) {
+		return false
+	}
+	switch args[index].(type) {
+	case *ast.VariableExpr, *ast.IdentifierExpr:
+		return true
+	}
+	return false
+}
+
+// isStringLiteralArg reports whether the argument at the given index is a string
+// literal — used to detect the string form of an overloaded function (e.g.
+// find(haystack, 'needle')) that must not become a list operation.
+func isStringLiteralArg(args []ast.Expression, index int) bool {
+	if index >= len(args) {
+		return false
+	}
+	lit, ok := args[index].(*ast.LiteralExpr)
+	return ok && lit.Kind == ast.LiteralString
+}
+
 // getArgumentExpression returns the expression at the given index, or nil if not present.
 func getArgumentExpression(args []ast.Expression, index int) ast.Expression {
 	if index >= len(args) {
@@ -850,31 +1148,45 @@ func getArgumentExpression(args []ast.Expression, index int) ast.Expression {
 	return args[index]
 }
 
-// extractVariableAndAttribute extracts variable and attribute from $Var/Attr or $Var, Attr.
-func extractVariableAndAttribute(args []ast.Expression, index int) (varName string, attrName string) {
-	if index >= len(args) {
-		return "", ""
+// buildSetAggregate builds an aggregate activity from a SET whose value is a
+// SUM/AVERAGE/MINIMUM/MAXIMUM call.
+//
+// It mirrors buildAggregateListStatement, which handles the same two spellings
+// when they arrive through the aggregateListStatement rule: one argument is a
+// list plus an attribute (`sum($List.Price)`), two arguments are a list plus an
+// expression evaluated per item (`sum($List, $currentObject/Price * 0.21)`).
+// Two conversions for one syntax is how the attribute went missing in the first
+// place, so the two must agree.
+func buildSetAggregate(targetVar string, op ast.AggregateListOperationType, args []ast.Expression) *ast.AggregateListStmt {
+	stmt := &ast.AggregateListStmt{OutputVariable: targetVar, Operation: op}
+	if len(args) == 0 {
+		return stmt
 	}
-	// Check for attribute path like $Var/Attr
-	if pathExpr, ok := args[index].(*ast.AttributePathExpr); ok {
-		varName = pathExpr.Variable
-		if len(pathExpr.Path) > 0 {
-			attrName = pathExpr.Path[len(pathExpr.Path)-1]
+
+	switch arg := args[0].(type) {
+	case *ast.AttributePathExpr:
+		stmt.InputVariable = arg.Variable
+		if len(arg.Path) > 0 {
+			stmt.Attribute = arg.Path[len(arg.Path)-1]
 		}
-		return
-	}
-	// Check for simple variable
-	if varExpr, ok := args[index].(*ast.VariableExpr); ok {
-		varName = varExpr.Name
-		// Look for attribute in next argument
-		if index+1 < len(args) {
-			if identExpr, ok := args[index+1].(*ast.IdentifierExpr); ok {
-				attrName = identExpr.Name
-			}
+	case *ast.VariableExpr:
+		// `sum($List.Price)` reaches the expression parser as one variable whose
+		// name carries the dot, not as an attribute path. Left joined, mxbuild
+		// reports the whole thing as an undefined variable (CE0109).
+		stmt.InputVariable = arg.Name
+		if list, attr, ok := strings.Cut(arg.Name, "."); ok {
+			stmt.InputVariable, stmt.Attribute = list, attr
 		}
-		return
 	}
-	return "", ""
+
+	// Any second argument is the per-item expression. Dropping it leaves an
+	// aggregate with nothing to aggregate, which mxbuild rejects with CE0015.
+	if len(args) > 1 {
+		stmt.IsExpression = true
+		stmt.Expression = args[1]
+		stmt.Attribute = ""
+	}
+	return stmt
 }
 
 // extractSortSpecs extracts sort specifications from function arguments.
@@ -945,6 +1257,9 @@ func buildCreateObjectStatement(ctx parser.ICreateObjectStatementContext) *ast.C
 		stmt.Changes = buildMemberAssignmentList(memberList)
 	}
 
+	stmt.Commit = buildCommitClause(createCtx.CommitClause())
+	stmt.RefreshInClient = createCtx.REFRESH() != nil
+
 	// Check for ON ERROR clause
 	if errClause := createCtx.OnErrorClause(); errClause != nil {
 		stmt.ErrorHandling = buildOnErrorClause(errClause)
@@ -953,9 +1268,22 @@ func buildCreateObjectStatement(ctx parser.ICreateObjectStatementContext) *ast.C
 	return stmt
 }
 
+// buildCommitClause maps the optional COMMIT modifier on a create/change activity.
+// Grammar: COMMIT (WITHOUT EVENTS)?  — absent means Mendix's default, No.
+func buildCommitClause(ctx parser.ICommitClauseContext) ast.CommitFlag {
+	if ctx == nil {
+		return ast.CommitNo
+	}
+	if cc, ok := ctx.(*parser.CommitClauseContext); ok && cc.EVENTS() != nil {
+		return ast.CommitYesWithoutEvents
+	}
+	return ast.CommitYes
+}
+
 // buildChangeObjectStatement converts CHANGE statement context to ChangeObjectStmt.
-// Grammar: CHANGE VARIABLE (LPAREN memberAssignmentList? RPAREN)?
+// Grammar: CHANGE VARIABLE (LPAREN changeMemberAssignmentList? RPAREN)?
 // Example: CHANGE $Product (Name = $NewName, ModifiedDate = [%CurrentDateTime%]);
+// Example: CHANGE $Order (Module.Order_Line += $Line, Module.Order_Line -= $Old);
 func buildChangeObjectStatement(ctx parser.IChangeObjectStatementContext) *ast.ChangeObjectStmt {
 	if ctx == nil {
 		return nil
@@ -970,16 +1298,22 @@ func buildChangeObjectStatement(ctx parser.IChangeObjectStatementContext) *ast.C
 	}
 
 	// Get SET member assignments
-	if memberList := changeCtx.MemberAssignmentList(); memberList != nil {
-		stmt.Changes = buildMemberAssignmentList(memberList)
+	if memberList := changeCtx.ChangeMemberAssignmentList(); memberList != nil {
+		stmt.Changes = buildChangeMemberAssignmentList(memberList)
 	}
+	stmt.Commit = buildCommitClause(changeCtx.CommitClause())
 	stmt.RefreshInClient = changeCtx.REFRESH() != nil
+
+	// Check for ON ERROR clause
+	if errClause := changeCtx.OnErrorClause(); errClause != nil {
+		stmt.ErrorHandling = buildOnErrorClause(errClause)
+	}
 
 	return stmt
 }
 
 // buildCommitStatement converts COMMIT statement context to MfCommitStmt.
-// Grammar: COMMIT VARIABLE (WITH EVENTS)? REFRESH?
+// Grammar: COMMIT VARIABLE ((WITH | WITHOUT) EVENTS)? REFRESH?
 func buildCommitStatement(ctx parser.ICommitStatementContext) *ast.MfCommitStmt {
 	if ctx == nil {
 		return nil
@@ -993,10 +1327,16 @@ func buildCommitStatement(ctx parser.ICommitStatementContext) *ast.MfCommitStmt 
 		stmt.Variable = strings.TrimPrefix(v.GetText(), "$")
 	}
 
-	// Check for WITH EVENTS
-	if commitCtx.EVENTS() != nil {
-		stmt.WithEvents = true
+	// Check for WITHOUT EVENTS.
+	//
+	// Absent means events ON — Mendix's default for the Commit activity (#895).
+	// A bare WITH EVENTS also leaves the flag clear: it says the same thing as
+	// writing nothing, and every script written before the default was corrected
+	// spells it out that way.
+	if commitCtx.WITHOUT() != nil {
+		stmt.WithoutEvents = true
 	}
+	stmt.ExplicitWithEvents = commitCtx.WITH() != nil
 
 	// Check for REFRESH
 	if commitCtx.REFRESH() != nil {
@@ -1012,6 +1352,7 @@ func buildCommitStatement(ctx parser.ICommitStatementContext) *ast.MfCommitStmt 
 }
 
 // buildDeleteObjectStatement converts DELETE statement context to DeleteObjectStmt.
+// Grammar: DELETE VARIABLE REFRESH?
 func buildDeleteObjectStatement(ctx parser.IDeleteObjectStatementContext) *ast.DeleteObjectStmt {
 	if ctx == nil {
 		return nil
@@ -1025,11 +1366,31 @@ func buildDeleteObjectStatement(ctx parser.IDeleteObjectStatementContext) *ast.D
 		stmt.Variable = strings.TrimPrefix(v.GetText(), "$")
 	}
 
+	stmt.RefreshInClient = delCtx.REFRESH() != nil
+
 	// Check for ON ERROR clause
 	if errClause := delCtx.OnErrorClause(); errClause != nil {
 		stmt.ErrorHandling = buildOnErrorClause(errClause)
 	}
 
+	return stmt
+}
+
+// buildExternalObjectStatement converts SEND/DELETE EXTERNAL OBJECT to an
+// ExternalObjectStmt.
+func buildExternalObjectStatement(ctx parser.IExternalObjectStatementContext) *ast.ExternalObjectStmt {
+	if ctx == nil {
+		return nil
+	}
+	c := ctx.(*parser.ExternalObjectStatementContext)
+	stmt := &ast.ExternalObjectStmt{Delete: c.DELETE() != nil}
+	if v := c.VARIABLE(); v != nil {
+		stmt.Variable = strings.TrimPrefix(v.GetText(), "$")
+	}
+	stmt.RefreshInClient = c.REFRESH() != nil
+	if errClause := c.OnErrorClause(); errClause != nil {
+		stmt.ErrorHandling = buildOnErrorClause(errClause)
+	}
 	return stmt
 }
 
@@ -1049,6 +1410,10 @@ func buildRollbackStatement(ctx parser.IRollbackStatementContext) *ast.RollbackS
 
 	// Check for REFRESH keyword
 	stmt.RefreshInClient = rollCtx.REFRESH() != nil
+
+	if errClause := rollCtx.OnErrorClause(); errClause != nil {
+		stmt.ErrorHandling = buildOnErrorClause(errClause)
+	}
 
 	return stmt
 }
@@ -1105,8 +1470,11 @@ func buildRetrieveStatement(ctx parser.IRetrieveStatementContext) *ast.RetrieveS
 				if xpathExpr := xcCtx.XpathExpr(); xpathExpr != nil {
 					andExprs = append(andExprs, buildXPathSourceExpression(xpathExpr))
 					if prc, ok := xpathExpr.(antlr.ParserRuleContext); ok {
-						if source := strings.TrimSpace(extractOriginalText(prc)); source != "" {
-							predicateSources = append(predicateSources, "["+source+"]")
+						if source := strings.TrimSpace(extractExpressionText(prc)); source != "" {
+							source = storedExpressionSource(source, lexedWithStrictEscapes(prc))
+							// Strip quoted names as the single-predicate path does: kept,
+							// "A" is a string literal to Mendix (mendixlabs/mxcli#1243).
+							predicateSources = append(predicateSources, stripExpressionIdentifierQuotes(normalizeXPathTokens("["+source+"]")))
 						}
 					}
 				}
@@ -1142,8 +1510,12 @@ func buildRetrieveStatement(ctx parser.IRetrieveStatementContext) *ast.RetrieveS
 		}
 	}
 
-	// Get LIMIT and OFFSET expressions
-	if limitExpr := retrCtx.GetLimitExpr(); limitExpr != nil {
+	// The range. `first` is the object range in every version; a bare
+	// `limit 1` is too in an mdl 0 script, and a list of one under mdl 1
+	// (limitOneIsAList). Resolved here so nothing downstream reads limit text.
+	if retrCtx.FIRST() != nil || retrieveLimitOneIsObject(retrCtx) {
+		stmt.First = true
+	} else if limitExpr := retrCtx.GetLimitExpr(); limitExpr != nil {
 		stmt.Limit = retrieveRangeExpressionSource(limitExpr) + retrieveLimitTrailingWhitespace(retrCtx, limitExpr)
 	}
 	if offsetExpr := retrCtx.GetOffsetExpr(); offsetExpr != nil {
@@ -1163,8 +1535,10 @@ func retrieveRangeExpressionSource(exprCtx parser.IExpressionContext) string {
 		return ""
 	}
 	if prc, ok := exprCtx.(antlr.ParserRuleContext); ok {
-		if source := strings.TrimSpace(extractOriginalText(prc)); source != "" {
-			return source
+		if source := strings.TrimSpace(extractExpressionText(prc)); source != "" {
+			// Stored as written: a string in it stores its value, as in any
+			// other expression (storedExpressionSource, #825).
+			return storedExpressionSource(source, lexedWithStrictEscapes(prc))
 		}
 	}
 	return exprCtx.GetText()
@@ -1262,11 +1636,19 @@ func buildSortColumnMicroflow(ctx parser.ISortColumnContext) *ast.SortColumnDef 
 		Order: "ASC", // Default to ASC
 	}
 
-	// Get attribute name from QualifiedName or IDENTIFIER
-	if qn := colCtx.QualifiedName(); qn != nil {
-		col.Attribute = qn.GetText()
+	// Get attribute name from QualifiedName or IDENTIFIER. Strip quotes from each
+	// segment: `sort by "Mod"."Entity"."Code"` must store the bare dotted form —
+	// keeping the quotes produced a nonsense reference that only failed on write
+	// ("attribute does not belong to entity"), unlike everywhere else where quoting
+	// is safe (FINDINGS #13).
+	//
+	// Several qualifiedNames mean an association path: every segment but the last
+	// is a hop, the last is the attribute (mendixlabs/mxcli#1152).
+	if qns := colCtx.AllQualifiedName(); len(qns) > 0 {
+		col.Associations = sortColumnHops(qns)
+		col.Attribute = unquoteQualifiedName(qns[len(qns)-1].GetText())
 	} else if id := colCtx.IDENTIFIER(); id != nil {
-		col.Attribute = id.GetText()
+		col.Attribute = unquoteIdentifier(id.GetText())
 	}
 
 	// Get sort order
@@ -1277,6 +1659,20 @@ func buildSortColumnMicroflow(ctx parser.ISortColumnContext) *ast.SortColumnDef 
 	return col
 }
 
+// sortColumnHops returns every segment of a sort column's association path but
+// the last — the last is the attribute. Shared by the microflow and page sort
+// column builders so the two cannot disagree about where the attribute is.
+func sortColumnHops(qns []parser.IQualifiedNameContext) []string {
+	if len(qns) < 2 {
+		return nil
+	}
+	hops := make([]string, 0, len(qns)-1)
+	for _, qn := range qns[:len(qns)-1] {
+		hops = append(hops, getQualifiedNameText(qn))
+	}
+	return hops
+}
+
 // buildIfStatement converts IF statement context to IfStmt.
 func buildIfStatement(ctx parser.IIfStatementContext) *ast.IfStmt {
 	if ctx == nil {
@@ -1284,28 +1680,75 @@ func buildIfStatement(ctx parser.IIfStatementContext) *ast.IfStmt {
 	}
 	ifCtx := ctx.(*parser.IfStatementContext)
 
-	stmt := &ast.IfStmt{}
-
-	// Get all expressions (condition for IF and ELSIFs)
+	// Grammar: IF expression THEN microflowBody
+	//          (ELSIF expression THEN microflowBody)*
+	//          (ELSE microflowBody)? END IF
+	// exprs[i] pairs with bodies[i]; one trailing extra body is the ELSE branch.
 	exprs := ifCtx.AllExpression()
-	if len(exprs) > 0 {
-		stmt.Condition = buildSourceExpression(exprs[0])
+	bodies := ifCtx.AllMicroflowBody()
+
+	if len(exprs) == 0 {
+		// Defensive only — the grammar guarantees at least one condition.
+		stmt := &ast.IfStmt{}
+		if len(bodies) > 0 {
+			stmt.ThenBody = buildMicroflowBody(bodies[0])
+		}
+		return stmt
 	}
 
-	// Get all microflow bodies (THEN, ELSIF THENs, ELSE)
-	bodies := ifCtx.AllMicroflowBody()
-	if len(bodies) > 0 {
-		stmt.ThenBody = buildMicroflowBody(bodies[0])
-	}
-	// Last body is ELSE if there's no ELSIF or if there are more bodies than expressions
+	hasElse := len(bodies) > len(exprs) || ifCtx.ELSE() != nil
+	var elseBody []ast.MicroflowStatement
 	if len(bodies) > len(exprs) {
-		stmt.HasElse = true
-		stmt.ElseBody = buildMicroflowBody(bodies[len(bodies)-1])
-	} else if ifCtx.ELSE() != nil {
-		stmt.HasElse = true
+		elseBody = buildMicroflowBody(bodies[len(bodies)-1])
+	}
+
+	// Mendix has no native elsif construct, so lower each ELSIF arm into a
+	// nested IfStmt in the ELSE branch of the arm before it (built innermost
+	// first). Previously only exprs[0]/bodies[0] and the trailing ELSE were
+	// read, silently dropping every ELSIF arm from the written model.
+	armAnnotations := elsifArmAnnotations(ifCtx)
+	var stmt *ast.IfStmt
+	for i := len(exprs) - 1; i >= 0; i-- {
+		s := &ast.IfStmt{}
+		if i > 0 && i-1 < len(armAnnotations) && armAnnotations[i-1] != nil {
+			s.Annotations = armAnnotations[i-1]
+		}
+		s.Condition = buildSourceExpression(exprs[i])
+		if i < len(bodies) {
+			s.ThenBody = buildMicroflowBody(bodies[i])
+		}
+		if stmt != nil {
+			s.HasElse = true
+			s.ElseBody = []ast.MicroflowStatement{stmt}
+		} else {
+			s.HasElse = hasElse
+			s.ElseBody = elseBody
+		}
+		stmt = s
 	}
 
 	return stmt
+}
+
+// elsifArmAnnotations returns, per ELSIF arm in source order, the annotations
+// written directly before its keyword (nil when there are none). They are
+// direct children of the ifStatement, so each run is closed by the ELSIF token
+// that follows it.
+func elsifArmAnnotations(ifCtx *parser.IfStatementContext) []*ast.ActivityAnnotations {
+	var out []*ast.ActivityAnnotations
+	var pending []parser.IAnnotationContext
+	for _, child := range ifCtx.GetChildren() {
+		switch c := child.(type) {
+		case parser.IAnnotationContext:
+			pending = append(pending, c)
+		case antlr.TerminalNode:
+			if c.GetSymbol().GetTokenType() == parser.MDLParserELSIF {
+				out = append(out, extractMicroflowAnnotations(pending))
+				pending = nil
+			}
+		}
+	}
+	return out
 }
 
 // buildLoopStatement converts LOOP statement context to LoopStmt.
@@ -1324,6 +1767,11 @@ func buildLoopStatement(ctx parser.ILoopStatementContext) *ast.LoopStmt {
 	}
 	if len(vars) >= 2 {
 		stmt.ListVariable = strings.TrimPrefix(vars[1].GetText(), "$")
+	}
+	// `loop $c in $Parent/Mod.Assoc` — the grammar takes a path here, and
+	// dropping it wrote a loop with no list (CE0099). Kept for the validator.
+	if ap := loopCtx.AttributePath(); ap != nil {
+		stmt.ListPath = strings.TrimSpace(extractExpressionText(ap.(antlr.ParserRuleContext)))
 	}
 
 	// Get body
@@ -1362,9 +1810,10 @@ func buildSourceExpression(ctx parser.IExpressionContext) ast.Expression {
 	}
 	expr := buildExpression(ctx)
 	if prc, ok := ctx.(antlr.ParserRuleContext); ok {
-		if source := strings.TrimSpace(extractOriginalText(prc)); source != "" {
-			if shouldPreserveExpressionSource(source) {
-				return &ast.SourceExpr{Expression: expr, Source: source}
+		if source := strings.TrimSpace(extractExpressionText(prc)); source != "" {
+			strict := lexedWithStrictEscapes(prc)
+			if shouldPreserveExpressionSource(source, strict) {
+				return &ast.SourceExpr{Expression: expr, Source: stripExpressionIdentifierQuotes(storedExpressionSource(source, strict))}
 			}
 		}
 	}
@@ -1377,8 +1826,13 @@ func buildXPathSourceExpression(ctx parser.IXpathExprContext) ast.Expression {
 	}
 	expr := buildXPathExpr(ctx)
 	if prc, ok := ctx.(antlr.ParserRuleContext); ok {
-		if source := strings.TrimSpace(extractOriginalText(prc)); source != "" {
-			return &ast.SourceExpr{Expression: expr, Source: source}
+		if source := strings.TrimSpace(extractExpressionText(prc)); source != "" {
+			// Requote any bare [%token%] so the stored constraint passes mx check
+			// (CE0161) — the original source preserves the unquoted form (#641).
+			// A string in it stores its value, as in an expression: Mendix XPath
+			// has no backslash escape either (storedExpressionSource).
+			source = storedExpressionSource(source, lexedWithStrictEscapes(prc))
+			return &ast.SourceExpr{Expression: expr, Source: stripExpressionIdentifierQuotes(normalizeXPathTokens(source))}
 		}
 	}
 	return expr
@@ -1389,32 +1843,114 @@ func buildRetrieveWhereExpression(ctx parser.IExpressionContext) ast.Expression 
 		return nil
 	}
 	expr := buildExpression(ctx)
+	// `where '<xpath>'` — the whole clause is a single quoted string carrying the
+	// XPath constraint as a literal. Use the UNQUOTED value as the source, not the
+	// raw token: preserving the raw text keeps the outer quotes and the doubled
+	// '' escapes, which get bracket-wrapped into `['[Title=''abc'']']` and fail
+	// CE0161. The inline `where [...]` form is unaffected (it takes the
+	// xpathConstraint path, not this one). Issue #642.
+	if lit, ok := expr.(*ast.LiteralExpr); ok && lit.Kind == ast.LiteralString {
+		if s, ok := lit.Value.(string); ok {
+			return &ast.SourceExpr{Expression: expr, Source: stripExpressionIdentifierQuotes(s)}
+		}
+	}
 	if prc, ok := ctx.(antlr.ParserRuleContext); ok {
-		if source := strings.TrimSpace(extractOriginalText(prc)); source != "" {
-			if shouldPreserveExpressionSource(source) || strings.Contains(source, "/") {
-				return &ast.SourceExpr{Expression: expr, Source: source}
+		if source := strings.TrimSpace(extractExpressionText(prc)); source != "" {
+			strict := lexedWithStrictEscapes(prc)
+			if shouldPreserveExpressionSource(source, strict) || strings.Contains(source, "/") {
+				// Stored as written, each string spelled as its value — the
+				// rendered constraint stores the value through QuoteLiteral, and
+				// describe cannot tell the two apart.
+				return &ast.SourceExpr{Expression: expr, Source: stripExpressionIdentifierQuotes(storedExpressionSource(source, strict))}
 			}
 		}
 	}
 	return expr
 }
 
-func shouldPreserveExpressionSource(source string) bool {
+func isDigitByte(c byte) bool { return c >= '0' && c <= '9' }
+
+func isIdentByte(c byte) bool {
+	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || isDigitByte(c)
+}
+
+// dotIsQualifiedNameSeparator reports whether the `.` at index i separates
+// segments of a qualified name (`Module.Entity`, `L48.Transaction`) rather than
+// being a decimal point. The token immediately before the `.` is a name segment
+// (not a number) when it contains a letter or underscore — so a module/entity
+// name that merely ends in a digit (`L48`, `Account2`) is not mistaken for a
+// decimal. Symmetrically, a `.` that directly follows an identifier char and is
+// followed by a name segment (a letter/underscore start) is a separator too.
+func dotIsQualifiedNameSeparator(source string, i int) bool {
+	// Walk back over the run of identifier chars ending at i-1; if any is a
+	// letter or underscore, the preceding token is a name, not a number.
+	s := i
+	for s > 0 && isIdentByte(source[s-1]) {
+		s--
+		if source[s] == '_' || (source[s] >= 'a' && source[s] <= 'z') || (source[s] >= 'A' && source[s] <= 'Z') {
+			return true
+		}
+	}
+	return false
+}
+
+// shouldPreserveExpressionSource reports whether an expression is stored as
+// written rather than rendered from its tree. strict is the string rule the
+// source was lexed with (lexedWithStrictEscapes): a string literal is skipped
+// whole, so an operator or a `.` inside one never counts — and under mdl 0 a
+// `\'` inside one does not end it. Reading `'it\'s'+$x` as the string `'it\'`
+// and a second string opening at `s'` made the decision on the wrong
+// characters (ako/mxcli#820).
+func shouldPreserveExpressionSource(source string, strict bool) bool {
 	if strings.ContainsAny(source, "\r\n") {
 		return true
 	}
-	inString := false
 	for i := 0; i < len(source); i++ {
 		if source[i] == '\'' {
-			if inString && i+1 < len(source) && source[i+1] == '\'' {
-				i++
-				continue
-			}
-			inString = !inString
+			i = stringLiteralEnd(source, i, strict) - 1
 			continue
 		}
-		if inString {
-			continue
+		// A `/` used as division with a variable right operand (`$a / $b`) parses
+		// as a member-access path (the `$` on the RHS is stripped), so the AST
+		// re-serializes to a bogus `$a/b`. Preserve the raw source ONLY for this
+		// unambiguous misuse — a `/` immediately followed (ignoring spaces) by `$`.
+		// A real association path never has `$` after `/`, so legitimate navigation
+		// (`$Order/Assoc/Name`) is NOT source-frozen. MDL045 then rejects it at
+		// check time using the preserved source. (#17, verification round)
+		if source[i] == '/' {
+			j := i + 1
+			for j < len(source) && (source[j] == ' ' || source[j] == '\t') {
+				j++
+			}
+			if j < len(source) && source[j] == '$' {
+				return true
+			}
+		}
+		// Otherwise `/` is the member-access separator (`$Order/Assoc/Name`), not
+		// division (which is `div`), so it is NOT a preservation trigger — that
+		// would wrongly source-freeze every association-navigation path.
+		//
+		// Decimal literal: the re-serializer truncates a zero fraction (`2.0` → `2`,
+		// which breaks Mendix's Decimal typing) and emits small values in scientific
+		// notation (`0.000001` → `1e-06`, which Mendix rejects). A `.` adjacent to a
+		// digit marks a numeric literal; preserving the source keeps the exact form.
+		// (#18, #19)
+		//
+		// BUT a `.` inside a QUALIFIED NAME (`L48.Transaction`, `Account2.Name`)
+		// must NOT be mistaken for a decimal point just because a name segment ends
+		// in a digit — modules/entities ending in a digit are common. Freezing such
+		// an expression bypasses association-target-entity resolution
+		// (`resolveAssociationPaths`), producing `$T/L48.Assoc/Attr` without the
+		// required entity step, which Mendix rejects with CE0117 (ledger #48 root
+		// cause). A decimal point's digit run is a standalone number — not preceded
+		// by an identifier char; a name separator's `.` follows a token that
+		// contains a letter or underscore.
+		if source[i] == '.' {
+			prevDigit := i > 0 && isDigitByte(source[i-1])
+			nextDigit := i+1 < len(source) && isDigitByte(source[i+1])
+			if (prevDigit || nextDigit) && !dotIsQualifiedNameSeparator(source, i) {
+				return true
+			}
 		}
 		switch source[i] {
 		case '=', '!', '<', '>', '+', '-', '*', ':', ',':
@@ -1454,4 +1990,83 @@ func buildReturnStatement(ctx parser.IReturnStatementContext) *ast.ReturnStmt {
 	}
 
 	return stmt
+}
+
+// parseCurveAnnotation populates result.Curve from @curve(from: (x, y), to: (x, y)).
+// Either end may be omitted, which leaves that end straight.
+func parseCurveAnnotation(params *parser.AnnotationParamsContext, result *ast.ActivityAnnotations) {
+	curve := &ast.FlowCurve{}
+	for _, p := range params.AllAnnotationParam() {
+		pCtx := p.(*parser.AnnotationParamContext)
+		nameCtx := pCtx.AnnotationParamName()
+		if nameCtx == nil {
+			result.InvalidCurves = append(result.InvalidCurves, strings.TrimSpace(pCtx.GetText()))
+			continue
+		}
+		pt, ok := annotationPointValue(pCtx)
+		if !ok {
+			result.InvalidCurves = append(result.InvalidCurves, strings.TrimSpace(pCtx.GetText()))
+			continue
+		}
+		switch strings.ToLower(nameCtx.GetText()) {
+		case "from":
+			curve.From = pt
+		case "to":
+			curve.To = pt
+		default:
+			result.InvalidCurves = append(result.InvalidCurves, strings.TrimSpace(pCtx.GetText()))
+		}
+	}
+	if curve.From != nil || curve.To != nil {
+		result.Curve = curve
+	}
+}
+
+// annotationPointValue reads a `(x, y)` parenthesised annotation value into a
+// Position. Reports false for any other shape — including a non-integer
+// coordinate, which the caller records so validation can refuse it.
+//
+// A free function rather than the Builder method the association anchors use
+// (annotationParenPoint), because extractMicroflowAnnotations has no Builder to
+// report through; the caller records the raw text on the AST instead.
+func annotationPointValue(paramCtx *parser.AnnotationParamContext) (*ast.Position, bool) {
+	paren := paramCtx.AnnotationParenValue()
+	if paren == nil {
+		return nil, false
+	}
+	inner := paren.(*parser.AnnotationParenValueContext).AnnotationParams()
+	if inner == nil {
+		return nil, false
+	}
+	coords := inner.(*parser.AnnotationParamsContext).AllAnnotationParam()
+	if len(coords) != 2 {
+		return nil, false
+	}
+	vals := make([]int, 0, 2)
+	for _, c := range coords {
+		cCtx := c.(*parser.AnnotationParamContext)
+		if cCtx.AnnotationParamName() != nil {
+			return nil, false // named, not a coordinate pair
+		}
+		v, err := strconv.Atoi(strings.TrimSpace(cCtx.GetText()))
+		if err != nil {
+			return nil, false
+		}
+		vals = append(vals, v)
+	}
+	return &ast.Position{X: vals[0], Y: vals[1]}, true
+}
+
+// mergeJoinLabel reads the label off a `merge`/`join` statement. Quoting is
+// what lets a label collide with a keyword, so it is stripped here rather than
+// carried into the AST — the label is matched by string when the merge is
+// resolved, and `join "end"` must find `merge "end"`.
+func mergeJoinLabel(plain, quoted antlr.TerminalNode) string {
+	if quoted != nil {
+		return unquoteIdentifier(quoted.GetText())
+	}
+	if plain != nil {
+		return plain.GetText()
+	}
+	return ""
 }

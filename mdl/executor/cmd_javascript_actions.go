@@ -11,7 +11,11 @@ import (
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/codesection"
+	"github.com/mendixlabs/mxcli/mdl/doccomment"
 	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
+	"github.com/mendixlabs/mxcli/mdl/types"
+	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/javaactions"
 )
 
@@ -64,6 +68,11 @@ func listJavaScriptActions(ctx *ExecContext, moduleName string) error {
 	return writeResult(ctx, result)
 }
 
+// jsSourceOmittedBody is the body DESCRIBE prints for an action whose .js source
+// it cannot read. exec recognises it and writes no source file (#731), as it
+// does for the Java twin, javaSourceOmittedBody.
+const jsSourceOmittedBody = "// JavaScript source not available from this project; body omitted by DESCRIBE."
+
 // describeJavaScriptAction handles DESCRIBE JAVASCRIPT ACTION command.
 func describeJavaScriptAction(ctx *ExecContext, name ast.QualifiedName) error {
 	qualifiedName := name.Module + "." + name.Name
@@ -79,7 +88,7 @@ func describeJavaScriptAction(ctx *ExecContext, name ast.QualifiedName) error {
 	doc = strings.ReplaceAll(doc, "\r", "\n")
 	if doc != "" {
 		sb.WriteString("/**\n")
-		for line := range strings.SplitSeq(doc, "\n") {
+		for line := range strings.SplitSeq(doccomment.Escape(doc), "\n") {
 			sb.WriteString(" * ")
 			sb.WriteString(line)
 			sb.WriteString("\n")
@@ -87,82 +96,27 @@ func describeJavaScriptAction(ctx *ExecContext, name ast.QualifiedName) error {
 		sb.WriteString(" */\n")
 	}
 
-	// Type parameters
-	sb.WriteString("create javascript action ")
+	// Type parameters have no clause of their own: as for Java actions, each is
+	// declared by an `entity <T>` parameter. The `Name<T>` this used to print
+	// after the action name does not parse.
+	sb.WriteString("create or modify javascript action ")
 	sb.WriteString(qualifiedName)
-	if len(jsa.TypeParameters) > 0 {
-		sb.WriteString("<")
-		for i, tp := range jsa.TypeParameters {
-			if i > 0 {
-				sb.WriteString(", ")
-			}
-			sb.WriteString(tp.Name)
-		}
-		sb.WriteString(">")
-	}
+	sb.WriteString(describeFolderClause(ctx, jsa.ContainerID))
 	sb.WriteString("(")
 
-	// Parameters
-	hasParamDescriptions := false
-	for _, p := range jsa.Parameters {
-		if p.Description != "" {
-			hasParamDescriptions = true
-			break
-		}
-	}
-
-	for i, param := range jsa.Parameters {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		if hasParamDescriptions {
-			sb.WriteString("\n    ")
-		}
-		sb.WriteString(param.Name)
-		sb.WriteString(": ")
-		if param.ParameterType != nil {
-			sb.WriteString(formatJavaScriptActionType(param.ParameterType))
-		} else {
-			sb.WriteString("Object")
-		}
-		if param.IsRequired {
-			sb.WriteString(" not null")
-		}
-		if param.Description != "" {
-			paramDoc := strings.ReplaceAll(param.Description, "\r\n", "\n")
-			paramDoc = strings.ReplaceAll(paramDoc, "\r", "\n")
-			firstLine, _, _ := strings.Cut(paramDoc, "\n")
-			sb.WriteString("  -- ")
-			sb.WriteString(firstLine)
-		}
-	}
-	if hasParamDescriptions {
-		sb.WriteString("\n")
-	}
+	// Parameters, each description as the doc comment create reads (see the Java twin).
+	writeCodeActionParams(&sb, jsa.Parameters, formatJavaScriptActionType)
 	sb.WriteString(")")
 
-	// Platform
-	platform := jsa.Platform
-	if platform == "" {
-		platform = "All"
-	}
-	if platform != "All" {
-		sb.WriteString("\n  PLATFORM ")
-		sb.WriteString(platform)
-	}
+	// Clauses are emitted in grammar order (returns, exposed, platform, body) so
+	// the DESCRIBE output re-parses as a CREATE JAVASCRIPT ACTION.
 
 	// Return type
 	if jsa.ReturnType != nil {
 		sb.WriteString("\n  returns ")
 		sb.WriteString(formatJavaActionReturnType(jsa.ReturnType))
 	}
-
-	// RETURN NAME metadata
-	if jsa.ActionDefaultReturnName != "" {
-		sb.WriteString("\n-- return NAME: '")
-		sb.WriteString(jsa.ActionDefaultReturnName)
-		sb.WriteString("'")
-	}
+	sb.WriteString(describeCodeActionReturnName(jsa.ActionDefaultReturnName, jsa.ReturnType != nil))
 
 	// EXPOSED AS clause
 	if jsa.MicroflowActionInfo != nil && jsa.MicroflowActionInfo.Caption != "" {
@@ -171,35 +125,48 @@ func describeJavaScriptAction(ctx *ExecContext, name ast.QualifiedName) error {
 		sb.WriteString("' in '")
 		sb.WriteString(jsa.MicroflowActionInfo.Category)
 		sb.WriteString("'")
-		if jsa.MicroflowActionInfo.Icon != "" {
-			sb.WriteString("\n-- icon: ")
-			sb.WriteString(jsa.MicroflowActionInfo.Icon)
-		}
 	}
 
-	// JavaScript source code
+	// PLATFORM clause (always emitted so the platform setting round-trips).
+	platform := jsa.Platform
+	if platform == "" {
+		platform = "Web"
+	}
+	sb.WriteString("\n  platform ")
+	sb.WriteString(platform)
+
+	// JavaScript source. The grammar requires an `as $$ ... $$` body, so always
+	// emit one; when the .js source can't be read (add-on modules without source
+	// on disk) emit a placeholder so the output still re-parses (cf. #637).
 	userCode, extraCode := readJavaScriptActionSource(ctx.MprPath, name.Module, name.Name)
-	if userCode != "" {
-		sb.WriteString("\nas $$\n")
-		sb.WriteString(userCode)
-		sb.WriteString("\n$$")
+	if userCode == "" {
+		userCode = jsSourceOmittedBody
 	}
-
+	sb.WriteString("\nas ")
+	sb.WriteString(mdlSourceBlock(ctx, userCode))
 	sb.WriteString(";")
 
-	fmt.Fprintln(ctx.Output, sb.String())
+	stmt := sb.String()
+	if gap := jsTypeParameterGap(jsa); gap != "" {
+		// A statement that parses into something else is worse than none:
+		// `EntityObject: T` with no `entity <T>` re-executes as the entity `.T`
+		// (mendixlabs/mxcli#1404). Commented out, the script still parses and
+		// re-running it leaves the stored action as it is.
+		fmt.Fprintf(ctx.Output, "-- NOT re-executable: %s; MDL has no form for this (mendixlabs/mxcli#1404), "+
+			"so the statement is commented out and re-running this script leaves the action unchanged\n", gap)
+		stmt = "-- " + strings.ReplaceAll(stmt, "\n", "\n-- ")
+	}
+	fmt.Fprintln(ctx.Output, stmt)
 
-	// Additional info as comments
+	// Additional info as comments.
+	if jsa.MicroflowActionInfo != nil && len(jsa.MicroflowActionInfo.IconData) > 0 {
+		fmt.Fprintf(ctx.Output, "-- icon: %d bytes\n", len(jsa.MicroflowActionInfo.IconData))
+	}
 	if jsa.ExportLevel != "" && jsa.ExportLevel != "Hidden" {
 		fmt.Fprintf(ctx.Output, "-- export level: %s\n", jsa.ExportLevel)
 	}
 	if jsa.Excluded {
 		fmt.Fprintln(ctx.Output, "-- EXCLUDED: true")
-	}
-	if platform != "All" {
-		// already shown inline
-	} else {
-		fmt.Fprintln(ctx.Output, "-- PLATFORM: All")
 	}
 	if extraCode != "" {
 		fmt.Fprintln(ctx.Output, "-- EXTRA CODE:")
@@ -209,6 +176,62 @@ func describeJavaScriptAction(ctx *ExecContext, name ast.QualifiedName) error {
 	}
 
 	return nil
+}
+
+// jsTypeParameterGap reports why the action's type parameters have no MDL form,
+// or "" when they have one. MDL declares a type parameter only through an
+// `entity <T>` parameter (the visitor collects them in parameter order), so the
+// stored list must be exactly the declared names in that order, and every
+// reference to a type parameter must name one of them.
+func jsTypeParameterGap(jsa *types.JavaScriptAction) string {
+	var declared []string
+	seen := map[string]bool{}
+	for _, p := range jsa.Parameters {
+		e, ok := p.ParameterType.(*types.EntityTypeParameterType)
+		if !ok {
+			continue
+		}
+		if e.TypeParameterName == "" {
+			return fmt.Sprintf("parameter %s is an entity selector bound to no type parameter", p.Name)
+		}
+		if !seen[e.TypeParameterName] {
+			seen[e.TypeParameterName] = true
+			declared = append(declared, e.TypeParameterName)
+		}
+	}
+	refGap := func(what string, t any) string {
+		name, id := "", model.ID("")
+		switch v := t.(type) {
+		case *types.TypeParameter:
+			name, id = v.TypeParameter, v.TypeParameterID
+		case *types.ListType:
+			name, id = v.TypeParameter, v.TypeParameterID
+		}
+		switch {
+		case name == "" && id != "":
+			return what + " points at a type parameter that does not exist"
+		case name != "" && !seen[name]:
+			return fmt.Sprintf("%s is typed by type parameter %s, which no `entity <%s>` parameter declares", what, name, name)
+		}
+		return ""
+	}
+	for _, p := range jsa.Parameters {
+		if gap := refGap("parameter "+p.Name, p.ParameterType); gap != "" {
+			return gap
+		}
+	}
+	if gap := refGap("the return type", jsa.ReturnType); gap != "" {
+		return gap
+	}
+	stored := make([]string, 0, len(jsa.TypeParameters))
+	for _, tp := range jsa.TypeParameters {
+		stored = append(stored, tp.Name)
+	}
+	if strings.Join(stored, ",") != strings.Join(declared, ",") {
+		return fmt.Sprintf("type parameters [%s] are not the ones its `entity <T>` parameters declare, in that order ([%s])",
+			strings.Join(stored, ", "), strings.Join(declared, ", "))
+	}
+	return ""
 }
 
 // readJavaScriptActionSource reads the JavaScript source file and extracts user code and extra code.
@@ -233,33 +256,41 @@ func readJavaScriptActionSource(mprPath, moduleName, actionName string) (userCod
 
 	source := string(content)
 
-	// Extract user code
-	beginUserCode := "// begin user CODE"
-	endUserCode := "// end user CODE"
-	if beginIdx := strings.Index(source, beginUserCode); beginIdx != -1 {
-		if endIdx := strings.Index(source, endUserCode); endIdx != -1 && endIdx > beginIdx {
-			uc := source[beginIdx+len(beginUserCode) : endIdx]
-			uc = strings.TrimPrefix(uc, "\n")
-			uc = strings.TrimSuffix(uc, "\n")
-			uc = strings.TrimRight(uc, " \t")
-			userCode = uc
-		}
+	// Marker casing varies (Studio Pro / the warning banner use uppercase
+	// "BEGIN USER CODE"; some older content used lowercase), so match
+	// case-insensitively.
+	if uc, ok := sliceBetweenFold(source, "// BEGIN USER CODE", "// END USER CODE"); ok {
+		// Relative, as for Java: the writer re-indents every line by one tab,
+		// so printing the stored tab made each round trip add one
+		// (ako/mxcli#2131).
+		userCode = codesection.Normalize(uc)
 	}
-
-	// Extract extra code
-	beginExtraCode := "// begin EXTRA CODE"
-	endExtraCode := "// end EXTRA CODE"
-	if beginIdx := strings.Index(source, beginExtraCode); beginIdx != -1 {
-		if endIdx := strings.Index(source, endExtraCode); endIdx != -1 && endIdx > beginIdx {
-			ec := source[beginIdx+len(beginExtraCode) : endIdx]
-			ec = strings.TrimSpace(ec)
-			if ec != "" {
-				extraCode = ec
-			}
-		}
+	if ec, ok := sliceBetweenFold(source, "// BEGIN EXTRA CODE", "// END EXTRA CODE"); ok {
+		extraCode = strings.TrimSpace(ec)
 	}
 
 	return userCode, extraCode
+}
+
+// sliceBetweenFold returns the substring of s between the first case-insensitive
+// occurrence of begin and the following case-insensitive occurrence of end.
+//
+// Only ASCII letters are folded. strings.ToLower changes the byte length of some
+// characters ("İ" 2 -> 3 bytes, the Kelvin sign 3 -> 1), so an index into its
+// result is not an index into s, and one such character above the markers cut
+// the section a byte off — the markers are ASCII, so nothing else needs folding.
+func sliceBetweenFold(s, begin, end string) (string, bool) {
+	lower := asciiLower(s)
+	bi := strings.Index(lower, asciiLower(begin))
+	if bi == -1 {
+		return "", false
+	}
+	rest := bi + len(begin)
+	ei := strings.Index(lower[rest:], asciiLower(end))
+	if ei == -1 {
+		return "", false
+	}
+	return s[rest : rest+ei], true
 }
 
 // formatJavaScriptActionType formats a JavaScript action parameter type for MDL output.
@@ -267,12 +298,19 @@ func formatJavaScriptActionType(t javaactions.CodeActionParameterType) string {
 	if t == nil {
 		return "Object"
 	}
-	// EntityTypeParameterType → ENTITY <name> syntax
-	if etp, ok := t.(*javaactions.EntityTypeParameterType); ok {
-		if etp.TypeParameterName != "" {
-			return "entity <" + etp.TypeParameterName + ">"
-		}
-		return "entity <>"
+	if s, ok := formatCodeActionTypeParameterRef(t); ok {
+		return s
 	}
 	return t.TypeString()
+}
+
+// asciiLower lower-cases ASCII letters only, so the result has s's byte offsets.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
 }

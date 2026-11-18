@@ -89,7 +89,7 @@ Activities like CREATE and RETRIEVE produce result variables:
 
 ```sql
 $Order = CREATE Sales.Order (Status = 'New');
-RETRIEVE $Customer FROM Sales.Customer WHERE Email = $Email LIMIT 1;
+RETRIEVE $Customer FROM Sales.Customer WHERE Email = $Email FIRST;
 $Result = CALL MICROFLOW Sales.CalculateTotal (Order = $Order);
 ```
 
@@ -117,6 +117,17 @@ RETURN $Order;
 RETURN $FilteredOrders;
 ```
 
+### Returning an Enumeration
+
+Declare the type in the signature with `returns enum Module.Name`; `returns Enumeration(Module.Name)` is the same. A bare `returns Module.Name` is also accepted when no entity has that name and an enumeration does. If an entity and an enumeration share the name, the entity wins, so write `enum` when a name could be either. Nanoflows and rules take the same spellings, and a rule must return a Boolean or an enumeration.
+
+```sql
+CREATE MICROFLOW Shop.SUB_Pick () RETURNS enum Shop.Variant AS $Variant
+BEGIN
+  RETURN Shop.Variant.Original;
+END;
+```
+
 ### Returning Nothing
 
 If the microflow returns nothing (void), you can omit the `RETURN` or use:
@@ -137,6 +148,112 @@ Set the canvas position of the next activity:
 @position(200, 100)
 $Order = CREATE Sales.Order (Status = 'New');
 ```
+
+Positions are optional. A microflow written without them is laid out by mxcli: the
+main line runs left to right and wraps onto a new row once it passes two canvas
+widths (2880 px); a guard — `if … then …; return; end if` — drops its branch into the
+lane below while the main line carries on above it; a custom error handler's row hangs
+in that same lane, 130 px under its activity; and a `case` of four or more branches
+leaves the decision in three groups (top, right, bottom) so its lines do not cross.
+Whatever reaches down into the lane — a decision, a loop, an activity with an error
+handler of its own — waits for the lane to clear, so two consecutive handlers never
+share a row; a plain activity does not wait. A statement that carries `@position` is
+never moved, and becomes the start of the row for the statements after it; the
+statements before it keep the places the builder derives for them, and only a
+`@position` on the first statement moves the start event. So either place everything
+or nothing: a few hand-placed statements are not measured against what is laid out
+around them.
+
+That is the default style. A project can choose another — the ELSE branch as a
+column under its decision, a guard's early return kept on the line, no wrapping —
+in a committed `layout-config.yaml`; flows written without `@position` then follow
+it. See [Choosing a layout style](../tools/flow-layout.md#choosing-a-layout-style).
+
+To re-arrange a flow that already exists — one drawn in Studio Pro, or one whose
+positions no longer fit after edits — run `mxcli layout flows`. It applies this
+same layout to the stored flow and changes nothing but coordinates; see
+[Microflow and Nanoflow Layout](../tools/flow-layout.md).
+
+### Start event
+
+The start event has no statement of its own, so `@start` goes on the **first**
+statement — the one the start flows into:
+
+```sql
+@start(145, 200)
+@position(260, 200)
+$Order = CREATE Sales.Order (Status = 'New');
+```
+
+It is optional. Omitted, the start is placed one spacing unit left of the first
+activity on that activity's centre line, and a rewrite re-derives it so the start
+follows the activities when they move. A start that is *not* at that derived spot
+was placed on purpose — in Studio Pro or with `@start` — so it survives a rewrite
+that does not mention it, and `DESCRIBE` emits an `@start` line for it. An
+explicit `@start` overrides both.
+
+### Anchors
+
+`@anchor(from: X, to: Y)` picks the side (`top`, `right`, `bottom`, `left`) each
+end of a flow attaches to: `to` is the flow arriving at the statement, `from` the
+flow leaving it. On an `if`, `true: (from: …, to: …)` and `false: (…)` are its
+branches, and `from` is the flow leaving its closing merge — the merge has no
+statement of its own, just as its position rides on the `if` as `@merge`:
+
+```sql
+create microflow Sales.ACT_CheckFactory ($Factory: Sales.Factory)
+begin
+  @anchor(from: bottom, to: top)
+  @merge(2650, 200)
+  if $Factory/Latitude = empty then
+    log warning node 'Factory' 'No location';
+  end if;
+end;
+```
+
+This is how `DESCRIBE` writes a decision whose merge drops onto the next row.
+
+An annotation never reaches the far end of its own outgoing flow: that end is
+the next statement's `to:`. A straight vertical edge from A down to B is
+`@anchor(from: bottom)` on A **and** `@anchor(to: top)` on B.
+
+A `case` names each outcome's edge by its `when` value, `(empty)` included, and
+its own `from:` is the flow leaving its merge, as on an `if`:
+
+```sql
+create microflow Sales.ACT_RouteOrder ($Order: Sales.Order)
+begin
+  @anchor(Open: (from: right), (empty): (from: bottom, to: top))
+  case $Order/Status
+    when Open then
+      log info node 'Order' 'open';
+    when Closed then
+      log info node 'Order' 'closed';
+    when (empty) then
+      log warning node 'Order' 'no status';
+  end case;
+end;
+```
+
+An outcome not named keeps its default side (with up to three outcomes: the
+first leaves the top corner, the second the right, the third the bottom).
+`DESCRIBE` writes an outcome only where its stored side differs from that.
+
+### Layout in `DESCRIBE` output
+
+`DESCRIBE MICROFLOW` and `DESCRIBE NANOFLOW` print a layout annotation —
+`@position`, `@merge`, `@anchor`, `@curve`, `@start` — only where the layout
+would not produce it on its own. A flow written without annotations describes
+without them. A statement placed by hand keeps its `@position`, and the
+statements the layout places after it follow from it without one.
+
+Whether an annotation is needed is not guessed from the coordinates. `DESCRIBE`
+builds the flow again from its own output, exactly as `CREATE OR MODIFY` would
+(nothing is written), and every node that lands elsewhere keeps its annotation.
+So re-executing a description never moves a node: a flow drawn in Studio Pro
+comes back with its layout, because Studio Pro positions are not ones the layout
+produces. `DESCRIBE … WITH HANDLES` and `DESCRIBE … NORMALIZED` still print every
+annotation.
 
 ### Caption
 
@@ -165,6 +282,42 @@ Attach a visual annotation note to the next activity:
 VALIDATION FEEDBACK $Customer/Email MESSAGE 'Email is required';
 ```
 
+A note is a node of its own, so one note can document several activities. Give it
+an `id:` at its first mention and refer to that id afterwards; without the id, two
+notes with the same text stay two notes:
+
+```sql
+@annotation(id: n1, text: 'Both of these touch the same record')
+COMMIT $Order;
+@annotation(id: n1)
+COMMIT $Invoice;
+```
+
+The id is scoped to the statement being written and is not stored in the model:
+`DESCRIBE` numbers shared notes afresh every time.
+
+### Attaching a Note Already in the Flow
+
+`ALTER MICROFLOW` (and `ALTER NANOFLOW`) inserts or replaces a fragment of a stored
+flow. The fragment cannot see the `id:` labels `DESCRIBE` prints, so it names a note
+that is already in the flow by its **text**, with `existing:`:
+
+```sql
+ALTER MICROFLOW Sales.ACT_ProcessOrder {
+  INSERT AFTER LOG NODE 'Sales' 'validated' BEGIN
+    @annotation(existing: 'Validates the order')
+    LOG INFO NODE 'Sales' 'discount applied';
+  END;
+};
+```
+
+The new activity is joined to the stored note, which keeps its identity, text and
+place on the canvas. The text must match exactly one note of the flow, as `DESCRIBE`
+prints it; when no note matches, or several do, the statement is refused and the
+message lists the flow's notes. `existing:` never creates a note and takes no other
+parameter, and only an `ALTER` fragment accepts it — a `CREATE` states the whole
+flow and declares its notes.
+
 ### Combining Annotations
 
 Multiple annotations can be stacked before a single activity:
@@ -174,7 +327,7 @@ Multiple annotations can be stacked before a single activity:
 @caption 'Validate and save'
 @color Green
 @annotation 'Final step: commit the validated order'
-COMMIT $Order WITH EVENTS;
+COMMIT $Order;
 ```
 
 ## Complete Example

@@ -1,11 +1,11 @@
 # Full-Text Search
 
-The `SEARCH` command performs full-text search across all strings and source code in a Mendix project. It searches element names, documentation, captions, expressions, and other string content.
+The `SEARCH` command performs full-text search across all strings and source code in a Mendix project. It searches captions, messages, the documentation of project elements (entities, attributes, constants, pages and more), and MDL source.
 
 ## Syntax
 
 ```sql
-SEARCH '<keyword>'
+SEARCH '<keyword>';
 ```
 
 ## Examples
@@ -37,15 +37,29 @@ mxcli search -p app.mpr "validation" -q
 mxcli search -p app.mpr "validation" -q --format names
 
 # Output as JSON array
-mxcli search -p app.mpr "validation" -q --format json
+mxcli search -p app.mpr "validation" --json
+
+# Exit 1 when anything matches (0 when nothing does)
+mxcli search -p app.mpr "validation" --fail-on-match
+
+# Leave out Marketplace modules
+mxcli search -p app.mpr "validation" --exclude-marketplace
 ```
 
 ## Output Formats
 
-| Format | Description |
-|--------|-------------|
-| `names` (default) | `type<TAB>name` per line, suitable for piping |
-| `json` | JSON array of search results |
+| Flag | Description |
+|------|-------------|
+| `--format table` (default) | Human-readable tables of string and source matches |
+| `--format names` | `type<TAB>name` per line, suitable for piping |
+| `--json` | JSON array of search results |
+
+`--json` is the same flag every query command takes (`refs`, `callers`,
+`callees`, `impact`, `context`, `show`, `describe`, `-c "select …"`). With it,
+stdout carries the JSON document and nothing else — connection and catalog
+progress go to stderr, an empty result is `[]`, and an error is a message on
+stderr with a non-zero exit. `--format json` is still accepted as a deprecated
+spelling of `--json`.
 
 The `-q` (quiet) flag suppresses headers and formatting, making output suitable for piping to other commands.
 
@@ -61,16 +75,69 @@ mxcli search -p app.mpr "error" -q --format names | head -1 | awk '{print $2}' |
 
 ## What Gets Searched
 
-The search command looks through:
+`SEARCH` looks in two indexes, and says which one a hit came from.
 
-- Element names (entities, microflows, pages, etc.)
-- Documentation comments
-- Attribute names and captions
-- Expression strings in microflows
-- Widget captions and labels
-- Enumeration value captions
-- Log message strings
-- Validation feedback messages
+**Strings** (a full catalog, built automatically):
+
+- Every translatable text: page titles, widget captions and labels, enumeration value captions, button and menu captions, show-message and validation-feedback texts, in every language
+- Log messages and log node names of microflows
+- Page URLs and the paths, resources and operation summaries of published REST services
+- Workflow names, descriptions, task names and activity captions
+- Agents' system and user prompts, descriptions, and the descriptions of their tools and knowledge bases, with the title a tool call shows the user (`ObjectType` `AGENT`; `StringContext` `system_prompt`, `user_prompt`, `agent_description`, `tool_description`, `tool_display_title`, `tool_display_description`, `knowledge_base_description`), and a published MCP service's tool descriptions and titles (`PUBLISHED_MCP_SERVICE`; `mcp_tool_description`, `mcp_tool_title`)
+- Element names: the qualified name is a searchable column too, so `SEARCH 'Customer'` also returns the rows of elements named Customer that have some indexed text
+- **Documentation of project elements.** A hit's `ObjectType` names the element and its `StringContext` is `documentation`:
+
+  | Documented element | `ObjectType` |
+  |--------------------|--------------|
+  | Entity | `ENTITY` |
+  | Attribute (qualified `Module.Entity.Attribute`) | `ATTRIBUTE` |
+  | Association | `ASSOCIATION` |
+  | Enumeration | `ENUMERATION` |
+  | Constant | `CONSTANT` |
+  | Page, snippet, layout, building block, page template | `PAGE`, `SNIPPET`, `LAYOUT`, `BUILDING_BLOCK`, `PAGE_TEMPLATE` |
+  | Microflow, nanoflow, rule | `MICROFLOW`, `NANOFLOW`, `RULE` |
+  | Workflow | `WORKFLOW` |
+  | Java action, JavaScript action | `JAVA_ACTION`, `JAVASCRIPT_ACTION` |
+  | Microflow parameter, Java action parameter (qualified `Module.Flow.Parameter`) | `MICROFLOW_PARAMETER`, `JAVA_ACTION_PARAMETER` |
+  | Consumed and published REST service, business event service | `CONSUMED_REST_SERVICE`, `PUBLISHED_REST_SERVICE`, `BUSINESS_EVENT_SERVICE` |
+  | Import mapping, export mapping, JSON structure, data transformer | `IMPORT_MAPPING`, `EXPORT_MAPPING`, `JSON_STRUCTURE`, `DATA_TRANSFORMER` |
+  | Scheduled event, task queue, regular expression, image and icon collection, menu | `SCHEDULED_EVENT`, `TASK_QUEUE`, `REGULAR_EXPRESSION`, `IMAGE_COLLECTION`, `ICON_COLLECTION`, `MENU` |
+  | Agent, AI model, knowledge base, consumed and published MCP service | `AGENT`, `AI_MODEL`, `KNOWLEDGE_BASE`, `CONSUMED_MCP_SERVICE`, `PUBLISHED_MCP_SERVICE` |
+  | A module's domain model documentation | `MODULE`, with `StringContext` `domain_model_documentation` |
+
+  This is the complete set: every document type whose catalog table carries a documentation text. Not covered: the documentation of an enumeration value (Mendix has no such field) and the summary text of a remote service's contract entities (written by the remote service, not by the project).
+
+**MDL source**: microflow, nanoflow and page bodies, expressions and the other definitions as MDL text, through the source index. The first search builds that index and says so on stderr. On a large project this takes a while, once. After a model change it is brought up to date incrementally: only the documents that changed, or that name one that did, are described again.
+
+## Searching without building the source index
+
+`--no-build` never builds the source index. That suits a caller that must stay cheap or must not write the catalog cache beyond what it already holds. If the project has a source index, the search is complete. If it has none, only string literals and documentation are searched: a warning on stderr says so, and the command exits `3`. A script can therefore never take "No matches found." for a complete answer.
+
+```bash
+mxcli search -p app.mpr "SUB_Do" --no-build --json   # exit 3 when the source index is missing
+```
+
+## Failing on a match
+
+`--fail-on-match` turns `search` into a gate. The results are printed as usual (a JSON array under `--json`), and the exit status carries the answer:
+
+| Exit status | Meaning |
+|-------------|---------|
+| `0` | No hit |
+| `1` | At least one hit |
+| `2` | The search could not run: an unknown project, or a query the index rejects (an unbalanced `"`, say) |
+| `3` | With `--no-build` and no source index, no hit was found but the MDL source was not searched |
+
+```bash
+# Refuse the change if a placeholder is left anywhere in the project's text
+mxcli search -p app.mpr "TODO" --fail-on-match --json
+```
+
+Without the flag a hit exits `0`, as before.
+
+## Marketplace modules
+
+By default every module is searched, Marketplace modules included, so existing results do not change. `--exclude-marketplace` leaves out hits inside modules downloaded from the Marketplace, which is what an audit of the app's own text usually wants: the vendor's documentation is not yours to edit. A Marketplace module's own documentation and domain model documentation are left out with the rest of it.
 
 ## Comparison with Catalog Queries
 

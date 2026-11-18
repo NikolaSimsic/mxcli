@@ -25,7 +25,7 @@ Name: String(200) NOT NULL
 With a custom error message displayed to the user:
 
 ```sql
-Name: String(200) NOT NULL ERROR 'Name is required'
+Name: String(200) NOT NULL ERROR MESSAGE 'Name is required'
 ```
 
 ## UNIQUE
@@ -39,7 +39,7 @@ Email: String(200) UNIQUE
 With a custom error message:
 
 ```sql
-Email: String(200) UNIQUE ERROR 'Email already exists'
+Email: String(200) UNIQUE ERROR MESSAGE 'Email already exists'
 ```
 
 ## DEFAULT
@@ -71,13 +71,45 @@ Omitting the `DEFAULT` clause means no default value is set:
 OptionalField: String(200)
 ```
 
+## LOCALIZED / NOT LOCALIZED (DateTime only)
+
+Studio Pro's **Localize** setting on a DateTime attribute (`LocalizeDate` in the
+model). A localized DateTime is converted to the user's time zone when it is
+shown or entered; a non-localized one is not, which is what a calendar date such
+as a birth date needs — otherwise it can show as the day before for a user west
+of UTC.
+
+```text
+OrderDate: DateTime,                -- localized (Mendix's default)
+BirthDate: DateTime NOT LOCALIZED,  -- not localized
+```
+
+- `LOCALIZED` states the default explicitly. It is mostly useful on `ALTER ENTITY
+  … MODIFY ATTRIBUTE` to switch a non-localized attribute back, the way
+  `NULLABLE` clears `NOT NULL`.
+- On a **new** attribute, no clause means localized.
+- On a **rewrite** — `CREATE OR MODIFY ENTITY` or `MODIFY ATTRIBUTE` — no clause
+  keeps the value already stored (a Studio Pro-authored non-localized attribute
+  stays non-localized); a stated clause wins. When the keep is a stored
+  `not localized`, the statement prints a `Note:` naming the attribute and the
+  `DateTime localized` spelling that changes it.
+- On a **view entity** the value follows the OQL source attribute and needs no
+  clause; a stated one overrides it, and a mismatch with the source is CE6770.
+- On any type other than DateTime the clause is an error: there is nowhere to
+  store it.
+- `DESCRIBE ENTITY` prints ` not localized` (right after the type) when the
+  attribute is not localized, and nothing otherwise, so its output round-trips.
+
+The deprecated `Date` type (MDL-DEPR160) is a localized DateTime. For a
+date-only value write `DateTime NOT LOCALIZED`.
+
 ## Combining Constraints
 
 All three constraints can be used together:
 
 ```sql
-Email: String(200) NOT NULL ERROR 'Email is required'
-                   UNIQUE ERROR 'Email already exists'
+Email: String(200) NOT NULL ERROR MESSAGE 'Email is required'
+                   UNIQUE ERROR MESSAGE 'Email already exists'
                    DEFAULT ''
 ```
 
@@ -89,14 +121,14 @@ CREATE PERSISTENT ENTITY Sales.Product (
   Name: String(200) NOT NULL,
 
   -- Required with custom error
-  SKU: String(50) NOT NULL ERROR 'SKU is required for all products',
+  SKU: String(50) NOT NULL ERROR MESSAGE 'SKU is required for all products',
 
   -- Unique only
   Barcode: String(50) UNIQUE,
 
   -- Required and unique with custom errors
-  ProductCode: String(20) NOT NULL ERROR 'Product code required'
-                          UNIQUE ERROR 'Product code must be unique',
+  ProductCode: String(20) NOT NULL ERROR MESSAGE 'Product code required'
+                          UNIQUE ERROR MESSAGE 'Product code must be unique',
 
   -- Default only
   Quantity: Integer DEFAULT 0,
@@ -114,6 +146,9 @@ Under the hood, constraints map to Mendix validation rules:
 |----------------|----------------------|
 | `NOT NULL` | `DomainModels$RequiredRuleInfo` |
 | `UNIQUE` | `DomainModels$UniqueRuleInfo` |
+
+`LOCALIZED` / `NOT LOCALIZED` is not a validation rule: it is the
+`LocalizeDate` property of the attribute's `DomainModels$DateTimeAttributeType`.
 
 ## See Also
 

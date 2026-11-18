@@ -9,9 +9,9 @@ import (
 	"strings"
 
 	bsondebug "github.com/mendixlabs/mxcli/cmd/mxcli/bson"
-	"github.com/mendixlabs/mxcli/sdk/mpr"
+	mpr "github.com/mendixlabs/mxcli/modelsdk/mpr"
 	"github.com/spf13/cobra"
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 var bsonDumpCmd = &cobra.Command{
@@ -40,7 +40,7 @@ Examples:
   mxcli bson dump -p app.mpr --type page --object "PgTest.MyPage"
 
   # Compare two objects (outputs both as JSON for diff)
-  mxcli bson dump -p app.mpr --type page --compare "PgTest.Broken" "PgTest.Fixed"
+  mxcli bson dump -p app.mpr --type page --compare "PgTest.Broken,PgTest.Fixed"
 
   # Save dump to file
   mxcli bson dump -p app.mpr --type page --object "PgTest.MyPage" > mypage.json

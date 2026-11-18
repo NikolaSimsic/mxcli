@@ -9,10 +9,12 @@ mxcli works with Mendix project files -- the `.mpr` files that Mendix Studio Pro
 The most common way to point mxcli at a project is with the `-p` flag:
 
 ```bash
-mxcli -p /path/to/app.mpr -c "SHOW MODULES"
+mxcli -p /path/to/app.mpr -c "LIST MODULES"
 ```
 
 This opens the project in read-only mode, runs the command, and exits. The `-p` flag works with all mxcli subcommands.
+
+`-c` takes several statements separated by `;`. Like `mxcli exec`, it stops at the first statement that fails, prints `statement 2 of 3: …` and how many later statements were not run, and exits non-zero; add `--continue-on-error` to run every statement and report each failure. An empty `-c ""` is an error: it never opens the interactive REPL, so a script that generates an empty command list cannot hang waiting on input.
 
 ## Opening in the REPL
 
@@ -25,7 +27,7 @@ mxcli
 
 ```sql
 OPEN PROJECT '/path/to/app.mpr';
-SHOW MODULES;
+LIST MODULES;
 ```
 
 Or pass `-p` when launching the REPL so it opens the project immediately:
@@ -36,7 +38,7 @@ mxcli -p /path/to/app.mpr
 
 ```sql
 -- Project is already open, start working
-SHOW MODULES;
+LIST MODULES;
 ```
 
 When you provide `-p`, the project stays open for the duration of your REPL session. You don't need to pass it again for each command.
@@ -71,7 +73,7 @@ The Dev Container sets the working directory to your project root, so relative p
 Once you have a project open, try listing the modules:
 
 ```bash
-mxcli -p app.mpr -c "SHOW MODULES"
+mxcli -p app.mpr -c "LIST MODULES"
 ```
 
 You should see a table of module names. If you see your project's modules listed, everything is working and you're ready to explore.

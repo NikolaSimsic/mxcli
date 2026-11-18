@@ -1,7 +1,10 @@
 # Implementation Plan — Adopt the modelsdk engine on `main`, behind a feature flag with dual-engine comparison
 
 **Date:** 2026-06-05
-**Status:** Draft plan
+**Status:** Superseded — the engine was adopted and became the default; the legacy engine it was
+flagged against was then deleted by
+[`2026-09-14-retire-legacy-engine.md`](2026-09-14-retire-legacy-engine.md). Kept for the design
+record; the dual-engine and feature-flag machinery it describes no longer exists.
 **Implements:** the "vendor the engine into `main`" path from
 [`PROPOSAL_backend_strategy.md`](../11-proposals/PROPOSAL_backend_strategy.md) (Option 3 evolved
 into a sequencing plan) — *keep `main` canonical and our product surface intact; lift the one
@@ -251,7 +254,7 @@ No forced early v2 migration.
 | Vendor `modelsdk/` + `unitstore` + read fixture; `mongo-driver/v2` coexists | ✅ done | `b1536ba7` |
 | Java-action `mdl/types` reconciliation (alias re-export; fixes 3 pkgs) | ✅ done | `b1536ba7` |
 | `MXCLI_ENGINE` / `--engine` selection seam (legacy wired; modelsdk/compare fail-fast) | ✅ done | `1e8ec679` |
-| Vendor engalar codegen + `TypeVersionInfo` type-level bound fix | ⏳ todo | — |
+| Vendor engalar codegen + `TypeVersionInfo` type-level bound fix | ❌ **decided against vendoring** | [PROPOSAL_codegen_ownership.md](../11-proposals/PROPOSAL_codegen_ownership.md) — its input (the TypeScript SDK) has no storage names, so regenerating reintroduces 102 wrong BSON keys. Hand overrides + `keyaudit_test.go` ledger instead; `TypeVersionInfo` fix still open |
 | Comparison harness — **read side** (`mdl/enginecompare` + `make engine-diff`) | ✅ done | `6a1fd4e2` |
 | Comparison harness — write/BSON side (port `cmd_bson_dump`/`cmd_bson_compare`, ID-canonicalizer) | ⏳ Phase-2-gated on the modelsdk write path | — |
 

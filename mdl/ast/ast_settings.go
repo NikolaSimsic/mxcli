@@ -11,20 +11,53 @@ type AlterSettingsStmt struct {
 	ConstantId   string // Qualified constant name
 	Value        string // Constant value
 	DropConstant bool   // If true, remove the constant override instead of setting it
+	// For LANGUAGE ADD/REMOVE: the ISO code of the language to enable or
+	// disable. A language is identified by its code alone — Studio Pro derives
+	// the display name ("Arabic, Sudan") from `ar_SD` and does not store it.
+	LanguageCode   string
+	AddLanguage    bool
+	ModifyLanguage bool
+	// UpsertLanguage is ADD OR MODIFY: enable the language when it is not there,
+	// change the named options when it is. It is what DESCRIBE emits, so a
+	// described project re-executes against a project that already has some of
+	// its languages.
+	UpsertLanguage bool
+	RemoveLanguage bool
+	// For WORKFLOWS ADD/MODIFY/REMOVE GROUP: the group's name. A
+	// Settings$WorkflowGroup declares Name and Description and no identifier, so
+	// the name is the group's identity — the same reason a language is addressed
+	// by its code.
+	GroupName   string
+	AddGroup    bool
+	ModifyGroup bool
+	// UpsertGroup is ADD OR MODIFY: add the group when it is not there, change
+	// its description when it is. It is what DESCRIBE emits, so a described
+	// project re-executes against a project that already has some of its groups.
+	UpsertGroup bool
+	RemoveGroup bool
 }
 
 func (s *AlterSettingsStmt) isStatement() {}
 
 // CreateConfigurationStmt represents CREATE CONFIGURATION 'name' [properties...].
 type CreateConfigurationStmt struct {
-	Name       string
-	Properties map[string]any
+	CreateGuard // `create … if not exists` (ako/mxcli#731)
+	Name        string
+	Properties  map[string]any
+	// CreateOrModify is CREATE OR MODIFY: update the configuration when it is
+	// already there instead of refusing. The grammar has always accepted the
+	// prefix — `CREATE (OR (MODIFY|REPLACE))?` is generic — so without this the
+	// documented upsert parsed and then behaved as a plain CREATE, answering
+	// "configuration already exists" to the statement whose whole point is that
+	// it should not.
+	CreateOrModify bool
 }
 
 func (s *CreateConfigurationStmt) isStatement() {}
 
 // DropConfigurationStmt represents DROP CONFIGURATION 'name'.
 type DropConfigurationStmt struct {
+	DropGuard
 	Name string
 }
 

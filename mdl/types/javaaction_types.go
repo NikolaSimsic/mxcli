@@ -35,12 +35,22 @@ type TypeParameterDef struct {
 }
 
 // MicroflowActionInfo exposes a Java action as a toolbox item in Studio Pro.
+//
+// The four *Data fields are the inline toolbox icon/image bitmaps. In Mendix
+// BSON they are binary (byte[]) primitives that must ALWAYS be present and
+// non-null — emitting BSON null (or omitting them) crashes Studio Pro's
+// UnitWriter on re-serialize ("Null value found in primitive property
+// 'ImageDataStorage'"); see issue #656. An empty bitmap is an empty binary, not
+// null. The legacy `Icon` string field (a key removed from the current
+// metamodel) was dropped.
 type MicroflowActionInfo struct {
 	model.BaseElement
-	Caption   string `json:"caption,omitempty"`
-	Category  string `json:"category,omitempty"`
-	Icon      string `json:"icon,omitempty"`
-	ImageData string `json:"imageData,omitempty"`
+	Caption       string `json:"caption,omitempty"`
+	Category      string `json:"category,omitempty"`
+	IconData      []byte `json:"iconData,omitempty"`
+	IconDataDark  []byte `json:"iconDataDark,omitempty"`
+	ImageData     []byte `json:"imageData,omitempty"`
+	ImageDataDark []byte `json:"imageDataDark,omitempty"`
 }
 
 // TypeParameter represents a generic type parameter reference in a return type or parameter type.
@@ -155,14 +165,25 @@ func (e EntityType) TypeString() string {
 }
 
 // ListType represents a list type.
+//
+// The element is either a concrete entity (Entity) or a type parameter
+// (TypeParameterID, a BY_ID reference to a TypeParameterDef, with TypeParameter
+// its resolved name) — Studio Pro's "List of <type parameter>". Reading the
+// latter as Entity "" made it describe as a bare `List` and rewrite as a list of
+// an entity with no name (mendixlabs/mxcli#1183).
 type ListType struct {
 	model.BaseElement
-	Entity string `json:"entity,omitempty"` // Qualified entity name for list items
+	Entity          string   `json:"entity,omitempty"`          // Qualified entity name for list items
+	TypeParameter   string   `json:"typeParameter,omitempty"`   // resolved type-parameter name, when the element is one
+	TypeParameterID model.ID `json:"typeParameterId,omitempty"` // BY_ID reference to TypeParameterDef
 }
 
 func (ListType) isCodeActionReturnType()    {}
 func (ListType) isCodeActionParameterType() {}
 func (l ListType) TypeString() string {
+	if l.TypeParameter != "" {
+		return "List of " + l.TypeParameter
+	}
 	if l.Entity != "" {
 		return "List of " + l.Entity
 	}
@@ -181,6 +202,23 @@ func (s StringTemplateParameterType) TypeString() string {
 		return "StringTemplate(" + s.Grammar + ")"
 	}
 	return "StringTemplate"
+}
+
+// CustomBlobDocumentType is a parameter whose value is a document of a custom
+// (extension-defined) document type — CodeActions$CustomBlobDocumentParameterType,
+// e.g. AgentEditorCommons' `Agent` parameter, of type "agenteditor.agent". A
+// call passes the document by name, never an expression. Read as a String, it
+// described as `String` and a call bound it as an expression (CE0115,
+// ako/mxcli#1451).
+type CustomBlobDocumentType struct {
+	model.BaseElement
+	DocumentType string `json:"documentType,omitempty"` // CustomDocumentTypeName, e.g. "agenteditor.agent"
+	ReadableName string `json:"readableName,omitempty"` // CustomDocumentReadableTypeName, e.g. "Agent"
+}
+
+func (CustomBlobDocumentType) isCodeActionParameterType() {}
+func (c CustomBlobDocumentType) TypeString() string {
+	return "Document(" + c.DocumentType + ")"
 }
 
 // FileDocumentType represents a file document type.

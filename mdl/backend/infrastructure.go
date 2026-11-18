@@ -12,7 +12,17 @@ import (
 type RenameBackend interface {
 	UpdateQualifiedNameInAllUnits(oldName, newName string) (int, error)
 	RenameReferences(oldName, newName string, dryRun bool) ([]types.RenameHit, error)
-	RenameDocumentByName(moduleName, oldName, newName string) error
+	// RenameDocument rewrites the Name of the document unit id from oldName to
+	// newName, refusing when the unit is not a document or is not named oldName.
+	//
+	// The caller passes the ID of the document it resolved, of the kind it was
+	// asked to rename, rather than a name to look up again. Its predecessor,
+	// RenameDocumentByName, took a module and a bare name and rewrote the first
+	// unit in the module's containers carrying that Name, whatever its $Type —
+	// and a folder is such a unit. A page in a folder of its own name, a common
+	// layout, therefore had its FOLDER renamed while every reference was pointed
+	// at a page that did not exist (ako/mxcli#1443, CE1613).
+	RenameDocument(id model.ID, oldName, newName string) error
 }
 
 // RawUnitBackend provides low-level unit access for operations that
@@ -24,16 +34,47 @@ type RawUnitBackend interface {
 	ListRawUnits(objectType string) ([]*types.RawUnitInfo, error)
 	GetRawUnitByName(objectType, qualifiedName string) (*types.RawUnitInfo, error)
 	GetRawMicroflowByName(qualifiedName string) ([]byte, error)
+	// AddRawUnit inserts a new unit with the given contents.
+	//
+	// The raw counterpart to the typed Create* methods, for a caller copying
+	// units it does not decode — the marketplace module transplant moves a
+	// whole module's units between projects verbatim, which is the point: a
+	// decode and re-encode would rewrite identities the runtime keys on (see
+	// CLAUDE.md on GUIDs).
+	//
+	// Takes strings (not model.ID) to match the writer layer convention, as
+	// UpdateRawUnit does.
+	AddRawUnit(unitID, containerID, containmentName, unitType string, contents []byte) error
+
 	// UpdateRawUnit replaces the contents of a unit by ID.
 	// Takes string (not model.ID) to match the SDK writer layer convention.
 	UpdateRawUnit(unitID string, contents []byte) error
+	// UpdateRawUnitOwningTranslations is UpdateRawUnit for a write that started
+	// from the stored bytes and is authoritative about the translations in them.
+	//
+	// The ordinary path carries the stored translations onto a write, because a
+	// rebuild from MDL can express only one string per text and would otherwise
+	// delete the rest. A targeted patch is the opposite case: a translation
+	// missing from its output is missing on purpose, and carrying it back would
+	// undo a deliberate deletion.
+	UpdateRawUnitOwningTranslations(unitID string, contents []byte) error
+
+	// UpdateRawUnitOwningStorageGUIDs is UpdateRawUnit for a write that
+	// deliberately transplants storage GUIDs onto elements that keep their $ID.
+	//
+	// The write path refuses that pattern by default, because for every ordinary
+	// write it means the database's identity for an element was dropped and the
+	// next deploy will drop its column (#1119). The marketplace module update is
+	// the exception: it captures a module's GUIDs and puts them back onto the
+	// documents replacing it, which is what stops an update destroying that
+	// module's data. Only a caller doing that may use this.
+	UpdateRawUnitOwningStorageGUIDs(unitID string, contents []byte) error
 }
 
 // MetadataBackend provides project-level metadata and introspection.
 type MetadataBackend interface {
 	ListAllUnitIDs() ([]string, error)
 	ListUnits() ([]*types.UnitInfo, error)
-	GetUnitTypes() (map[string]int, error)
 	GetProjectRootID() (string, error)
 	ContentsDir() string
 	ExportJSON() ([]byte, error)
@@ -62,6 +103,10 @@ type AgentEditorBackend interface {
 	CreateAgentEditorConsumedMCPService(c *agenteditor.ConsumedMCPService) error
 	UpdateAgentEditorConsumedMCPService(c *agenteditor.ConsumedMCPService) error
 	DeleteAgentEditorConsumedMCPService(id string) error
+	ListAgentEditorPublishedMCPServices() ([]*agenteditor.PublishedMCPService, error)
+	CreateAgentEditorPublishedMCPService(p *agenteditor.PublishedMCPService) error
+	UpdateAgentEditorPublishedMCPService(p *agenteditor.PublishedMCPService) error
+	DeleteAgentEditorPublishedMCPService(id string) error
 	CreateAgentEditorAgent(a *agenteditor.Agent) error
 	UpdateAgentEditorAgent(a *agenteditor.Agent) error
 	DeleteAgentEditorAgent(id string) error
@@ -71,6 +116,11 @@ type AgentEditorBackend interface {
 type SettingsBackend interface {
 	GetProjectSettings() (*model.ProjectSettings, error)
 	UpdateProjectSettings(ps *model.ProjectSettings) error
+	// ParseProjectSettingsFromRaw converts a Settings$ProjectSettings document
+	// that is not in storage — diff-local's historical revision of the unit,
+	// read back with `git show` — the way GetProjectSettings converts the
+	// stored one. Read-only.
+	ParseProjectSettingsFromRaw(raw map[string]any) (*model.ProjectSettings, error)
 }
 
 // ImageBackend provides image collection operations.
@@ -79,10 +129,32 @@ type ImageBackend interface {
 	CreateImageCollection(ic *types.ImageCollection) error
 	UpdateImageCollection(ic *types.ImageCollection) error
 	DeleteImageCollection(id string) error
+	// ListIconCollections reads the project's icon collections (CustomIcons$
+	// CustomIconCollection) for SHOW / DESCRIBE ICON COLLECTION. Read-only.
+	ListIconCollections() ([]*types.IconCollection, error)
+}
+
+// QueueBackend provides task queue (Queues$Queue) operations.
+type QueueBackend interface {
+	ListQueues() ([]*types.Queue, error)
+	CreateQueue(q *types.Queue) error
+	UpdateQueue(q *types.Queue) error
+	DeleteQueue(id string) error
+}
+
+// RegularExpressionBackend provides regular expression document operations.
+type RegularExpressionBackend interface {
+	ListRegularExpressions() ([]*model.RegularExpression, error)
+	CreateRegularExpression(re *model.RegularExpression) error
+	UpdateRegularExpression(re *model.RegularExpression) error
+	DeleteRegularExpression(id string) error
 }
 
 // ScheduledEventBackend provides scheduled event operations.
 type ScheduledEventBackend interface {
 	ListScheduledEvents() ([]*model.ScheduledEvent, error)
 	GetScheduledEvent(id model.ID) (*model.ScheduledEvent, error)
+	CreateScheduledEvent(ev *model.ScheduledEvent) error
+	UpdateScheduledEvent(ev *model.ScheduledEvent) error
+	DeleteScheduledEvent(id string) error
 }

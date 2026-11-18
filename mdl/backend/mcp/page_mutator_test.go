@@ -3,6 +3,7 @@
 package mcp
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/mendixlabs/mxcli/mdl/backend"
@@ -63,6 +64,22 @@ func TestPageMutator_InsertAfterBefore(t *testing.T) {
 	}
 	if got := dvChildNames(m); len(got) != 3 || got[0] != "t0" || got[1] != "t1" || got[2] != "t2" {
 		t.Fatalf("after BEFORE insert: %v (want [t0 t1 t2])", got)
+	}
+}
+
+func TestPageMutator_InsertInto(t *testing.T) {
+	m := newTestMutator()
+	// INSERT INTO appends as the last child of the container itself (dv), not a sibling.
+	if err := m.InsertWidget("dv", "", backend.InsertPosition("INTO"), []pages.Widget{dynText("t2")}); err != nil {
+		t.Fatal(err)
+	}
+	if got := dvChildNames(m); len(got) != 2 || got[0] != "t1" || got[1] != "t2" {
+		t.Fatalf("after INTO insert: %v (want [t1 t2])", got)
+	}
+	// Inserting into a non-container (the DynamicText t1) is a clear error.
+	err := m.InsertWidget("t1", "", backend.InsertPosition("INTO"), []pages.Widget{dynText("x")})
+	if err == nil || !strings.Contains(err.Error(), "INSERT INTO") {
+		t.Fatalf("expected INSERT INTO error for non-container, got %v", err)
 	}
 }
 
@@ -132,3 +149,49 @@ func TestPageMutator_SetLayoutAndUnsupported(t *testing.T) {
 		t.Error("AddVariable should be rejected")
 	}
 }
+
+// Page-level SET Title (empty widgetRef) maps onto the pg LightPage's top-level
+// "title" key — the same key CreatePage writes and pg_read_page returns.
+func TestPageMutator_PageLevelSet_Title(t *testing.T) {
+	m := newTestMutator()
+	if err := m.SetWidgetProperty("", "Title", "Edit Expense"); err != nil {
+		t.Fatalf("SET Title: %v", err)
+	}
+	if m.content["title"] != "Edit Expense" {
+		t.Fatalf("title = %v, want \"Edit Expense\"", m.content["title"])
+	}
+	// Lowercase from the executor must work too.
+	if err := m.SetWidgetProperty("", "title", "Lower"); err != nil {
+		t.Fatalf("SET title (lowercase): %v", err)
+	}
+	if m.content["title"] != "Lower" {
+		t.Fatalf("title = %v, want \"Lower\"", m.content["title"])
+	}
+	// A non-string Title is rejected (no silent coercion).
+	if err := m.SetWidgetProperty("", "Title", 42); err == nil {
+		t.Error("non-string Title should be rejected")
+	}
+}
+
+// Url and pop-up settings are not part of the pg LightPage shape (its schema is
+// additionalProperties:false), so they must reject clearly — before Save(), so
+// they never poison the content tree — rather than report the misleading
+// "widget \"\" not found" (issue #661).
+func TestPageMutator_PageLevelSet_Unsupported(t *testing.T) {
+	for _, prop := range []string{"Url", "PopupWidth", "PopupHeight", "PopupResizable", "PopupCloseAction"} {
+		m := newTestMutator()
+		err := m.SetWidgetProperty("", prop, 800)
+		if err == nil {
+			t.Fatalf("%s: expected rejection, got nil", prop)
+		}
+		if got := err.Error(); !contains(got, "page-level property") || !contains(got, "MCP backend") {
+			t.Errorf("%s: unclear error %q", prop, got)
+		}
+		// The unsupported key must NOT have leaked into the content tree.
+		if _, leaked := m.content[strings.ToLower(prop)]; leaked {
+			t.Errorf("%s: rejected property leaked into content tree", prop)
+		}
+	}
+}
+
+func contains(s, sub string) bool { return strings.Contains(s, sub) }

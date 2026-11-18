@@ -5,15 +5,17 @@ package executor
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
 	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
+	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 )
 
 // execMove handles MOVE PAGE/MICROFLOW/SNIPPET/NANOFLOW/ENTITY/ENUMERATION statements.
-func execMove(ctx *ExecContext, s *ast.MoveStmt) error {
+func execMove(ctx *ExecContext, s *ast.MoveStmt) (moveErr error) {
 	if !ctx.ConnectedForWrite() {
 		return mdlerrors.NewNotConnected()
 	}
@@ -53,6 +55,39 @@ func execMove(ctx *ExecContext, s *ast.MoveStmt) error {
 		targetContainerID = targetModule.ID
 	}
 
+	// A document already where the statement puts it is not moved, and the
+	// statement says so: an organise step re-run on a settled project
+	// announced every document as moved although nothing was written
+	// (ako/mxcli#890).
+	if !isCrossModuleMove && alreadyPlaced(ctx, s, targetContainerID) {
+		return nil
+	}
+	// Every mover changes a container the cached hierarchy indexes by, so a
+	// later statement resolving the document through it would not find it
+	// ("microflow not found" on a second move of the same document).
+	defer invalidateHierarchy(ctx)
+
+	// A Java or JavaScript action's source lives under its module's directory,
+	// and mxbuild looks for it under the module the model now names: left
+	// behind, the build succeeded with a stub that throws where the app calls
+	// the action (measured on 11.13.0). The source moves first, so an occupied
+	// destination refuses the statement before the model changes, and moves
+	// back if the rest of the statement fails. exec names the move with the
+	// other files beside the model a statement touched.
+	if isCrossModuleMove {
+		moved, err := moveActionSource(ctx, s.DocumentType, s.Name.Module, targetModule.Name, s.Name.Name)
+		if err != nil {
+			return err
+		}
+		if moved != "" {
+			defer func() {
+				if moveErr != nil {
+					_, _ = moveActionSource(ctx, s.DocumentType, targetModule.Name, s.Name.Module, s.Name.Name)
+				}
+			}()
+		}
+	}
+
 	// Execute move based on document type
 	switch s.DocumentType {
 	case ast.DocumentTypePage:
@@ -68,11 +103,21 @@ func execMove(ctx *ExecContext, s *ast.MoveStmt) error {
 			return err
 		}
 	case ast.DocumentTypeNanoflow:
-		if err := moveNanoflow(ctx, s.Name, targetContainerID); err != nil {
+		if err := moveNanoflow(ctx, s.Name, targetContainerID, targetModule, isCrossModuleMove); err != nil {
+			return err
+		}
+	case ast.DocumentTypeRule:
+		if err := moveRule(ctx, s.Name, targetContainerID); err != nil {
 			return err
 		}
 	case ast.DocumentTypeEnumeration:
-		return moveEnumeration(ctx, s.Name, targetContainerID, targetModule.Name)
+		// Not a return: an enumeration's cross-module move needs the reference
+		// sweep below like any other document's. Returning here left every
+		// reference outside the domain models — parameter and variable types,
+		// enumeration values — naming the old module (CE1613, ako/mxcli#1674).
+		if err := moveEnumeration(ctx, s.Name, targetContainerID, targetModule.Name); err != nil {
+			return err
+		}
 	case ast.DocumentTypeConstant:
 		if err := moveConstant(ctx, s.Name, targetContainerID); err != nil {
 			return err
@@ -81,8 +126,23 @@ func execMove(ctx *ExecContext, s *ast.MoveStmt) error {
 		if err := moveDatabaseConnection(ctx, s.Name, targetContainerID); err != nil {
 			return err
 		}
+	case ast.DocumentTypeJavaAction:
+		if err := moveJavaAction(ctx, s.Name, targetContainerID); err != nil {
+			return err
+		}
+	case ast.DocumentTypeODataService:
+		if err := movePublishedODataService(ctx, s.Name, targetContainerID); err != nil {
+			return err
+		}
 	default:
-		return mdlerrors.NewUnsupported("unsupported document type: " + string(s.DocumentType))
+		// Every remaining doctype is a plain top-level document, and a move is
+		// one containment row — so they share a handler instead of each needing
+		// a list call and a finder written for it. The typed cases above are the
+		// ones whose move does extra work (access-role remapping, reference
+		// rewriting); this is everything else, including doctypes added later.
+		if err := moveDocumentUnit(ctx, s.DocumentType, s.Name, targetContainerID); err != nil {
+			return err
+		}
 	}
 
 	// For cross-module moves, update all BY_NAME references throughout the project
@@ -93,6 +153,43 @@ func execMove(ctx *ExecContext, s *ast.MoveStmt) error {
 	}
 
 	return nil
+}
+
+// moveActionSource moves a Java or JavaScript action's source file from one
+// module's directory to another's and returns its new project-relative path, or
+// "" when the document type has no source file or there was none to move.
+func moveActionSource(ctx *ExecContext, docType ast.DocumentType, fromModule, toModule, name string) (string, error) {
+	var (
+		moved string
+		err   error
+	)
+	switch docType {
+	case ast.DocumentTypeJavaAction:
+		moved, err = ctx.Backend.MoveJavaSourceFile(fromModule, toModule, name)
+	case ast.DocumentTypeJavaScriptAction:
+		moved, err = ctx.Backend.MoveJavaScriptSourceFile(fromModule, toModule, name)
+	default:
+		return "", nil
+	}
+	if err != nil {
+		return "", mdlerrors.NewBackend("move "+docType.CanonicalSpelling()+" source", err)
+	}
+	return moved, nil
+}
+
+// alreadyPlaced reports, as Unchanged, a move whose document already sits in
+// the target container. Anything it cannot establish — no such document, a
+// different doctype under that name — is left to the mover, which reports it.
+func alreadyPlaced(ctx *ExecContext, s *ast.MoveStmt, targetContainerID model.ID) bool {
+	doc, err := findDocumentOfKind(ctx, s.DocumentType.CanonicalSpelling(), s.Name)
+	if err != nil || doc == nil || doc.ContainerID != targetContainerID {
+		return false
+	}
+	if checkMovedDocumentType(s.DocumentType.CanonicalSpelling(), doc.Kind, s.Name) != nil {
+		return false
+	}
+	reportUnchanged(ctx, fmt.Sprintf("%s: %s", doc.Kind, s.Name))
+	return true
 }
 
 // updateQualifiedNameRefs updates all BY_NAME references to an element after a cross-module move.
@@ -212,7 +309,37 @@ func moveSnippet(ctx *ExecContext, name ast.QualifiedName, targetContainerID mod
 }
 
 // moveNanoflow moves a nanoflow to a new container.
-func moveNanoflow(ctx *ExecContext, name ast.QualifiedName, targetContainerID model.ID) error {
+// moveRule reparents a rule unit. A rule's placement is ordinary — the unit row
+// is ContainmentName "Documents" with the folder as its container, identical to
+// a microflow (measured on ako/TestApp, where both rules sit in a folder).
+func moveRule(ctx *ExecContext, name ast.QualifiedName, targetContainerID model.ID) error {
+	rules, err := ctx.Backend.ListRules()
+	if err != nil {
+		return mdlerrors.NewBackend("list rules", err)
+	}
+
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return mdlerrors.NewBackend("build hierarchy", err)
+	}
+
+	for _, rule := range rules {
+		modID := h.FindModuleID(rule.ContainerID)
+		if h.GetModuleName(modID) != name.Module || rule.Name != name.Name {
+			continue
+		}
+		rule.ContainerID = targetContainerID
+		if err := ctx.Backend.MoveRule(rule); err != nil {
+			return mdlerrors.NewBackend("move rule", err)
+		}
+		fmt.Fprintf(ctx.Output, "Moved rule %s to new location\n", name.String())
+		return nil
+	}
+
+	return mdlerrors.NewNotFound("rule", name.String())
+}
+
+func moveNanoflow(ctx *ExecContext, name ast.QualifiedName, targetContainerID model.ID, targetModule *model.Module, isCrossModuleMove bool) error {
 	// Find the nanoflow
 	nfs, err := ctx.Backend.ListNanoflows()
 	if err != nil {
@@ -232,6 +359,15 @@ func moveNanoflow(ctx *ExecContext, name ast.QualifiedName, targetContainerID mo
 			nf.ContainerID = targetContainerID
 			if err := ctx.Backend.MoveNanoflow(nf); err != nil {
 				return mdlerrors.NewBackend("move nanoflow", err)
+			}
+			// A nanoflow's grants map to the target's same-named roles, as a
+			// microflow's do; left naming the old module they were CE0148
+			// (ako/mxcli#1836).
+			if isCrossModuleMove {
+				nf.AllowedModuleRoles = remapDocumentAccessRoles(ctx, targetModule, nf.AllowedModuleRoles)
+				if err := ctx.Backend.UpdateAllowedRoles(nf.ID, documentRoleStrings(nf.AllowedModuleRoles)); err != nil {
+					return mdlerrors.NewBackend("remap nanoflow access", err)
+				}
 			}
 			fmt.Fprintf(ctx.Output, "Moved nanoflow %s to new location\n", name.String())
 			return nil
@@ -270,7 +406,14 @@ func moveEntity(ctx *ExecContext, name ast.QualifiedName, sourceModule, targetMo
 		return mdlerrors.NewBackend("get target domain model", err)
 	}
 
-	// Move entity via writer (converts associations to CrossAssociations, updates validation rule refs)
+	// An entity's access rules may only name its own module's roles, so each
+	// moves to the target's role of the same name; one the target lacks is kept,
+	// and said, rather than dropped — a rule that silently lost its role would
+	// hide the entity from it (ako/mxcli#1836).
+	remapEntityAccessRoles(ctx, entity, sourceModule, targetModule)
+
+	// Move entity via writer (converts associations to CrossAssociations, updates
+	// validation rule and access rule refs)
 	convertedAssocs, err := ctx.Backend.MoveEntity(entity, sourceDM.ID, targetDM.ID, sourceModule.Name, targetModule.Name)
 	if err != nil {
 		return mdlerrors.NewBackend("move entity", err)
@@ -295,10 +438,62 @@ func moveEntity(ctx *ExecContext, name ast.QualifiedName, sourceModule, targetMo
 		fmt.Fprintf(ctx.Output, "Updated %d OQL query(ies) referencing %s\n", oqlUpdated, oldQualifiedName)
 	}
 
+	// Every OTHER cross-module move sweeps the project for BY_NAME references (the
+	// isCrossModuleMove branch in execMove). An entity move returns early, before
+	// both the doctype switch and that sweep — correctly, because an entity is not a
+	// top-level unit, but the sweep is purely name-based and applies just the same.
+	// Without it a move reported success and left every reference to the entity, its
+	// attribute paths and the converted association naming the old module: 33 CE1613s
+	// in a blank 11.13 app, in microflow activities, page widgets, page parameters and
+	// access rules (#605).
+	//
+	// The association renames come from the backend rather than from the module names,
+	// because only the direction that carried the cross-association to the target
+	// changed its qualified name; the other is a no-op here by construction.
+	sweep := func(oldQN, newQN string) error {
+		if oldQN == newQN {
+			return nil
+		}
+		updated, err := ctx.Backend.UpdateQualifiedNameInAllUnits(oldQN, newQN)
+		if err != nil {
+			return mdlerrors.NewBackend("update references", err)
+		}
+		if updated > 0 {
+			fmt.Fprintf(ctx.Output, "Updated references in %d document(s): %s → %s\n", updated, oldQN, newQN)
+		}
+		return nil
+	}
+	// The entity itself, which also covers every `Module.Entity.Attribute` path
+	// because the sweep matches a name that equals the old one or is prefixed by it.
+	if err := sweep(oldQualifiedName, newQualifiedName); err != nil {
+		return err
+	}
+	for _, assoc := range convertedAssocs {
+		if err := sweep(assoc.OldQualifiedName, assoc.NewQualifiedName); err != nil {
+			return err
+		}
+	}
+
 	fmt.Fprintf(ctx.Output, "Moved entity %s to %s\n", name.String(), targetModule.Name)
-	if len(convertedAssocs) > 0 {
-		fmt.Fprintf(ctx.Output, "Converted %d association(s) to cross-module associations:\n", len(convertedAssocs))
-		for _, assocName := range convertedAssocs {
+	// A move that brings both endpoints of a cross-association into one module turns
+	// it back into a plain association (ako/mxcli#628); report the two apart.
+	var toCross, toPlain []types.MovedAssociation
+	for _, a := range convertedAssocs {
+		if a.SameModule {
+			toPlain = append(toPlain, a)
+		} else {
+			toCross = append(toCross, a)
+		}
+	}
+	if len(toCross) > 0 {
+		fmt.Fprintf(ctx.Output, "Converted %d association(s) to cross-module associations:\n", len(toCross))
+		for _, assocName := range types.MovedAssociationNames(toCross) {
+			fmt.Fprintf(ctx.Output, "  - %s\n", assocName)
+		}
+	}
+	if len(toPlain) > 0 {
+		fmt.Fprintf(ctx.Output, "Converted %d cross-module association(s) to associations within %s:\n", len(toPlain), targetModule.Name)
+		for _, assocName := range types.MovedAssociationNames(toPlain) {
 			fmt.Fprintf(ctx.Output, "  - %s\n", assocName)
 		}
 	}
@@ -308,6 +503,15 @@ func moveEntity(ctx *ExecContext, name ast.QualifiedName, sourceModule, targetMo
 // moveEnumeration moves an enumeration to a new container.
 // For cross-module moves, updates all EnumerationAttributeType references across all domain models.
 func moveEnumeration(ctx *ExecContext, name ast.QualifiedName, targetContainerID model.ID, targetModuleName string) error {
+	// Neither end may be System: its enumerations are platform built-ins with no
+	// stored unit, so there is nothing to move out and nowhere to move in (#1102).
+	if err := refuseSystemEnumerationWrite("move enumeration", name); err != nil {
+		return err
+	}
+	if targetModuleName == "System" {
+		return refuseSystemEnumerationWrite("move enumeration into",
+			ast.QualifiedName{Module: "System", Name: name.Name})
+	}
 	enum := findEnumeration(ctx, name.Module, name.Name)
 	if enum == nil {
 		return mdlerrors.NewNotFound("enumeration", name.String())
@@ -387,4 +591,104 @@ func moveDatabaseConnection(ctx *ExecContext, name ast.QualifiedName, targetCont
 	}
 
 	return mdlerrors.NewNotFound("database connection", name.String())
+}
+
+// moveJavaAction moves a Java action to a new container.
+//
+// Java actions and published OData services had no MOVE doctype at all, and
+// neither CREATE form takes a folder clause — so those documents could never
+// leave the module root from MDL (mxcli-formula1 #32).
+func moveJavaAction(ctx *ExecContext, name ast.QualifiedName, targetContainerID model.ID) error {
+	actions, err := ctx.Backend.ListJavaActionsFull()
+	if err != nil {
+		return mdlerrors.NewBackend("list java actions", err)
+	}
+
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return mdlerrors.NewBackend("build hierarchy", err)
+	}
+
+	for _, ja := range actions {
+		modID := h.FindModuleID(ja.ContainerID)
+		if h.GetModuleName(modID) == name.Module && ja.Name == name.Name {
+			ja.ContainerID = targetContainerID
+			if err := ctx.Backend.MoveJavaAction(ja); err != nil {
+				return mdlerrors.NewBackend("move java action", err)
+			}
+			fmt.Fprintf(ctx.Output, "Moved java action %s to new location\n", name.String())
+			return nil
+		}
+	}
+
+	return mdlerrors.NewNotFound("java action", name.String())
+}
+
+// movePublishedODataService moves a published OData service to a new container.
+func movePublishedODataService(ctx *ExecContext, name ast.QualifiedName, targetContainerID model.ID) error {
+	services, err := ctx.Backend.ListPublishedODataServices()
+	if err != nil {
+		return mdlerrors.NewBackend("list published OData services", err)
+	}
+
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return mdlerrors.NewBackend("build hierarchy", err)
+	}
+
+	for _, svc := range services {
+		modID := h.FindModuleID(svc.ContainerID)
+		if h.GetModuleName(modID) == name.Module && svc.Name == name.Name {
+			svc.ContainerID = targetContainerID
+			if err := ctx.Backend.MovePublishedODataService(svc); err != nil {
+				return mdlerrors.NewBackend("move published OData service", err)
+			}
+			fmt.Fprintf(ctx.Output, "Moved odata service %s to new location\n", name.String())
+			return nil
+		}
+	}
+
+	return mdlerrors.NewNotFound("odata service", name.String())
+}
+
+// remapEntityAccessRoles points each of the entity's access rules at the target
+// module's role of the same name, and warns of a role the target lacks.
+func remapEntityAccessRoles(ctx *ExecContext, entity *domainmodel.Entity, sourceModule, targetModule *model.Module) {
+	if len(entity.AccessRules) == 0 {
+		return
+	}
+	targetRoles := map[string]bool{}
+	if ms, err := ctx.Backend.GetModuleSecurity(targetModule.ID); err == nil && ms != nil {
+		for _, r := range ms.ModuleRoles {
+			targetRoles[r.Name] = true
+		}
+	}
+	oldPrefix := sourceModule.Name + "."
+	var missing []string
+	seen := map[string]bool{}
+	for _, ar := range entity.AccessRules {
+		names := append([]string(nil), ar.ModuleRoleNames...)
+		changed := false
+		for i, qn := range names {
+			if !strings.HasPrefix(qn, oldPrefix) {
+				continue
+			}
+			role := qn[len(oldPrefix):]
+			if targetRoles[role] {
+				names[i] = targetModule.Name + "." + role
+				changed = true
+			} else if !seen[qn] {
+				seen[qn] = true
+				missing = append(missing, qn)
+			}
+		}
+		if changed {
+			ar.ModuleRoleNames = names
+		}
+	}
+	for _, qn := range missing {
+		fmt.Fprintf(ctx.Output, "Warning: entity %s.%s keeps access-rule role %s: module %s has no role named %s. "+
+			"An entity's access rules may only use its own module's roles — create %s.%s and grant again.\n",
+			targetModule.Name, entity.Name, qn, targetModule.Name, qn[len(oldPrefix):], targetModule.Name, qn[len(oldPrefix):])
+	}
 }

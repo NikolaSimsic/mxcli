@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/mendixlabs/mxcli/mdl/backend"
+	"github.com/mendixlabs/mxcli/sdk/pages"
 	"github.com/mendixlabs/mxcli/sdk/widgets/mpk"
 )
 
@@ -21,6 +22,11 @@ func TestDeriveMDLName(t *testing.T) {
 		{"com.mendix.widget.web.gallery.Gallery", "GALLERY"},
 		{"com.company.widget.MyCustomWidget", "MYCUSTOMWIDGET"},
 		{"SimpleWidget", "SIMPLEWIDGET"},
+		// mendixlabs/mxcli#1463: native widgets must not take the web
+		// keyword (`image`, `radiobuttons`, `badge`, …).
+		{"com.mendix.widget.native.image.Image", "NATIVEIMAGE"},
+		{"com.mendix.widget.native.radiobuttons.RadioButtons", "NATIVERADIOBUTTONS"},
+		{"com.mendix.widget.web.image.Image", "IMAGE"},
 	}
 
 	for _, tc := range tests {
@@ -138,12 +144,127 @@ func TestGenerateDefJSON_SkipsComplexTypes(t *testing.T) {
 
 	def := GenerateDefJSON(mpkDef, "COMPLEX")
 
-	// Complex types should be skipped
-	if len(def.PropertyMappings) != 0 {
-		t.Errorf("PropertyMappings count = %d, want 0 (complex types should be skipped)", len(def.PropertyMappings))
+	// textTemplate always yields a mapping (so captions like Badge `value` are
+	// authorable), and so does every action property — one whose key is not
+	// onClick/onChange becomes a NAMED slot, mapped with no Source and addressed
+	// by its own key (#956) — and every expression, the same way
+	// (mendixlabs/mxcli#1578). icon/non-list object remain skipped.
+	if len(def.PropertyMappings) != 3 {
+		t.Fatalf("PropertyMappings count = %d, want 3 (texttemplate + the named action slot + the expression; icon/object skipped): %+v",
+			len(def.PropertyMappings), def.PropertyMappings)
+	}
+	byKey := map[string]PropertyMapping{}
+	for _, m := range def.PropertyMappings {
+		byKey[m.PropertyKey] = m
+	}
+	if ex := byKey["myExpr"]; ex.Operation != "expression" || ex.Source != "" {
+		t.Errorf("myExpr = {op=%q src=%q}, want {op=expression src=\"\"}", ex.Operation, ex.Source)
+	}
+	if tt := byKey["myTemplate"]; tt.Operation != "texttemplate" {
+		t.Errorf("myTemplate operation = %q, want texttemplate", tt.Operation)
+	}
+	// A named slot must carry no Source: that is what tells resolveMapping to
+	// read the AST property by this key rather than from a fixed slot.
+	if act := byKey["myAction"]; act.Operation != "action" || act.Source != "" {
+		t.Errorf("myAction = {op=%q src=%q}, want {op=action src=\"\"} — a slot with no MDL "+
+			"alias is addressed by its own key", act.Operation, act.Source)
 	}
 	if len(def.ChildSlots) != 0 {
 		t.Errorf("ChildSlots count = %d, want 0", len(def.ChildSlots))
+	}
+}
+
+// Every top-level texttemplate property yields an authorable mapping, keyed by
+// its own property name, regardless of whether a friendly alias is registered.
+// Regression guard for the Badge `value` / TreeNode `headerCaption` / Timeline
+// `title` drop (MDL-WIDGET01).
+func TestGenerateDefJSON_TextTemplatesAlwaysMapped(t *testing.T) {
+	mpkDef := &mpk.WidgetDefinition{
+		ID:   "com.mendix.widget.custom.badge.Badge",
+		Name: "Badge",
+		Properties: []mpk.PropertyDef{
+			{Key: "type", Type: "enumeration", DefaultValue: "badge"},
+			{Key: "value", Type: "textTemplate"},
+			{Key: "onClick", Type: "action"},
+		},
+	}
+	def := GenerateDefJSON(mpkDef, "BADGE")
+	m := findMapping(def.PropertyMappings, "value")
+	if m == nil {
+		t.Fatal("value (textTemplate) has no mapping — it would be dropped (MDL-WIDGET01)")
+	}
+	if m.Operation != "texttemplate" || m.Source != "TextTemplate" {
+		t.Errorf("value mapping = {op=%s src=%s}, want {texttemplate TextTemplate}", m.Operation, m.Source)
+	}
+}
+
+// TestGenerateDefJSON_ActionMapping covers ledger #67: an `onClick` action
+// property must yield an `action` PropertyMapping (source OnClick) so the writer
+// serializes the client action instead of silently dropping it. A non-authorable
+// action key (e.g. DataGrid2 `onSelectionChange`) is a NAMED slot: it maps too,
+// with no Source, and is addressed by its own key (#956).
+func TestGenerateDefJSON_ActionMapping(t *testing.T) {
+	mpkDef := &mpk.WidgetDefinition{
+		ID:   "com.mendix.widget.web.datagrid.Datagrid",
+		Name: "Datagrid",
+		Properties: []mpk.PropertyDef{
+			{Key: "onClick", Type: "action"},
+			{Key: "onSelectionChange", Type: "action"},
+		},
+	}
+	def := GenerateDefJSON(mpkDef, "DATAGRID")
+	onClick := findMapping(def.PropertyMappings, "onClick")
+	if onClick == nil {
+		t.Fatal("onClick (action) has no mapping — the action would be silently dropped (#67)")
+	}
+	if onClick.Operation != "action" || onClick.Source != "OnClick" {
+		t.Errorf("onClick mapping = {op=%s src=%s}, want {action OnClick}", onClick.Operation, onClick.Source)
+	}
+	sel := findMapping(def.PropertyMappings, "onSelectionChange")
+	if sel == nil {
+		t.Fatal("onSelectionChange (action) has no mapping — a slot with no MDL alias is " +
+			"addressed by its own key and cannot be written without one (#956)")
+	}
+	if sel.Operation != "action" || sel.Source != "" {
+		t.Errorf("onSelectionChange mapping = {op=%s src=%s}, want {action \"\"} — a Source "+
+			"would route it through a fixed AST slot instead of its own key",
+			sel.Operation, sel.Source)
+	}
+}
+
+// TestGenerateDefJSON_KnownPropertiesUnmapped covers the general #67-class guard:
+// every declared property with NO mapping in the generated def is recorded in
+// KnownProperties, so the checker warns "recognized but not persisted" rather
+// than silently dropping it or falsely rejecting it as unknown. A mapped property
+// must NOT appear there.
+func TestGenerateDefJSON_KnownPropertiesUnmapped(t *testing.T) {
+	mpkDef := &mpk.WidgetDefinition{
+		ID:   "com.mendix.widget.web.datagrid.Datagrid",
+		Name: "Datagrid",
+		Properties: []mpk.PropertyDef{
+			{Key: "onClick", Type: "action"},           // mapped (action → OnClick)
+			{Key: "pageSize", Type: "integer"},         // mapped (primitive)
+			{Key: "onSelectionChange", Type: "action"}, // mapped as a named slot (#956)
+			{Key: "rowClass", Type: "expression"},      // mapped by its own key (mendixlabs/mxcli#1578)
+			{Key: "rowIcon", Type: "icon"},             // unmapped (icon not handled)
+		},
+	}
+	def := GenerateDefJSON(mpkDef, "DATAGRID")
+	known := make(map[string]bool)
+	for _, k := range def.KnownProperties {
+		known[k] = true
+	}
+	for _, want := range []string{"rowIcon"} {
+		if !known[want] {
+			t.Errorf("KnownProperties missing unmapped property %q — the checker can't warn it will be dropped", want)
+		}
+	}
+	// onSelectionChange is now mapped as a named slot, so listing it would make
+	// MDL-WIDGET06 warn that a value mxcli writes is going to be dropped (#956).
+	for _, notWant := range []string{"onClick", "pageSize", "onSelectionChange", "rowClass"} {
+		if known[notWant] {
+			t.Errorf("KnownProperties should not list mapped property %q", notWant)
+		}
 	}
 }
 
@@ -468,6 +589,8 @@ func TestObjectListItemAliases(t *testing.T) {
 					{Key: "tooltip", Type: "textTemplate"},
 					{Key: "attribute", Type: "attribute"},
 					{Key: "width", Type: "enumeration"},
+					{Key: "columnClass", Type: "expression"},
+					{Key: "visible", Type: "expression"},
 				},
 			},
 		},
@@ -497,12 +620,55 @@ func TestObjectListItemAliases(t *testing.T) {
 	if got := aliases["width"]; len(got) != 1 || got[0] != "ColumnWidth" {
 		t.Errorf("width MdlAliases = %v, want [ColumnWidth]", got)
 	}
+	// columnClass is filled by MDL `DynamicCellClass:` (Bug 10a — per-cell
+	// dynamic class was silently dropped without this alias).
+	if got := aliases["columnClass"]; len(got) != 1 || got[0] != "DynamicCellClass" {
+		t.Errorf("columnClass MdlAliases = %v, want [DynamicCellClass]", got)
+	}
+	// visible is filled by the visitor's VisibleIf — every expression spelling
+	// of `Visible:` (`if … then … else …`, `$currentObject/Flag`, `[cond]`) is
+	// lowered there; without the alias a column's visibility was dropped.
+	if got := aliases["visible"]; len(got) != 1 || got[0] != "VisibleIf" {
+		t.Errorf("visible MdlAliases = %v, want [VisibleIf]", got)
+	}
 	// tooltip and attribute have no aliases — schema name is the MDL keyword.
 	if got := aliases["tooltip"]; len(got) != 0 {
 		t.Errorf("tooltip MdlAliases = %v, want []", got)
 	}
 	if got := aliases["attribute"]; len(got) != 0 {
 		t.Errorf("attribute MdlAliases = %v, want []", got)
+	}
+}
+
+// HeatMap scaleColors `colour` (British spelling) is filled by MDL `ColorValue:`
+// — without the alias the scale colour is silently dropped on write (Bug 10a class).
+func TestObjectListItemAliases_HeatMapColour(t *testing.T) {
+	mpkDef := &mpk.WidgetDefinition{
+		ID:   "com.mendix.widget.web.heatmap.HeatMap",
+		Name: "Heat map",
+		Properties: []mpk.PropertyDef{{
+			Key:    "scaleColors",
+			Type:   "object",
+			IsList: true,
+			Children: []mpk.PropertyDef{
+				{Key: "valuePercentage", Type: "integer"},
+				{Key: "colour", Type: "string"},
+			},
+		}},
+	}
+	def := GenerateDefJSON(mpkDef, "HEATMAP")
+	if len(def.ObjectLists) != 1 {
+		t.Fatalf("ObjectLists = %d, want 1", len(def.ObjectLists))
+	}
+	aliases := map[string][]string{}
+	for _, ip := range def.ObjectLists[0].ItemProperties {
+		aliases[ip.PropertyKey] = ip.MdlAliases
+	}
+	if got := aliases["colour"]; len(got) != 1 || got[0] != "ColorValue" {
+		t.Errorf("colour MdlAliases = %v, want [ColorValue]", got)
+	}
+	if got := aliases["valuePercentage"]; len(got) != 0 {
+		t.Errorf("valuePercentage MdlAliases = %v, want [] (matches case-insensitively)", got)
 	}
 }
 
@@ -563,20 +729,21 @@ func TestApplyColumnHeaderFallback(t *testing.T) {
 			{PropertyKey: "attribute", Operation: "attribute", AttributePath: "Mod.Ent.Foo"},
 		},
 	}
-	applyColumnHeaderFallback(spec1)
+	applyColumnHeaderFallback(spec1, true)
 	if len(spec1.Properties) != 2 {
 		t.Errorf("Case 1 (header present): expected 2 properties, got %d", len(spec1.Properties))
 	}
 
-	// Case 2: no header, no attribute → no change
+	// Case 2: no header slot (a header-less object-list item like a chart series)
+	// → never touched, even with no attribute.
 	spec2 := &backend.ObjectListItemSpec{
 		Properties: []backend.ObjectListItemProperty{
-			{PropertyKey: "showContentAs", Operation: "primitive", PrimitiveVal: "attribute"},
+			{PropertyKey: "staticName", Operation: "primitive", PrimitiveVal: "x"},
 		},
 	}
-	applyColumnHeaderFallback(spec2)
+	applyColumnHeaderFallback(spec2, false)
 	if len(spec2.Properties) != 1 {
-		t.Errorf("Case 2 (no attribute): expected 1 property, got %d", len(spec2.Properties))
+		t.Errorf("Case 2 (no header slot): expected 1 property, got %d", len(spec2.Properties))
 	}
 
 	// Case 3: no header, attribute set → synthesize header from attribute leaf
@@ -585,7 +752,7 @@ func TestApplyColumnHeaderFallback(t *testing.T) {
 			{PropertyKey: "attribute", Operation: "attribute", AttributePath: "Mod.Ent.OrderNumber"},
 		},
 	}
-	applyColumnHeaderFallback(spec3)
+	applyColumnHeaderFallback(spec3, true)
 	if len(spec3.Properties) != 2 {
 		t.Fatalf("Case 3 (fallback): expected 2 properties, got %d", len(spec3.Properties))
 	}
@@ -600,9 +767,119 @@ func TestApplyColumnHeaderFallback(t *testing.T) {
 			{PropertyKey: "attribute", Operation: "attribute", AttributePath: "BareName"},
 		},
 	}
-	applyColumnHeaderFallback(spec4)
+	applyColumnHeaderFallback(spec4, true)
 	if len(spec4.Properties) != 2 || spec4.Properties[1].TextTemplate != "BareName" {
 		t.Errorf("Case 4: fallback for unqualified path = %v", spec4.Properties)
+	}
+
+	// Case 5 (ledger #54): an explicit empty caption (`Caption: ''`) reaches the
+	// engine as a texttemplate header with empty text and no params. Studio Pro
+	// rejects an empty column header with CE0463, so it must be treated like an
+	// absent one — filled IN PLACE with the attribute leaf, not left empty and
+	// not duplicated.
+	spec5 := &backend.ObjectListItemSpec{
+		Properties: []backend.ObjectListItemProperty{
+			{PropertyKey: "header", Operation: "texttemplate", TextTemplate: ""},
+			{PropertyKey: "attribute", Operation: "attribute", AttributePath: "Mod.Ent.Amount"},
+		},
+	}
+	applyColumnHeaderFallback(spec5, true)
+	if len(spec5.Properties) != 2 {
+		t.Fatalf("Case 5 (empty caption): expected 2 properties (no duplicate), got %d", len(spec5.Properties))
+	}
+	if h := spec5.Properties[0]; h.PropertyKey != "header" || h.Operation != "texttemplate" || h.TextTemplate != "Amount" {
+		t.Errorf("Case 5: empty header not filled in place: %+v, want TextTemplate=Amount", spec5.Properties[0])
+	}
+
+	// Case 6: a template header WITH params (e.g. Caption: '{1}') is NOT empty —
+	// it must be left untouched even though its literal text may be blank.
+	spec6 := &backend.ObjectListItemSpec{
+		Properties: []backend.ObjectListItemProperty{
+			{PropertyKey: "header", Operation: "texttemplate", TextTemplate: "", Parameters: []*pages.ClientTemplateParameter{{}}},
+			{PropertyKey: "attribute", Operation: "attribute", AttributePath: "Mod.Ent.Amount"},
+		},
+	}
+	applyColumnHeaderFallback(spec6, true)
+	if spec6.Properties[0].TextTemplate != "" {
+		t.Errorf("Case 6: param-bearing header must not be overwritten, got TextTemplate=%q", spec6.Properties[0].TextTemplate)
+	}
+
+	// Case 7 (ako/mxcli#535): a custom-content column with `Caption: ''` and no
+	// attribute gets an EMPTY header, never the column's name. Mendix stores no
+	// name for a column, and Data grid 2 renders an empty header blank — so
+	// writing the name put an internal identifier ("colTriage") in front of end
+	// users. The empty header is written as one empty translation (EmptyText),
+	// which mx check accepts (0 errors on 11.15.0).
+	spec7 := &backend.ObjectListItemSpec{
+		Properties: []backend.ObjectListItemProperty{
+			{PropertyKey: "header", Operation: "texttemplate", TextTemplate: ""},
+			{PropertyKey: "showContentAs", Operation: "primitive", PrimitiveVal: "customContent"},
+		},
+	}
+	applyColumnHeaderFallback(spec7, true)
+	if h := spec7.Properties[0]; h.PropertyKey != "header" || h.TextTemplate != "" || !h.EmptyText {
+		t.Errorf("Case 7: empty custom-content header = %+v, want an empty texttemplate with EmptyText=true (not the column name)", spec7.Properties[0])
+	}
+
+	// Case 8 (ako/mxcli#535): custom-content column with NO header prop at all —
+	// append an empty header, the same as Case 7.
+	spec8 := &backend.ObjectListItemSpec{
+		Properties: []backend.ObjectListItemProperty{
+			{PropertyKey: "showContentAs", Operation: "primitive", PrimitiveVal: "customContent"},
+		},
+	}
+	applyColumnHeaderFallback(spec8, true)
+	if len(spec8.Properties) != 2 {
+		t.Fatalf("Case 8 (absent custom-content header): expected 2 properties, got %d", len(spec8.Properties))
+	}
+	if h := spec8.Properties[1]; h.PropertyKey != "header" || h.TextTemplate != "" || !h.EmptyText {
+		t.Errorf("Case 8: appended header = %+v, want an empty texttemplate with EmptyText=true", spec8.Properties[1])
+	}
+
+	// Case 9 (ChipCoV8 #11): an UNNAMED column with no caption and no attribute
+	// (`column (Caption: '') { … }`, or bare `column { … }`) has nothing to fall
+	// back to. Its header must still serialize as a Forms$ClientTemplate, not
+	// TextTemplate: null, which is CE0463 — and as one empty translation
+	// (EmptyText), so a rewrite can clear a stored caption (ako/mxcli#1877).
+	spec9 := &backend.ObjectListItemSpec{
+		Properties: []backend.ObjectListItemProperty{
+			{PropertyKey: "header", Operation: "texttemplate", TextTemplate: ""},
+			{PropertyKey: "showContentAs", Operation: "primitive", PrimitiveVal: "customContent"},
+		},
+	}
+	applyColumnHeaderFallback(spec9, true)
+	if len(spec9.Properties) != 2 {
+		t.Fatalf("Case 9 (unnamed, empty caption): expected 2 properties (no duplicate), got %d", len(spec9.Properties))
+	}
+	if h := spec9.Properties[0]; h.PropertyKey != "header" || h.Operation != "texttemplate" || h.TextTemplate != "" || !h.EmptyText {
+		t.Errorf("Case 9: header = %+v, want an empty texttemplate with EmptyText=true", h)
+	}
+
+	// Case 10: unnamed column with NO header prop at all — append an
+	// EmptyText header.
+	spec10 := &backend.ObjectListItemSpec{
+		Properties: []backend.ObjectListItemProperty{
+			{PropertyKey: "showContentAs", Operation: "primitive", PrimitiveVal: "customContent"},
+		},
+	}
+	applyColumnHeaderFallback(spec10, true)
+	if len(spec10.Properties) != 2 {
+		t.Fatalf("Case 10 (unnamed, absent header): expected 2 properties, got %d", len(spec10.Properties))
+	}
+	if h := spec10.Properties[1]; h.PropertyKey != "header" || h.Operation != "texttemplate" || !h.EmptyText {
+		t.Errorf("Case 10: appended header = %+v, want an empty texttemplate with EmptyText=true", h)
+	}
+
+	// Case 11: no header slot, unnamed — still untouched (the EmptyTemplate
+	// header is scoped to datagrid columns, never to header-less items).
+	spec11 := &backend.ObjectListItemSpec{
+		Properties: []backend.ObjectListItemProperty{
+			{PropertyKey: "staticName", Operation: "texttemplate", TextTemplate: ""},
+		},
+	}
+	applyColumnHeaderFallback(spec11, false)
+	if len(spec11.Properties) != 1 || spec11.Properties[0].EmptyTemplate {
+		t.Errorf("Case 11 (no header slot): must be untouched, got %+v", spec11.Properties)
 	}
 }
 
@@ -764,4 +1041,77 @@ func writeDef(t *testing.T, dir, name string, genVersion int) {
 	if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestRegenerateWidgetDocsMultiWidgetMPK guards bug 9a's docs half: a bundled
+// .mpk (Charts.mpk holds 10 chart widgets) must produce one doc per widget, not
+// just the first widgetFile. Before the fix RegenerateWidgetDocs used ParseMPK
+// (first widget only), so only areachart.md was written and the other charts
+// (columnchart, barchart, piechart, linechart, bubblechart, …) were omitted.
+func TestRegenerateWidgetDocsMultiWidgetMPK(t *testing.T) {
+	const chartsFixture = "../../testdata/expr-checker/widgets/Charts.mpk"
+	if _, err := os.Stat(chartsFixture); err != nil {
+		t.Skipf("Charts.mpk fixture not available: %v", err)
+	}
+
+	projectDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projectDir, "widgets"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Copy the bundled Charts.mpk into the project's widgets/ dir.
+	src, err := os.ReadFile(chartsFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projectDir, "widgets", "Charts.mpk"), src, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	projectPath := filepath.Join(projectDir, "App.mpr")
+	generated, err := RegenerateWidgetDocs(projectPath)
+	if err != nil {
+		t.Fatalf("RegenerateWidgetDocs: %v", err)
+	}
+
+	// ParseMPKAll reports 10 widgets in this fixture; assert we documented more
+	// than the single first widget the old code produced.
+	all, err := mpk.ParseMPKAll(chartsFixture)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generated != len(all) {
+		t.Errorf("generated %d docs, want %d (one per widget in the bundle)", generated, len(all))
+	}
+
+	docsDir := filepath.Join(projectDir, ".claude", "skills", "widgets")
+	// Every chart widget must have a doc file, not just areachart.md.
+	for _, w := range all {
+		name := "widget"
+		if i := lastDotIndex(w.ID); i >= 0 {
+			name = w.ID[i+1:]
+		}
+		f := filepath.Join(docsDir, toLowerASCII(name)+".md")
+		if _, err := os.Stat(f); err != nil {
+			t.Errorf("expected doc for %s at %s, but it is missing", w.ID, f)
+		}
+	}
+}
+
+func lastDotIndex(s string) int {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == '.' {
+			return i
+		}
+	}
+	return -1
+}
+
+func toLowerASCII(s string) string {
+	b := []byte(s)
+	for i := range b {
+		if b[i] >= 'A' && b[i] <= 'Z' {
+			b[i] += 'a' - 'A'
+		}
+	}
+	return string(b)
 }

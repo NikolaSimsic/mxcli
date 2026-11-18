@@ -132,7 +132,8 @@ func TestTables_CoversAllViews(t *testing.T) {
 		if err := rows.Scan(&name); err != nil {
 			t.Fatalf("Scan failed: %v", err)
 		}
-		if !listed[name] {
+		// A retired name kept as an alias is deliberately unlisted (#1395).
+		if !listed[name] && LegacyTableAliases[name] == "" {
 			t.Errorf("catalog view %q is not listed in Tables() — add CATALOG.%s "+
 				"so SHOW CATALOG TABLES includes it", name, strings.ToUpper(name))
 		}
@@ -231,6 +232,12 @@ func TestObjectsView_IncludesNewDocumentTypes(t *testing.T) {
 	}{
 		{"javascript_actions", "JAVASCRIPT_ACTION"},
 		{"image_collections", "IMAGE_COLLECTION"},
+		// Both were built into their own tables but never joined to the objects
+		// view, so bare `DESCRIBE Module.Name` could not resolve them.
+		{"building_blocks", "BUILDING_BLOCK"},
+		{"icon_collections", "ICON_COLLECTION"},
+		{"menus", "MENU"},
+		{"page_templates", "PAGE_TEMPLATE"},
 		{"data_transformers", "DATA_TRANSFORMER"},
 		{"agents", "AGENT"},
 		{"ai_models", "AI_MODEL"},
@@ -531,7 +538,7 @@ func TestCreateTablesAreQueryable(t *testing.T) {
 	// Verify all core tables can be queried
 	coreTables := []string{
 		"modules", "entities", "attributes", "microflows",
-		"pages", "snippets", "layouts", "enumerations",
+		"pages", "snippets", "building_blocks", "layouts", "enumerations",
 		"java_actions", "projects", "snapshots", "catalog_meta",
 		"workflows", "odata_clients", "odata_services",
 		"business_event_services", "database_connections",
@@ -773,5 +780,58 @@ func TestPartialViewsExposeSnapshotColumns(t *testing.T) {
 
 	if _, err := cat.CatalogDB().Exec(`SELECT SourceBranch FROM external_entities`); err == nil {
 		t.Errorf("external_entities view unexpectedly exposes SourceBranch (drift from original schema)")
+	}
+}
+
+// A write that lands in the same second as the build that made the cache must
+// still make the cache stale: the modification time is compared as an instant,
+// not as whole seconds. A write one second later was always seen; one inside the
+// same second was answered from the stale catalog.
+func TestModTimeUnchanged(t *testing.T) {
+	base := time.Date(2026, 11, 17, 19, 25, 30, 250_000_000, time.UTC)
+	cases := []struct {
+		name            string
+		cached, current time.Time
+		want            bool
+	}{
+		{"same instant", base, base, true},
+		{"same instant, other zone", base, base.In(time.FixedZone("x", 3600)), true},
+		{"later in the same second", base, base.Add(300 * time.Millisecond), false},
+		{"earlier in the same second", base, base.Add(-200 * time.Millisecond), false},
+		{"one nanosecond later", base, base.Add(time.Nanosecond), false},
+		{"a second later", base, base.Add(time.Second), false},
+		// A cache written before sub-second times were kept holds whole seconds; it
+		// cannot tell whether the file changed inside that second, so it rebuilds once.
+		{"legacy whole-second cache against a fractional time", base.Truncate(time.Second), base, false},
+		{"legacy whole-second cache against a whole-second file", base.Truncate(time.Second), base.Truncate(time.Second), true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ModTimeUnchanged(c.cached, c.current); got != c.want {
+				t.Errorf("ModTimeUnchanged(%v, %v) = %v, want %v", c.cached, c.current, got, c.want)
+			}
+		})
+	}
+}
+
+// The recorded time survives the round trip through the cache file to the
+// nanosecond; RFC3339 kept only whole seconds, which is what made the check above
+// impossible.
+func TestCacheInfoKeepsModTimeToTheNanosecond(t *testing.T) {
+	cat, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	mt := time.Date(2026, 11, 17, 19, 25, 30, 123_456_789, time.UTC)
+	if err := cat.SetCacheInfo("/p/app.mpr", mt, "11.8.0", "fast", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	info, err := cat.GetCacheInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ModTimeUnchanged(info.MprModTime, mt) {
+		t.Errorf("recorded %v, read back %v", mt, info.MprModTime)
 	}
 }

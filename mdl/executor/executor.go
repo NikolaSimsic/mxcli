@@ -5,9 +5,12 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -17,6 +20,7 @@ import (
 	"github.com/mendixlabs/mxcli/mdl/catalog"
 	"github.com/mendixlabs/mxcli/mdl/diaglog"
 	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
+	"github.com/mendixlabs/mxcli/mdl/langver"
 	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
@@ -25,10 +29,14 @@ import (
 
 // executorCache holds cached data for performance across multiple operations.
 type executorCache struct {
+	// modulesMu guards modules, the one cache a parallel describe fills
+	// lazily (see getModulesFromCache, ako/mxcli#765).
+	modulesMu    sync.Mutex
 	modules      []*model.Module
 	units        []*types.UnitInfo
 	folders      []*types.FolderInfo
 	domainModels []*domainmodel.DomainModel
+	enumerations []*model.Enumeration
 	hierarchy    *ContainerHierarchy
 	// pages, layouts, microflows are cached separately as they may change during execution
 
@@ -51,7 +59,15 @@ type executorCache struct {
 	// Track domain models modified during this session for finalization
 	modifiedDomainModels map[model.ID]string // domain model unit ID -> module name
 
+	// Project default language for describe text selection (issue #702). Loaded
+	// once (pre-warmed before any parallel widget extraction) so the getter is a
+	// race-free read during describe.
+	defaultLang       string
+	defaultLangLoaded bool
+
 	// Pre-warmed name lookup maps for parallel describe (goroutine-safe after init)
+	// diffNames is set for the length of a diff-local run (buildNameLookups).
+	diffNames      *diffNames
 	entityNames    map[model.ID]string // entity ID -> "Module.EntityName"
 	microflowNames map[model.ID]string // microflow ID -> "Module.MicroflowName"
 	pageNames      map[model.ID]string // page ID -> "Module.PageName"
@@ -131,7 +147,7 @@ func getMicroflowNames(ctx *ExecContext, h *ContainerHierarchy) map[model.ID]str
 		return ctx.Cache.microflowNames
 	}
 	microflowNames := make(map[model.ID]string)
-	mfs, err := ctx.Backend.ListMicroflows()
+	mfs, err := microflowHeaders(ctx)
 	if err != nil {
 		if ctx.Logger != nil {
 			ctx.Logger.Warn("getMicroflowNames: ListMicroflows failed", "error", err)
@@ -153,7 +169,7 @@ func getPageNames(ctx *ExecContext, h *ContainerHierarchy) map[model.ID]string {
 		return ctx.Cache.pageNames
 	}
 	pageNames := make(map[model.ID]string)
-	pgs, err := ctx.Backend.ListPages()
+	pgs, err := pageHeaders(ctx)
 	if err != nil {
 		if ctx.Logger != nil {
 			ctx.Logger.Warn("getPageNames: ListPages failed", "error", err)
@@ -170,13 +186,19 @@ func getPageNames(ctx *ExecContext, h *ContainerHierarchy) map[model.ID]string {
 }
 
 const (
-	// maxOutputLines is the per-statement line limit. Statements that produce more
-	// lines than this are aborted to prevent runaway output from infinite loops.
+	// maxOutputLines is the default per-statement line limit. Statements that
+	// produce more lines than this are aborted to prevent runaway output from
+	// infinite loops. MXCLI_OUTPUT_LINE_LIMIT overrides it (effectiveOutputLineLimit).
 	maxOutputLines = 10_000
 	// defaultExecuteTimeout is the maximum wall-clock time allowed for a single
 	// statement when MXCLI_EXEC_TIMEOUT is not set.
 	defaultExecuteTimeout = 5 * time.Minute
 )
+
+// executeTimeoutDefault is the limit effectiveExecuteTimeout applies when no
+// MXCLI_EXEC_TIMEOUT is set. A variable so a test can bring it below the
+// duration of a catalog build.
+var executeTimeoutDefault = defaultExecuteTimeout
 
 // configuredExecuteTimeout returns the per-statement wall-clock timeout. The
 // value is read from the MXCLI_EXEC_TIMEOUT environment variable on every call
@@ -201,11 +223,11 @@ func configuredExecuteTimeout() time.Duration {
 
 // effectiveExecuteTimeout returns the wall-clock timeout to apply to a single
 // statement. An explicit MXCLI_EXEC_TIMEOUT always wins (so users can both raise
-// and cap the limit). Otherwise, known bounded-but-slow statements — currently
-// REFRESH CATALOG, which on a large project legitimately runs past the default
-// 5m — are exempt from the guard (returns 0 = no wall-clock limit); the per-
-// statement output-line guard still bounds runaway output. The guard exists to
-// abort runaway loops, which a deterministic catalog build is not. See #651.
+// and cap the limit). Otherwise, known bounded-but-slow statements — REFRESH
+// CATALOG, which on a large project legitimately runs past the default 5m, and
+// DESCRIBE MODULE … WITH ALL on a large module (#1624) — are exempt from the
+// guard (returns 0 = no wall-clock limit). The guard exists to abort runaway
+// loops, which a deterministic catalog build or module dump is not. See #651.
 func effectiveExecuteTimeout(stmt ast.Statement) time.Duration {
 	if os.Getenv("MXCLI_EXEC_TIMEOUT") != "" {
 		return configuredExecuteTimeout()
@@ -213,18 +235,44 @@ func effectiveExecuteTimeout(stmt ast.Statement) time.Duration {
 	if isExemptFromExecuteTimeout(stmt) {
 		return 0
 	}
-	return defaultExecuteTimeout
+	return executeTimeoutDefault
 }
 
 // isExemptFromExecuteTimeout reports whether a statement is a known long-running
 // but bounded operation that should not be capped by the default wall-clock guard.
 func isExemptFromExecuteTimeout(stmt ast.Statement) bool {
-	switch stmt.(type) {
+	switch s := stmt.(type) {
 	case *ast.RefreshCatalogStmt:
 		return true
 	default:
-		return false
+		return isModuleDump(s)
 	}
+}
+
+// isModuleDump reports whether stmt is `describe module M with all`. Its work
+// and its output are bounded by the module, not by anything that can run away,
+// so neither default guard applies to it — on a module of 229 microflows it
+// hit both, and could not be described at all (mendixlabs/mxcli#1624).
+func isModuleDump(stmt ast.Statement) bool {
+	d, ok := stmt.(*ast.DescribeStmt)
+	return ok && d.ObjectType == ast.DescribeModule && d.WithAll
+}
+
+// effectiveOutputLineLimit returns the line limit for one statement; 0 means
+// none. An explicit MXCLI_OUTPUT_LINE_LIMIT — a number of lines, 0 for no
+// limit — applies to every statement, as MXCLI_EXEC_TIMEOUT does; otherwise a
+// module dump has no limit and everything else the default.
+func effectiveOutputLineLimit(stmt ast.Statement) int {
+	if raw := os.Getenv("MXCLI_OUTPUT_LINE_LIMIT"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			return n
+		}
+		return maxOutputLines
+	}
+	if isModuleDump(stmt) {
+		return 0
+	}
+	return maxOutputLines
 }
 
 // BackendFactory creates a new backend instance for connecting to a project.
@@ -237,25 +285,52 @@ type Executor struct {
 	output         io.Writer
 	guard          *outputGuard // line-limit wrapper around output
 	mprPath        string
-	settings       map[string]any
-	cache          *executorCache
-	catalog        *catalog.Catalog
-	quiet          bool                               // suppress connection and status messages
-	format         OutputFormat                       // output format (table, json)
-	logger         *diaglog.Logger                    // session diagnostics logger (nil = no logging)
-	tracer         *backend.Tracer                    // MCP tool-call tracer (--mcp-trace; nil = off)
-	fragments      map[string]*ast.DefineFragmentStmt // script-scoped fragment definitions
-	sqlMgr         *sqllib.Manager                    // external SQL connection manager (lazy init)
-	themeRegistry  *ThemeRegistry                     // cached theme design property definitions (lazy init)
-	registry       *Registry                          // statement dispatch registry
-	catalogMu      sync.RWMutex                       // protects catalog field from background goroutine writes
-	catalogGen     uint64                             // monotonic generation counter for catalog swaps
+	// flowLayoutOverride is the style `mxcli layout flows --style` lays out
+	// with, in place of the project's layout-config.yaml.
+	flowLayoutOverride *flowLayout
+	scriptDir          string           // directory of the .mdl file being executed (see SetScriptDir)
+	langVersion        langver.Version  // `mdl <n>;` of the program being run (see enterLanguage)
+	describeLang       *langver.Version // the language DESCRIBE writes, when set (SetDescribeLanguage)
+	// forwardFlowCalls is set when the run is all-or-nothing (SetForwardFlowCalls);
+	// scriptFlows then holds every flow the program being run declares.
+	forwardFlowCalls bool
+	scriptFlows      map[string]*selfFlow
+	scriptTargets    map[defKey]bool // pages and flows the program declares, same run
+	settings         map[string]any
+	cache            *executorCache
+	catalog          *catalog.Catalog
+	quiet            bool            // suppress connection and status messages
+	terminal         bool            // output is a terminal (catalog progress in full)
+	tally            *mutationTally  // collapses a program run's "Unchanged" reports into one line
+	accessRun        *accessRuleRun  // the open run of access-rule statements, if any (#872, #890)
+	format           OutputFormat    // output format (table, json)
+	logger           *diaglog.Logger // session diagnostics logger (nil = no logging)
+	tracer           *backend.Tracer // MCP tool-call tracer (--mcp-trace; nil = off)
+	stmtGuard        func(ast.Statement) (ast.Statement, error)
+	fragments        map[string]*ast.DefineFragmentStmt // script-scoped fragment definitions
+	sqlMgr           *sqllib.Manager                    // external SQL connection manager (lazy init)
+	themeRegistry    *ThemeRegistry                     // cached theme design property definitions (lazy init)
+	registry         *Registry                          // statement dispatch registry
+	catalogMu        sync.RWMutex                       // protects catalog field from background goroutine writes
+	untimedMu        sync.Mutex                         // protects untimed
+	// running counts statement goroutines still running, including one the
+	// wall-clock guard gave up on: Close waits for them (ako/mxcli#2043).
+	running    sync.WaitGroup
+	untimed    *untimedWork // the running statement's untimed-work tracker (see untimed_work.go)
+	catalogGen uint64       // monotonic generation counter for catalog swaps
+
+	// Files changed beside the model (ako/mxcli#1618): a program run's, for
+	// its summary line, and whether the caller wants them reported at all —
+	// not when its writes are temporary (SetSourceFileReport).
+	sourceFiles        sourceFileLog
+	noSourceFileReport bool
 }
 
 // New creates a new executor with the given output writer.
 func New(output io.Writer) *Executor {
 	guard := newOutputGuard(output, maxOutputLines)
 	return &Executor{
+		terminal: isTerminal(output),
 		output:   guard,
 		guard:    guard,
 		settings: make(map[string]any),
@@ -273,9 +348,62 @@ func (e *Executor) SetQuiet(quiet bool) {
 	e.quiet = quiet
 }
 
+// SetFlowLayoutStyle lays flows out in the named preset instead of the
+// project's layout-config.yaml. "" restores the project's style.
+func (e *Executor) SetFlowLayoutStyle(preset string) error {
+	if preset == "" {
+		e.flowLayoutOverride = nil
+		return nil
+	}
+	l, err := FlowLayoutPreset(preset)
+	if err != nil {
+		return err
+	}
+	e.flowLayoutOverride = l
+	return nil
+}
+
+// FlowLayoutStyle describes the style flows are laid out with and where it
+// comes from: the --style override, the project's layout-config.yaml, or the
+// default.
+func (e *Executor) FlowLayoutStyle() (style, source string, err error) {
+	ctx := e.newExecContext(context.Background())
+	l, err := ctx.ProjectFlowLayout()
+	if err != nil {
+		return "", "", err
+	}
+	switch {
+	case e.flowLayoutOverride != nil:
+		source = "--style"
+	case e.mprPath != "" && FindFlowLayoutConfig(filepath.Dir(e.mprPath)) != "":
+		source = FindFlowLayoutConfig(filepath.Dir(e.mprPath))
+	default:
+		source = "default (no " + flowLayoutConfigName + ")"
+	}
+	return l.String(), source, nil
+}
+
 // SetFormat sets the output format (table or json).
 func (e *Executor) SetFormat(f OutputFormat) {
 	e.format = f
+}
+
+// SetScriptDir records the directory of the .mdl file being executed, so a
+// relative path written inside a script names a file next to that script rather
+// than next to whoever invoked mxcli.
+//
+// Empty for a -c one-liner, the REPL or stdin, where there is no script to be
+// relative to; resolution then falls back to the working directory.
+func (e *Executor) SetScriptDir(dir string) {
+	e.scriptDir = dir
+}
+
+// SetDescribeLanguage sets the MDL language describe writes for the rest of
+// the session: `mxcli describe --mdl 0`, `--mdl` on the REPL and `-c`, and the
+// REPL's `mdl 0;` / `mdl 1;` (ako/mxcli#840). Unset, describe writes the
+// frozen language, mdl 1, headed by `mdl 1;` (describeLanguage).
+func (e *Executor) SetDescribeLanguage(v langver.Version) {
+	e.describeLang = &v
 }
 
 // SetLogger sets the diagnostics logger for session logging.
@@ -291,11 +419,34 @@ func (e *Executor) SetTracer(t *backend.Tracer) {
 	e.tracer = t
 }
 
+// SetStatementGuard installs a function every statement passes through before
+// it runs — including the statements of a nested EXECUTE SCRIPT, which are
+// dispatched through Execute too. It returns the statement to run in its place,
+// or an error to refuse it. `mxcli diff` uses it to keep a script it runs on a
+// scratch copy from reaching anything but the copy.
+func (e *Executor) SetStatementGuard(g func(ast.Statement) (ast.Statement, error)) {
+	e.stmtGuard = g
+}
+
 // Execute runs a single MDL statement with output-line and wall-clock guards.
 // Each statement gets a fresh line budget. If the statement exceeds maxOutputLines
 // lines of output or runs longer than the configured timeout, it is aborted with an error.
 func (e *Executor) Execute(stmt ast.Statement) error {
 	start := time.Now()
+
+	if e.stmtGuard != nil {
+		s, err := e.stmtGuard(stmt)
+		if err != nil {
+			return err
+		}
+		stmt = s
+	}
+
+	// Another process may have written to the project since the last
+	// statement (ako/mxcli#2121).
+	if err := e.syncWithDisk(); err != nil {
+		return err
+	}
 
 	// Announce the MDL command so the PED calls it triggers (reported by the MCP
 	// client) group under it (--mcp-trace, level 2; no-op otherwise).
@@ -303,35 +454,80 @@ func (e *Executor) Execute(stmt ast.Statement) error {
 
 	// Reset per-statement line counter.
 	if e.guard != nil {
-		e.guard.reset()
+		e.guard.reset(effectiveOutputLineLimit(stmt))
 	}
 
-	// Enforce wall-clock timeout via context.WithTimeout.
+	// A describe writes nothing, and the describers look the same documents up
+	// again and again — a module dump describes every document of the module,
+	// each one listing the folders, the flows and the domain models anew — so
+	// the statement reads each unit file once (mendixlabs/mxcli#1624). A write
+	// would empty the cache, as it does in check's passes.
+	if _, ok := stmt.(*ast.DescribeStmt); ok {
+		defer e.CacheUnitReads()()
+	}
+
+	// Enforce the wall-clock timeout with a timer that skips untimed work.
 	// The goroutine pattern is retained because handlers are not yet
 	// context-aware; threading context through handlers is a follow-up.
 	executeTimeout := effectiveExecuteTimeout(stmt)
+
+	// Time spent rebuilding the catalog implicitly is not counted against the
+	// default limit, for the reason REFRESH CATALOG is exempt from it
+	// (mendixlabs/mxcli#1329). An explicit MXCLI_EXEC_TIMEOUT caps it, as it
+	// caps REFRESH CATALOG.
+	untimed := e.pushUntimed(os.Getenv("MXCLI_EXEC_TIMEOUT") == "")
+	defer e.popUntimed(untimed)
+	baseCtx := withUntimedWork(context.Background(), untimed)
 
 	var err error
 	if executeTimeout <= 0 {
 		// No wall-clock guard for exempt statements (e.g. REFRESH CATALOG on a
 		// large project). The output-line guard still bounds runaway output.
-		err = e.executeInner(context.Background(), stmt)
+		err = e.executeRecovered(baseCtx, stmt)
 	} else {
-		ctx, cancel := context.WithTimeout(context.Background(), executeTimeout)
+		ctx, cancel := context.WithCancel(baseCtx)
 		defer cancel()
 
 		type result struct{ err error }
 		ch := make(chan result, 1)
+		begun := time.Now()
+		// The goroutine outlives a timeout: handlers are not context-aware, so
+		// the statement runs on after Execute has returned. Close waits for it,
+		// and a panic in it is recovered — unrecovered, a panic in any goroutine
+		// ends the process, and exec's rollback with it (ako/mxcli#2043).
+		e.running.Add(1)
 		go func() {
-			ch <- result{e.executeInner(ctx, stmt)}
+			defer e.running.Done()
+			ch <- result{e.executeRecovered(ctx, stmt)}
 		}()
 
-		select {
-		case r := <-ch:
-			err = r.err
-		case <-ctx.Done():
-			err = mdlerrors.NewValidationf("statement timed out after %v (raise the limit with MXCLI_EXEC_TIMEOUT, e.g. MXCLI_EXEC_TIMEOUT=30m)", executeTimeout)
+		timer := time.NewTimer(executeTimeout)
+		defer timer.Stop()
+	wait:
+		for {
+			select {
+			case r := <-ch:
+				err = r.err
+				break wait
+			case <-timer.C:
+				now := time.Now()
+				counted := now.Sub(begun) - untimed.excluded(now)
+				if remaining := executeTimeout - counted; remaining > 0 {
+					timer.Reset(remaining)
+					continue
+				}
+				cancel()
+				err = executeTimeoutError(executeTimeout, untimed.inProgress())
+				break wait
+			}
 		}
+	}
+
+	// A handler that ignored the guard's Write error still "succeeded" with its
+	// output cut off at the limit; that must fail the statement, not exit 0
+	// (mendixlabs/mxcli#1425).
+	if err == nil && e.guard != nil {
+		err = e.guard.exceededError()
 	}
 
 	if e.logger != nil {
@@ -340,8 +536,104 @@ func (e *Executor) Execute(stmt ast.Statement) error {
 	return err
 }
 
+// executeRecovered is executeInner with a panic turned into the statement's
+// error. A handler defect must fail its statement, not the process: `exec`
+// rolls the script back on a statement's error, and a panic used to skip that
+// and leave every earlier statement written (ako/mxcli#2043).
+func (e *Executor) executeRecovered(ctx context.Context, stmt ast.Statement) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = statementPanicError(r, debug.Stack())
+		}
+	}()
+	return e.executeInner(ctx, stmt)
+}
+
+// statementPanicError is the error for a statement whose handler panicked. The
+// stack goes with it: it is the defect report.
+func statementPanicError(r any, stack []byte) error {
+	return fmt.Errorf("internal error while running the statement: %v\n"+
+		"This is a defect in mxcli; please report it with the stack below.\n%s", r, stack)
+}
+
+// abandonedStatementWait bounds how long Close waits for a statement the
+// wall-clock guard gave up on. A variable so a test need not wait it out.
+var abandonedStatementWait = 2 * time.Minute
+
+// WaitForAbandonedStatements waits up to limit for the statements Execute
+// returned from on a timeout to stop, and reports whether they did.
+func (e *Executor) WaitForAbandonedStatements(limit time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		e.running.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(limit):
+		return false
+	}
+}
+
+// executeTimeoutError is the error for a statement the wall-clock guard
+// stopped. When it stopped an implicit catalog rebuild it says so: the build
+// is only saved once it finishes, so the next statement that needs the catalog
+// starts the same rebuild over — without the hint, every retry looks like a new
+// failure (mendixlabs/mxcli#1329).
+func executeTimeoutError(limit time.Duration, building string) error {
+	if building == "" {
+		return mdlerrors.NewValidationf("statement timed out after %v (raise the limit with MXCLI_EXEC_TIMEOUT, e.g. MXCLI_EXEC_TIMEOUT=30m)", limit)
+	}
+	return mdlerrors.NewValidationf("statement timed out after %v while rebuilding the catalog (%s); the catalog cache was not updated, so the next statement that needs it rebuilds again. Rebuild it once with REFRESH CATALOG FULL SOURCE (with MXCLI_EXEC_TIMEOUT unset, so the default limit does not apply), or raise the limit with MXCLI_EXEC_TIMEOUT, e.g. MXCLI_EXEC_TIMEOUT=30m", limit, building)
+}
+
+// pushUntimed installs a fresh untimed-work tracker for the statement about to
+// run, chained to the enclosing statement's when Execute is re-entered by
+// EXECUTE SCRIPT.
+func (e *Executor) pushUntimed(exclude bool) *untimedWork {
+	e.untimedMu.Lock()
+	defer e.untimedMu.Unlock()
+	w := newUntimedWork(e.untimed, exclude)
+	e.untimed = w
+	return w
+}
+
+// popUntimed restores the enclosing statement's tracker.
+func (e *Executor) popUntimed(w *untimedWork) {
+	e.untimedMu.Lock()
+	defer e.untimedMu.Unlock()
+	if e.untimed == w {
+		e.untimed = w.parent
+	}
+}
+
 // ExecuteProgram runs all statements in a program.
 func (e *Executor) ExecuteProgram(prog *ast.Program) error {
+	_, err := e.ExecuteProgramReportingStop(prog)
+	return err
+}
+
+// ExecuteProgramReportingStop is ExecuteProgram that also says where it
+// stopped: the 0-based index of the statement whose error ended the run, or
+// -1 when no statement failed (an error from the run's end-of-program work —
+// the access-rule flush, reconciliation — is not one statement's). A caller
+// running several statements uses it to say which one failed and how many
+// were not run, rather than leaving the rest silently skipped
+// (mendixlabs/mxcli#1218).
+func (e *Executor) ExecuteProgramReportingStop(prog *ast.Program) (stoppedAt int, err error) {
+	stoppedAt = -1
+	if e.beginTally() {
+		defer e.flushTally()
+	}
+	defer e.enterLanguage(prog.LanguageVersion)()
+	defer e.enterScriptFlows(prog)()
+	// A script's statements list the same document types one after another,
+	// so the run reads each unit file once and again only after rewriting it
+	// (ako/mxcli#2160). The cache ends with the run: a session that stays
+	// open must not keep serving bytes Studio Pro has since rewritten.
+	defer e.CacheUnitReads()()
+
 	// Collect all names defined in the script for forward-reference hints.
 	allDefined := newScriptContext()
 	allDefined.collectDefinitions(prog)
@@ -349,13 +641,145 @@ func (e *Executor) ExecuteProgram(prog *ast.Program) error {
 	// Track which names have been created so far.
 	created := newScriptContext()
 
-	for _, stmt := range prog.Statements {
+	// A run of access-rule statements is written once, at its end (#872). The
+	// deferred end also covers a statement that fails mid-run: what the run's
+	// earlier statements did still lands, as it did when each wrote itself. If
+	// it cannot land, that is returned with the statement's error — those
+	// statements already reported success.
+	var rules accessRuleRun
+	// A run of entity and association statements likewise (entity_run.go).
+	var entities entityRun
+	defer func() {
+		if ferr := errors.Join(entities.end(), rules.end()); ferr != nil {
+			err = errors.Join(err, ferr)
+		}
+	}()
+
+	for i, stmt := range prog.Statements {
+		if err := stepRuns(e, &rules, &entities, stmt); err != nil {
+			return -1, err
+		}
 		if err := e.Execute(stmt); err != nil {
-			return annotateForwardRef(err, stmt, created, allDefined)
+			return i, annotateForwardRef(err, stmt, created, allDefined)
 		}
 		created.collectSingle(stmt)
 	}
-	return e.finalizeProgramExecution()
+	if err := errors.Join(entities.end(), rules.end()); err != nil {
+		return -1, err
+	}
+	return -1, e.finalizeProgramExecution()
+}
+
+// SetForwardFlowCalls says whether a call may name a microflow or nanoflow a
+// LATER statement of the script creates (mendixlabs/mxcli#1405). A call is
+// stored by name, so it can be written before its callee; what makes it unsafe
+// is a later statement failing and leaving the call dangling. Only a run that
+// rolls back on failure — plain `mxcli exec` under the #1408 journal — may
+// allow it, and `mxcli check`, which cannot know how the script will run.
+// Off by default: --continue-on-error, the REPL and -c refuse it.
+func (e *Executor) SetForwardFlowCalls(on bool) { e.forwardFlowCalls = on }
+
+// enterScriptFlows makes every flow the program declares resolvable by a call
+// in it, wherever the declaration stands, and returns the function that
+// restores the previous set. Only a run that can roll back does this
+// (SetForwardFlowCalls); otherwise a call still resolves in statement order.
+// A nested EXECUTE SCRIPT sees its caller's flows as well as its own.
+func (e *Executor) enterScriptFlows(prog *ast.Program) func() {
+	if !e.forwardFlowCalls {
+		return func() {}
+	}
+	prev, prevTargets := e.scriptFlows, e.scriptTargets
+	flows := make(map[string]*selfFlow, len(prev))
+	for k, v := range prev {
+		flows[k] = v
+	}
+	targets := make(map[defKey]bool, len(prevTargets))
+	for k, v := range prevTargets {
+		targets[k] = v
+	}
+	for _, stmt := range prog.Statements {
+		switch s := stmt.(type) {
+		case *ast.CreateMicroflowStmt:
+			declareScriptFlow(flows, false, s.Name, s.ReturnType)
+		case *ast.CreateNanoflowStmt:
+			declareScriptFlow(flows, true, s.Name, s.ReturnType)
+		}
+		// What a navigation target may name, wherever the declaration stands.
+		if key, _ := definedBy(stmt); key.name != "" {
+			switch key.kind {
+			case defPage, defMicroflow, defNanoflow:
+				targets[key] = true
+			}
+		}
+	}
+	e.scriptFlows, e.scriptTargets = flows, targets
+	return func() { e.scriptFlows, e.scriptTargets = prev, prevTargets }
+}
+
+// enterLanguage runs the following statements under a program's language
+// version and returns the function that restores the previous one. The version
+// belongs to the script, so a nested EXECUTE SCRIPT runs under its own header
+// and its caller's is back afterwards. A statement run outside a program (the
+// REPL, a -c one-liner) is mdl 0, the same as a headerless script.
+func (e *Executor) enterLanguage(v langver.Version) func() {
+	prev := e.langVersion
+	e.langVersion = v
+	return func() { e.langVersion = prev }
+}
+
+// ExecuteProgramResult reports the outcome of a continue-on-error run.
+type ExecuteProgramResult struct {
+	Total     int // statements attempted
+	Succeeded int
+	Failed    int
+}
+
+// ExecuteProgramContinueOnError runs every statement in the program, reporting
+// each failure to w instead of halting on the first one, and returns a summary.
+// This makes a partially-applied domain script re-runnable: the already-applied
+// statements error individually (e.g. "attribute already exists") while the not-
+// yet-applied ones still run. Unlike the default ExecuteProgram, a failure never
+// masks later work — but each error is surfaced, so a real mistake is still
+// visible (the caller is expected to exit non-zero when Failed > 0). ErrExit is
+// honoured (stops the run) and returned, so `exit`/`quit` still work.
+func (e *Executor) ExecuteProgramContinueOnError(prog *ast.Program, w io.Writer) (ExecuteProgramResult, error) {
+	if e.beginTally() {
+		defer e.flushTally()
+	}
+	defer e.enterLanguage(prog.LanguageVersion)()
+
+	allDefined := newScriptContext()
+	allDefined.collectDefinitions(prog)
+	created := newScriptContext()
+
+	var rules accessRuleRun // see ExecuteProgram
+	var entities entityRun
+	defer func() { _ = entities.end(); _ = rules.end() }()
+
+	var res ExecuteProgramResult
+	for i, stmt := range prog.Statements {
+		res.Total++
+		if err := stepRuns(e, &rules, &entities, stmt); err != nil {
+			return res, err
+		}
+		if err := e.Execute(stmt); err != nil {
+			if errors.Is(err, ErrExit) {
+				return res, err
+			}
+			res.Failed++
+			fmt.Fprintf(w, "statement %d: %v\n", i+1, annotateForwardRef(err, stmt, created, allDefined))
+			continue
+		}
+		res.Succeeded++
+		created.collectSingle(stmt)
+	}
+	if err := errors.Join(entities.end(), rules.end()); err != nil {
+		return res, err
+	}
+	if err := e.finalizeProgramExecution(); err != nil {
+		return res, err
+	}
+	return res, nil
 }
 
 // finalizeProgramExecution runs post-execution reconciliation on modified domain models.
@@ -405,11 +829,25 @@ func (e *Executor) Backend() backend.FullBackend {
 	return e.backend
 }
 
+// CacheUnitReads holds the units the backend reads in memory until release is
+// called, for a pass that writes nothing (see ExecContext.CacheUnitReads).
+func (e *Executor) CacheUnitReads() (release func()) {
+	return (&ExecContext{Backend: e.Backend()}).CacheUnitReads()
+}
+
 // Close closes the connection to the project and all SQL connections.
 func (e *Executor) Close() error {
 	var closeErr error
+	// A statement the wall-clock guard gave up on may still be reading or
+	// writing the project. Disconnecting under it made it read a nil reader and
+	// panic, and a caller's rollback could run alongside it (ako/mxcli#2043).
+	if !e.WaitForAbandonedStatements(abandonedStatementWait) {
+		closeErr = fmt.Errorf("a statement that timed out was still running after %v; closing the project under it", abandonedStatementWait)
+	}
 	if e.backend != nil && e.backend.IsConnected() {
-		closeErr = e.backend.Disconnect()
+		if err := disconnectBackend(e.backend); err != nil && closeErr == nil {
+			closeErr = err
+		}
 		e.backend = nil
 	}
 	if e.sqlMgr != nil {
@@ -492,4 +930,26 @@ func consumeDroppedNanoflow(ctx *ExecContext, qualifiedName string) *droppedUnit
 	}
 	delete(ctx.Cache.droppedNanoflows, qualifiedName)
 	return info
+}
+
+// beginTally starts collapsing this program run's "Unchanged" reports, and
+// reports whether this call owns the tally (see mutationTally.begin).
+func (e *Executor) beginTally() bool {
+	if e.tally == nil {
+		e.tally = &mutationTally{}
+	}
+	owns := e.tally.begin()
+	if owns {
+		e.sourceFiles.begin()
+	}
+	return owns
+}
+
+// flushTally writes the run's one-line summaries and stands the tally down.
+// The files changed beside the model come last: what to stage is the line a
+// reader should finish on.
+func (e *Executor) flushTally() {
+	e.tally.flush(e.output)
+	e.sourceFiles.flush(e.output)
+	e.tally.end()
 }

@@ -12,7 +12,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,9 +23,115 @@ import (
 type Logger struct {
 	slog      *slog.Logger
 	file      *os.File
+	pid       int
 	cmdCount  int
 	errCount  int
 	startTime time.Time
+	closed    bool
+	// stopBeat ends the heartbeat goroutine. See startHeartbeat.
+	stopBeat chan struct{}
+}
+
+// HeartbeatInterval is how often a live session records that it is still
+// running. A var so tests can shorten it.
+//
+// It exists because mxcli's long-running commands almost never write a
+// session_end: `run --local` is a `Run:` (not `RunE:`) command that exits
+// through os.Exit at every failure site — 258 such sites in cmd/mxcli — and a
+// boot the agent kills writes nothing at all. So `diag loop-report` summed wall
+// time over the runs that happened to close, which on two measured projects was
+// 4 of 30 and 7 of 34 `run` invocations: the restart bill, the single largest
+// item in an agent session, was invisible
+// (PROPOSAL_agent_loop_efficiency.md item 2d).
+//
+// A heartbeat turns that into a MEASURED lower bound rather than an
+// extrapolation, and it does so for every death mode at once — SIGKILL, an
+// os.Exit deep inside a command, a crash — without touching any of them. The
+// interval is coarse on purpose: a 90-second boot costs three lines.
+var HeartbeatInterval = 30 * time.Second
+
+// startHeartbeat records "still running" until the session ends, so a process
+// that never closes still bounds its own duration from below.
+//
+// Called with mu held, from Init.
+func (l *Logger) startHeartbeat() {
+	if HeartbeatInterval <= 0 {
+		return
+	}
+	stop := make(chan struct{})
+	l.stopBeat = stop
+	start, pid, logger := l.startTime, l.pid, l.slog
+	go func() {
+		t := time.NewTicker(HeartbeatInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case now := <-t.C:
+				// Only the fields a reader needs to bound the run: anything
+				// mutable (the command counter) would be a data race, and the
+				// record is written from this goroutine.
+				logger.Info("session_alive",
+					"pid", pid,
+					"elapsed_s", int(now.Sub(start).Seconds()),
+				)
+			}
+		}
+	}()
+}
+
+// parentPIDEnv names the mxcli process that spawned this one, when one did.
+// Set by Init and inherited by every child, so a self-spawned run is
+// distinguishable from a call the user or agent made (ako/mxcli#629).
+const parentPIDEnv = "MXCLI_SESSION_PID"
+
+// One session per process.
+//
+// `diag loop-report` counts session records, so a process that opened two would
+// count twice and one that opened none would be invisible. Init is called from
+// mxcli's main() for every command and again by each command that builds a
+// logged executor; the second call has to return the SAME logger (ako/mxcli#617).
+var (
+	mu      sync.Mutex
+	current *Logger
+)
+
+// CloseCurrent ends the process session, if one was started, as a clean exit.
+func CloseCurrent() {
+	CloseCurrentWithExit(0)
+}
+
+// CloseCurrentWithExit ends the process session and records the exit code the
+// process is about to leave with.
+//
+// main() calls this on the error path as well as the clean one. It used to call
+// Close only on a normal return, so a command that merely returned an error
+// wrote no session_end — and with it went the run's DURATION, not just its
+// verdict. `diag loop-report` then computed wall time over the runs that
+// happened to succeed: on two measured projects only 4 of 30 and 7 of 34 `run`
+// invocations were counted, making the restart bill a floor
+// (PROPOSAL_agent_loop_efficiency.md item 2d).
+//
+// A run that exits through os.Exit *inside* a command still leaves no
+// session_end, and so does one that is killed with SIGKILL. Those remain in the
+// report's `unclosed` bucket, which is now what it says: a process that
+// vanished rather than one that failed.
+func CloseCurrentWithExit(code int) {
+	mu.Lock()
+	l := current
+	mu.Unlock()
+	l.closeWithExit(code)
+}
+
+// resetForTest drops the process logger so a test can start a fresh session.
+func resetForTest() {
+	mu.Lock()
+	defer mu.Unlock()
+	if current != nil && current.file != nil {
+		current.file.Close()
+	}
+	current = nil
 }
 
 // Init creates the daily log file and writes a session header.
@@ -31,6 +139,11 @@ type Logger struct {
 func Init(version, mode string) *Logger {
 	if isDisabled() {
 		return nil
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if current != nil {
+		return current
 	}
 
 	logDir := logDirectory()
@@ -56,6 +169,25 @@ func Init(version, mode string) *Logger {
 		startTime: time.Now(),
 	}
 
+	current = l
+	l.pid = os.Getpid()
+	l.startHeartbeat()
+
+	// mxcli spawns mxcli: `test` runs `-c DESCRIBE SETTINGS`, `-c SHOW MODULES`
+	// and an `exec` of the generated runner before a single test executes, and
+	// `new`, `eval`, `tui` and the LSP do the same. Each child logs a session of
+	// its own, so without a marker the report counts them as calls the agent made
+	// — 3 phantom calls per `mxcli test` — and shows the parent as never having
+	// closed, because a session_start used to end the open invocation.
+	//
+	// The marker rides the ENVIRONMENT rather than each spawn site: a child
+	// started with exec.Command inherits this process's environment (explicitly
+	// via os.Environ(), or implicitly when Cmd.Env is nil), so setting it once
+	// here covers all six self-spawn sites and any added later without touching
+	// them (ako/mxcli#629).
+	parent := os.Getenv(parentPIDEnv)
+	os.Setenv(parentPIDEnv, strconv.Itoa(l.pid))
+
 	// Write session header
 	l.slog.Info("session_start",
 		"version", version,
@@ -64,22 +196,73 @@ func Init(version, mode string) *Logger {
 		"arch", runtime.GOARCH,
 		"mode", mode,
 		"args", os.Args,
-		"pid", os.Getpid(),
+		"pid", l.pid,
+		"parent_pid", parent,
 	)
 
 	return l
 }
 
-// Close writes a session summary and closes the log file.
+// Close releases a command's hold on the session. It writes nothing when this
+// logger is the PROCESS session, because the process ends that — see
+// closeWithExit.
+//
+// Commands `defer logger.Close()` after building a logged executor, and that
+// defer runs while the command is RETURNING, before cobra hands its error back
+// to main(). So the command always closed the session first and recorded the
+// exit code as 0, which made main's close a no-op and left every failing run
+// looking clean (and, before main closed on error at all, left it with no
+// duration — PROPOSAL_agent_loop_efficiency.md item 2d).
+//
+// Nothing is lost by deferring the write to the process: a command that reaches
+// its own defer has returned, so main's close is still ahead of it. A command
+// that exits through os.Exit skips BOTH, exactly as before.
 func (l *Logger) Close() {
 	if l == nil {
 		return
 	}
-	l.slog.Info("session_end",
+	mu.Lock()
+	isProcessSession := current == l
+	mu.Unlock()
+	if isProcessSession {
+		return
+	}
+	l.closeWithExit(0)
+}
+
+// closeWithExit writes the session summary and closes the log file, recording
+// the code the process is exiting with.
+func (l *Logger) closeWithExit(code int) {
+	if l == nil {
+		return
+	}
+	// Still first-wins: a process has one session_end whoever gets here first.
+	mu.Lock()
+	defer mu.Unlock()
+	if l.closed {
+		return
+	}
+	l.closed = true
+	if l.stopBeat != nil {
+		close(l.stopBeat)
+		l.stopBeat = nil
+	}
+	attrs := []any{
 		"commands_executed", l.cmdCount,
 		"errors_count", l.errCount,
 		"duration_s", int(time.Since(l.startTime).Seconds()),
-	)
+		// The pid is what pairs this with its session_start. Without it a reader
+		// can only guess by position, which is wrong the moment one mxcli runs
+		// another — and mxcli runs itself routinely (ako/mxcli#629).
+		"pid", l.pid,
+	}
+	// Omitted when zero, so a reader cannot mistake "exited cleanly" for
+	// "we did not record it" — and so a session_end from a log written before
+	// this existed (where closing implied success) reads correctly as 0.
+	if code != 0 {
+		attrs = append(attrs, "exit_code", code)
+	}
+	l.slog.Info("session_end", attrs...)
 	l.file.Close()
 }
 
@@ -176,6 +359,10 @@ func isDisabled() bool {
 
 // logDirectory returns ~/.mxcli/logs/.
 func logDirectory() string {
+	// MXCLI_LOG_DIR keeps a test out of the user's real log directory.
+	if d := os.Getenv("MXCLI_LOG_DIR"); d != "" {
+		return d
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""

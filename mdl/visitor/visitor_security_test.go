@@ -3,6 +3,7 @@
 package visitor
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
@@ -27,8 +28,25 @@ func TestCreateModuleRole(t *testing.T) {
 	if stmt.Name.Module != "MyModule" || stmt.Name.Name != "Editor" {
 		t.Errorf("Expected MyModule.Editor, got %s.%s", stmt.Name.Module, stmt.Name.Name)
 	}
-	if stmt.Description != "Can edit content" {
-		t.Errorf("Expected description 'Can edit content', got %q", stmt.Description)
+	if stmt.DescriptionText() != "Can edit content" {
+		t.Errorf("Expected description 'Can edit content', got %q", stmt.DescriptionText())
+	}
+}
+
+// A description clause with an empty string states an empty description, which
+// clears a stored one under `create or modify`; no clause states none, which
+// keeps it (ako/mxcli#1218).
+func TestCreateModuleRole_EmptyDescriptionIsStated(t *testing.T) {
+	prog, errs := Build(`create or modify module role MyModule.Viewer description '';`)
+	if len(errs) > 0 {
+		t.Fatalf("parse: %v", errs)
+	}
+	stmt, ok := prog.Statements[0].(*ast.CreateModuleRoleStmt)
+	if !ok {
+		t.Fatalf("Expected CreateModuleRoleStmt, got %T", prog.Statements[0])
+	}
+	if stmt.Description == nil || *stmt.Description != "" {
+		t.Errorf("Description = %v, want a stated empty string", stmt.Description)
 	}
 }
 
@@ -45,8 +63,8 @@ func TestCreateModuleRole_NoDescription(t *testing.T) {
 	if !ok {
 		t.Fatalf("Expected CreateModuleRoleStmt, got %T", prog.Statements[0])
 	}
-	if stmt.Description != "" {
-		t.Errorf("Expected empty description, got %q", stmt.Description)
+	if stmt.Description != nil {
+		t.Errorf("Expected no description clause, got %q", *stmt.Description)
 	}
 }
 
@@ -229,6 +247,53 @@ func TestGrantEntityAccess(t *testing.T) {
 	}
 }
 
+func TestGrantEntityAccess_QuotedMembers(t *testing.T) {
+	// Members whose name is a reserved word can be escaped with quotes.
+	input := `GRANT MyModule.Admin ON MyModule.Order (READ ("Order", "Status"), WRITE ("Order"));`
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		for _, e := range errs {
+			t.Errorf("Parse error: %v", e)
+		}
+		return
+	}
+	stmt := prog.Statements[0].(*ast.GrantEntityAccessStmt)
+	if len(stmt.Rights) != 2 {
+		t.Fatalf("expected 2 rights, got %d", len(stmt.Rights))
+	}
+	if stmt.Rights[0].Type != ast.EntityAccessReadMembers ||
+		len(stmt.Rights[0].Members) != 2 ||
+		stmt.Rights[0].Members[0] != "Order" || stmt.Rights[0].Members[1] != "Status" {
+		t.Errorf("expected READ members [Order Status] (unquoted), got %v", stmt.Rights[0].Members)
+	}
+	if stmt.Rights[1].Type != ast.EntityAccessWriteMembers ||
+		len(stmt.Rights[1].Members) != 1 || stmt.Rights[1].Members[0] != "Order" {
+		t.Errorf("expected WRITE members [Order] (unquoted), got %v", stmt.Rights[1].Members)
+	}
+}
+
+// A member list took only IDENTIFIER or a quoted name, so any attribute whose
+// name lexes as a keyword — Region, Status, Title, Value, Date — was a parse
+// error ("mismatched input 'Region'") although `create entity` accepts it
+// unquoted. Every other name rule in the grammar includes `keyword`.
+func TestGrantEntityAccess_KeywordMembers(t *testing.T) {
+	input := `GRANT MyModule.Admin ON MyModule.Engineer (READ (FullName, Region, Status, Title), WRITE (Value, Date));`
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("Parse error: %v", errs)
+	}
+	stmt := prog.Statements[0].(*ast.GrantEntityAccessStmt)
+	want := [][]string{{"FullName", "Region", "Status", "Title"}, {"Value", "Date"}}
+	if len(stmt.Rights) != 2 {
+		t.Fatalf("expected 2 rights, got %d", len(stmt.Rights))
+	}
+	for i, w := range want {
+		if strings.Join(stmt.Rights[i].Members, ",") != strings.Join(w, ",") {
+			t.Errorf("right %d members %v, want %v", i, stmt.Rights[i].Members, w)
+		}
+	}
+}
+
 func TestGrantEntityAccess_MultipleRoles(t *testing.T) {
 	input := `GRANT MyModule.Admin, MyModule.Editor ON MyModule.Customer (READ *);`
 	prog, errs := Build(input)
@@ -367,44 +432,6 @@ func TestGrantRevokePage(t *testing.T) {
 		}
 		if stmt.Page.Name != "AdminPage" {
 			t.Errorf("Expected AdminPage, got %s", stmt.Page.Name)
-		}
-	})
-}
-
-func TestGrantRevokeWorkflow(t *testing.T) {
-	t.Run("grant", func(t *testing.T) {
-		input := `GRANT EXECUTE ON WORKFLOW MyModule.ApprovalWF TO MyModule.Manager;`
-		prog, errs := Build(input)
-		if len(errs) > 0 {
-			for _, e := range errs {
-				t.Errorf("Parse error: %v", e)
-			}
-			return
-		}
-		stmt, ok := prog.Statements[0].(*ast.GrantWorkflowAccessStmt)
-		if !ok {
-			t.Fatalf("Expected GrantWorkflowAccessStmt, got %T", prog.Statements[0])
-		}
-		if stmt.Workflow.Name != "ApprovalWF" {
-			t.Errorf("Expected ApprovalWF, got %s", stmt.Workflow.Name)
-		}
-	})
-
-	t.Run("revoke", func(t *testing.T) {
-		input := `REVOKE EXECUTE ON WORKFLOW MyModule.ApprovalWF FROM MyModule.Manager;`
-		prog, errs := Build(input)
-		if len(errs) > 0 {
-			for _, e := range errs {
-				t.Errorf("Parse error: %v", e)
-			}
-			return
-		}
-		stmt, ok := prog.Statements[0].(*ast.RevokeWorkflowAccessStmt)
-		if !ok {
-			t.Fatalf("Expected RevokeWorkflowAccessStmt, got %T", prog.Statements[0])
-		}
-		if stmt.Workflow.Name != "ApprovalWF" {
-			t.Errorf("Expected ApprovalWF, got %s", stmt.Workflow.Name)
 		}
 	})
 }
@@ -623,5 +650,49 @@ func TestUpdateSecurity_InModule(t *testing.T) {
 	}
 	if stmt.Module != "MyModule" {
 		t.Errorf("Expected MyModule, got %q", stmt.Module)
+	}
+}
+
+func TestAlterProjectSecurity_GuestAccess(t *testing.T) {
+	cases := []struct {
+		input    string
+		wantOn   bool
+		wantRole string
+	}{
+		{`ALTER PROJECT SECURITY GUEST ACCESS ON ROLE Anonymous;`, true, "Anonymous"},
+		{`ALTER PROJECT SECURITY GUEST ACCESS ON ROLE "Guest User";`, true, "Guest User"},
+		// Bare ON is legal to parse — the executor decides whether a stored role
+		// makes it valid, since re-enabling should not force a retype.
+		{`ALTER PROJECT SECURITY GUEST ACCESS ON;`, true, ""},
+		{`ALTER PROJECT SECURITY GUEST ACCESS OFF;`, false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			prog, errs := Build(tc.input)
+			if len(errs) > 0 {
+				t.Fatalf("Parse error: %v", errs[0])
+			}
+			stmt, ok := prog.Statements[0].(*ast.AlterProjectSecurityStmt)
+			if !ok {
+				t.Fatalf("Expected AlterProjectSecurityStmt, got %T", prog.Statements[0])
+			}
+			if stmt.GuestAccessEnabled == nil {
+				t.Fatal("GuestAccessEnabled is nil — the guest branch did not fire")
+			}
+			if *stmt.GuestAccessEnabled != tc.wantOn {
+				t.Errorf("GuestAccessEnabled = %v, want %v", *stmt.GuestAccessEnabled, tc.wantOn)
+			}
+			if stmt.GuestUserRole != tc.wantRole {
+				t.Errorf("GuestUserRole = %q, want %q", stmt.GuestUserRole, tc.wantRole)
+			}
+			// The other two ALTER PROJECT SECURITY forms share this node; a
+			// guest statement must not look like a level or demo-user one.
+			if stmt.SecurityLevel != "" {
+				t.Errorf("SecurityLevel = %q, want empty", stmt.SecurityLevel)
+			}
+			if stmt.DemoUsersEnabled != nil {
+				t.Errorf("DemoUsersEnabled = %v, want nil", *stmt.DemoUsersEnabled)
+			}
+		})
 	}
 }

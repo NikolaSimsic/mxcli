@@ -8,23 +8,236 @@ Mendix apps are React single-page applications. The server returns a JavaScript 
 
 ## Prerequisites
 
-- **Node.js** -- Required for playwright-cli
-- **playwright-cli** -- Install globally: `npm install -g @playwright/cli@latest`
-- **Chromium** -- Install via: `playwright-cli install --with-deps chromium`
-- **Running Mendix app** -- Start with `mxcli docker run -p app.mpr --wait`
+`mxcli init` provisions everything below inside the generated devcontainer, so in a normal project you do not install anything manually:
 
-### Devcontainer Setup
+- **Node.js** (LTS) -- via the base image; required for playwright-cli.
+- **playwright-cli** -- installed globally and **pinned** to a known-good version (`npm install -g @playwright/cli@0.1.15`). It is deliberately *not* `@latest`: the package is young and its CLI surface shifts between releases.
+- **Chromium (headless shell)** -- installed via `@playwright/cli`'s **bundled** `playwright-core` into a shared `PLAYWRIGHT_BROWSERS_PATH`, and exposed at the stable path `/usr/local/bin/mx-headless-shell`. The generated `.playwright/cli.config.json` pins `executablePath` to that symlink.
+- **Running Mendix app** -- start with `mxcli docker run -p app.mpr --wait`.
 
-If using a devcontainer, add the following to `postCreateCommand` in your `devcontainer.json`:
+`mxcli init` also generates `.playwright/cli.config.json` (headless Chromium, timeouts, allowed origins) and sets `PLAYWRIGHT_CLI_SESSION=mendix-app` in the devcontainer so the runner and your scripts share one browser session.
+
+### Manual / non-devcontainer setup (Linux arm64 gotchas)
+
+If you provision outside `mxcli init` or debug a browser-launch failure:
+
+- `playwright-cli install` **initializes the workspace** -- it does *not* install a browser (the browser command is `playwright-cli install-browser`).
+- `open --browser` only accepts `chrome | firefox | webkit | msedge` (no `chromium`), and defaults to the **chrome channel**, which has **no distribution on Linux arm64**. Use the bundled Chromium instead and pin it explicitly:
+
+  ```bash
+  node "$(npm root -g)/@playwright/cli/node_modules/playwright-core/cli.js" \
+    install chromium chromium-headless-shell
+  ```
+
+  Then point `.playwright/cli.config.json` at the headless-shell binary (headless mode needs the `chromium_headless_shell-*` build, not the full `chromium-*` one):
+
+  ```json
+  "browser": {
+    "browserName": "chromium",
+    "launchOptions": {
+      "headless": true,
+      "executablePath": "/usr/local/bin/mx-headless-shell"
+    }
+  }
+  ```
+
+## mxcli playwright check
+
+The first question about a page is usually textual — does it render, is there an
+error, did the list get rows — and `mxcli playwright check` answers it in one call
+against an app that is already running, with no screenshot to read:
 
 ```bash
-npm install -g @playwright/cli@latest && playwright-cli install --with-deps chromium
+mxcli playwright check /p/Customer_Overview /p/Order_Overview -p app.mpr
 ```
 
-The `mxcli init` command generates a `.playwright/cli.config.json` with sensible defaults for headless Chromium and a `PLAYWRIGHT_CLI_SESSION` environment variable for session management.
+```
+page /p/Customer_Overview  title="Customers"  h="Customer overview"  rows=12  text=812  console-errors=0
+page /p/Order_Overview  title="Orders"  text=254  console-errors=1
+  ALERT  An error occurred, please contact your system administrator.
+  ERR    [Client] An error occurred while executing microflow data source for widget …
+  HTTP   560 POST /xas/
+  FAIL   1 error banner(s)
+  FAIL   1 console error(s)
+  FAIL   1 failed request(s)
+FAIL 1 of 2 page(s)
+```
+
+The verdict line is the same one `mxcli run --local --page-check` prints; both use
+one probe, and every page of a call is loaded in one headless browser.
+
+A page is measured once it has **settled**: no request to the app open for half a
+second, no progress indicator, and its text unchanged. The requests are the part
+that matters. While a list view's data source runs, the list view shows nothing
+that says so — no spinner, no "no items" placeholder — so a page caught then looks
+finished and simply empty (ako/mxcli#845). A page that has not settled within
+`--wait` (default 15s; a page that settles sooner is measured then) is reported as
+still loading and fails, naming what it was waiting for:
+
+```
+page /p/Order_Overview  title="Orders"  STILL LOADING  rows=0  text=37  console-errors=0
+  WAIT   not settled after 3.1s: still waiting for POST /xas/
+  FAIL   still loading when measured, so the verdict may describe a partly rendered page (raise --wait if it is only slow)
+```
+
+The sign-in form is not waited for: the client keeps a request open behind it, so
+it would otherwise run out the whole `--wait` and then read as still loading. Once
+the form holds still it is measured, and it fails as the sign-in form.
+
+A page with a list view, data grid or gallery always reports `rows=`, `rows=0`
+included, so an empty list does not read the same as a page without one.
+
+When the browser ends up somewhere other than the URL it was sent to, the verdict
+says where, as `url=`, right after the page — the title and heading that follow
+describe the page at *that* URL. A `/p/` URL that ends anywhere else fails: the
+runtime answers every `/p/<x>` with a redirect to `/#/<x>`, and the client sends one
+it has no page for to the home page, with HTTP 200 throughout (ako/mxcli#998). The
+match is exact, so `/p/Items` and `/p/items/` fail where `/p/items` passes.
+
+```
+page /p/doesnotexist  url=/  title="Mendix - Homepage"  h="Welcome to your homepage"  text=1925  console-errors=0
+  ALERT  The page you requested was not found. You are redirected to the home page.
+  FAIL   the browser ended on /, not on /p/doesnotexist: the client sends a /p/ URL it has no page for to the home page
+```
+
+A page that ends on the sign-in form (`url=/login.html#/items`) fails for that
+reason only.
+
+A page the signed-in user's roles may not open ends on the sign-in form too, but
+with `messageCode=403` in the URL: the runtime refuses the client's session request
+for that page with 403, and the client sends the browser to
+`/login.html?messageCode=403#/<page>`. The form shows no message, so the URL is the
+only thing that tells it from "not signed in". It fails as access denied, naming who
+the check signed in as; signing in again would get the same answer, so the check
+does not:
+
+```
+page /p/secret  url=/login.html?messageCode=403#/secret  ACCESS DENIED  title="Login"  h="Sign in"  text=34  console-errors=1
+  ERR    [Startup] An error occurred while creating a new session. i_: Internal server error …
+  HTTP   403 POST /xas/
+  FAIL   access denied: signed in as demo_user (user role User), the runtime refused /p/secret (403)
+```
+
+Check the page's allowed module roles (`mxcli -p app.mpr -c "show access on page
+Module.Page"`) against the user role's (`describe user role R`).
+
+| Exit status | Meaning |
+|---|---|
+| 0 | every page passed |
+| 1 | a page failed: still loading when measured, HTTP error, access denied to the signed-in user (403), sign-in form instead of the page (or a 401 from the runtime), a `/p/` URL that ended elsewhere (no page has that URL), error banner or error dialog, console error, failed same-origin request, or a failed `--assert-*` |
+| 2 | the check could not run (no Node/Playwright, sign-in rejected, bad flag) |
+
+A warning banner or validation message is shown but does not fail the page.
+
+### An app on this machine, by its own host name, behind a proxy
+
+An app on this machine is reached directly, whatever name the URL gives it. This
+matters where the environment sets a proxy — a dev container, a Claude Code
+session — and the app is checked by a host name of its own, such as an
+`/etc/hosts` entry `frontend.local` for `127.0.0.1` (the usual way to give two
+local apps separate cookie jars). Chromium takes its proxy from `http_proxy` /
+`https_proxy`, and for a WebSocket it prefers the HTTPS proxy even for `ws://`.
+With only `https_proxy` set and `no_proxy` listing `localhost` and `127.0.0.1`,
+the page loaded directly while the runtime's dev channel,
+`ws://frontend.local:8180/mxdevtools/`, went to the proxy, which cannot reach
+this machine and answered 502. A page that rendered failed on two console errors
+(ako/mxcli#1800):
+
+```
+  ERR    WebSocket connection to 'ws://frontend.local:8180/mxdevtools/' failed: Error during WebSocket handshake: Unexpected response code: 502
+```
+
+The browser that `playwright check`, `run --page-check` and `run --screenshot`
+start now adds a host that resolves only to this machine (loopback, or an address
+of one of its interfaces) to `no_proxy`. Nothing is ignored: the channel connects,
+as it does on `127.0.0.1`, and a console error the page does have still fails it.
+A remote URL, such as a `--hub` preview, still goes through the proxy. A browser
+of your own needs the same entry in `no_proxy`.
+
+### Signing in
+
+| Flags | Signs in as |
+|---|---|
+| `--user U --password P` | that user |
+| `--role R -p app.mpr` | the project's demo user holding user role `R` |
+| `-p app.mpr` only | a demo user of the project (an administrator first), when demo users are enabled |
+| none | nobody; a secured page fails with "the sign-in form is showing" |
+
+The sign-in happens on the **host of the pages checked**, not on `--base-url`: a
+session's cookies belong to the host they were set on, so one signed in on
+`localhost` is not sent to `127.0.0.1` or to another name for the same app. A page
+given as a full URL on another host (`mxcli playwright check http://frontend.local:8180/
+-p app.mpr`) gets a session of its own; before ako/mxcli#1216 it was checked with
+the base URL's session, showed the sign-in form on every run, and signed in again
+on each.
+
+The session is saved as a Playwright storage state under
+`<project>/.mxcli/playwright-check/<host>-<user>.json` (or `~/.mxcli/playwright-check/`
+without `-p`) and reused by the next check, so repeated checks do not sign in again —
+on the unlicensed runtime every sign-in takes one of a handful of session slots, and
+a reused session stays one session however many checks run. When the runtime no
+longer knows the session (it restarted), the check signs in once more and reloads
+only the affected pages.
+
+- `--fresh-login` signs the saved session out, then signs in again.
+- `--sign-out` ends the run signed out and keeps nothing for the next check — for a
+  last check in a script that should leave no session behind.
+- A session the run signed in that got no page past the sign-in form is signed out
+  rather than kept: kept, every later check would sign in again beside it. A page
+  the user's roles may not open does not count — the runtime knew the session and
+  refused the page — so that session is kept and reused, and is not renewed either.
+
+Signing out is best effort and never changes the verdict; a sign-out that does not
+complete is reported on stderr, and that session expires on its own. When the
+runtime refuses a sign-in, the check reads `<project>/.mxcli/runtime.log` for the
+cause — the unlicensed runtime's session cap shows on the sign-in page only as
+"Sign in failed".
+
+The sign-in types into the Mendix login form, so the "setting `.value` leaves the
+field empty" problem of hand-written `eval` logins does not arise. When the app root
+lets anonymous users in, it signs in at `/login.html`.
+
+### Assertions and screenshots
+
+```bash
+mxcli playwright check /p/Customer_Overview -p app.mpr \
+  --assert-text 'Customer overview' \
+  --assert-count '.mx-name-dgCustomers [role=row]:has([role=gridcell])>=1'
+```
+
+- `--assert-text T` — the page's visible text contains `T`.
+- `--assert-count 'SELECTOR OP N'` — `OP` is one of `>= <= == != > <` (`=` means
+  `==`); the operator is read from the right, so a selector can use `>` as a child
+  combinator. A bare selector means "at least one".
+- Both are repeatable and apply to every page in the call.
+- `--screenshot out.png` also writes a full-page PNG (with several pages, one per
+  page: `out-p-Customer_Overview.png`, …) and prints only its path. Take one when
+  the question is about appearance, not to find out whether the page works.
+
+### Options
+
+| Flag | Default | Description |
+|---|---|---|
+| `--base-url` | `http://localhost:8080` | App root; with `-p`, the port of a live `mxcli run --local` for the project, else `APP_PORT` from `.docker/.env` |
+| `--user`, `--password` | | Sign in as this user |
+| `--role` | | Sign in as the project's demo user with this user role (needs `-p`) |
+| `--assert-text` | | Text the page must contain (repeatable) |
+| `--assert-count` | | `SELECTOR OP N` that must hold (repeatable) |
+| `--screenshot` | | Also write a PNG here; the path is printed |
+| `--wait` | `15s` | Longest a page may keep loading after it mounts (open requests, changing text) before it is measured; the sign-in form is measured as soon as it holds still |
+| `--fresh-login` | `false` | Sign the saved session out and sign in again |
+| `--sign-out` | `false` | Sign out when the check is done instead of keeping the session |
+| `--allow-console-errors` | `false` | Report console errors without failing on them |
+
+The check needs Node and the Playwright package (`require('playwright')` or the
+`playwright-core` bundled with `@playwright/cli`, both resolved from the global
+`node_modules`). Without a `node` on `PATH`, the one bundled with a cached MxBuild is
+used. The browser is `/usr/local/bin/mx-headless-shell` when present (the
+devcontainer), `$MXCLI_CHROMIUM` when set, otherwise Playwright's own.
 
 ## mxcli playwright verify
 
+Use `verify` when the test needs an **interaction** — clicking, filling, submitting.
 The `mxcli playwright verify` command runs `.test.sh` scripts against a running Mendix application and collects results.
 
 ```bash
@@ -61,6 +274,7 @@ mxcli playwright verify tests/ --skip-health-check
 | `--timeout`, `-t` | `2m` | Timeout per script execution |
 | `--base-url` | `http://localhost:8080` | Mendix app base URL |
 | `--skip-health-check` | `false` | Skip app reachability check before running |
+| `--keep-open` | `false` | Leave the browser session open after the run so the next verify reuses it |
 | `-p` | | Path to the `.mpr` project file |
 
 ### How It Works
@@ -70,13 +284,74 @@ The verify runner performs these steps:
 1. **Discovers** all `.test.sh` files in the provided paths
 2. **Checks** that `playwright-cli` is available in PATH
 3. **Health-checks** the app at the base URL (unless `--skip-health-check`)
-4. **Opens** a playwright-cli browser session (Chromium by default)
+4. **Reuses** a live browser session if one is already open on the same origin (left by a prior `--keep-open` run), re-navigating to the base URL so a rebuilt app loads fresh; otherwise **opens** a new one (Chromium by default)
 5. **Runs** each `.test.sh` script sequentially via `bash`
 6. **Captures** a screenshot on failure for debugging
-7. **Closes** the browser session
+7. **Closes** the browser session -- unless `--keep-open` was passed, in which case it is left warm
 8. **Reports** pass/fail per script with timing
 9. **Writes** JUnit XML if `--junit` is specified
 10. **Exits** with non-zero status if any script failed
+
+### Reusing the session across runs (the iterate loop)
+
+The generate → build → verify → fix loop re-runs `verify` after each change.
+Passing `--keep-open` leaves the browser warm and logged in, and the next run
+detects that live session and **skips the ~1–2s Chromium cold start**:
+
+```bash
+# First run opens the browser (log in once inside a script or via state-save)
+mxcli playwright verify tests/ -p app.mpr --keep-open
+
+# ... edit MDL, mxcli exec, mxcli docker run ...
+
+# Subsequent runs reuse the warm, still-authenticated session
+mxcli playwright verify tests/ -p app.mpr --keep-open
+```
+
+Reuse only happens when a session is alive **and** on the target origin; if not,
+verify opens fresh, so there is no downside to leaving `--keep-open` on. On reuse
+the runner re-navigates to the base URL, so a rebuilt app is always loaded fresh
+(no risk of verifying a stale, pre-rebuild page). For CI regression runs, omit
+`--keep-open` so the browser is torn down at the end.
+
+> **Note:** if a script ends with its own `playwright-cli close`, it tears down
+> the shared session regardless of `--keep-open` — drop the trailing `close`
+> from scripts you want to reuse across runs.
+
+## Session lifecycle commands
+
+For interactive or agent-driven use, manage the browser session explicitly
+instead of only through `verify`:
+
+```bash
+# Open (or attach to) the session; URL from the arg, else --base-url,
+# else APP_PORT in .docker/.env, else :8080
+mxcli playwright open -p app.mpr
+mxcli playwright open http://localhost:9090
+
+# Is a session live, and what page is it on?
+mxcli playwright status
+
+# Tear it down
+mxcli playwright close
+mxcli playwright close --all   # close every session
+```
+
+`open` uses the same open-or-reuse behavior as `verify` (attach to a live
+same-origin session and re-navigate, or open fresh). A typical agent loop is:
+`open` once, log in, then iterate `verify --keep-open` — and `status` to check
+whether the browser is still up before deciding to reopen.
+
+## `eval` vs `run-code` -- read this first
+
+`@playwright/cli` has **two** evaluation commands with **different execution contexts**. Getting this wrong is the most common scripting mistake:
+
+| Command | Runs in | Use for |
+|---------|---------|---------|
+| `playwright-cli eval "() => ..."` | **browser page** (`document`, `window` exist) | DOM assertions, clicks, filling fields, reading `.mx-name-*` |
+| `playwright-cli run-code "..."` | **Node** (Playwright API; `document` is **undefined**) | Playwright-level scripting, not page DOM |
+
+`eval` takes a **function** (`"() => ..."`) and prints its return value under `### Result`; it awaits a returned Promise. **Do not** use `run-code "document.querySelector(...)"` -- it throws `ReferenceError: document is not defined`. Every page/DOM assertion below uses `eval`.
 
 ## Test Script Format
 
@@ -89,25 +364,27 @@ Test scripts are plain bash files using playwright-cli commands. The naming conv
 # tests/verify-customers.test.sh -- Customer module smoke test
 set -euo pipefail
 
-# --- Login ---
+# --- Login (page context -> eval) ---
 playwright-cli open http://localhost:8080
-playwright-cli fill e12 "MxAdmin"
-playwright-cli fill e15 "AdminPassword1!"
-playwright-cli click e18
+playwright-cli eval "() => { document.querySelector('#usernameInput').value = 'MxAdmin' }"
+playwright-cli eval "() => { document.querySelector('#passwordInput').value = 'AdminPassword1!' }"
+playwright-cli eval "() => document.querySelector('#loginButton').click()"
+playwright-cli eval "() => new Promise(r => setTimeout(r, 3000))"
 playwright-cli state-save mendix-auth
 
-# --- Customer Overview page ---
+# --- Customer Overview page (throw to fail the script under set -e) ---
 playwright-cli goto http://localhost:8080/p/Customer_Overview
-playwright-cli run-code "document.querySelector('.mx-name-dgCustomers') !== null"
-playwright-cli run-code "document.querySelector('.mx-name-btnNew') !== null"
-playwright-cli run-code "document.querySelector('.mx-name-btnEdit') !== null"
+playwright-cli eval "() => { if (!document.querySelector('.mx-name-dgCustomers')) throw new Error('dgCustomers not found') }"
+playwright-cli eval "() => { if (!document.querySelector('.mx-name-btnNew')) throw new Error('btnNew not found') }"
+playwright-cli eval "() => { if (!document.querySelector('.mx-name-btnEdit')) throw new Error('btnEdit not found') }"
 
 # --- Create a customer ---
-playwright-cli click btnNew
-playwright-cli snapshot
+playwright-cli eval "() => document.querySelector('.mx-name-btnNew').click()"
+playwright-cli eval "() => new Promise(r => setTimeout(r, 2000))"
 playwright-cli fill txtName "CI Test Customer"
 playwright-cli fill txtEmail "ci@test.com"
-playwright-cli click btnSave
+playwright-cli eval "() => document.querySelector('.mx-name-btnSave').click()"
+playwright-cli eval "() => new Promise(r => setTimeout(r, 2000))"
 
 # --- Verify persistence (via OQL, not direct DB query) ---
 mxcli oql -p app.mpr --json \
@@ -131,23 +408,23 @@ These `.mx-name-*` classes are stable, predictable, and directly derived from MD
 
 ### Using Selectors in Scripts
 
-The recommended approach for CI scripts is to use `run-code` with CSS selectors, since dynamic element refs (`e12`, `e15`) change between page loads:
+The recommended approach for CI scripts is to use `eval` (page context) with CSS selectors, since dynamic element refs (`e12`, `e15`) change between page loads:
 
 ```bash
 # Check widget presence
-playwright-cli run-code "document.querySelector('.mx-name-btnSave') !== null"
+playwright-cli eval "() => document.querySelector('.mx-name-btnSave') !== null"
 
 # Click a widget
-playwright-cli run-code "document.querySelector('.mx-name-btnSave').click()"
+playwright-cli eval "() => document.querySelector('.mx-name-btnSave').click()"
 
 # Check text content
-playwright-cli run-code "document.querySelector('.mx-name-lblTitle').textContent.includes('Customers')"
+playwright-cli eval "() => document.querySelector('.mx-name-lblTitle').textContent.includes('Customers')"
 ```
 
-For assertions that should cause failures, use `throw` so the script exits non-zero under `set -e`:
+For assertions that should cause failures, `throw` inside the function so the script exits non-zero under `set -e`:
 
 ```bash
-playwright-cli run-code "if (!document.querySelector('.mx-name-btnSave')) throw new Error('btnSave not found')"
+playwright-cli eval "() => { if (!document.querySelector('.mx-name-btnSave')) throw new Error('btnSave not found') }"
 ```
 
 ## Three Test Layers
@@ -169,12 +446,12 @@ Verify that every widget generated in MDL is present and interactive in the DOM.
 
 ```bash
 # Widget presence
-playwright-cli run-code "document.querySelector('.mx-name-dgCustomers') !== null"
-playwright-cli run-code "document.querySelector('.mx-name-btnNew') !== null"
+playwright-cli eval "() => document.querySelector('.mx-name-dgCustomers') !== null"
+playwright-cli eval "() => document.querySelector('.mx-name-btnNew') !== null"
 
-# Form interaction
-playwright-cli run-code "document.querySelector('.mx-name-txtName input').value = 'Test'"
-playwright-cli run-code "document.querySelector('.mx-name-btnSave').click()"
+# Form interaction (dispatch an input event so Mendix registers the change)
+playwright-cli eval "() => { const el = document.querySelector('.mx-name-txtName input'); el.value = 'Test'; el.dispatchEvent(new Event('input', {bubbles: true})) }"
+playwright-cli eval "() => document.querySelector('.mx-name-btnSave').click()"
 ```
 
 ### Layer 3: Data Assertions

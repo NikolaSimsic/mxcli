@@ -1,0 +1,675 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package executor
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/sdk/domainmodel"
+)
+
+// `check --references` resolved the DOCUMENT and the ENTITY a statement names,
+// and then stopped at the door. A member name inside one — the attribute on the
+// left of a CREATE / CHANGE assignment — was never resolved against the entity
+// it belongs to, so a typo passed check, passed exec, and surfaced at the far
+// end of a build as CE1613 (mendixlabs/mxcli#1048):
+//
+//	CHANGE $Order ("IsArchived" = true);   -- no such attribute
+//	  mxcli check --references             -> exit 0
+//	  mxcli exec                           -> "Created microflow"
+//	  mx check                             -> [CE1613] "The selected attribute
+//	                                          'Bench.Order.IsArchived' no longer exists."
+//
+// exec does resolve the name — resolveAttributeInEntityHierarchy, in the flow
+// builder — but when resolution FAILS it falls back to writing
+// `<entityQN>.<memberName>` anyway. That fabricated identifier is what mxbuild
+// rejects. This check reports the same failure at the point it is cheap to fix.
+//
+// # Why this cannot simply mirror exec's resolver
+//
+// exec's resolver answers a two-valued question (resolved / did not resolve)
+// because it has a fallback either way: it writes the fabricated name and lets
+// the build complain. A CHECK has no such luxury — "did not resolve" conflates a
+// real typo with a lookup that could not be PERFORMED, and reporting the second
+// is a false error that blocks a script which would have worked. So the walk
+// below has three outcomes and reports only the middle one.
+//
+// What that guard is and is not for, measured rather than assumed:
+//
+//   - INHERITANCE is not the case. The walk follows GeneralizationRef through
+//     the backend, and the System module answers normally that way:
+//     System.FileDocument loads with its 6 attributes, so `CHANGE $File (Name =
+//     …)` on an entity extending it resolves, while a name on no link of the
+//     chain is correctly reported. (`update security` fails on System for an
+//     unrelated reason — it loads the domain-model UNIT BY ID out of
+//     mprcontents, where System has no file. Different mechanism, and not this
+//     one; mendixlabs/mxcli#1047.)
+//
+//   - A BACKEND THAT CANNOT ANSWER is the case. mxcli has more than one
+//     (MPR, MCP/PED, mock), the interface permits an error from every lookup,
+//     and a check that turns "I could not look" into "your attribute is
+//     missing" fails every script against such a backend. That is what
+//     memberUnknown covers, and TestResolveMemberOnEntity_SilentWhenTheModelCannotBeRead
+//     is the control: flip that branch to memberMissing and it reports.
+type memberResolution int
+
+const (
+	// memberFound: the name is an attribute of the entity or of one of its
+	// generalizations.
+	memberFound memberResolution = iota
+	// memberMissing: the whole chain was walked to its root and the name is not
+	// there. Only this is reported.
+	memberMissing
+	// memberUnknown: a link in the chain could not be loaded, so the question
+	// was never answered. Silent.
+	memberUnknown
+)
+
+// resolveMemberOnEntity walks entityQN and its generalizations looking for a
+// member called memberName.
+//
+// Matching is case-sensitive, as Mendix's own is: mxbuild rejects `orderno` for
+// `OrderNo` with the same CE1613, so accepting it here would let through the
+// error this exists to catch.
+func resolveMemberOnEntity(ctx *ExecContext, entityQN, memberName string) memberResolution {
+	b, ok := ctx.Backend.(entityLookupBackend)
+	if !ok {
+		return memberUnknown
+	}
+	res, _ := entityMemberKind(b, entityQN, memberName)
+	return res
+}
+
+// backendRefusesModule reports whether the project's module list answers,
+// confidently, that no module of this name exists. A list that cannot be read
+// is NOT absence — this file's rule is silence over a guess
+// (TestResolveMemberOnEntity_SilentWhenTheModelCannotBeRead).
+func backendRefusesModule(ctx *ExecContext, qualifier string) bool {
+	b, ok := ctx.Backend.(entityLookupBackend)
+	if !ok {
+		return false
+	}
+	mods, err := b.ListModules()
+	if err != nil {
+		return false
+	}
+	for _, m := range mods {
+		if m != nil && m.Name == qualifier {
+			return false
+		}
+	}
+	return true
+}
+
+// associationNamedInModule reports whether the domain model has an association
+// of this bare name. A qualified member is handled by the caller; this covers
+// the unqualified spelling, which resolves in the entity's own module.
+func associationNamedInModule(dm *domainmodel.DomainModel, name string) bool {
+	for _, a := range dm.Associations {
+		if a != nil && a.Name == name {
+			return true
+		}
+	}
+	for _, a := range dm.CrossAssociations {
+		if a != nil && a.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// assocResolution is the three-valued answer to "where does this association
+// lead from this entity", for the same reason memberResolution exists: a boolean
+// cannot carry "no" and "don't know" to two callers that must tell them apart.
+//
+// It used to be a boolean, and a second caller inverted its meaning. The
+// association lookup returned false for a start entity that is a SPECIALISATION
+// of an end — documented as deliberate, because the one caller then treated
+// false as silence. When the XPath constraint checker began calling it, false
+// became a REPORT, and the precise case the comment declined to chase turned
+// into a false error on every inherited association: `Administration.Account`
+// constrained on `System.UserRoles` (declared from `System.User`) was reported
+// against a project mxbuild builds at 0 errors.
+type assocResolution int
+
+const (
+	// assocResolved: the start entity, or one of its generalizations, is an end
+	// of the association. The target is known.
+	assocResolved assocResolution = iota
+	// assocMissing: the module named in the qualified name was read and has no
+	// association of that name. The name means nothing. Reported.
+	assocMissing
+	// assocNotAnEnd: the association exists, the start entity's generalization
+	// chain was walked to its root, and no link in it is an end. Reported —
+	// this is the real defect the check exists for.
+	assocNotAnEnd
+	// assocUnknown: a module, domain model or generalization could not be read,
+	// so the question was never answered. Silent.
+	assocUnknown
+)
+
+// associationTargetFrom returns the entity at the other end of an association
+// traversed from fromEntityQN. It is the two-valued face of
+// resolveAssociationFrom, for callers that only act on a resolved target.
+func associationTargetFrom(ctx *ExecContext, assocQN, fromEntityQN string) (string, bool) {
+	to, res := resolveAssociationFrom(ctx, assocQN, fromEntityQN)
+	return to, res == assocResolved
+}
+
+// resolveAssociationFrom resolves an association hop, distinguishing the two
+// ways it can fail to produce a target.
+//
+// ParentID is the FROM entity (the foreign-key owner) and ChildID the TO entity
+// — Mendix's inverted naming, per CLAUDE.md — and a hop may be traversed from
+// either end, so both directions resolve.
+//
+// The start entity is matched against the ends through its GENERALIZATION CHAIN,
+// not by equality. An `Administration.Account` genuinely has `System.UserRoles`:
+// it extends `System.User`, and a specialization inherits its generalization's
+// associations. That is Mendix's semantics rather than a guess, which is why it
+// is chased here and reported honestly when the chain runs out.
+func resolveAssociationFrom(ctx *ExecContext, assocQN, fromEntityQN string) (string, assocResolution) {
+	if assocQN == "" || fromEntityQN == "" {
+		return "", assocUnknown
+	}
+	b, ok := ctx.Backend.(entityLookupBackend)
+	if !ok {
+		return "", assocUnknown
+	}
+	parts := strings.SplitN(assocQN, ".", 2)
+	if len(parts) != 2 {
+		return "", assocUnknown
+	}
+	mod, err := b.GetModuleByName(parts[0])
+	if err != nil || mod == nil {
+		// The module the name points at is not in the project, so no association
+		// of this name exists anywhere. That is the shape #1049 reported.
+		return "", assocMissing
+	}
+	dm, err := b.GetDomainModel(mod.ID)
+	if err != nil || dm == nil {
+		return "", assocUnknown
+	}
+	from, to, found := associationEndsByName(ctx, dm, parts[1])
+	if !found {
+		return "", assocMissing
+	}
+	if from == "" || to == "" {
+		// An end that cannot be named (an external entity, a broken reference)
+		// leaves the hop unanswerable rather than half-answered.
+		return "", assocUnknown
+	}
+
+	chain, complete := generalizationChain(ctx, fromEntityQN)
+	for _, qn := range chain {
+		switch qn {
+		case from:
+			return to, assocResolved
+		case to:
+			return from, assocResolved
+		}
+	}
+	if !complete {
+		// The chain stopped at a link that could not be read, so an ancestor
+		// further up may well be an end. Not established, so not reported.
+		return "", assocUnknown
+	}
+	return "", assocNotAnEnd
+}
+
+// associationEndsByName names the two entities the association called name
+// connects, looking it up in one module's domain model.
+//
+// A CROSS-MODULE association is stored in the FROM entity's module under
+// CrossAssociations, with the far end held BY NAME rather than by element ID, so
+// a lookup that reads only dm.Associations misses every association that leaves
+// its module — and, at the reporting call site, calls each of them missing.
+func associationEndsByName(ctx *ExecContext, dm *domainmodel.DomainModel, name string) (from, to string, found bool) {
+	for _, a := range dm.Associations {
+		if a != nil && a.Name == name {
+			from, to = associationEnds(ctx, a)
+			return from, to, true
+		}
+	}
+	for _, a := range dm.CrossAssociations {
+		if a != nil && a.Name == name {
+			return entityQNByID(ctx, a.ParentID), a.ChildRef, true
+		}
+	}
+	return "", "", false
+}
+
+// generalizationChain returns entityQN followed by its generalizations, nearest
+// first.
+//
+// complete is false when a link could not be read — an unreadable module, an
+// entity the project does not have, a generalization cycle. The slice then holds
+// what was established before the walk stopped, which is enough to answer "yes"
+// and never enough to answer "no".
+//
+// This deliberately does not share resolveMemberOnEntity's walk. That one
+// answers at each level as it goes, so an attribute found on the entity itself
+// stays memberFound even when an ancestor is unreadable; pre-computing the whole
+// chain for it would turn that into memberUnknown and cost the check its reach.
+func generalizationChain(ctx *ExecContext, entityQN string) ([]string, bool) {
+	b, ok := ctx.Backend.(entityLookupBackend)
+	if !ok {
+		return nil, false
+	}
+	return generalizationChainFor(b, entityQN)
+}
+
+// validateMemberReferences reports CREATE / CHANGE member names that do not
+// exist on the entity they are assigned to.
+//
+// Runs in the --references pass: it needs the project, and the whole point is to
+// answer a question `mxcli check` without -p cannot.
+func validateMemberReferences(ctx *ExecContext, prog *ast.Program, sc *scriptContext) []string {
+	if prog == nil || !ctx.Connected() {
+		return nil
+	}
+	authored := authoredMembers(prog)
+	refs := newFlowMemberRefs(ctx, sc)
+	var out []string
+	for _, stmt := range prog.Statements {
+		switch s := stmt.(type) {
+		case *ast.CreateMicroflowStmt:
+			out = append(out, checkFlowMembers(ctx, sc, authored, refs,
+				s.Name.String(), s.Parameters, s.Body)...)
+		case *ast.CreateNanoflowStmt:
+			out = append(out, checkFlowMembers(ctx, sc, authored, refs,
+				s.Name.String(), s.Parameters, s.Body)...)
+		}
+		refs.declare(stmt)
+	}
+	return out
+}
+
+// checkFlowMembers walks one flow body, tracking which entity each variable
+// holds so a CHANGE can be resolved at all.
+func checkFlowMembers(ctx *ExecContext, sc *scriptContext, authored map[string]bool, refs *flowMemberRefs,
+	flowQN string, params []ast.MicroflowParam, body []ast.MicroflowStatement) []string {
+
+	var out []string
+	walkTypedFlow(ctx, sc, params, body, func(st ast.MicroflowStatement, vars map[string]string) {
+		out = append(out, refs.statementMembers(flowQN, st, vars)...)
+		switch s := st.(type) {
+		case *ast.CreateObjectStmt:
+			out = append(out, checkMembers(ctx, sc, authored, flowQN,
+				fmt.Sprintf("create %s", s.EntityType.String()),
+				s.EntityType.String(), s.Changes)...)
+		case *ast.ChangeObjectStmt:
+			out = append(out, checkMembers(ctx, sc, authored, flowQN,
+				fmt.Sprintf("change $%s", s.Variable), vars[s.Variable], s.Changes)...)
+		case *ast.RetrieveStmt:
+			if s.Variable != "" && s.Source.Name != "" && s.StartVariable == "" {
+				out = append(out, checkSortSystemMemberSpelling(ctx, sc, authored, flowQN, s.Source.String(), s.SortColumns)...)
+			}
+		}
+	})
+	return out
+}
+
+// walkTypedFlow calls visit for every statement of a flow body — nested blocks,
+// loop bodies and custom error handlers included — with the entity each
+// variable is known to hold at that point. visit runs before the statement's
+// own output variable is typed, so a statement sees the variables it reads.
+//
+// It is the one variable-typing walk the --references checks share
+// (checkFlowMembers, the Protected-module member check): two copies of it would
+// drift on which statements type a variable, and a check that loses a variable
+// goes silent rather than wrong.
+//
+// sc resolves a `call microflow` output against the script's own definition of
+// the callee before the stored one; nil leaves call results untyped.
+func walkTypedFlow(ctx *ExecContext, sc *scriptContext, params []ast.MicroflowParam, body []ast.MicroflowStatement,
+	visit func(st ast.MicroflowStatement, vars map[string]string)) {
+
+	vars := map[string]string{}
+	for _, p := range params {
+		if p.Name == "" {
+			continue
+		}
+		// A bare qualified name parses as TypeEnumeration with EnumRef set (see
+		// CLAUDE.md), so both spellings are recorded rather than guessed
+		// between. A name that is really an enumeration resolves no entity and
+		// is skipped, so the wrong guess costs nothing.
+		switch {
+		case p.Type.EntityRef != nil:
+			vars[p.Name] = p.Type.EntityRef.String()
+		case p.Type.Kind == ast.TypeEnumeration && p.Type.EnumRef != nil:
+			vars[p.Name] = p.Type.EnumRef.String()
+		}
+	}
+
+	var walk func(stmts []ast.MicroflowStatement)
+	walk = func(stmts []ast.MicroflowStatement) {
+		for _, st := range stmts {
+			visit(st, vars)
+			switch s := st.(type) {
+			case *ast.CreateObjectStmt:
+				if s.Variable != "" {
+					vars[s.Variable] = s.EntityType.String()
+				}
+			case *ast.RetrieveStmt:
+				// Source is the ENTITY for a database retrieve and the
+				// ASSOCIATION for an association retrieve (StartVariable set).
+				// Both are modelled: an association retrieve feeding a LOOP is
+				// the ordinary bulk-update shape, and leaving it untyped made
+				// the check silent on the commonest place a member is named.
+				switch {
+				case s.Variable == "" || s.Source.Name == "":
+				case s.StartVariable == "":
+					vars[s.Variable] = s.Source.String()
+				default:
+					if from, ok := vars[strings.TrimPrefix(s.StartVariable, "$")]; ok {
+						if to, ok := associationTargetFrom(ctx, s.Source.String(), from); ok {
+							vars[s.Variable] = to
+						}
+					}
+				}
+			case *ast.CallMicroflowStmt:
+				// The callee's return type (ako/mxcli#1701): untyped, every
+				// member read on a call result was silent, in both checks.
+				if s.OutputVariable != "" && sc != nil {
+					if qn := sc.microflowReturnEntity(ctx, s.MicroflowName); qn != "" {
+						vars[s.OutputVariable] = qn
+					}
+				}
+			case *ast.IfStmt:
+				walk(s.ThenBody)
+				walk(s.ElseBody)
+			case *ast.WhileStmt:
+				walk(s.Body)
+			case *ast.LoopStmt:
+				// The iterator holds the list's element type; without this a
+				// CHANGE on the loop variable is unresolvable and silent.
+				if s.LoopVariable != "" && s.ListVariable != "" {
+					if qn, ok := vars[s.ListVariable]; ok {
+						vars[s.LoopVariable] = qn
+					}
+				}
+				walk(s.Body)
+			}
+			if eh := stmtErrorHandling(st); eh != nil && len(eh.Body) > 0 {
+				walk(eh.Body)
+			}
+		}
+	}
+	walk(body)
+}
+
+// microflowReturnEntity is the entity a call of qn yields — its object or list
+// return type — or "" when that is not established. The script's definition
+// wins: a `create or modify` is the signature exec writes, and typing the
+// call from the stored one would judge members against an entity the callee
+// no longer returns. Else the stored microflow, read once per name.
+func (sc *scriptContext) microflowReturnEntity(ctx *ExecContext, qn ast.QualifiedName) string {
+	if qn.Module == "" {
+		return ""
+	}
+	if sc.microflows[qn.String()] {
+		if sig := sc.flowParams[strings.ToLower(qn.String())]; sig != nil {
+			return sig.Returns
+		}
+		return ""
+	}
+	if e, ok := sc.storedReturns[qn.String()]; ok {
+		return e
+	}
+	e := storedMicroflowReturnEntity(ctx, qn)
+	if sc.storedReturns == nil {
+		sc.storedReturns = map[string]string{}
+	}
+	sc.storedReturns[qn.String()] = e
+	return e
+}
+
+func storedMicroflowReturnEntity(ctx *ExecContext, qn ast.QualifiedName) string {
+	h, err := getHierarchy(ctx)
+	if err != nil || h == nil {
+		return ""
+	}
+	mfs, err := microflowsNamed(ctx, qn.Name)
+	if err != nil {
+		return ""
+	}
+	for _, mf := range mfs {
+		if mf != nil && h.GetModuleName(h.FindModuleID(mf.ContainerID)) == qn.Module {
+			return sdkDataTypeEntity(mf.ReturnType)
+		}
+	}
+	return ""
+}
+
+// checkMembers resolves each member of one CREATE / CHANGE.
+func checkMembers(ctx *ExecContext, sc *scriptContext, authored map[string]bool,
+	flowQN, where, entityQN string, changes []ast.ChangeItem) []string {
+
+	// No entity established (an untyped variable, an enumeration parameter, a
+	// retrieve this walk did not model) — nothing to resolve against.
+	if entityQN == "" || !strings.Contains(entityQN, ".") {
+		return nil
+	}
+	// NOTE: there is deliberately no "skip entities the script creates" guard.
+	// It looks necessary and is not, and having it cost the check most of its
+	// reach: a self-contained script defines its own entities, so the guard
+	// skipped the whole file — including the example written to demonstrate
+	// this very check, which passed while exercising nothing.
+	//
+	// Two mechanisms already cover the case without the loss. An attribute the
+	// script DECLARES is in `authored`. An entity that is not in the project at
+	// all resolves to memberUnknown (FindEntityByName returns nil), which is
+	// silent. What is left over — an entity the project has, and a member
+	// neither it nor the script declares — is exactly the defect.
+
+	var out []string
+	for _, ch := range changes {
+		name := strings.Trim(ch.Attribute, `"`)
+		if name == "" {
+			continue
+		}
+		// Qualified members are a different question with a different answer.
+		// `Module.Assoc` (one dot over a real module) is a legal association-set
+		// — exec's #51 refusal covers the association-less case — and
+		// `Module.Entity.Attribute` (two dots) a legal qualified attribute. But
+		// one dot over a NON-module qualifier (`Assoc.Attr`) is a member reached
+		// through an association, which Mendix's ChangeActionItem cannot
+		// represent: exec writes the name verbatim and mxbuild rejects the
+		// project with CE1613. Report it here so check and build agree; the
+		// writer refuses the same shape.
+		// (docs/12-bug-reports/2026-10-16-change-member-through-association.md)
+		if dot := strings.Index(name, "."); dot >= 0 {
+			// A module the script creates further up is a module, even though
+			// the project does not have it yet.
+			if strings.Count(name, ".") == 1 && !(sc != nil && sc.modules[name[:dot]]) &&
+				backendRefusesModule(ctx, name[:dot]) {
+				out = append(out, fmt.Sprintf(
+					"%s: %q on %s is a member reached through an association — a change item cannot set it. "+
+						"Retrieve the associated object and change that instead (`retrieve $obj from $var/%s;` then `change $obj (%s = ...)`); "+
+						"mxbuild rejects this form with CE1613",
+					flowQN, name, entityQN, name[:dot], name[dot+1:]))
+			} else if strings.Count(name, ".") == 1 && moduleLacksAssociation(ctx, sc, name[:dot], name[dot+1:]) {
+				// `Module.Assoc` over a real module is an association, and only
+				// one: exec's builder refuses a name the module does not have,
+				// so check must too, or the two disagree (ako/mxcli#1810 — on a
+				// 9.x project, System.WorkflowUserTask_Assignees passed check
+				// and stopped exec; on a version-blind System model it wrote
+				// and failed the build with CE1613).
+				out = append(out, fmt.Sprintf(
+					"%s: %q on %s is not an association the project has (and a one-qualifier name cannot be "+
+						"an attribute) — mxbuild reports CE1613 \"no longer exists\"",
+					flowQN, name, entityQN))
+			}
+			continue
+		}
+		if authored[strings.ToLower(entityQN+"."+name)] {
+			continue
+		}
+		if resolveMemberOnEntity(ctx, entityQN, name) != memberMissing {
+			continue
+		}
+		out = append(out, fmt.Sprintf(
+			"%s: %s has no member %q (in %s)%s — mxbuild reports this as CE1613 "+
+				"\"The selected attribute '%s.%s' no longer exists\"",
+			flowQN, entityQN, name, where, nearMembers(ctx, entityQN), entityQN, name))
+	}
+	return out
+}
+
+// checkSortSystemMemberSpelling reports a sort on createdDate / changedDate
+// spelled in another case. Measured on mxbuild 11.14.0 on a System.FileDocument
+// specialization (which stores both):
+//
+//	sort by createdDate          clean
+//	sort by M.E.createdDate      clean
+//	sort by CreatedDate          CE1613 "The selected attribute 'M.E.CreatedDate' no longer exists."
+//	sort by M.E.CreatedDate      CE1613
+//
+// The capitalised spelling is the one describe prints for an AutoCreatedDate
+// declaration, so it is the natural one to write. Reported only where the
+// entity provably has no attribute of that exact name — an entity may declare
+// an ordinary `CreatedDate: DateTime`, and sorting on that is fine.
+func checkSortSystemMemberSpelling(ctx *ExecContext, sc *scriptContext, authored map[string]bool,
+	flowQN, entityQN string, cols []ast.SortColumnDef) []string {
+	var out []string
+	for _, col := range cols {
+		if len(col.Associations) > 0 {
+			continue
+		}
+		name := col.Attribute
+		if i := strings.LastIndex(name, "."); i >= 0 {
+			name = name[i+1:]
+		}
+		var spelling string
+		for _, sys := range []string{"createdDate", "changedDate"} {
+			if name != sys && strings.EqualFold(name, sys) {
+				spelling = sys
+			}
+		}
+		if spelling == "" {
+			continue
+		}
+		// `CreatedDate: AutoCreatedDate` declares the member, not an attribute
+		// of that name — exactly the declaration that makes the capitalised
+		// sort tempting.
+		decl := sc.entityDecls[entityQN]
+		declaredPseudo := false
+		if decl != nil {
+			for _, a := range decl.Attributes {
+				if a.Name == name {
+					declaredPseudo = isAutoSystemMemberType(a.Type.Kind)
+				}
+			}
+		}
+		if !declaredPseudo {
+			if authored[strings.ToLower(entityQN+"."+name)] {
+				continue
+			}
+			res := resolveMemberOnEntity(ctx, entityQN, name)
+			if res == memberFound {
+				continue
+			}
+			if res != memberMissing && (decl == nil || decl.Generalization != nil) {
+				continue // the entity's members cannot be established
+			}
+		}
+		fix := spelling
+		if strings.Contains(col.Attribute, ".") {
+			fix = strings.TrimSuffix(col.Attribute, name) + spelling
+		}
+		out = append(out, fmt.Sprintf(
+			"%s: sort by %s on %s — the system member is spelled `%s` (XPath and sort names are case-sensitive); "+
+				"mxbuild reports CE1613 \"The selected attribute '%s.%s' no longer exists\". Write `sort by %s`",
+			flowQN, col.Attribute, entityQN, spelling, entityQN, name, fix))
+	}
+	return out
+}
+
+// authoredMembers collects every attribute the SCRIPT itself declares, so a
+// script that adds an attribute and then assigns it is not reported.
+//
+// Without this the check fires on the ordinary shape of a migration script —
+// add the column, then populate it — which is the change most likely to be
+// written against an entity that does not yet have the member.
+func authoredMembers(prog *ast.Program) map[string]bool {
+	out := map[string]bool{}
+	add := func(entityQN, attr string) {
+		if entityQN != "" && attr != "" {
+			out[strings.ToLower(entityQN+"."+strings.Trim(attr, `"`))] = true
+		}
+	}
+	for _, stmt := range prog.Statements {
+		switch s := stmt.(type) {
+		case *ast.CreateEntityStmt:
+			for _, a := range s.Attributes {
+				add(s.Name.String(), a.Name)
+			}
+		case *ast.AlterEntityStmt:
+			if s.Operation == ast.AlterEntityAddAttribute && s.Attribute != nil {
+				add(s.Name.String(), s.Attribute.Name)
+			}
+			// A rename makes the NEW name legal for the rest of the script.
+			if s.Operation == ast.AlterEntityRenameAttribute {
+				add(s.Name.String(), s.NewName)
+			}
+		case *ast.CreateAssociationStmt:
+			// An association is a member of its ends, assigned by its bare
+			// name: `create M.Child (Child_Parent = $P)`. Without this, a script
+			// that adds an association to entities the project already has was
+			// told the entity "has no member" it had just created.
+			add(s.Parent.String(), s.Name.Name)
+			add(s.Child.String(), s.Name.Name)
+		}
+	}
+	return out
+}
+
+// nearMembers lists what the entity does have, capped so a wide entity does not
+// bury the error. A typo is cheap to fix only when you can see what is there.
+func nearMembers(ctx *ExecContext, entityQN string) string {
+	b, ok := ctx.Backend.(entityLookupBackend)
+	if !ok {
+		return ""
+	}
+	return nearMembersFor(b, entityQN)
+}
+
+// moduleLacksAssociation reports whether module provably has no association
+// named assoc: neither the project's domain model of that module nor the
+// script declares one. A module the project cannot be read for answers false
+// (could-not-establish stays silent).
+func moduleLacksAssociation(ctx *ExecContext, sc *scriptContext, module, assoc string) bool {
+	if sc != nil {
+		if qn, ok := sc.associations[assoc]; ok && strings.EqualFold(qn, module+"."+assoc) {
+			return false
+		}
+		if sc.modules[module] {
+			return false // created by the script: its domain model is not readable yet
+		}
+	}
+	if ctx == nil || ctx.Backend == nil || !ctx.Connected() {
+		return false
+	}
+	mod, err := ctx.Backend.GetModuleByName(module)
+	if err != nil || mod == nil {
+		return false
+	}
+	dm, err := ctx.Backend.GetDomainModel(mod.ID)
+	if err != nil || dm == nil {
+		return false
+	}
+	for _, a := range dm.Associations {
+		if a != nil && a.Name == assoc {
+			return false
+		}
+	}
+	for _, a := range dm.CrossAssociations {
+		if a != nil && a.Name == assoc {
+			return false
+		}
+	}
+	return true
+}

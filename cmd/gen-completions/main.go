@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Command gen-completions parses MDLLexer.g4 and generates Go source with
-// LSP completion items derived from the grammar's keyword tokens.
+// LSP completion items derived from the grammar's keyword tokens. A token the
+// parser grammar beside it accepts only as a deprecated alias is left out
+// (aliases.go).
 //
 // Usage:
 //
@@ -37,6 +39,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("parsing lexer grammar: %v", err)
 	}
+	sources, err := parserGrammarSources(*lexerPath)
+	if err != nil {
+		log.Fatalf("reading parser grammar: %v", err)
+	}
+	entries = withoutTokens(entries, aliasOnlyTokens(sources))
 
 	src, err := generateSource(entries)
 	if err != nil {
@@ -48,6 +55,17 @@ func main() {
 	}
 
 	fmt.Fprintf(os.Stderr, "Generated %s with %d keyword entries\n", *outputPath, len(entries))
+}
+
+// withoutTokens drops the entries for the named tokens.
+func withoutTokens(entries []tokenEntry, drop map[string]bool) []tokenEntry {
+	out := entries[:0:0]
+	for _, e := range entries {
+		if !drop[e.Name] {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // Tokens to exclude from completions — not keywords the user would type.
@@ -67,6 +85,8 @@ var excludeTokens = map[string]bool{
 	"STRING_LITERAL": true, "NUMBER_LITERAL": true, "DOLLAR_STRING": true,
 	"MENDIX_TOKEN": true, "IDENTIFIER": true, "VARIABLE": true,
 	"HYPHENATED_ID": true, "QUOTED_IDENTIFIER": true,
+	// `{1} = <unbound>`: a value placeholder describe prints, not a keyword
+	"UNBOUND_PARAM": true,
 }
 
 // sectionHeaderRE matches section headers like "// ============" followed by "// SECTION NAME"
@@ -189,8 +209,7 @@ func parseLexerGrammar(path string) ([]tokenEntry, error) {
 			}
 
 			// Try to reconstruct from the first alternative
-			firstAlt := strings.TrimSuffix(strings.TrimSpace(body), "|")
-			firstAlt = strings.TrimSpace(firstAlt)
+			firstAlt := firstAlternative(body)
 			text := reconstructKeyword(tokenName, firstAlt)
 			if text != "" {
 				entries = append(entries, tokenEntry{
@@ -203,6 +222,22 @@ func parseLexerGrammar(path string) ([]tokenEntry, error) {
 	}
 
 	return entries, scanner.Err()
+}
+
+// groupOpenRE matches the paren that opens a grouped rule body, as in
+// `ERROR_MESSAGE: ( E R R O R WS+ M E S S A G E` whose group carries a
+// right-edge predicate.
+var groupOpenRE = regexp.MustCompile(`^\(\s+`)
+
+// firstAlternative returns the keyword spelling on the first line of a
+// multi-line lexer rule: the body with a trailing `|` and an opening group
+// paren removed. Without the paren strip a predicated keyword silently dropped
+// out of the LSP completions (mendixlabs/mxcli#1720).
+func firstAlternative(body string) string {
+	alt := strings.TrimSpace(body)
+	alt = groupOpenRE.ReplaceAllString(alt, "")
+	alt = strings.TrimSuffix(alt, "|")
+	return strings.TrimSpace(alt)
 }
 
 // reconstructKeyword converts a token body (the RHS of the lexer rule) to user-facing text.

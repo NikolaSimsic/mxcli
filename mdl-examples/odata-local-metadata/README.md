@@ -11,28 +11,29 @@ This example demonstrates how to create consumed OData services using local meta
 
 ## Important Notes
 
-1. **Relative paths are normalized** — Any relative path is automatically converted to an absolute `file://` URL in the Mendix model for Studio Pro compatibility
+1. **Relative paths are normalized** — Any relative path is automatically converted to an absolute `file://` URL in the Mendix model for Studio Pro compatibility. Re-running the script from a checkout at another path keeps the stored URL when it names the same project file, and `describe` prints a stored URL inside the project as `./<path>` (ako/mxcli#1499)
 2. **ServiceUrl must be a constant** — Always use `@Module.ConstantName` format, not direct URLs
 
 ## Supported Formats
 
 ### 1. Absolute `file://` URI
 ```mdl
-CREATE ODATA CLIENT MyModule.Service (
+CREATE CONSUMED ODATA SERVICE MyModule.Service (
   MetadataUrl: 'file:///absolute/path/to/metadata.xml'
 );
 ```
 
 ### 2. Relative path (with or without `./`)
 ```mdl
+mdl 1;
 -- Resolved relative to the .mpr file's directory, then normalized to absolute file://
 -- Example: './metadata/service.xml' → 'file:///absolute/path/to/project/metadata/service.xml'
-CREATE ODATA CLIENT MyModule.Service (
+CREATE CONSUMED ODATA SERVICE MyModule.Service (
   MetadataUrl: './metadata/service.xml',
   ServiceUrl: '@MyModule.ServiceLocation'
 );
 
-CREATE ODATA CLIENT MyModule.Service2 (
+CREATE CONSUMED ODATA SERVICE MyModule.Service2 (
   MetadataUrl: 'metadata/service.xml',
   ServiceUrl: '@MyModule.ServiceLocation'
 );
@@ -40,7 +41,7 @@ CREATE ODATA CLIENT MyModule.Service2 (
 
 ### 3. HTTP(S) URL (existing behavior)
 ```mdl
-CREATE ODATA CLIENT MyModule.Service (
+CREATE CONSUMED ODATA SERVICE MyModule.Service (
   MetadataUrl: 'https://api.example.com/$metadata'
 );
 ```

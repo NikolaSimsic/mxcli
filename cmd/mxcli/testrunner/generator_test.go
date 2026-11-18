@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mendixlabs/mxcli/mdl/langver"
 	"github.com/mendixlabs/mxcli/mdl/visitor"
 )
 
@@ -17,7 +18,7 @@ func TestRewriteWithErrorHandling_OnlyWrapsCalls(t *testing.T) {
 		"DELETE $p1;",
 	}
 
-	got := rewriteWithErrorHandling(lines, "test_1")
+	got := rewriteWithErrorHandling(lines, "test_1", langver.V0)
 	joined := strings.Join(got, "\n")
 
 	if strings.Contains(joined, "CHANGE $p1 (IsActive = false) ON ERROR CONTINUE;") {
@@ -49,7 +50,7 @@ func TestGenerateTestRunner_ParsesWhenTestUsesChangeAndListOps(t *testing.T) {
 					"$count = CALL MICROFLOW MfTest.M051_AggregateCount(ProductList = $filtered);",
 				}, "\n"),
 				Expects: []Expect{
-					{Variable: "$count", Operator: "=", Value: "1"},
+					expectOf("$count = 1"),
 				},
 			},
 		},
@@ -81,7 +82,7 @@ func TestGenerateTestRunner_RenamesAllAssignmentsInTestBlock(t *testing.T) {
 					"ADD $product TO $list;",
 				}, "\n"),
 				Expects: []Expect{
-					{Variable: "$result", Operator: "=", Value: "true"},
+					expectOf("$result = true"),
 				},
 			},
 		},
@@ -98,6 +99,30 @@ func TestGenerateTestRunner_RenamesAllAssignmentsInTestBlock(t *testing.T) {
 	} {
 		if !strings.Contains(mdl, want) {
 			t.Fatalf("generated runner is missing renamed fragment %q:\n%s", want, mdl)
+		}
+	}
+}
+
+// The generated test flows are MDL mxcli executes itself, so their error
+// handlers use the canonical `on error begin … end error` and record no
+// deprecated spelling (MDL-DEPR540, ako/mxcli#754).
+func TestGeneratedErrorHandlersAreCanonical(t *testing.T) {
+	suite := &TestSuite{Tests: []TestCase{
+		{ID: "t1", Name: "call", MDL: "$r = CALL MICROFLOW Mod.A();", Setups: []string{"Mod.Setup"}},
+		{ID: "t2", Name: "multi", MDL: "$r = CALL MICROFLOW Mod.A(\n  X = 1\n);"},
+	}}
+	for name, src := range map[string]string{
+		"endpoint": GenerateTestFlows(suite),
+		"legacy":   GenerateTestRunner(suite),
+	} {
+		prog, errs := visitor.Build(src)
+		if len(errs) > 0 {
+			t.Fatalf("%s: generated MDL does not parse: %v\n%s", name, errs[0], src)
+		}
+		for _, d := range prog.Deprecations {
+			if d.Code == "MDL-DEPR540" {
+				t.Errorf("%s: line %d uses the brace error handler:\n%s", name, d.Line, src)
+			}
 		}
 	}
 }

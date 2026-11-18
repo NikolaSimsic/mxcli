@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/types"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
+	"github.com/mendixlabs/mxcli/model"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // UpdateQualifiedNameInAllUnits rewrites every reference to oldName across all
@@ -26,6 +26,23 @@ func (b *Backend) UpdateQualifiedNameInAllUnits(oldName, newName string) (int, e
 	if err != nil {
 		return 0, fmt.Errorf("UpdateQualifiedNameInAllUnits: list units: %w", err)
 	}
+	// A path step — `[Src.Assoc/Src.Entity/Attr = 1]` in an access rule,
+	// `$O/Src.Assoc/Name` in an expression — names an entity or an association,
+	// and only those: an enumeration renamed must not rewrite an association
+	// that shares its name. By the time a move or rename sweeps, the element
+	// already carries newName, so that is what decides (ako/mxcli#1836).
+	paths := b.isDomainElementName(newName)
+	rewrite := func(s string) (any, bool) {
+		if v, ok := replaceQualifiedNameRef(s, oldName, newName); ok {
+			return v, true
+		}
+		if paths {
+			if v, n := types.RewritePathSteps(s, oldName, newName); n > 0 {
+				return v, true
+			}
+		}
+		return s, false
+	}
 	updated := 0
 	for _, id := range ids {
 		raw, err := b.reader.GetRawUnitBytes(id)
@@ -36,7 +53,7 @@ func (b *Backend) UpdateQualifiedNameInAllUnits(oldName, newName string) (int, e
 		if err := bson.Unmarshal(raw, &doc); err != nil {
 			continue
 		}
-		if replaced, ok := replaceQNInValue(doc, oldName, newName); ok {
+		if replaced, ok := replaceQNInValueWith(doc, rewrite); ok {
 			contents, err := bson.Marshal(replaced)
 			if err != nil {
 				return updated, fmt.Errorf("UpdateQualifiedNameInAllUnits: marshal %s: %w", id, err)
@@ -97,60 +114,67 @@ func (b *Backend) RenameReferences(oldName, newName string, dryRun bool) ([]type
 	return hits, nil
 }
 
-// RenameDocumentByName finds the document named oldName inside moduleName (directly
-// or via a nested folder) and rewrites its top-level "Name" field to newName. Works
-// for any document type via a raw BSON scan. Mirrors the legacy writer.
-func (b *Backend) RenameDocumentByName(moduleName, oldName, newName string) error {
+// RenameDocument rewrites the top-level "Name" of the document unit id from
+// oldName to newName. Works for any document type via a raw BSON rewrite.
+//
+// The unit is addressed by ID because the caller has already resolved it among
+// the documents of the kind it was asked to rename. This replaced a lookup by
+// module and bare name over every unit in the module's containers, which took
+// the first unit with that Name whatever its $Type: a folder created by a FOLDER
+// clause is inserted before the document it holds, so `rename page M.X` on a page
+// in folder 'X' renamed the folder (ako/mxcli#1443).
+//
+// Two refusals keep a wrong ID from doing the same damage. A folder or module is
+// never renamed here — they are containers, not documents, and RENAME MODULE has
+// its own path. And the stored Name must be oldName, so a stale or mismatched ID
+// fails before anything is written instead of renaming whatever it points at.
+func (b *Backend) RenameDocument(id model.ID, oldName, newName string) error {
 	if b.writer == nil {
-		return fmt.Errorf("RenameDocumentByName: not connected for writing")
+		return fmt.Errorf("RenameDocument: not connected for writing")
 	}
-	modules, err := b.reader.ListModules()
+	if id == "" {
+		return fmt.Errorf("RenameDocument: no document to rename")
+	}
+	raw, err := b.reader.GetRawUnitBytes(string(id))
 	if err != nil {
-		return fmt.Errorf("RenameDocumentByName: list modules: %w", err)
+		return fmt.Errorf("RenameDocument: read %s: %w", id, err)
 	}
-	var moduleID string
-	for _, m := range modules {
-		if m.Name == moduleName {
-			moduleID = m.ID
-			break
+	if len(raw) == 0 {
+		return fmt.Errorf("RenameDocument: unit %s not found", id)
+	}
+	var doc bson.D
+	if err := bson.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("RenameDocument: decode %s: %w", id, err)
+	}
+	unitType, _ := docField(doc, "$Type").(string)
+	if unitType == "Projects$Folder" || unitType == "Projects$ModuleImpl" || unitType == "Projects$Module" {
+		return fmt.Errorf("RenameDocument: unit %s is a %s, not a document", id, unitType)
+	}
+	for i, elem := range doc {
+		if elem.Key != "Name" {
+			continue
 		}
+		if s, _ := elem.Value.(string); s != oldName {
+			return fmt.Errorf("RenameDocument: %s %s is named %q, not %q", unitType, id, s, oldName)
+		}
+		doc[i].Value = newName
+		contents, err := bson.Marshal(doc)
+		if err != nil {
+			return fmt.Errorf("RenameDocument: marshal: %w", err)
+		}
+		return b.writer.UpdateRawUnit(string(id), contents)
 	}
-	if moduleID == "" {
-		return fmt.Errorf("module not found: %s", moduleName)
-	}
-	containers := b.containerSetForModule(moduleID)
+	return fmt.Errorf("RenameDocument: %s %s has no Name", unitType, id)
+}
 
-	units, err := b.reader.ListUnits()
-	if err != nil {
-		return fmt.Errorf("RenameDocumentByName: list units: %w", err)
-	}
-	for _, u := range units {
-		if !containers[u.ContainerID] {
-			continue
-		}
-		raw, err := b.reader.GetRawUnitBytes(u.ID)
-		if err != nil || len(raw) == 0 {
-			continue
-		}
-		var doc bson.D
-		if err := bson.Unmarshal(raw, &doc); err != nil {
-			continue
-		}
-		for i, elem := range doc {
-			if elem.Key != "Name" {
-				continue
-			}
-			if s, ok := elem.Value.(string); ok && s == oldName {
-				doc[i].Value = newName
-				contents, err := bson.Marshal(doc)
-				if err != nil {
-					return fmt.Errorf("RenameDocumentByName: marshal: %w", err)
-				}
-				return b.writer.UpdateRawUnit(u.ID, contents)
-			}
+// docField returns the value of a top-level field of a decoded unit, or nil.
+func docField(doc bson.D, key string) any {
+	for _, elem := range doc {
+		if elem.Key == key {
+			return elem.Value
 		}
 	}
-	return fmt.Errorf("document '%s.%s' not found", moduleName, oldName)
+	return nil
 }
 
 // containerSetForModule returns the module ID plus every folder ID nested under it
@@ -189,10 +213,28 @@ func docNameOf(doc bson.D) string {
 // used by RenameReferences to report per-unit hit counts.
 func replaceQNInDocCounted(doc bson.D, oldName, newName string, count *int) bson.D {
 	for i, elem := range doc {
+		// A view entity's OQL is the one place a qualified name is stored inside
+		// a sentence rather than as a property of its own, so the whole-string
+		// match below never sees it. Without this, renaming an entity a view
+		// selects from left the view pointing at a name that no longer exists —
+		// CE0174 "Cannot resolve object name" — and reported 0 references
+		// updated. See types.RewriteOQLQualifiedName.
+		if elem.Key == oqlPropertyKey {
+			if q, ok := elem.Value.(string); ok {
+				if rewritten, n := types.RewriteOQLQualifiedName(q, oldName, newName); n > 0 {
+					*count += n
+					doc[i].Value = rewritten
+				}
+				continue
+			}
+		}
 		doc[i].Value = replaceQNInValueCounted(elem.Value, oldName, newName, count)
 	}
 	return doc
 }
+
+// oqlPropertyKey is where DomainModels$OqlViewEntitySource keeps the query.
+const oqlPropertyKey = "Oql"
 
 func replaceQNInValueCounted(v any, oldName, newName string, count *int) any {
 	switch val := v.(type) {
@@ -205,10 +247,16 @@ func replaceQNInValueCounted(v any, oldName, newName string, count *int) any {
 			*count++
 			return newName + val[len(oldName):]
 		}
+		// A reference inside an expression: @Module.Constant, or an
+		// enumeration value in a longer expression (ako/mxcli#1671).
+		if rewritten, n := types.RewriteExpressionReferences(val, oldName, newName); n > 0 {
+			*count += n
+			return rewritten
+		}
 		return val
-	case primitive.D:
+	case bson.D:
 		return replaceQNInDocCounted(val, oldName, newName, count)
-	case primitive.A:
+	case bson.A:
 		for i, elem := range val {
 			val[i] = replaceQNInValueCounted(elem, oldName, newName, count)
 		}
@@ -222,25 +270,68 @@ func replaceQNInValueCounted(v any, oldName, newName string, count *int) any {
 	return v
 }
 
-// replaceQNInValue recursively rewrites qualified-name references in a decoded
-// BSON value, returning the (possibly mutated) value and whether anything changed.
-func replaceQNInValue(v any, oldName, newName string) (any, bool) {
+// isDomainElementName reports whether qn names an entity, an association or a
+// cross-module association in the project.
+func (b *Backend) isDomainElementName(qn string) bool {
+	mod, name, ok := strings.Cut(qn, ".")
+	if !ok || name == "" || strings.Contains(name, ".") {
+		return false
+	}
+	modules, err := b.ListModules()
+	if err != nil {
+		return false
+	}
+	var modID model.ID
+	for _, m := range modules {
+		if m.Name == mod {
+			modID = m.ID
+		}
+	}
+	if modID == "" {
+		return false
+	}
+	dm, err := b.GetDomainModel(modID)
+	if err != nil || dm == nil {
+		return false
+	}
+	for _, e := range dm.Entities {
+		if e.Name == name {
+			return true
+		}
+	}
+	for _, a := range dm.Associations {
+		if a.Name == name {
+			return true
+		}
+	}
+	for _, a := range dm.CrossAssociations {
+		if a.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// replaceQNInValueWith recursively applies rewrite to every string in a decoded
+// BSON value, returning the (possibly mutated) value and whether anything
+// changed.
+func replaceQNInValueWith(v any, rewrite func(string) (any, bool)) (any, bool) {
 	switch val := v.(type) {
 	case string:
-		return replaceQualifiedNameRef(val, oldName, newName)
-	case primitive.D: // also matches bson.D (alias)
+		return rewrite(val)
+	case bson.D:
 		changed := false
 		for i, elem := range val {
-			if nv, ok := replaceQNInValue(elem.Value, oldName, newName); ok {
+			if nv, ok := replaceQNInValueWith(elem.Value, rewrite); ok {
 				val[i].Value = nv
 				changed = true
 			}
 		}
 		return val, changed
-	case primitive.A:
+	case bson.A:
 		changed := false
 		for i, elem := range val {
-			if nv, ok := replaceQNInValue(elem, oldName, newName); ok {
+			if nv, ok := replaceQNInValueWith(elem, rewrite); ok {
 				val[i] = nv
 				changed = true
 			}
@@ -249,7 +340,7 @@ func replaceQNInValue(v any, oldName, newName string) (any, bool) {
 	case []any:
 		changed := false
 		for i, elem := range val {
-			if nv, ok := replaceQNInValue(elem, oldName, newName); ok {
+			if nv, ok := replaceQNInValueWith(elem, rewrite); ok {
 				val[i] = nv
 				changed = true
 			}
@@ -260,13 +351,19 @@ func replaceQNInValue(v any, oldName, newName string) (any, bool) {
 }
 
 // replaceQualifiedNameRef rewrites s when it equals oldName or is prefixed
-// "oldName." (so "Mod.Old.Param" → "Mod.New.Param"), matching the legacy logic.
+// "oldName." (so "Mod.Old.Param" → "Mod.New.Param"), matching the legacy logic,
+// and otherwise rewrites the references to oldName inside it as an expression —
+// @Module.Constant, or an enumeration value in a longer expression — which a
+// cross-module move of a constant left naming the old module (ako/mxcli#1671).
 func replaceQualifiedNameRef(s, oldName, newName string) (any, bool) {
 	if s == oldName {
 		return newName, true
 	}
 	if strings.HasPrefix(s, oldName+".") {
 		return newName + s[len(oldName):], true
+	}
+	if rewritten, n := types.RewriteExpressionReferences(s, oldName, newName); n > 0 {
+		return rewritten, true
 	}
 	return s, false
 }

@@ -5,10 +5,10 @@
 ```sql
 CREATE [ OR MODIFY ] KNOWLEDGE BASE module.Name (
     Provider: MxCloudGenAI,
-    key: module.KeyConstant
+    key: @module.KeyConstant
 );
 
-DROP KNOWLEDGE BASE module.Name
+DROP KNOWLEDGE BASE module.Name;
 ```
 
 Requires Mendix 11.9+.
@@ -27,7 +27,7 @@ If `OR MODIFY` is specified and the knowledge base already exists, its propertie
 :   The qualified name of the knowledge base document.
 
 `Provider: MxCloudGenAI`
-:   The provider. `MxCloudGenAI` is the only supported value.
+:   The provider. `MxCloudGenAI` is the only supported value; `mxcli check` warns on any other (MDL-AGENT01).
 
 `key: module.KeyConstant`
 :   A qualified reference to a String constant that holds the Portal resource key for the knowledge base.
@@ -37,16 +37,15 @@ If `OR MODIFY` is specified and the knowledge base already exists, its propertie
 ### Create a knowledge base
 
 ```sql
+mdl 1;
 CREATE CONSTANT MyModule."KBKey"
-    TYPE String
-    DEFAULT '';
-/
+    ( Type: String, DefaultValue: '' );
 
 CREATE KNOWLEDGE BASE MyModule."ProductDocs" (
     Provider: MxCloudGenAI,
-    key: MyModule.KBKey
+    key: @MyModule.KBKey
 );
-/
+
 ```
 
 ### Idempotent upsert
@@ -54,11 +53,11 @@ CREATE KNOWLEDGE BASE MyModule."ProductDocs" (
 ```sql
 CREATE OR MODIFY KNOWLEDGE BASE MyModule."ProductDocs" (
     Provider: MxCloudGenAI,
-    key: MyModule.KBKey
+    key: @MyModule.KBKey
 );
-/
+
 ```
 
 ## See Also
 
-[CREATE AGENT](create-agent.md), [CREATE MODEL](create-model.md)
+[CREATE AGENT](create-agent.md), [CREATE AI MODEL](create-model.md)

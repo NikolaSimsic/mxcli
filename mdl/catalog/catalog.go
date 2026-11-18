@@ -6,6 +6,9 @@ package catalog
 import (
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -101,45 +104,69 @@ func (c *Catalog) SetBuilt(built bool) {
 func (c *Catalog) Tables() []string {
 	return []string{
 		"CATALOG.MODULES",
+		"CATALOG.FOLDERS",
+		"CATALOG.ANNOTATIONS",
 		"CATALOG.ENTITIES",
 		"CATALOG.ASSOCIATIONS",
 		"CATALOG.ATTRIBUTES",
 		"CATALOG.MICROFLOWS",
 		"CATALOG.NANOFLOWS",
+		"CATALOG.RULES",
 		"CATALOG.PAGES",
+		"CATALOG.PAGE_TEMPLATES",
 		"CATALOG.SNIPPETS",
+		"CATALOG.BUILDING_BLOCKS",
 		"CATALOG.LAYOUTS",
 		"CATALOG.ENUMERATIONS",
+		"CATALOG.ENUMERATION_VALUES",
+		"CATALOG.MICROFLOW_PARAMETERS",
 		"CATALOG.JAVA_ACTIONS",
+		"CATALOG.JAVA_ACTION_PARAMETERS",
 		"CATALOG.JAVASCRIPT_ACTIONS",
 		"CATALOG.IMAGE_COLLECTIONS",
+		"CATALOG.ICON_COLLECTIONS",
+		"CATALOG.MENUS",
+		"CATALOG.SCHEDULED_EVENTS",
+		"CATALOG.TASK_QUEUES",
+		"CATALOG.REGULAR_EXPRESSIONS",
 		"CATALOG.DATA_TRANSFORMERS",
+		"CATALOG.MESSAGE_DEFINITION_COLLECTIONS",
+		"CATALOG.MESSAGE_DEFINITIONS",
 		"CATALOG.AGENTS",
 		"CATALOG.AI_MODELS",
 		"CATALOG.KNOWLEDGE_BASES",
 		"CATALOG.CONSUMED_MCP_SERVICES",
+		"CATALOG.PUBLISHED_MCP_SERVICES",
+		"CATALOG.AGENT_TOOLS",
+		"CATALOG.AGENT_MCP_SERVICES",
+		"CATALOG.AGENT_KNOWLEDGE_BASES",
 		"CATALOG.NAVIGATION_PROFILES",
+		"CATALOG.OFFLINE_ENTITY_CONFIGS",
+		"CATALOG.ENTITY_EVENT_HANDLERS",
 		"CATALOG.ACTIVITIES",
+		"CATALOG.FLOWS",
 		"CATALOG.WIDGETS",
 		"CATALOG.WIDGET_DEFINITIONS",
 		"CATALOG.WIDGET_DEFINITION_PROPERTIES",
 		"CATALOG.XPATH_EXPRESSIONS",
 		"CATALOG.REFS",
+		"CATALOG.USER_ROLES",
 		"CATALOG.ROLE_MAPPINGS",
 		"CATALOG.PERMISSIONS",
 		"CATALOG.PROJECTS",
 		"CATALOG.SNAPSHOTS",
 		"CATALOG.OBJECTS",
 		"CATALOG.WORKFLOWS",
-		"CATALOG.ODATA_CLIENTS",
-		"CATALOG.ODATA_SERVICES",
+		"CATALOG.WORKFLOW_ACTIVITIES",
+		"CATALOG.CONSUMED_ODATA_SERVICES",
+		"CATALOG.PUBLISHED_ODATA_SERVICES",
 		"CATALOG.BUSINESS_EVENT_SERVICES",
 		"CATALOG.DATABASE_CONNECTIONS",
 		"CATALOG.JAR_DEPENDENCIES",
 		"CATALOG.CONSTANTS",
 		"CATALOG.CONSTANT_VALUES",
-		"CATALOG.REST_CLIENTS",
-		"CATALOG.REST_OPERATIONS",
+		"CATALOG.CONSUMED_REST_SERVICES",
+		"CATALOG.CONSUMED_REST_OPERATIONS",
 		"CATALOG.PUBLISHED_REST_SERVICES",
 		"CATALOG.PUBLISHED_REST_OPERATIONS",
 		"CATALOG.EXTERNAL_ENTITIES",
@@ -162,6 +189,8 @@ func (c *Catalog) Tables() []string {
 		"CATALOG.COMMUNITIES",
 		"CATALOG.COMMUNITY_SUMMARY",
 		"CATALOG.GRAPH_CYCLES",
+		"CATALOG.GRAPH_MODULE_CYCLES",
+		"CATALOG.GRAPH_ANALYSIS_SCOPE",
 		"CATALOG.GRAPH_LAYERS",
 		"CATALOG.GRAPH_CENTRALITY",
 		"CATALOG.GRAPH_MODULE_DEPENDENCIES",
@@ -268,6 +297,21 @@ const (
 	MetaBuildMode     = "build_mode"
 	MetaBuildTime     = "build_time"
 	MetaBuildDuration = "build_duration"
+
+	// MetaGraphAnalysis records that AddGraphAnalysis has run against this
+	// catalog, and MetaGraphResolution the Leiden resolution it used.
+	//
+	// Deliberately NOT another build mode. fast/full/source is a LEVEL — each
+	// contains the one below, so a rank comparison decides everything. The graph
+	// pass is orthogonal: it augments whatever level is there (that is the whole
+	// point of AddGraphAnalysis being additive), so folding it into the rank
+	// would make "source" and "full+graph" incomparable. It is a flag.
+	//
+	// Without it an un-run graph pass is indistinguishable from a graph with
+	// nothing in it: the tables are empty either way, and the recorded mode still
+	// says "full" (mendixlabs/mxcli#1060).
+	MetaGraphAnalysis   = "graph_analysis"
+	MetaGraphResolution = "graph_resolution"
 )
 
 // CacheInfo contains information about the cached catalog.
@@ -280,6 +324,11 @@ type CacheInfo struct {
 	BuildDuration time.Duration
 	IsValid       bool
 	InvalidReason string
+
+	// GraphAnalysis reports whether the communities/cycles/layers/centrality
+	// pass has run against this catalog, and at which resolution.
+	GraphAnalysis   bool
+	GraphResolution float64
 }
 
 // NewFromFile opens a catalog from a persisted SQLite file.
@@ -310,6 +359,17 @@ func NewFromFile(path string) (*Catalog, error) {
 	if err := c.migrateIfSchemaMismatch(); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("failed to migrate cached catalog: %w", err)
+	}
+
+	// A cache already at the current schema version was saved from a catalog
+	// that ran createTables, so it is complete — open it without writing. Opening
+	// must stay read-only: a parallel process may rename a fresh cache over this
+	// path at any moment (SaveToFile is atomic, ako/mxcli#951), and SQLite refuses
+	// a write to a file that has been moved ("attempt to write a readonly
+	// database"), while concurrent openers writing the version row contend for
+	// the lock.
+	if stored, err := c.GetMeta(MetaSchemaVersion); err == nil && stored == CatalogSchemaVersion {
+		return c, nil
 	}
 
 	// Idempotent schema upgrade — adds any tables/indexes the cached file
@@ -394,6 +454,7 @@ func (c *Catalog) migrateIfSchemaMismatch() error {
 	for _, key := range []string{
 		MetaMprPath, MetaMprModTime, MetaMendixVersion,
 		MetaBuildMode, MetaBuildTime, MetaBuildDuration,
+		MetaGraphAnalysis, MetaGraphResolution, MetaSourceFingerprint,
 	} {
 		if _, err := c.db.Exec(`DELETE FROM catalog_meta WHERE Key = ?`, key); err != nil {
 			return fmt.Errorf("clearing cache-info key %s: %w", key, err)
@@ -406,6 +467,15 @@ func (c *Catalog) migrateIfSchemaMismatch() error {
 // SaveToFile saves the catalog to a SQLite file.
 // This copies the in-memory database to a file for persistence.
 // Requires the underlying CatalogDB to be a *SqliteCatalogDB.
+//
+// The save is atomic: the database is written to a temporary file in the same
+// directory and renamed over path. Parallel mxcli processes on one project all
+// save the same cache (ako/mxcli#951: eight parallel `lint` runs), and writing in
+// place let them collide — VACUUM INTO refused the file another process had just
+// created, the manual fallback then failed with "table catalog_meta already
+// exists" or "database is locked", and a reader could open a half-written file.
+// With a rename every writer succeeds (the last one wins) and a reader sees the
+// old cache or a complete new one, never a partial file.
 func (c *Catalog) SaveToFile(path string) error {
 	sdb, ok := c.db.(*SqliteCatalogDB)
 	if !ok {
@@ -413,15 +483,38 @@ func (c *Catalog) SaveToFile(path string) error {
 	}
 	rawDB := sdb.RawDB()
 
+	// Same directory, so the rename cannot cross a filesystem boundary.
+	tmpFile, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := tmpFile.Name()
+	tmpFile.Close()
+	// VACUUM INTO requires the target to be absent or empty; it is empty.
+	committed := false
+	defer func() {
+		if !committed {
+			os.Remove(tmp)
+		}
+	}()
+
 	// Use SQLite backup API via VACUUM INTO (SQLite 3.27+)
 	// Fall back to manual copy if not available
-	safePath := strings.ReplaceAll(path, "'", "''")
-	_, err := rawDB.Exec(fmt.Sprintf("VACUUM INTO '%s'", safePath))
-	if err != nil {
-		// Fall back: export and import
-		return c.saveToFileManual(path, rawDB)
+	safePath := strings.ReplaceAll(tmp, "'", "''")
+	if _, err := rawDB.Exec(fmt.Sprintf("VACUUM INTO '%s'", safePath)); err != nil {
+		// Fall back: export and import, into a fresh empty temp file.
+		if err := os.Truncate(tmp, 0); err != nil {
+			return err
+		}
+		if err := c.saveToFileManual(tmp, rawDB); err != nil {
+			return err
+		}
 	}
 
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("replace catalog cache %s: %w", path, err)
+	}
+	committed = true
 	return nil
 }
 
@@ -573,7 +666,9 @@ func (c *Catalog) GetCacheInfo() (*CacheInfo, error) {
 	info.BuildMode, _ = c.GetMeta(MetaBuildMode)
 
 	if modTimeStr, _ := c.GetMeta(MetaMprModTime); modTimeStr != "" {
-		info.MprModTime, _ = time.Parse(time.RFC3339, modTimeStr)
+		// Parse accepts the fractional seconds RFC3339Nano writes, and a whole-second
+		// value written by an older mxcli.
+		info.MprModTime, _ = time.Parse(time.RFC3339Nano, modTimeStr)
 	}
 	if buildTimeStr, _ := c.GetMeta(MetaBuildTime); buildTimeStr != "" {
 		info.BuildTime, _ = time.Parse(time.RFC3339, buildTimeStr)
@@ -581,8 +676,28 @@ func (c *Catalog) GetCacheInfo() (*CacheInfo, error) {
 	if durationStr, _ := c.GetMeta(MetaBuildDuration); durationStr != "" {
 		info.BuildDuration, _ = time.ParseDuration(durationStr)
 	}
+	if v, _ := c.GetMeta(MetaGraphAnalysis); v != "" {
+		info.GraphAnalysis = true
+	}
+	if v, _ := c.GetMeta(MetaGraphResolution); v != "" {
+		info.GraphResolution, _ = strconv.ParseFloat(v, 64)
+	}
 
 	return info, nil
+}
+
+// ModTimeUnchanged reports whether a project file still has the modification time
+// a cache recorded when it was built. It compares the instant exactly, to the
+// precision the file system reports.
+//
+// It used to compare whole seconds, so a write landing in the same second as the
+// build left the cache looking fresh and the next read answered from the catalog
+// as it was before the write (a test that reads, writes and reads again failed
+// about one run in six). The stored value is now kept to the nanosecond; a cache
+// written before that holds whole seconds and so never equals a fractional time,
+// which costs one rebuild per project and no wrong answer.
+func ModTimeUnchanged(cached, current time.Time) bool {
+	return cached.Equal(current)
 }
 
 // SetCacheInfo stores cache metadata after building.
@@ -590,7 +705,7 @@ func (c *Catalog) SetCacheInfo(mprPath string, mprModTime time.Time, mendixVersi
 	if err := c.SetMeta(MetaMprPath, mprPath); err != nil {
 		return err
 	}
-	if err := c.SetMeta(MetaMprModTime, mprModTime.Format(time.RFC3339)); err != nil {
+	if err := c.SetMeta(MetaMprModTime, mprModTime.UTC().Format(time.RFC3339Nano)); err != nil {
 		return err
 	}
 	if err := c.SetMeta(MetaMendixVersion, mendixVersion); err != nil {

@@ -12,6 +12,8 @@ mxcli new MyApp --version 11.8.0 --skip-init   # Skip AI tooling setup
 
 This downloads MxBuild, creates a blank Mendix project via `mx create-project`, runs `mxcli init` to set up AI tooling and Dev Container, and downloads the correct Linux mxcli binary for the container. The result is a ready-to-open folder.
 
+Placing that Linux binary is best-effort. If the download fails (no network, a proxy, or a development build with no matching release), `mxcli new` prints a warning and still exits 0, because the project is already complete. Add the binary afterwards with `mxcli setup mxcli --output ./mxcli` in the project directory, adding `--tag <release>` when you're running a development build.
+
 | Flag | Description |
 |------|-------------|
 | `--version` | Mendix version (required, e.g., `11.8.0`) |
@@ -64,6 +66,12 @@ All tools also receive the universal files (`AGENTS.md`, `.ai-context/`).
 4. **Set up dev container** -- `.devcontainer/` with Dockerfile and configuration
 5. **Copy mxcli binary** -- places the mxcli executable in the project root
 6. **Install VS Code extension** -- copies and installs the bundled `.vsix` file
+7. **Create `mdlsource/`** -- the directory the generated `CLAUDE.md` tells the assistant to keep MDL scripts in, with a short README (`mxcli new` creates it even with `--skip-init`)
+8. **Stamp the version** -- `.ai-context/mxcli-tooling.json` records which mxcli wrote the tooling; see [Syncing with Updates](./syncing.md#the-version-stamp)
+
+`CLAUDE.md` and `AGENTS.md` are written between `<!-- mxcli:begin … -->` and
+`<!-- mxcli:end -->` markers. Notes you add outside the markers survive a
+re-run of `mxcli init` and every `mxcli init --sync-skills`.
 
 ## Adding a Tool Later
 

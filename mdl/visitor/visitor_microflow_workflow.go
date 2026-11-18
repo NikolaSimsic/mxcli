@@ -16,14 +16,30 @@ func buildCallWorkflowStatement(ctx parser.ICallWorkflowStatementContext) *ast.C
 	c := ctx.(*parser.CallWorkflowStatementContext)
 	stmt := &ast.CallWorkflowStmt{}
 
-	if v := c.VARIABLE(); v != nil {
-		stmt.OutputVariable = strings.TrimPrefix(v.GetText(), "$")
+	// With the positional form there are two VARIABLEs — the output variable
+	// before the `=`, and the context object inside the parentheses — so which
+	// one is which depends on whether an EQUALS is present.
+	vars := c.AllVARIABLE()
+	positional := ""
+	switch {
+	case c.EQUALS() != nil && len(vars) >= 2:
+		stmt.OutputVariable = strings.TrimPrefix(vars[0].GetText(), "$")
+		positional = strings.TrimPrefix(vars[1].GetText(), "$")
+	case c.EQUALS() != nil && len(vars) == 1:
+		stmt.OutputVariable = strings.TrimPrefix(vars[0].GetText(), "$")
+	case len(vars) >= 1:
+		positional = strings.TrimPrefix(vars[0].GetText(), "$")
 	}
 	if qn := c.QualifiedName(); qn != nil {
 		stmt.Workflow = buildQualifiedName(qn)
 	}
 	if argList := c.CallArgumentList(); argList != nil {
 		stmt.Arguments = buildCallArgumentList(argList)
+	} else if positional != "" {
+		// Named form omitted: the single argument IS the workflow context. The
+		// parameter name is not stored in the model, so the builder keys off the
+		// value alone — see addCallWorkflowAction.
+		stmt.ContextVariable = positional
 	}
 	if errClause := c.OnErrorClause(); errClause != nil {
 		stmt.ErrorHandling = buildOnErrorClause(errClause)
@@ -143,7 +159,7 @@ func buildSetTaskOutcomeStatement(ctx parser.ISetTaskOutcomeStatementContext) *a
 		stmt.WorkflowTaskVariable = strings.TrimPrefix(v.GetText(), "$")
 	}
 	if str := c.STRING_LITERAL(); str != nil {
-		stmt.OutcomeValue = unquoteString(str.GetText())
+		stmt.OutcomeValue = unquoteStringLit(str)
 	}
 	if errClause := c.OnErrorClause(); errClause != nil {
 		stmt.ErrorHandling = buildOnErrorClause(errClause)
@@ -181,6 +197,9 @@ func buildNotifyWorkflowStatement(ctx parser.INotifyWorkflowStatementContext) *a
 	} else if len(vars) >= 1 {
 		stmt.WorkflowVariable = strings.TrimPrefix(vars[0].GetText(), "$")
 	}
+	if qn := c.QualifiedName(); qn != nil {
+		stmt.Target = getQualifiedNameText(qn)
+	}
 	if errClause := c.OnErrorClause(); errClause != nil {
 		stmt.ErrorHandling = buildOnErrorClause(errClause)
 	}
@@ -210,10 +229,14 @@ func buildLockWorkflowStatement(ctx parser.ILockWorkflowStatementContext) *ast.L
 	c := ctx.(*parser.LockWorkflowStatementContext)
 	stmt := &ast.LockWorkflowStmt{}
 
-	if c.ALL() != nil {
-		stmt.PauseAllWorkflows = true
-	} else if v := c.VARIABLE(); v != nil {
+	if v := c.VARIABLE(); v != nil {
 		stmt.WorkflowVariable = strings.TrimPrefix(v.GetText(), "$")
+	} else if qn := c.QualifiedName(); qn != nil {
+		stmt.Workflow = getQualifiedNameText(qn)
+	}
+	// `pause all` after a workflow, or the bare `lock workflow all`.
+	if c.PAUSE() != nil || len(c.AllALL()) > 0 {
+		stmt.PauseAllWorkflows = true
 	}
 	if errClause := c.OnErrorClause(); errClause != nil {
 		stmt.ErrorHandling = buildOnErrorClause(errClause)
@@ -228,10 +251,13 @@ func buildUnlockWorkflowStatement(ctx parser.IUnlockWorkflowStatementContext) *a
 	c := ctx.(*parser.UnlockWorkflowStatementContext)
 	stmt := &ast.UnlockWorkflowStmt{}
 
-	if c.ALL() != nil {
-		stmt.ResumeAllPausedWorkflows = true
-	} else if v := c.VARIABLE(); v != nil {
+	if v := c.VARIABLE(); v != nil {
 		stmt.WorkflowVariable = strings.TrimPrefix(v.GetText(), "$")
+	} else if qn := c.QualifiedName(); qn != nil {
+		stmt.Workflow = getQualifiedNameText(qn)
+	}
+	if c.UNPAUSE() != nil || len(c.AllALL()) > 0 {
+		stmt.ResumeAllPausedWorkflows = true
 	}
 	if errClause := c.OnErrorClause(); errClause != nil {
 		stmt.ErrorHandling = buildOnErrorClause(errClause)

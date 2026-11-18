@@ -5,6 +5,7 @@ package modelsdkbackend
 import (
 	"fmt"
 
+	"github.com/mendixlabs/mxcli/mdl/dbconnector"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/modelsdk/codec"
 	"github.com/mendixlabs/mxcli/modelsdk/element"
@@ -14,17 +15,26 @@ import (
 )
 
 func init() {
-	// Every list in a DatabaseConnection tree uses the typed-array marker 2 (the
-	// legacy serializer prefixes each bson.A with int32(2)), both empty and
-	// populated. Register the per-child-$Type marker for the populated case and
-	// MandatoryListMarkers on the parents for the empty case. Mirrors the legacy
-	// serializer in sdk/mpr/writer_dbconnection.go field-for-field.
-	codec.RegisterListMarker("DatabaseConnector$DatabaseQuery", 2)
+	// A DatabaseConnection's Queries list is marker 3, empty or not; every other
+	// list in the tree (AdditionalProperties, a query's Parameters and
+	// TableMappings, a mapping's Columns) is marker 2. Measured (ako/mxcli#2256):
+	// Studio Pro 11.16.1 saving ChatV2's VectorDatabase (ChatV2 commit 5a85760,
+	// two queries) changed only Queries 2 -> 3; `mx convert` 11.16.0 rewriting a
+	// connection with no queries and one with a query did the same and nothing
+	// else. The 2 mxcli used to write for Queries came from the legacy
+	// serializer's initial commit, never from a measurement, and every exec of
+	// the defining script flipped Studio Pro's 3 back.
+	//
+	// Queries is registered per owner/key, so it covers the empty list and every
+	// write applies it to a stored list too (canon.NormalizeListMarkers): a
+	// connection an older mxcli stored with 2 gets 3 on its next write.
+	codec.RegisterMandatoryPropertyList("DatabaseConnector$DatabaseConnection", "Queries", 3)
+	codec.RegisterListMarker("DatabaseConnector$DatabaseQuery", 3)
 	codec.RegisterListMarker("DatabaseConnector$QueryParameter", 2)
 	codec.RegisterListMarker("DatabaseConnector$TableMapping", 2)
 	codec.RegisterListMarker("DatabaseConnector$ColumnMapping", 2)
 	codec.RegisterTypeDefaults("DatabaseConnector$DatabaseConnection", codec.TypeDefaults{
-		MandatoryListMarkers: map[string]int32{"Queries": 2, "AdditionalProperties": 2},
+		MandatoryListMarkers: map[string]int32{"AdditionalProperties": 2},
 	})
 	codec.RegisterTypeDefaults("DatabaseConnector$DatabaseQuery", codec.TypeDefaults{
 		MandatoryListMarkers: map[string]int32{"TableMappings": 2, "Parameters": 2},
@@ -49,7 +59,7 @@ func (b *Backend) CreateDatabaseConnection(conn *model.DatabaseConnection) error
 	if conn.ID == "" {
 		conn.ID = model.ID(mmpr.GenerateID())
 	}
-	g := databaseConnectionToGen(conn)
+	g := databaseConnectionToGen(conn, b.storesQueryTypeEnum(), b.storesLastSelectedQuery())
 	contents, err := (&codec.Encoder{}).Encode(g)
 	if err != nil {
 		return fmt.Errorf("CreateDatabaseConnection: encode: %w", err)
@@ -67,10 +77,15 @@ func (b *Backend) UpdateDatabaseConnection(conn *model.DatabaseConnection) error
 	if b.writer == nil {
 		return fmt.Errorf("UpdateDatabaseConnection: not connected for writing")
 	}
-	g := databaseConnectionToGen(conn)
+	g := databaseConnectionToGen(conn, b.storesQueryTypeEnum(), b.storesLastSelectedQuery())
 	contents, err := (&codec.Encoder{}).Encode(g)
 	if err != nil {
 		return fmt.Errorf("UpdateDatabaseConnection: encode: %w", err)
+	}
+	// databaseConnectionToGen writes ExportLevel "Hidden" as a constant (#816).
+	contents, err = b.keepStoredExportLevel(string(conn.ID), contents)
+	if err != nil {
+		return fmt.Errorf("UpdateDatabaseConnection: %w", err)
 	}
 	return b.writer.UpdateRawUnit(string(conn.ID), contents)
 }
@@ -86,10 +101,31 @@ func (b *Backend) DeleteDatabaseConnection(id model.ID) error {
 	return b.writer.DeleteUnit(string(id))
 }
 
+// storesQueryTypeEnum reports whether this project stores a query's type under the
+// Mendix 11.13+ `Type` key. An unreadable version falls back to the legacy key.
+func (b *Backend) storesQueryTypeEnum() bool {
+	pv := b.ProjectVersion()
+	if pv == nil {
+		return false
+	}
+	return dbconnector.StoresTypeEnum(pv.MajorVersion, pv.MinorVersion)
+}
+
+// storesLastSelectedQuery reports whether this project's metamodel declares
+// DatabaseConnection.LastSelectedQuery: introduced in 10.0, gone in 11.11
+// (measured with `mx convert`: kept by 11.10.0, removed by 11.11.0). Writing it
+// to a project without it leaves a key Studio Pro drops on its next save, and
+// Mendix's merge engine refuses to compare the two (mendixlabs/mxcli#1373). An
+// unreadable version omits it.
+func (b *Backend) storesLastSelectedQuery() bool {
+	pv := b.ProjectVersion()
+	return pv != nil && pv.IsAtLeast(10, 0) && !pv.IsAtLeast(11, 11)
+}
+
 // databaseConnectionToGen builds the DatabaseConnection element tree directly with
 // the verified storage keys. The gen/databaseconnector setters bind different
 // property keys, so this mirrors sdk/mpr.serializeDatabaseConnection field-for-field.
-func databaseConnectionToGen(conn *model.DatabaseConnection) element.Element {
+func databaseConnectionToGen(conn *model.DatabaseConnection, typeEnum, lastSelectedQuery bool) element.Element {
 	e := newElem("DatabaseConnector$DatabaseConnection", string(conn.ID))
 	addStr(e, "Name", conn.Name)
 	addStr(e, "DatabaseType", conn.DatabaseType)
@@ -107,22 +143,30 @@ func databaseConnectionToGen(conn *model.DatabaseConnection) element.Element {
 
 	queries := make([]element.Element, 0, len(conn.Queries))
 	for _, q := range conn.Queries {
-		queries = append(queries, databaseQueryToGen(q))
+		queries = append(queries, databaseQueryToGen(q, typeEnum))
 	}
 	addPartList(e, "Queries", queries)
 
 	// AdditionalProperties always serializes as an empty marker-2 list.
 	addPartList(e, "AdditionalProperties", nil)
-	addStr(e, "LastSelectedQuery", "")
+	if lastSelectedQuery {
+		addStr(e, "LastSelectedQuery", "")
+	}
 	return e
 }
 
 // databaseQueryToGen builds a DatabaseConnector$DatabaseQuery sub-element.
-func databaseQueryToGen(q *model.DatabaseQuery) element.Element {
+func databaseQueryToGen(q *model.DatabaseQuery, typeEnum bool) element.Element {
 	e := newElem("DatabaseConnector$DatabaseQuery", string(q.ID))
 	addStr(e, "Name", q.Name)
 	addStr(e, "Query", q.SQL)
-	addInt64(e, "QueryType", int64(q.QueryType))
+	// Exactly one of the two spellings — writing the other invents a property the
+	// target version's metamodel does not define. See mdl/dbconnector.
+	if typeEnum {
+		addStr(e, dbconnector.TypeKey, dbconnector.TypeToWrite(q.QueryTypeName, q.SQL))
+	} else {
+		addInt64(e, dbconnector.QueryTypeKey, int64(q.QueryType))
+	}
 
 	mappings := make([]element.Element, 0, len(q.TableMappings))
 	for _, m := range q.TableMappings {

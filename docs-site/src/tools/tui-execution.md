@@ -20,14 +20,14 @@ From the browser mode, press `x` to switch to the MDL execution view. A full-scr
 The textarea supports standard text editing. Type or paste any MDL statements:
 
 ```sql
-SHOW MODULES;
+mdl 1;
+LIST MODULES;
 
-CREATE ENTITY MyModule.Customer
-  NAME "Customer"
-  PERSISTENT
-  ATTRIBUTE Name STRING(100)
-  ATTRIBUTE Email STRING(200)
-  ATTRIBUTE Age INTEGER;
+CREATE PERSISTENT ENTITY MyModule.Customer (
+  Name: String(100),
+  Email: String(200),
+  Age: Integer
+);
 ```
 
 Press `Ctrl+E` to execute. The TUI writes the content to a temporary file and runs `mxcli exec` as a subprocess. During execution, a status indicator shows "Executing..." in the status bar.
@@ -62,7 +62,7 @@ The execution view accepts any valid MDL statement, including:
 
 | Category | Examples |
 |----------|---------|
-| **Query** | `SHOW MODULES`, `SHOW ENTITIES`, `DESCRIBE ENTITY MyModule.Customer` |
+| **Query** | `LIST MODULES`, `LIST ENTITIES`, `DESCRIBE ENTITY MyModule.Customer` |
 | **Create** | `CREATE ENTITY`, `CREATE MICROFLOW`, `CREATE PAGE` |
 | **Modify** | `ALTER ENTITY`, `ALTER PAGE`, `ALTER NAVIGATION` |
 | **Delete** | `DROP ENTITY`, `DROP MICROFLOW`, `DROP PAGE` |

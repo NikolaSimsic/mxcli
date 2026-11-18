@@ -3,9 +3,8 @@
 package executor
 
 import (
-	"strings"
-
 	"github.com/mendixlabs/mxcli/mdl/backend"
+	"github.com/mendixlabs/mxcli/mdl/folderpath"
 	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 )
@@ -69,6 +68,13 @@ func newContainerHierarchyImpl(src hierarchySource) (*ContainerHierarchy, error)
 	return h, nil
 }
 
+// addFolder records a folder created after the hierarchy was built, so a
+// cached hierarchy can resolve documents placed in it (ako/mxcli#1486).
+func (h *ContainerHierarchy) addFolder(id, containerID model.ID, name string) {
+	h.folderNames[id] = name
+	h.containerParent[id] = containerID
+}
+
 // FindModuleID finds the module ID for any container by traversing the hierarchy.
 func (h *ContainerHierarchy) FindModuleID(containerID model.ID) model.ID {
 	current := containerID
@@ -85,6 +91,11 @@ func (h *ContainerHierarchy) FindModuleID(containerID model.ID) model.ID {
 	return containerID
 }
 
+// ContainerOf returns the container a unit or folder sits in, "" if unknown.
+func (h *ContainerHierarchy) ContainerOf(id model.ID) model.ID {
+	return h.containerParent[id]
+}
+
 // GetModuleName returns the module name for a module ID.
 func (h *ContainerHierarchy) GetModuleName(moduleID model.ID) string {
 	return h.moduleNames[moduleID]
@@ -95,7 +106,9 @@ func (h *ContainerHierarchy) IsModule(id model.ID) bool {
 	return h.moduleIDs[id]
 }
 
-// BuildFolderPath builds a folder path string from container to module.
+// BuildFolderPath builds a folder path string from container to module, each
+// folder name escaped so a name holding '/' stays one segment
+// (folderpath.Join, mendixlabs/mxcli#1367).
 func (h *ContainerHierarchy) BuildFolderPath(containerID model.ID) string {
 	var parts []string
 	current := containerID
@@ -115,7 +128,7 @@ func (h *ContainerHierarchy) BuildFolderPath(containerID model.ID) string {
 	if len(parts) == 0 {
 		return ""
 	}
-	return strings.Join(parts, "/")
+	return folderpath.Join(parts)
 }
 
 // GetQualifiedName returns the fully qualified name for a document.

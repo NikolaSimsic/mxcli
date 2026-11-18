@@ -14,9 +14,11 @@ import (
 	"fmt"
 	"strings"
 
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 
+	"github.com/mendixlabs/mxcli/mdl/backend"
 	"github.com/mendixlabs/mxcli/mdl/backend/bsonnav"
+	"github.com/mendixlabs/mxcli/mdl/backend/wfnames"
 	"github.com/mendixlabs/mxcli/mdl/bsonutil"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/workflows"
@@ -94,9 +96,71 @@ func (m *Mutator) SetProperty(prop string, value string) error {
 		bsonnav.DSet(m.rawData, "DueDate", value)
 		return nil
 
+	case "annotation":
+		return m.setStartNote(value)
+
 	default:
 		return fmt.Errorf("unsupported workflow property: %s", prop)
 	}
+}
+
+// setStartNote sets the note on the workflow's start, the header's
+// `annotation '…'` (ako/mxcli#1717): the start activity's, where Studio Pro
+// stores and shows it. The workflow's own Annotation — shown nowhere, and where
+// mxcli wrote the note before — is cleared, or describe would still print the
+// note the statement replaced or removed.
+//
+// A workflow whose main flow has no start activity is one stored below Mendix
+// 11.3, which keeps the start implicit and the note as the workflow's own
+// Annotation (ako/mxcli#1754); the note is set there.
+func (m *Mutator) setStartNote(text string) error {
+	var start bson.D
+	for _, el := range bsonnav.DGetArrayElements(bsonnav.DGet(bsonnav.DGetDoc(m.rawData, "Flow"), "Activities")) {
+		if d, ok := el.(bson.D); ok && bsonnav.DGetString(d, "$Type") == "Workflows$StartWorkflowActivity" {
+			start = d
+			break
+		}
+	}
+	if start == nil {
+		if setNote(m.rawData, "the workflow", text) == nil {
+			return nil
+		}
+		return fmt.Errorf("the workflow has no start activity to hold its note")
+	}
+	if err := setNote(start, "the workflow's start activity", text); err != nil {
+		return err
+	}
+	bsonnav.DSet(m.rawData, "Annotation", nil)
+	return nil
+}
+
+// setNote writes the note Studio Pro attaches to an activity (ako/mxcli#1717):
+// a Workflows$Annotation holding Description — the shape CREATE writes for
+// `@annotation '…'` — or null for "".
+// An existing note keeps its $ID. A document without the Annotation slot is
+// refused: every type with a note stores the slot, null when empty (11.15.0),
+// so a missing one is a type or version that has no note to write.
+func setNote(owner bson.D, what, text string) error {
+	for i := range owner {
+		if owner[i].Key != "Annotation" {
+			continue
+		}
+		note, _ := owner[i].Value.(bson.D)
+		switch {
+		case text == "":
+			owner[i].Value = nil
+		case note != nil && bsonnav.DSet(note, "Description", text):
+			// Edited in place, keeping the note's $ID.
+		default:
+			owner[i].Value = bson.D{
+				{Key: "$ID", Value: bsonutil.NewIDBsonBinary()},
+				{Key: "$Type", Value: "Workflows$Annotation"},
+				{Key: "Description", Value: text},
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("%s has no annotation to set", what)
 }
 
 func (m *Mutator) SetPropertyWithEntity(prop string, value string, entity string) error {
@@ -153,6 +217,62 @@ func (m *Mutator) SetPropertyWithEntity(prop string, value string, entity string
 // Activity operations
 // ---------------------------------------------------------------------------
 
+// templateKeys maps SetTemplateParameters' property to the key of the
+// Microflows$StringTemplate it fills, on the workflow and on a user task.
+var templateKeys = map[string][2]string{
+	"display":     {"WorkflowName", ""},
+	"description": {"WorkflowDescription", "TaskDescription"},
+	"task_name":   {"", "TaskName"},
+}
+
+// SetTemplateParameters replaces a text's parameters with one
+// Microflows$TemplateParameter per expression — the shape the create path
+// writes (ako/mxcli#1714).
+func (m *Mutator) SetTemplateParameters(activityRef string, atPos int, prop string, params []string) error {
+	keys, ok := templateKeys[strings.ToLower(prop)]
+	if !ok {
+		return fmt.Errorf("%s is not a text with parameters", prop)
+	}
+	owner, key := m.rawData, keys[0]
+	if activityRef != "" {
+		actDoc, err := m.findActivityByCaption(activityRef, atPos)
+		if err != nil {
+			return err
+		}
+		owner, key = actDoc, keys[1]
+	}
+	if key == "" {
+		return fmt.Errorf("%s has no parameters here", prop)
+	}
+	tmpl := bsonnav.DGetDoc(owner, key)
+	if tmpl == nil {
+		if len(params) == 0 {
+			return nil
+		}
+		return fmt.Errorf("%s has no %s to give parameters", orWorkflow(activityRef), key)
+	}
+	list := bson.A{int32(2)}
+	for _, p := range params {
+		list = append(list, bson.D{
+			{Key: "$ID", Value: bsonutil.NewIDBsonBinary()},
+			{Key: "$Type", Value: "Microflows$TemplateParameter"},
+			{Key: "Expression", Value: p},
+		})
+	}
+	if !bsonnav.DSet(tmpl, "Parameters", list) {
+		return fmt.Errorf("%s's %s has no parameter list", orWorkflow(activityRef), key)
+	}
+	return nil
+}
+
+// orWorkflow names what SetTemplateParameters edits, for its errors.
+func orWorkflow(activityRef string) string {
+	if activityRef == "" {
+		return "the workflow"
+	}
+	return "activity " + activityRef
+}
+
 func (m *Mutator) SetActivityProperty(activityRef string, atPos int, prop string, value string) error {
 	actDoc, err := m.findActivityByCaption(activityRef, atPos)
 	if err != nil {
@@ -184,27 +304,45 @@ func (m *Mutator) SetActivityProperty(activityRef string, atPos int, prop string
 		}
 		return nil
 
+	case "task_name":
+		taskName := bsonnav.DGetDoc(actDoc, "TaskName")
+		if taskName == nil {
+			return fmt.Errorf("activity %q has no task name", activityRef)
+		}
+		bsonnav.DSet(taskName, "Text", value)
+		return nil
+
 	case "targeting_microflow":
-		userTargeting := bson.D{
+		m.setUserTargeting(actDoc, bson.D{
 			{Key: "$ID", Value: bsonutil.NewIDBsonBinary()},
 			{Key: "$Type", Value: "Workflows$MicroflowUserTargeting"},
 			{Key: "Microflow", Value: value},
-		}
-		bsonnav.DSet(actDoc, "UserTargeting", userTargeting)
+		})
 		return nil
 
 	case "targeting_xpath":
-		userTargeting := bson.D{
+		m.setUserTargeting(actDoc, bson.D{
 			{Key: "$ID", Value: bsonutil.NewIDBsonBinary()},
 			{Key: "$Type", Value: "Workflows$XPathUserTargeting"},
 			{Key: "XPathConstraint", Value: value},
-		}
-		bsonnav.DSet(actDoc, "UserTargeting", userTargeting)
+		})
 		return nil
 
 	case "due_date":
 		bsonnav.DSet(actDoc, "DueDate", value)
 		return nil
+
+	case "annotation":
+		switch bsonnav.DGetString(actDoc, "$Type") {
+		case "Workflows$StartWorkflowActivity":
+			// The workflow's note, which describe prints in the header.
+			return m.setStartNote(value)
+		case "Workflows$EndWorkflowActivity", "Workflows$EndOfParallelSplitPathActivity", "Workflows$EndOfBoundaryEventPathActivity":
+			// Studio Pro's workflow editor draws no note on an end (11.15.0),
+			// and describe prints none: a note there is one nothing shows.
+			return fmt.Errorf("activity %q is an end of the flow, which shows no note", activityRef)
+		}
+		return setNote(actDoc, fmt.Sprintf("activity %q", activityRef), value)
 
 	default:
 		return fmt.Errorf("unsupported activity property: %s", prop)
@@ -217,7 +355,7 @@ func (m *Mutator) InsertAfterActivity(activityRef string, atPos int, activities 
 		return err
 	}
 
-	newBsonActs := m.serializeAndDedup(activities)
+	newBsonActs := m.serializeAndDedup(activities, "")
 
 	insertIdx := idx + 1
 	newArr := make([]any, 0, len(acts)+len(newBsonActs))
@@ -227,6 +365,49 @@ func (m *Mutator) InsertAfterActivity(activityRef string, atPos int, activities 
 
 	bsonnav.DSetArray(containingFlow, "Activities", newArr)
 	return nil
+}
+
+// InsertBeforeActivity inserts activities just before the referenced one, in
+// the same flow: the generic ALTER's `insert before X { … }`.
+func (m *Mutator) InsertBeforeActivity(activityRef string, atPos int, activities []workflows.WorkflowActivity) error {
+	idx, acts, containingFlow, err := m.findActivityIndex(activityRef, atPos)
+	if err != nil {
+		return err
+	}
+
+	newBsonActs := m.serializeAndDedup(activities, "")
+
+	newArr := make([]any, 0, len(acts)+len(newBsonActs))
+	newArr = append(newArr, acts[:idx]...)
+	newArr = append(newArr, newBsonActs...)
+	newArr = append(newArr, acts[idx:]...)
+
+	bsonnav.DSetArray(containingFlow, "Activities", newArr)
+	return nil
+}
+
+// ResolveAlterTarget is the workflow's backend.AlterTargetResolver: the
+// activities whose name or caption the target names, in describe order, under
+// the rule backend.ResolveWorkflowActivityTarget shares with every backend.
+func (m *Mutator) ResolveAlterTarget(t backend.AlterTarget) (backend.AlterTargetMatch, error) {
+	if err := backend.CheckWorkflowAlterTarget(t); err != nil {
+		return backend.AlterTargetMatch{}, err
+	}
+	flow := bsonnav.DGetDoc(m.rawData, "Flow")
+	if flow == nil {
+		return backend.AlterTargetMatch{}, fmt.Errorf("workflow has no Flow")
+	}
+	var found []bson.D
+	findActivitiesRecursive(flow, backend.WorkflowTargetText(t), &found)
+	candidates := make([]backend.WorkflowActivityCandidate, 0, len(found))
+	for _, d := range found {
+		candidates = append(candidates, backend.WorkflowActivityCandidate{
+			Name:        bsonnav.DGetString(d, "Name"),
+			Caption:     bsonnav.DGetString(d, "Caption"),
+			StorageType: bsonnav.DGetString(d, "$Type"),
+		})
+	}
+	return backend.ResolveWorkflowActivityTarget(t, candidates)
 }
 
 func (m *Mutator) DropActivity(activityRef string, atPos int) error {
@@ -249,7 +430,13 @@ func (m *Mutator) ReplaceActivity(activityRef string, atPos int, activities []wo
 		return err
 	}
 
-	newBsonActs := m.serializeAndDedup(activities)
+	// Free the outgoing activity's name for the replacement. It is read off the
+	// resolved element rather than from activityRef, which may be a caption.
+	var outgoing string
+	if old, ok := acts[idx].(bson.D); ok {
+		outgoing = bsonnav.DGetString(old, "Name")
+	}
+	newBsonActs := m.serializeAndDedup(activities, outgoing)
 
 	newArr := make([]any, 0, len(acts)-1+len(newBsonActs))
 	newArr = append(newArr, acts[:idx]...)
@@ -265,7 +452,7 @@ func (m *Mutator) ReplaceActivity(activityRef string, atPos int, activities []wo
 // ---------------------------------------------------------------------------
 
 func (m *Mutator) InsertOutcome(activityRef string, atPos int, outcomeName string, activities []workflows.WorkflowActivity) error {
-	actDoc, err := m.findActivityByCaption(activityRef, atPos)
+	actDoc, err := m.findMemberTarget(activityRef, atPos, "insert outcome", backend.WorkflowUserTaskOutcomes)
 	if err != nil {
 		return err
 	}
@@ -297,31 +484,46 @@ func (m *Mutator) DropOutcome(activityRef string, atPos int, outcomeName string)
 	}
 
 	outcomes := bsonnav.DGetArrayElements(bsonnav.DGet(actDoc, "Outcomes"))
-	found := false
-	var kept []any
-	for _, elem := range outcomes {
-		oDoc, ok := elem.(bson.D)
-		if !ok {
-			kept = append(kept, elem)
-			continue
+	kept, err := dropOneOutcome(outcomes, "outcome", outcomeName, activityRef, func(oDoc bson.D) bool {
+		// Only an outcome that stores a string value can be addressed by one:
+		// a path, a void or a boolean outcome reads back as "" and would match
+		// an empty value (found reviewing ako/mxcli#791).
+		value, hasValue := bsonnav.DGet(oDoc, "Value").(string)
+		if hasValue && value == outcomeName {
+			return true
 		}
-		value := bsonnav.DGetString(oDoc, "Value")
-		typeName := bsonnav.DGetString(oDoc, "$Type")
-		matched := value == outcomeName
-		if !matched && strings.EqualFold(outcomeName, "Default") && typeName == "Workflows$VoidConditionOutcome" {
-			matched = true
-		}
-		if matched && !found {
-			found = true
-			continue
-		}
-		kept = append(kept, elem)
-	}
-	if !found {
-		return fmt.Errorf("outcome %q not found on activity %q", outcomeName, activityRef)
+		return strings.EqualFold(outcomeName, "Default") && bsonnav.DGetString(oDoc, "$Type") == "Workflows$VoidConditionOutcome"
+	})
+	if err != nil {
+		return err
 	}
 	bsonnav.DSetArray(actDoc, "Outcomes", kept)
 	return nil
+}
+
+// dropOneOutcome removes the single outcome that matches. A value is the only
+// address an outcome has, and Mendix does not keep it unique: with two outcomes
+// of the same value, dropping the first was a guess at which one was meant, so
+// it is refused instead (ako/mxcli#808).
+func dropOneOutcome(outcomes []any, kind, value, activityRef string, matches func(bson.D) bool) ([]any, error) {
+	at, n := -1, 0
+	for i, elem := range outcomes {
+		if oDoc, ok := elem.(bson.D); ok && matches(oDoc) {
+			if at < 0 {
+				at = i
+			}
+			n++
+		}
+	}
+	if n == 0 {
+		return nil, fmt.Errorf("%s %q not found on activity %q", kind, value, activityRef)
+	}
+	if n > 1 {
+		return nil, fmt.Errorf("%s %q on activity %q is ambiguous: %d outcomes have that value. Nothing was written", kind, value, activityRef, n)
+	}
+	kept := make([]any, 0, len(outcomes)-1)
+	kept = append(kept, outcomes[:at]...)
+	return append(kept, outcomes[at+1:]...), nil
 }
 
 // ---------------------------------------------------------------------------
@@ -329,7 +531,7 @@ func (m *Mutator) DropOutcome(activityRef string, atPos int, outcomeName string)
 // ---------------------------------------------------------------------------
 
 func (m *Mutator) InsertPath(activityRef string, atPos int, pathCaption string, activities []workflows.WorkflowActivity) error {
-	actDoc, err := m.findActivityByCaption(activityRef, atPos)
+	actDoc, err := m.findMemberTarget(activityRef, atPos, "insert path", backend.WorkflowParallelPaths)
 	if err != nil {
 		return err
 	}
@@ -339,9 +541,12 @@ func (m *Mutator) InsertPath(activityRef string, atPos int, pathCaption string, 
 		{Key: "$Type", Value: "Workflows$ParallelSplitOutcome"},
 	}
 
-	if len(activities) > 0 {
-		pathDoc = append(pathDoc, bson.E{Key: "Flow", Value: m.buildSubFlowBson(activities)})
-	}
+	// A path must end with Mendix's end-of-path marker or the engine skips its
+	// contents at runtime (workflows.EndParallelSplitPath) — an empty path too.
+	ended := workflows.EndParallelSplitPath(&workflows.Flow{Activities: activities}, func() model.ID {
+		return model.ID(bsonutil.BsonBinaryToID(bsonutil.NewIDBsonBinary()))
+	})
+	pathDoc = append(pathDoc, bson.E{Key: "Flow", Value: m.buildSubFlowBson(ended.Activities)})
 
 	pathDoc = append(pathDoc, bson.E{Key: "PersistentId", Value: bsonutil.NewIDBsonBinary()})
 
@@ -351,28 +556,21 @@ func (m *Mutator) InsertPath(activityRef string, atPos int, pathCaption string, 
 	return nil
 }
 
+// DropPath removes a parallel split's path by its number ("Path N"). Only a
+// parallel split has paths: on any other activity the number would index that
+// activity's outcomes instead — `drop userTask1 path 1` deleted the user task's
+// first outcome (ako/mxcli#791) — so the target's kind is checked first, and an
+// address that names no single path is refused rather than resolved.
 func (m *Mutator) DropPath(activityRef string, atPos int, pathCaption string) error {
-	actDoc, err := m.findActivityByCaption(activityRef, atPos)
+	actDoc, err := m.findMemberTarget(activityRef, atPos, "drop path", backend.WorkflowParallelPaths)
 	if err != nil {
 		return err
 	}
 
 	outcomes := bsonnav.DGetArrayElements(bsonnav.DGet(actDoc, "Outcomes"))
-	if pathCaption == "" && len(outcomes) > 0 {
-		outcomes = outcomes[:len(outcomes)-1]
-		bsonnav.DSetArray(actDoc, "Outcomes", outcomes)
-		return nil
-	}
-
-	pathIdx := -1
-	for i := range outcomes {
-		if fmt.Sprintf("Path %d", i+1) == pathCaption {
-			pathIdx = i
-			break
-		}
-	}
-	if pathIdx < 0 {
-		return fmt.Errorf("path %q not found on parallel split %q", pathCaption, activityRef)
+	pathIdx, err := backend.ParallelPathIndex(pathCaption, activityRef, len(outcomes))
+	if err != nil {
+		return err
 	}
 
 	newOutcomes := make([]any, 0, len(outcomes)-1)
@@ -387,7 +585,7 @@ func (m *Mutator) DropPath(activityRef string, atPos int, pathCaption string) er
 // ---------------------------------------------------------------------------
 
 func (m *Mutator) InsertBranch(activityRef string, atPos int, condition string, activities []workflows.WorkflowActivity) error {
-	actDoc, err := m.findActivityByCaption(activityRef, atPos)
+	actDoc, err := m.findMemberTarget(activityRef, atPos, "insert outcome", backend.WorkflowConditionOutcomes)
 	if err != nil {
 		return err
 	}
@@ -419,9 +617,13 @@ func (m *Mutator) InsertBranch(activityRef string, atPos int, condition string, 
 		}
 	}
 
-	if len(activities) > 0 {
-		outcomeDoc = append(outcomeDoc, bson.E{Key: "Flow", Value: m.buildSubFlowBson(activities)})
-	}
+	// Every outcome carries a Flow (empty when the branch is) and a
+	// PersistentId: Studio Pro stores both on all of them (ako/TestApp 11.14.0),
+	// and an outcome without them is one Mendix's merge engine cannot compare
+	// with Studio Pro's next save of the workflow (mendixlabs/mxcli#1373).
+	outcomeDoc = append(outcomeDoc,
+		bson.E{Key: "Flow", Value: m.buildSubFlowBson(activities)},
+		bson.E{Key: "PersistentId", Value: bsonutil.NewIDBsonBinary()})
 
 	outcomes := bsonnav.DGetArrayElements(bsonnav.DGet(actDoc, "Outcomes"))
 	outcomes = append(outcomes, outcomeDoc)
@@ -436,48 +638,21 @@ func (m *Mutator) DropBranch(activityRef string, atPos int, branchName string) e
 	}
 
 	outcomes := bsonnav.DGetArrayElements(bsonnav.DGet(actDoc, "Outcomes"))
-	found := false
-	var kept []any
-	for _, elem := range outcomes {
-		oDoc, ok := elem.(bson.D)
-		if !ok {
-			kept = append(kept, elem)
-			continue
+	kept, err := dropOneOutcome(outcomes, "branch", branchName, activityRef, func(oDoc bson.D) bool {
+		typeName := bsonnav.DGetString(oDoc, "$Type")
+		switch strings.ToLower(branchName) {
+		case "true", "false":
+			v, ok := bsonnav.DGet(oDoc, "Value").(bool)
+			return typeName == "Workflows$BooleanConditionOutcome" && ok && v == strings.EqualFold(branchName, "true")
+		case "default":
+			return typeName == "Workflows$VoidConditionOutcome"
+		default:
+			value, ok := bsonnav.DGet(oDoc, "Value").(string)
+			return ok && value == branchName
 		}
-		if !found {
-			typeName := bsonnav.DGetString(oDoc, "$Type")
-			switch strings.ToLower(branchName) {
-			case "true":
-				if typeName == "Workflows$BooleanConditionOutcome" {
-					if v, ok := bsonnav.DGet(oDoc, "Value").(bool); ok && v {
-						found = true
-						continue
-					}
-				}
-			case "false":
-				if typeName == "Workflows$BooleanConditionOutcome" {
-					if v, ok := bsonnav.DGet(oDoc, "Value").(bool); ok && !v {
-						found = true
-						continue
-					}
-				}
-			case "default":
-				if typeName == "Workflows$VoidConditionOutcome" {
-					found = true
-					continue
-				}
-			default:
-				value := bsonnav.DGetString(oDoc, "Value")
-				if value == branchName {
-					found = true
-					continue
-				}
-			}
-		}
-		kept = append(kept, elem)
-	}
-	if !found {
-		return fmt.Errorf("branch %q not found on activity %q", branchName, activityRef)
+	})
+	if err != nil {
+		return err
 	}
 	bsonnav.DSetArray(actDoc, "Outcomes", kept)
 	return nil
@@ -487,47 +662,68 @@ func (m *Mutator) DropBranch(activityRef string, atPos int, branchName string) e
 // Boundary event operations
 // ---------------------------------------------------------------------------
 
-func (m *Mutator) InsertBoundaryEvent(activityRef string, atPos int, eventType string, delay string, activities []workflows.WorkflowActivity) error {
-	actDoc, err := m.findActivityByCaption(activityRef, atPos)
+func (m *Mutator) InsertBoundaryEvent(activityRef string, atPos int, eventType string, delay string, caption string, recurrence *workflows.Recurrence, activities []workflows.WorkflowActivity) error {
+	actDoc, err := m.findMemberTarget(activityRef, atPos, "insert boundary event", backend.WorkflowBoundaryEvents)
 	if err != nil {
 		return err
 	}
 
-	typeName := "Workflows$InterruptingTimerBoundaryEvent"
-	switch eventType {
-	case "NonInterruptingTimer":
-		typeName = "Workflows$NonInterruptingTimerBoundaryEvent"
-	case "Timer":
-		typeName = "Workflows$TimerBoundaryEvent"
+	// Unknown kinds used to fall through to an interrupting timer. A notification
+	// event needs a name this op does not carry, so it is refused too.
+	typeName, ok := workflows.BoundaryEventStorageType(eventType)
+	if !ok || (&workflows.BoundaryEvent{EventType: eventType}).IsNotification() {
+		return fmt.Errorf("insert boundary event: %q boundary events cannot be inserted by ALTER WORKFLOW", eventType)
 	}
 
 	eventDoc := bson.D{
 		{Key: "$ID", Value: bsonutil.NewIDBsonBinary()},
 		{Key: "$Type", Value: typeName},
-		{Key: "Caption", Value: ""},
+		{Key: "Caption", Value: caption},
 	}
 
 	if delay != "" {
 		eventDoc = append(eventDoc, bson.E{Key: "FirstExecutionTime", Value: delay})
 	}
 
-	if len(activities) > 0 {
-		eventDoc = append(eventDoc, bson.E{Key: "Flow", Value: m.buildSubFlowBson(activities)})
-	}
+	// End the path with Mendix's marker (workflows.EndBoundaryEventPath) — an
+	// unterminated non-interrupting path builds, then stops the runtime starting.
+	ended := workflows.EndBoundaryEventPath(&workflows.Flow{Activities: activities}, func() model.ID {
+		return model.ID(bsonutil.BsonBinaryToID(bsonutil.NewIDBsonBinary()))
+	})
+	eventDoc = append(eventDoc, bson.E{Key: "Flow", Value: m.buildSubFlowBson(ended.Activities)})
 
 	eventDoc = append(eventDoc, bson.E{Key: "PersistentId", Value: bsonutil.NewIDBsonBinary()})
 
 	if typeName == "Workflows$NonInterruptingTimerBoundaryEvent" {
-		eventDoc = append(eventDoc, bson.E{Key: "Recurrence", Value: nil})
+		var rec any // null: fires once
+		if recurrence != nil {
+			rec = bson.D{
+				{Key: "$ID", Value: bsonutil.NewIDBsonBinary()},
+				{Key: "$Type", Value: "Workflows$LinearRecurrence"},
+				{Key: "Interval", Value: int32(recurrence.Interval)},
+				{Key: "IntervalType", Value: recurrence.IntervalType},
+				{Key: "MaxExecutions", Value: int32(recurrence.MaxExecutions)},
+			}
+		}
+		eventDoc = append(eventDoc, bson.E{Key: "Recurrence", Value: rec})
+	} else if recurrence != nil {
+		return fmt.Errorf("insert boundary event: only a non-interrupting timer repeats")
 	}
 
 	events := bsonnav.DGetArrayElements(bsonnav.DGet(actDoc, "BoundaryEvents"))
+	// mx check reports CE6696 on a sixth boundary event (ako/mxcli#2242). Only
+	// here is the stored count known, so the static MDL-WF23 check cannot
+	// catch an insert onto an activity that already has five.
+	if len(events) >= workflows.MaxBoundaryEventsPerActivity {
+		return fmt.Errorf("insert boundary event: activity '%s' already has %d boundary events, the most an activity may have (mx check CE6696) [MDL-WF23]",
+			activityRef, len(events))
+	}
 	events = append(events, eventDoc)
 	bsonnav.DSetArray(actDoc, "BoundaryEvents", events)
 	return nil
 }
 
-func (m *Mutator) DropBoundaryEvent(activityRef string, atPos int) error {
+func (m *Mutator) DropBoundaryEvent(activityRef string, atPos int, index int) error {
 	actDoc, err := m.findActivityByCaption(activityRef, atPos)
 	if err != nil {
 		return err
@@ -537,9 +733,11 @@ func (m *Mutator) DropBoundaryEvent(activityRef string, atPos int) error {
 	if len(events) == 0 {
 		return fmt.Errorf("activity %q has no boundary events", activityRef)
 	}
-
-	// Drop the first boundary event silently.
-	bsonnav.DSetArray(actDoc, "BoundaryEvents", events[1:])
+	at, err := backend.BoundaryEventIndex(activityRef, index, len(events))
+	if err != nil {
+		return err
+	}
+	bsonnav.DSetArray(actDoc, "BoundaryEvents", append(append([]any{}, events[:at]...), events[at+1:]...))
 	return nil
 }
 
@@ -563,6 +761,22 @@ func (m *Mutator) Save() error {
 // matching on $ID. Needed when appending new keys to an activity document,
 // because the slice header returned by findActivityByCaption cannot propagate
 // appends back to the parent bson.A.
+// setUserTargeting replaces a user task's targeting with targeting, in the
+// current (11.2) shape and in the place of whichever key stores it: below 11.2
+// that is UserSource (ako/mxcli#1771), which the write lowers it back to
+// (canon.LowerToProjectShape). Setting UserTargeting only where it already
+// existed changed nothing on such a task, and the statement still reported
+// success.
+func (m *Mutator) setUserTargeting(actDoc bson.D, targeting bson.D) {
+	for i := range actDoc {
+		if actDoc[i].Key == "UserTargeting" || actDoc[i].Key == "UserSource" {
+			actDoc[i] = bson.E{Key: "UserTargeting", Value: targeting}
+			return
+		}
+	}
+	m.replaceActivity(append(actDoc, bson.E{Key: "UserTargeting", Value: targeting}))
+}
+
 func (m *Mutator) replaceActivity(updated bson.D) {
 	actID := bsonnav.ExtractBinaryIDFromDoc(bsonnav.DGet(updated, "$ID"))
 	if actID == "" {
@@ -595,6 +809,20 @@ func replaceActivityRecursive(flow bson.D, actID string, updated bson.D) bool {
 	return false
 }
 
+// findMemberTarget resolves the activity a member op addresses and refuses it
+// when its document does not declare the list the op reads or writes
+// (backend.CheckWorkflowMemberList).
+func (m *Mutator) findMemberTarget(ref string, atPos int, op string, list backend.WorkflowMemberList) (bson.D, error) {
+	actDoc, err := m.findActivityByCaption(ref, atPos)
+	if err != nil {
+		return nil, err
+	}
+	if err := backend.CheckWorkflowMemberList(bsonnav.DGetString(actDoc, "$Type"), ref, op, list); err != nil {
+		return nil, err
+	}
+	return actDoc, nil
+}
+
 // findActivityByCaption searches the workflow for an activity matching caption.
 func (m *Mutator) findActivityByCaption(caption string, atPosition int) (bson.D, error) {
 	flow := bsonnav.DGetDoc(m.rawData, "Flow")
@@ -602,8 +830,11 @@ func (m *Mutator) findActivityByCaption(caption string, atPosition int) (bson.D,
 		return nil, fmt.Errorf("workflow has no Flow")
 	}
 
-	var matches []bson.D
-	findActivitiesRecursive(flow, caption, &matches)
+	var all []bson.D
+	findActivitiesRecursive(flow, caption, &all)
+	matches := preferNameMatches(all, atPosition, func(d bson.D) bool {
+		return bsonnav.DGetString(d, "Name") == caption
+	})
 
 	if len(matches) == 0 {
 		return nil, fmt.Errorf("activity %q not found", caption)
@@ -626,21 +857,43 @@ func (m *Mutator) findActivityByCaption(caption string, atPosition int) (bson.D,
 	return matches[atPosition-1], nil
 }
 
-// findActivitiesRecursive collects all activities matching caption in a flow and nested sub-flows.
-func findActivitiesRecursive(flow bson.D, caption string, matches *[]bson.D) {
+// preferNameMatches narrows the activities a reference matched. Without @N, the
+// ones whose Name equals the reference win when there are any: a name is an
+// activity's identity (deduplicated within the workflow), while a caption is a
+// label that may repeat another activity's name — buildJumpTo defaults a jump's
+// caption to its target's name — so pooling the two made every jump target
+// ambiguous. With @N every match counts, in the depth-first order DESCRIBE
+// walks, so an existing `ACT_Process@2` keeps addressing what it always did.
+func preferNameMatches[T any](all []T, atPosition int, isName func(T) bool) []T {
+	if atPosition > 0 {
+		return all
+	}
+	var named []T
+	for _, m := range all {
+		if isName(m) {
+			named = append(named, m)
+		}
+	}
+	if len(named) > 0 {
+		return named
+	}
+	return all
+}
+
+// findActivitiesRecursive collects all activities whose name or caption equals
+// ref in a flow and nested sub-flows, in document order.
+func findActivitiesRecursive(flow bson.D, ref string, matches *[]bson.D) {
 	activities := bsonnav.DGetArrayElements(bsonnav.DGet(flow, "Activities"))
 	for _, elem := range activities {
 		actDoc, ok := elem.(bson.D)
 		if !ok {
 			continue
 		}
-		actCaption := bsonnav.DGetString(actDoc, "Caption")
-		actName := bsonnav.DGetString(actDoc, "Name")
-		if actCaption == caption || actName == caption {
+		if bsonnav.DGetString(actDoc, "Name") == ref || bsonnav.DGetString(actDoc, "Caption") == ref {
 			*matches = append(*matches, actDoc)
 		}
 		for _, nestedFlow := range getNestedFlows(actDoc) {
-			findActivitiesRecursive(nestedFlow, caption, matches)
+			findActivitiesRecursive(nestedFlow, ref, matches)
 		}
 	}
 }
@@ -685,8 +938,12 @@ func (m *Mutator) findActivityIndex(caption string, atPosition int) (int, []any,
 		return -1, nil, nil, fmt.Errorf("workflow has no Flow")
 	}
 
-	var matches []activityIndexMatch
-	findActivityIndexRecursive(flow, caption, &matches)
+	var all []activityIndexMatch
+	findActivityIndexRecursive(flow, caption, &all)
+	matches := preferNameMatches(all, atPosition, func(am activityIndexMatch) bool {
+		actDoc, _ := am.activities[am.idx].(bson.D)
+		return bsonnav.DGetString(actDoc, "Name") == caption
+	})
 
 	if len(matches) == 0 {
 		return -1, nil, nil, fmt.Errorf("activity %q not found", caption)
@@ -704,20 +961,18 @@ func (m *Mutator) findActivityIndex(caption string, atPosition int) (int, []any,
 	return am.idx, am.activities, am.flow, nil
 }
 
-func findActivityIndexRecursive(flow bson.D, caption string, matches *[]activityIndexMatch) {
+func findActivityIndexRecursive(flow bson.D, ref string, matches *[]activityIndexMatch) {
 	activities := bsonnav.DGetArrayElements(bsonnav.DGet(flow, "Activities"))
 	for i, elem := range activities {
 		actDoc, ok := elem.(bson.D)
 		if !ok {
 			continue
 		}
-		actCaption := bsonnav.DGetString(actDoc, "Caption")
-		actName := bsonnav.DGetString(actDoc, "Name")
-		if actCaption == caption || actName == caption {
+		if bsonnav.DGetString(actDoc, "Name") == ref || bsonnav.DGetString(actDoc, "Caption") == ref {
 			*matches = append(*matches, activityIndexMatch{idx: i, activities: activities, flow: flow})
 		}
 		for _, nestedFlow := range getNestedFlows(actDoc) {
-			findActivityIndexRecursive(nestedFlow, caption, matches)
+			findActivityIndexRecursive(nestedFlow, ref, matches)
 		}
 	}
 }
@@ -752,36 +1007,24 @@ func collectNamesRecursive(flow bson.D, names map[string]bool) {
 	}
 }
 
-// deduplicateNewActivityName ensures a new activity name doesn't conflict.
-func deduplicateNewActivityName(act workflows.WorkflowActivity, existingNames map[string]bool) {
-	name := act.GetName()
-	if name == "" {
-		return
-	}
-	if !existingNames[name] {
-		existingNames[name] = true
-		return
-	}
-	for i := 2; i < 1000; i++ {
-		candidate := fmt.Sprintf("%s_%d", name, i)
-		if !existingNames[candidate] {
-			act.SetName(candidate)
-			existingNames[candidate] = true
-			return
-		}
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Internal helpers — serialization (via Deps)
 // ---------------------------------------------------------------------------
 
-// serializeAndDedup serializes workflow activities to BSON, deduplicating names.
-func (m *Mutator) serializeAndDedup(activities []workflows.WorkflowActivity) []any {
-	existingNames := m.collectAllActivityNames()
-	for _, act := range activities {
-		deduplicateNewActivityName(act, existingNames)
-	}
+// serializeAndDedup serializes workflow activities to BSON, deduplicating their
+// names against the ones already in the workflow.
+//
+// freeName, when non-empty, names an activity that this same operation is
+// removing, so it is not really taken. REPLACE ACTIVITY needs it: the
+// replacement reusing the original's name is the ordinary in-place edit, not a
+// collision, and treating it as one renamed every same-name replace to Name_2 —
+// compounding on each re-run (Name_2_2, Name_2_2_2, ...) so an ALTER that
+// changed nothing still mutated the model (issue #944). INSERT passes "": there
+// the incoming activity is genuinely additional, and every existing name stands.
+func (m *Mutator) serializeAndDedup(activities []workflows.WorkflowActivity, freeName string) []any {
+	taken := m.collectAllActivityNames()
+	delete(taken, freeName) // no-op for ""
+	wfnames.Dedup(activities, taken)
 
 	result := make([]any, 0, len(activities))
 	for _, act := range activities {
@@ -795,10 +1038,9 @@ func (m *Mutator) serializeAndDedup(activities []workflows.WorkflowActivity) []a
 
 // buildSubFlowBson builds a Workflows$Flow BSON document from activities.
 func (m *Mutator) buildSubFlowBson(activities []workflows.WorkflowActivity) bson.D {
-	existingNames := m.collectAllActivityNames()
-	for _, act := range activities {
-		deduplicateNewActivityName(act, existingNames)
-	}
+	// An outcome/path/branch/boundary-event sub-flow is always new content, so
+	// every existing name stands (unlike ReplaceActivity — see serializeAndDedup).
+	wfnames.Dedup(activities, m.collectAllActivityNames())
 
 	var subActsBson bson.A
 	subActsBson = append(subActsBson, bsonArrayMarker)

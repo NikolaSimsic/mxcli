@@ -11,7 +11,9 @@ import (
 	modelsdk "github.com/mendixlabs/mxcli"
 	"github.com/mendixlabs/mxcli/mdl/catalog"
 	"github.com/mendixlabs/mxcli/mdl/executor"
+	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/mdl/visitor"
+	"github.com/mendixlabs/mxcli/sdk/security"
 	"github.com/spf13/cobra"
 )
 
@@ -20,13 +22,20 @@ var describeCmd = &cobra.Command{
 	Short: "Describe a project element",
 	Long: `Describe an element from a Mendix project in MDL syntax.
 
+The description is written in mdl 1 and starts with the header "mdl 1;", so
+it can be executed back as it is; descriptions concatenated into one file
+repeat the header, which is allowed. --mdl 0 writes the alpha language
+instead, with no header (ako/mxcli#840).
+
 The <type> is optional for a qualified document name: 'describe MyModule.Customer'
-auto-detects the document type. Pass the type explicitly to disambiguate (a name
-can match both an entity and a document, for example) or for forms that have no
-single qualified name (module, settings, navigation, module role).
+auto-detects the document type. So it is for a module role ('describe
+Administration.Administrator'), a user role and a navigation profile
+('describe Responsive'). Pass the type explicitly to disambiguate (a name can
+match both an entity and a document, for example) or for forms that have no
+single name (module, settings).
 
 Types:
-  module           Describe a module (all contents)
+  module           Describe a module and its module roles (--all: everything in it)
   entity           Describe an entity
   externalentity   Describe an external entity (alias for entity)
   association      Describe an association
@@ -34,50 +43,65 @@ Types:
   constant         Describe a constant
   microflow        Describe a microflow
   nanoflow         Describe a nanoflow
+  rule             Describe a rule
   workflow         Describe a workflow
   page             Describe a page
   snippet          Describe a snippet
+  buildingblock    Describe a building block (read-only, also: "building block")
   layout           Describe a layout
   javaaction       Describe a java action
+  javascriptaction Describe a JavaScript action (also: "javascript action")
   jsonstructure    Describe a JSON structure (also: "json structure")
   importmapping    Describe an import mapping (also: "import mapping")
   exportmapping    Describe an export mapping (also: "export mapping")
-  restclient       Describe a consumed REST service (also: "rest client")
-  odataclient      Describe a consumed OData service
-  odataservice     Describe a published OData service
+  consumedrestservice   Describe a consumed REST service (also: "consumed rest service"; old: restclient)
+  consumedodataservice  Describe a consumed OData service (also: "consumed odata service"; old: odataclient)
+  publishedodataservice Describe a published OData service (also: "published odata service"; old: odataservice)
+  publishedrestservice  Describe a published REST service (also: "published rest service", "rest service")
   imagecollection  Describe an image collection (also: "image collection")
+  menu             Describe a standalone menu document
+  taskqueue        Describe a task queue (also: "task queue"; old: queue)
+  scheduledevent   Describe a scheduled event (also: "scheduled event")
+  regularexpression  Describe a regular expression (also: "regular expression")
   businesseventservice  Describe a business event service (also: "business event service")
   databaseconnection    Describe a database connection (also: "database connection")
   agent            Describe an AI agent (also: "agent")
-  aimodel          Describe an AI model (also: "model", "ai model")
+  aimodel          Describe an AI model (also: "ai model"; old: model)
   knowledgebase    Describe a knowledge base (also: "knowledge base")
   consumedmcpservice  Describe a consumed MCP service (also: "consumed mcp service")
+  publishedmcpservice Describe a published MCP service (also: "published mcp service")
   datatransformer  Describe a data transformer (also: "data transformer")
   modulerole       Describe a module role
   userrole         Describe a user role
-  projectsecurity  Show project security settings
+  appsecurity      Describe app security settings (also: "app security"; old: projectsecurity)
   settings         Describe project settings
   demouser         Describe a demo user
   navigation       Describe a navigation profile
   systemoverview   Module dependency graph (requires --format elk)
+  domainmodel      A module's domain model as a diagram (--format svg or elk; the name is the module)
 
 Example:
   mxcli describe -p app.mpr MyModule.Customer          # type auto-detected
   mxcli describe -p app.mpr MyModule.ProcessOrder      # type auto-detected
   mxcli describe -p app.mpr module MyModule
+  mxcli describe -p app.mpr --all module MyModule    # DESCRIBE MODULE ... WITH ALL
   mxcli describe -p app.mpr entity MyModule.Customer
   mxcli describe -p app.mpr microflow MyModule.ProcessOrder
+  mxcli describe -p app.mpr --mdl 0 microflow MyModule.ProcessOrder
   mxcli describe -p app.mpr nanoflow MyModule.ValidateInput
   mxcli describe -p app.mpr page MyModule.Customer_Overview
   mxcli describe -p app.mpr json structure MyModule.CustomerResponse
   mxcli describe -p app.mpr import mapping MyModule.IMM_Customer
   mxcli describe -p app.mpr export mapping MyModule.EMM_Customer
-  mxcli describe -p app.mpr rest client MyModule.PetStoreAPI
+  mxcli describe -p app.mpr consumed rest service MyModule.PetStoreAPI
+  mxcli describe -p app.mpr consumed odata service MyModule.CrmApi
+  mxcli describe -p app.mpr task queue MyModule.EmailQueue
   mxcli describe -p app.mpr settings Settings
   mxcli describe -p app.mpr navigation Responsive
   mxcli describe -p app.mpr --format elk systemoverview SystemOverview
+  mxcli describe -p app.mpr --format svg domainmodel MyModule
   mxcli describe -p app.mpr agent MyModule.MyAgent
-  mxcli describe -p app.mpr model MyModule.GPT4
+  mxcli describe -p app.mpr ai model MyModule.GPT4
   mxcli describe -p app.mpr knowledge base MyModule.ProductDocs
   mxcli describe -p app.mpr consumed mcp service MyModule.FilesystemMCP
   mxcli describe -p app.mpr data transformer MyModule.TransformCustomer
@@ -113,82 +137,17 @@ Example:
 		name := args[len(args)-1]
 		objectType := strings.ToUpper(strings.Join(args[:len(args)-1], " "))
 
-		var mdlCmd string
-		switch objectType {
-		case "MODULE":
-			mdlCmd = fmt.Sprintf("DESCRIBE MODULE %s", name)
-		case "ENTITY":
-			mdlCmd = fmt.Sprintf("DESCRIBE ENTITY %s", name)
-		case "ASSOCIATION":
-			mdlCmd = fmt.Sprintf("DESCRIBE ASSOCIATION %s", name)
-		case "ENUMERATION":
-			mdlCmd = fmt.Sprintf("DESCRIBE ENUMERATION %s", name)
-		case "MICROFLOW":
-			mdlCmd = fmt.Sprintf("DESCRIBE MICROFLOW %s", name)
-		case "NANOFLOW":
-			mdlCmd = fmt.Sprintf("DESCRIBE NANOFLOW %s", name)
-		case "WORKFLOW":
-			mdlCmd = fmt.Sprintf("DESCRIBE WORKFLOW %s", name)
-		case "PAGE":
-			mdlCmd = fmt.Sprintf("DESCRIBE PAGE %s", name)
-		case "SNIPPET":
-			mdlCmd = fmt.Sprintf("DESCRIBE SNIPPET %s", name)
-		case "LAYOUT":
-			mdlCmd = fmt.Sprintf("DESCRIBE LAYOUT %s", name)
-		case "MODULEROLE", "MODULE ROLE":
-			mdlCmd = fmt.Sprintf("DESCRIBE MODULE ROLE %s", name)
-		case "USERROLE", "USER ROLE":
-			mdlCmd = fmt.Sprintf("DESCRIBE USER ROLE '%s'", name)
-		case "PROJECTSECURITY", "PROJECT SECURITY":
-			mdlCmd = "SHOW PROJECT SECURITY"
-		case "SETTINGS":
-			mdlCmd = "DESCRIBE SETTINGS"
-		case "DEMOUSER", "DEMO USER":
-			mdlCmd = fmt.Sprintf("DESCRIBE DEMO USER '%s'", name)
-		case "JAVAACTION", "JAVA ACTION":
-			mdlCmd = fmt.Sprintf("DESCRIBE JAVA ACTION %s", name)
-		case "CONSTANT":
-			mdlCmd = fmt.Sprintf("DESCRIBE CONSTANT %s", name)
-		case "JSONSTRUCTURE", "JSON STRUCTURE":
-			mdlCmd = fmt.Sprintf("DESCRIBE JSON STRUCTURE %s", name)
-		case "IMPORTMAPPING", "IMPORT MAPPING":
-			mdlCmd = fmt.Sprintf("DESCRIBE IMPORT MAPPING %s", name)
-		case "EXPORTMAPPING", "EXPORT MAPPING":
-			mdlCmd = fmt.Sprintf("DESCRIBE EXPORT MAPPING %s", name)
-		case "RESTCLIENT", "REST CLIENT":
-			mdlCmd = fmt.Sprintf("DESCRIBE REST CLIENT %s", name)
-		case "ODATACLIENT", "ODATA CLIENT":
-			mdlCmd = fmt.Sprintf("DESCRIBE ODATA CLIENT %s", name)
-		case "ODATASERVICE", "ODATA SERVICE":
-			mdlCmd = fmt.Sprintf("DESCRIBE ODATA SERVICE %s", name)
-		case "IMAGECOLLECTION", "IMAGE COLLECTION":
-			mdlCmd = fmt.Sprintf("DESCRIBE IMAGE COLLECTION %s", name)
-		case "BUSINESSEVENTSERVICE", "BUSINESS EVENT SERVICE":
-			mdlCmd = fmt.Sprintf("DESCRIBE BUSINESS EVENT SERVICE %s", name)
-		case "DATABASECONNECTION", "DATABASE CONNECTION":
-			mdlCmd = fmt.Sprintf("DESCRIBE DATABASE CONNECTION %s", name)
-		case "EXTERNALENTITY", "EXTERNAL ENTITY":
-			mdlCmd = fmt.Sprintf("DESCRIBE ENTITY %s", name)
-		case "NAVIGATION":
-			mdlCmd = fmt.Sprintf("DESCRIBE NAVIGATION %s", name)
-		case "NAVPROFILE":
-			mdlCmd = fmt.Sprintf("DESCRIBE NAVIGATION %s", name)
-		case "AGENT":
-			mdlCmd = fmt.Sprintf("DESCRIBE AGENT %s", name)
-		case "AIMODEL", "AI MODEL", "MODEL":
-			mdlCmd = fmt.Sprintf("DESCRIBE MODEL %s", name)
-		case "KNOWLEDGEBASE", "KNOWLEDGE BASE":
-			mdlCmd = fmt.Sprintf("DESCRIBE KNOWLEDGE BASE %s", name)
-		case "CONSUMEDMCPSERVICE", "CONSUMED MCP SERVICE", "MCP SERVICE":
-			mdlCmd = fmt.Sprintf("DESCRIBE CONSUMED MCP SERVICE %s", name)
-		case "DATATRANSFORMER", "DATA TRANSFORMER":
-			mdlCmd = fmt.Sprintf("DESCRIBE DATA TRANSFORMER %s", name)
-		case "SYSTEMOVERVIEW":
-			mdlCmd = "" // handled directly by format-specific path
-		default:
+		mdlCmd, ok := describeMDLCommand(objectType, name)
+		if !ok {
 			fmt.Fprintf(os.Stderr, "Unknown type: %s\n", strings.Join(args[:len(args)-1], " "))
-			fmt.Fprintln(os.Stderr, "Valid types: module, entity, association, enumeration, constant, microflow, nanoflow, workflow, page, snippet, layout, javaaction, jsonstructure, importmapping, exportmapping, restclient, odataclient, odataservice, imagecollection, businesseventservice, databaseconnection, agent, aimodel, knowledgebase, consumedmcpservice, datatransformer, modulerole, userrole, projectsecurity, settings, demouser, navigation, systemoverview")
-			fmt.Fprintln(os.Stderr, "Multi-word types also accepted: json structure, import mapping, export mapping, rest client, image collection, business event service, agent, model, knowledge base, consumed mcp service, data transformer, etc.")
+			fmt.Fprintln(os.Stderr, "Valid types: module, entity, association, enumeration, constant, microflow, nanoflow, rule, workflow, page, snippet, layout, javaaction, javascriptaction, jsonstructure, importmapping, exportmapping, consumedrestservice, consumedodataservice, publishedodataservice, publishedrestservice, imagecollection, menu, taskqueue, scheduledevent, businesseventservice, databaseconnection, agent, aimodel, knowledgebase, consumedmcpservice, publishedmcpservice, datatransformer, modulerole, userrole, appsecurity, settings, demouser, navigation, systemoverview")
+			fmt.Fprintln(os.Stderr, "Multi-word types also accepted: json structure, import mapping, export mapping, consumed rest service, consumed odata service, published odata service, published rest service, task queue, app security, image collection, scheduled event, regular expression, business event service, ai model, knowledge base, consumed mcp service, published mcp service, data transformer, etc.")
+			os.Exit(1)
+		}
+		all, _ := cmd.Flags().GetBool("all")
+		mdlCmd, err := applyDescribeAll(objectType, mdlCmd, all)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
 
@@ -196,6 +155,7 @@ Example:
 		defer logger.Close()
 		defer exec.Close()
 		exec.SetQuiet(true) // suppress status messages for programmatic output
+		exec.SetDescribeLanguage(mdlFlag(cmd))
 
 		// Connect
 		connectProg, _ := visitor.Build(fmt.Sprintf("CONNECT LOCAL '%s'", visitor.QuoteString(projectPath)))
@@ -218,6 +178,17 @@ Example:
 				os.Exit(1)
 			}
 			return
+		} else if format == "svg" {
+			upper := objectType
+			if upper == "DOMAINMODEL" || upper == "DOMAIN MODEL" || (upper == "ENTITY" && !strings.Contains(name, ".")) {
+				if err := exec.DomainModelSVG(name); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+					os.Exit(1)
+				}
+				return
+			}
+			fmt.Fprintf(os.Stderr, "SVG format not supported for type: %s (supported: domainmodel <Module>)\n", typeArg)
+			os.Exit(1)
 		} else if format == "elk" {
 			upper := objectType
 			if upper == "SYSTEMOVERVIEW" {
@@ -257,9 +228,9 @@ Example:
 			return
 		}
 
-		// SYSTEMOVERVIEW requires elk format
+		// SYSTEMOVERVIEW and DOMAINMODEL are diagrams with no MDL form
 		if mdlCmd == "" {
-			fmt.Fprintf(os.Stderr, "Type %s requires --format elk\n", args[0])
+			fmt.Fprintf(os.Stderr, "Type %s is a diagram: use --format elk (or --format svg for a domain model)\n", args[0])
 			os.Exit(1)
 		}
 
@@ -281,58 +252,193 @@ Example:
 	},
 }
 
+// describeMDLCommand maps a `describe` subcommand type (upper-cased, words joined
+// by single spaces) and a name to the MDL DESCRIBE statement it runs. ok is false
+// for an unknown type. SYSTEMOVERVIEW returns "" with ok true: it has no MDL form
+// and is handled by the --format elk path.
+func describeMDLCommand(objectType, name string) (mdlCmd string, ok bool) {
+	switch objectType {
+	case "MODULE":
+		return fmt.Sprintf("DESCRIBE MODULE %s", name), true
+	case "ENTITY":
+		return fmt.Sprintf("DESCRIBE ENTITY %s", name), true
+	case "ASSOCIATION":
+		return fmt.Sprintf("DESCRIBE ASSOCIATION %s", name), true
+	case "ENUMERATION":
+		return fmt.Sprintf("DESCRIBE ENUMERATION %s", name), true
+	case "MICROFLOW":
+		return fmt.Sprintf("DESCRIBE MICROFLOW %s", name), true
+	case "NANOFLOW":
+		return fmt.Sprintf("DESCRIBE NANOFLOW %s", name), true
+	case "RULE":
+		return fmt.Sprintf("DESCRIBE RULE %s", name), true
+	case "WORKFLOW":
+		return fmt.Sprintf("DESCRIBE WORKFLOW %s", name), true
+	case "PAGE":
+		return fmt.Sprintf("DESCRIBE PAGE %s", name), true
+	case "SNIPPET":
+		return fmt.Sprintf("DESCRIBE SNIPPET %s", name), true
+	case "BUILDINGBLOCK", "BUILDING BLOCK":
+		return fmt.Sprintf("DESCRIBE BUILDING BLOCK %s", name), true
+	case "LAYOUT":
+		return fmt.Sprintf("DESCRIBE LAYOUT %s", name), true
+	case "MODULEROLE", "MODULE ROLE":
+		return fmt.Sprintf("DESCRIBE MODULE ROLE %s", name), true
+	case "USERROLE", "USER ROLE":
+		return fmt.Sprintf("DESCRIBE USER ROLE '%s'", name), true
+	case "APPSECURITY", "APP SECURITY", "PROJECTSECURITY", "PROJECT SECURITY":
+		return "DESCRIBE APP SECURITY", true
+	case "SETTINGS":
+		return "DESCRIBE SETTINGS", true
+	case "DEMOUSER", "DEMO USER":
+		return fmt.Sprintf("DESCRIBE DEMO USER '%s'", name), true
+	case "JAVAACTION", "JAVA ACTION":
+		return fmt.Sprintf("DESCRIBE JAVA ACTION %s", name), true
+	case "JAVASCRIPTACTION", "JAVASCRIPT ACTION":
+		return fmt.Sprintf("DESCRIBE JAVASCRIPT ACTION %s", name), true
+	case "CONSTANT":
+		return fmt.Sprintf("DESCRIBE CONSTANT %s", name), true
+	case "JSONSTRUCTURE", "JSON STRUCTURE":
+		return fmt.Sprintf("DESCRIBE JSON STRUCTURE %s", name), true
+	case "IMPORTMAPPING", "IMPORT MAPPING":
+		return fmt.Sprintf("DESCRIBE IMPORT MAPPING %s", name), true
+	case "EXPORTMAPPING", "EXPORT MAPPING":
+		return fmt.Sprintf("DESCRIBE EXPORT MAPPING %s", name), true
+	case "CONSUMEDRESTSERVICE", "CONSUMED REST SERVICE", "RESTCLIENT", "REST CLIENT":
+		return fmt.Sprintf("DESCRIBE CONSUMED REST SERVICE %s", name), true
+	case "CONSUMEDODATASERVICE", "CONSUMED ODATA SERVICE", "ODATACLIENT", "ODATA CLIENT":
+		return fmt.Sprintf("DESCRIBE CONSUMED ODATA SERVICE %s", name), true
+	case "PUBLISHEDODATASERVICE", "PUBLISHED ODATA SERVICE", "ODATASERVICE", "ODATA SERVICE":
+		return fmt.Sprintf("DESCRIBE PUBLISHED ODATA SERVICE %s", name), true
+	case "PUBLISHEDRESTSERVICE", "PUBLISHED REST SERVICE", "RESTSERVICE", "REST SERVICE":
+		return fmt.Sprintf("DESCRIBE PUBLISHED REST SERVICE %s", name), true
+	case "IMAGECOLLECTION", "IMAGE COLLECTION":
+		return fmt.Sprintf("DESCRIBE IMAGE COLLECTION %s", name), true
+	case "MENU":
+		return fmt.Sprintf("DESCRIBE MENU %s", name), true
+	case "TASKQUEUE", "TASK QUEUE", "QUEUE":
+		return fmt.Sprintf("DESCRIBE TASK QUEUE %s", name), true
+	case "SCHEDULEDEVENT", "SCHEDULED EVENT":
+		return fmt.Sprintf("DESCRIBE SCHEDULED EVENT %s", name), true
+	case "REGULAREXPRESSION", "REGULAR EXPRESSION", "REGEX":
+		return fmt.Sprintf("DESCRIBE REGULAR EXPRESSION %s", name), true
+	case "BUSINESSEVENTSERVICE", "BUSINESS EVENT SERVICE":
+		return fmt.Sprintf("DESCRIBE BUSINESS EVENT SERVICE %s", name), true
+	case "DATABASECONNECTION", "DATABASE CONNECTION":
+		return fmt.Sprintf("DESCRIBE DATABASE CONNECTION %s", name), true
+	case "EXTERNALENTITY", "EXTERNAL ENTITY":
+		return fmt.Sprintf("DESCRIBE ENTITY %s", name), true
+	case "NAVIGATION":
+		// "Navigation" is project-tree's name for the navigation document
+		// itself, not a profile (profiles are named by kind: Responsive,
+		// Phone, ...), so it describes every profile.
+		if strings.EqualFold(name, "Navigation") {
+			return "DESCRIBE NAVIGATION", true
+		}
+		return fmt.Sprintf("DESCRIBE NAVIGATION %s", name), true
+	case "NAVPROFILE":
+		return fmt.Sprintf("DESCRIBE NAVIGATION %s", name), true
+	case "AGENT":
+		return fmt.Sprintf("DESCRIBE AGENT %s", name), true
+	case "AIMODEL", "AI MODEL", "MODEL":
+		return fmt.Sprintf("DESCRIBE AI MODEL %s", name), true
+	case "KNOWLEDGEBASE", "KNOWLEDGE BASE":
+		return fmt.Sprintf("DESCRIBE KNOWLEDGE BASE %s", name), true
+	case "CONSUMEDMCPSERVICE", "CONSUMED MCP SERVICE", "MCP SERVICE":
+		return fmt.Sprintf("DESCRIBE CONSUMED MCP SERVICE %s", name), true
+	case "PUBLISHEDMCPSERVICE", "PUBLISHED MCP SERVICE":
+		return fmt.Sprintf("DESCRIBE PUBLISHED MCP SERVICE %s", name), true
+	case "DATATRANSFORMER", "DATA TRANSFORMER":
+		return fmt.Sprintf("DESCRIBE DATA TRANSFORMER %s", name), true
+	case "SYSTEMOVERVIEW", "DOMAINMODEL", "DOMAIN MODEL":
+		return "", true // diagrams only: handled by the --format elk / svg paths
+	}
+	return "", false
+}
+
+// applyDescribeAll applies the --all flag: for a module it describes everything
+// in it (DESCRIBE MODULE ... WITH ALL), where a plain describe module prints the
+// module and its roles only (mendixlabs/mxcli#1435). --all on any other type is
+// an error rather than a flag silently ignored.
+func applyDescribeAll(objectType, mdlCmd string, all bool) (string, error) {
+	if !all {
+		return mdlCmd, nil
+	}
+	if objectType != "MODULE" {
+		return "", fmt.Errorf("--all applies to describe module only")
+	}
+	return mdlCmd + " WITH ALL", nil
+}
+
 // objectTypeToDescribe maps a catalog `objects` view ObjectType to the `describe`
 // keyword. Only directly describable types with a `Module.Name` shape are listed.
 var objectTypeToDescribe = map[string]string{
-	"MODULE":                 "module",
-	"ENTITY":                 "entity",
-	"EXTERNAL_ENTITY":        "entity",
-	"ASSOCIATION":            "association",
-	"MICROFLOW":              "microflow",
-	"NANOFLOW":               "nanoflow",
-	"PAGE":                   "page",
-	"SNIPPET":                "snippet",
-	"LAYOUT":                 "layout",
-	"ENUMERATION":            "enumeration",
-	"CONSTANT":               "constant",
-	"JAVA_ACTION":            "javaaction",
-	"WORKFLOW":               "workflow",
-	"JSON_STRUCTURE":         "jsonstructure",
-	"IMPORT_MAPPING":         "importmapping",
-	"EXPORT_MAPPING":         "exportmapping",
-	"ODATA_CLIENT":           "odataclient",
-	"ODATA_SERVICE":          "odataservice",
-	"REST_CLIENT":            "restclient",
+	"MODULE":                  "module",
+	"ENTITY":                  "entity",
+	"EXTERNAL_ENTITY":         "entity",
+	"ASSOCIATION":             "association",
+	"MICROFLOW":               "microflow",
+	"NANOFLOW":                "nanoflow",
+	"RULE":                    "rule",
+	"PAGE":                    "page",
+	"SNIPPET":                 "snippet",
+	"LAYOUT":                  "layout",
+	"ENUMERATION":             "enumeration",
+	"CONSTANT":                "constant",
+	"JAVA_ACTION":             "javaaction",
+	"WORKFLOW":                "workflow",
+	"JSON_STRUCTURE":          "jsonstructure",
+	"IMPORT_MAPPING":          "importmapping",
+	"EXPORT_MAPPING":          "exportmapping",
+	"CONSUMED_ODATA_SERVICE":  "consumedodataservice",
+	"PUBLISHED_ODATA_SERVICE": "publishedodataservice",
+	"CONSUMED_REST_SERVICE":   "consumedrestservice",
+	"TASK_QUEUE":              "taskqueue",
+	// Pre-#1395 ObjectType values, for a catalog cached by an older build.
+	"ODATA_CLIENT":           "consumedodataservice",
+	"ODATA_SERVICE":          "publishedodataservice",
+	"REST_CLIENT":            "consumedrestservice",
+	"QUEUE":                  "taskqueue",
+	"PUBLISHED_REST_SERVICE": "publishedrestservice",
 	"BUSINESS_EVENT_SERVICE": "businesseventservice",
 	"DATABASE_CONNECTION":    "databaseconnection",
 	"IMAGE_COLLECTION":       "imagecollection",
+	"MENU":                   "menu",
 	"DATA_TRANSFORMER":       "datatransformer",
 	"AGENT":                  "agent",
-	"AI_MODEL":               "model",
+	"AI_MODEL":               "aimodel",
 	"KNOWLEDGE_BASE":         "knowledgebase",
 	"CONSUMED_MCP_SERVICE":   "consumedmcpservice",
-	// JAVASCRIPT_ACTION is cataloged but has no `describe` CLI form, so it is
-	// intentionally omitted from auto-detect.
+	"PUBLISHED_MCP_SERVICE":  "publishedmcpservice",
+	"JAVASCRIPT_ACTION":      "javascriptaction",
 }
 
 // unitTypeToDescribe maps a top-level unit's BSON $Type to the `describe`
 // keyword. Used by the live-reader fallback. Only directly describable document
-// types are listed (page templates, building blocks, rules, etc. are absent so
-// they don't resolve).
+// types are listed (page templates etc. are absent so they don't resolve).
 var unitTypeToDescribe = map[string]string{
-	"Microflows$Microflow":         "microflow",
-	"Microflows$Nanoflow":          "nanoflow",
-	"Forms$Page":                   "page",
-	"Forms$Snippet":                "snippet",
-	"Forms$Layout":                 "layout",
-	"Enumerations$Enumeration":     "enumeration",
-	"Constants$Constant":           "constant",
-	"JavaActions$JavaAction":       "javaaction",
-	"JsonStructures$JsonStructure": "jsonstructure",
-	"ImportMappings$ImportMapping": "importmapping",
-	"ExportMappings$ExportMapping": "exportmapping",
-	"Images$ImageCollection":       "imagecollection",
-	"Workflows$Workflow":           "workflow",
+	"Microflows$Microflow":                 "microflow",
+	"Microflows$Nanoflow":                  "nanoflow",
+	"Microflows$Rule":                      "rule",
+	"Forms$Page":                           "page",
+	"Forms$Snippet":                        "snippet",
+	"Pages$BuildingBlock":                  "buildingblock",
+	"Forms$BuildingBlock":                  "buildingblock",
+	"Forms$Layout":                         "layout",
+	"Enumerations$Enumeration":             "enumeration",
+	"Constants$Constant":                   "constant",
+	"JavaActions$JavaAction":               "javaaction",
+	"JavaScriptActions$JavaScriptAction":   "javascriptaction",
+	"JsonStructures$JsonStructure":         "jsonstructure",
+	"ImportMappings$ImportMapping":         "importmapping",
+	"ExportMappings$ExportMapping":         "exportmapping",
+	"Images$ImageCollection":               "imagecollection",
+	"Menus$MenuDocument":                   "menu",
+	"Workflows$Workflow":                   "workflow",
+	"Queues$Queue":                         "taskqueue",
+	"ScheduledEvents$ScheduledEvent":       "scheduledevent",
+	"RegularExpressions$RegularExpression": "regularexpression",
+	"Rest$PublishedRestService":            "publishedrestservice",
 }
 
 // resolveDescribeType auto-detects the `describe` type for a qualified document
@@ -412,7 +518,7 @@ func resolveViaCatalog(projectPath, name string) []string {
 
 // catalogMatchesProject reports whether the cached catalog was built from the
 // current project file and is still up to date — same MPR path and unchanged
-// modification time (Unix seconds, mirroring isCacheValid). Any read failure or
+// modification time (the same instant, mirroring isCacheValid). Any read failure or
 // mismatch is treated as "not fresh" so the caller live-scans (safe but slower).
 func catalogMatchesProject(cat *catalog.Catalog, projectPath string) bool {
 	info, err := cat.GetCacheInfo()
@@ -423,17 +529,13 @@ func catalogMatchesProject(cat *catalog.Catalog, projectPath string) bool {
 	if err != nil {
 		return false
 	}
-	if info.MprModTime.Unix() != fi.ModTime().Unix() {
+	if !catalog.ModTimeUnchanged(info.MprModTime, fi.ModTime()) {
 		return false
 	}
 	// Compare absolute paths when both resolve; a path mismatch means the cache
 	// is for a different .mpr in the same directory.
-	if info.MprPath != "" {
-		a, err1 := filepath.Abs(info.MprPath)
-		b, err2 := filepath.Abs(projectPath)
-		if err1 == nil && err2 == nil && a != b {
-			return false
-		}
+	if info.MprPath != "" && !catalog.SameMprPath(info.MprPath, projectPath) {
+		return false
 	}
 	return true
 }
@@ -446,7 +548,7 @@ func resolveViaReader(projectPath, name string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer reader.Close()
+	defer reader.Disconnect()
 
 	var out []string
 	// Top-level documents (microflow, page, snippet, enumeration, ...).
@@ -485,5 +587,52 @@ func resolveViaReader(projectPath, name string) ([]string, error) {
 			}
 		}
 	}
+	out = append(out, describableMembers(reader, moduleName, name)...)
 	return out, nil
+}
+
+// describableMembers is the `describe` type of each member named name that
+// is not a document of its own: a module role (Module.Role), a user role and
+// a navigation profile (both bare names). Each has a describe type, but the
+// auto-detect saw only documents, so `describe Administration.Administrator`
+// answered "no describable document named …" for a role `describe module
+// role` describes (ako/mxcli#1262).
+//
+// The catalog's objects view does not list them, and has no complete table to
+// list module roles from (role_mappings holds only the mapped ones), so these
+// are resolved here, by the live scan a catalog miss falls back to.
+func describableMembers(reader memberReader, moduleName map[string]string, name string) []string {
+	var out []string
+	if mss, err := reader.ListModuleSecurity(); err == nil {
+		for _, ms := range mss {
+			mn := moduleName[string(ms.ContainerID)]
+			for _, r := range ms.ModuleRoles {
+				if mn+"."+r.Name == name {
+					out = append(out, "modulerole")
+				}
+			}
+		}
+	}
+	if ps, err := reader.GetProjectSecurity(); err == nil && ps != nil {
+		for _, r := range ps.UserRoles {
+			if r.Name == name {
+				out = append(out, "userrole")
+			}
+		}
+	}
+	if nav, err := reader.GetNavigation(); err == nil && nav != nil {
+		for _, p := range nav.Profiles {
+			if p.Name == name {
+				out = append(out, "navigation")
+			}
+		}
+	}
+	return out
+}
+
+// memberReader is the part of the backend describableMembers reads.
+type memberReader interface {
+	ListModuleSecurity() ([]*security.ModuleSecurity, error)
+	GetProjectSecurity() (*security.ProjectSecurity, error)
+	GetNavigation() (*types.NavigationDocument, error)
 }

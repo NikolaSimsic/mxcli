@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"strings"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
+
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/modelsdk/codec"
 	"github.com/mendixlabs/mxcli/modelsdk/element"
 	mmpr "github.com/mendixlabs/mxcli/modelsdk/mpr"
-	"github.com/mendixlabs/mxcli/modelsdk/property"
 )
 
 func init() {
@@ -29,8 +30,22 @@ func init() {
 	codec.RegisterListMarker("ODataPublish$PublishedAttribute", 3)
 	codec.RegisterListMarker("ODataPublish$PublishedAssociationEnd", 3)
 	codec.RegisterListMarker("ODataPublish$PublishedId", 3)
+	// Published microflows (OData actions) and their parameters. Marker 3 like
+	// every other part list in this document.
+	codec.RegisterListMarker("ODataPublish$PublishedMicroflow", 3)
+	codec.RegisterListMarker("ODataPublish$PublishedMicroflowParameter", 3)
+	// An action without parameters still writes the list, empty: Studio Pro
+	// serializes it on every action, and `mx convert -p -s` fills an absent one
+	// with [3] on 10.24.24, 11.13.0 and 11.15.0 (ako/mxcli#1805).
+	codec.RegisterMandatoryPropertyList("ODataPublish$PublishedMicroflow", "Parameters", 3)
+	// AllowedModuleRoles empties as marker 1, not 3 — it is a BY_NAME role list,
+	// not a part list. Without the entry, a service with no grants omits the key
+	// entirely, and since the document is serialized wholesale that DELETES the
+	// stored grants on the next modify (CE0307). An empty list is only reached
+	// when the property itself wrote nothing, because ByNameRefList marks dirty
+	// on Append.
 	codec.RegisterTypeDefaults("ODataPublish$PublishedODataService2", codec.TypeDefaults{
-		MandatoryListMarkers: map[string]int32{"AuthenticationTypes": 3, "EntityTypes": 3, "EntitySets": 3, "Enumerations": 3, "Microflows": 3},
+		MandatoryListMarkers: map[string]int32{"AllowedModuleRoles": 1, "AuthenticationTypes": 3, "EntityTypes": 3, "EntitySets": 3, "Enumerations": 3, "Microflows": 3},
 	})
 	codec.RegisterTypeDefaults("ODataPublish$EntityType", codec.TypeDefaults{
 		MandatoryListMarkers: map[string]int32{"ChildMembers": 3},
@@ -52,7 +67,7 @@ func (b *Backend) CreateConsumedODataService(svc *model.ConsumedODataService) er
 		svc.ID = model.ID(mmpr.GenerateID())
 	}
 	svc.TypeName = "Rest$ConsumedODataService"
-	contents, err := (&codec.Encoder{}).Encode(consumedODataServiceToGen(svc))
+	contents, err := b.encodeConsumedODataService(svc)
 	if err != nil {
 		return fmt.Errorf("CreateConsumedODataService: encode: %w", err)
 	}
@@ -66,11 +81,146 @@ func (b *Backend) UpdateConsumedODataService(svc *model.ConsumedODataService) er
 	if b.writer == nil {
 		return fmt.Errorf("UpdateConsumedODataService: not connected for writing")
 	}
-	contents, err := (&codec.Encoder{}).Encode(consumedODataServiceToGen(svc))
+	contents, err := b.encodeConsumedODataService(svc)
 	if err != nil {
 		return fmt.Errorf("UpdateConsumedODataService: encode: %w", err)
 	}
+	stored, err := b.GetRawUnitBytes(svc.ID)
+	if err != nil {
+		return fmt.Errorf("UpdateConsumedODataService: read stored service: %w", err)
+	}
+	if len(stored) > 0 {
+		configKey, headersKey := b.microflowKeys()
+		contents, err = carryStoredConsumedODataService(stored, contents, consumedODataOptionalKeys(configKey, headersKey))
+		if err != nil {
+			return fmt.Errorf("UpdateConsumedODataService: carry stored properties: %w", err)
+		}
+	}
 	return b.writer.UpdateRawUnit(string(svc.ID), contents)
+}
+
+// consumedODataStoredWins are the keys consumedODataServiceToGen writes as fixed
+// placeholders rather than from the model: the stored value is kept. Studio Pro
+// stores UseQuerySegment true on a client it creates (ako/TestApp), and a
+// rewrite reset it to false (#743).
+var consumedODataStoredWins = map[string]bool{
+	"UseQuerySegment":      true,
+	"ExportLevel":          true,
+	"LastUpdated":          true,
+	"MinimumMxVersion":     true,
+	"RecommendedMxVersion": true,
+	"MetadataReferences":   true,
+	"ValidatedEntities":    true,
+}
+
+// consumedODataOptionalKeys are the keys the writer emits only when the model
+// holds a value (addStrIf). Studio Pro stores them as "" when unset, so a key
+// the fresh document omits is written "" when it is stored — which also keeps a
+// value the statement cleared cleared, where carrying the stored one would undo
+// the change.
+func consumedODataOptionalKeys(configKey, headersKey string) map[string]bool {
+	return map[string]bool{
+		configKey: true, headersKey: true, "ErrorHandlingMicroflow": true,
+		"ProxyHost": true, "ProxyPort": true, "ProxyUsername": true, "ProxyPassword": true,
+		"ApplicationId": true, "EndpointId": true, "CatalogUrl": true, "EnvironmentType": true,
+	}
+}
+
+// carryStoredConsumedODataService lays the freshly encoded service over the
+// stored one (ADR-0012: carry or refuse). The model holds only part of what
+// Studio Pro stores on a Rest$ConsumedODataService — the Icon, UseQuerySegment,
+// the empty catalog and proxy keys, the HttpConfiguration's
+// CustomLocationTemplate — and the document is written wholesale, so a key the
+// writer does not produce was deleted by every rewrite (#743).
+//
+// The result is the stored document with each key the fresh one writes set to
+// the fresh value, except:
+//   - consumedODataStoredWins keys keep the stored value;
+//   - an optional key the fresh document omits is written "" when stored;
+//   - the HttpConfiguration part is laid over the stored part the same way;
+//   - a list keeps the stored marker, with the fresh elements.
+//
+// Keys the fresh document adds are appended after the stored ones.
+func carryStoredConsumedODataService(stored, fresh []byte, optional map[string]bool) ([]byte, error) {
+	var s, f bson.D
+	if err := bson.Unmarshal(stored, &s); err != nil {
+		return nil, fmt.Errorf("decode stored: %w", err)
+	}
+	if err := bson.Unmarshal(fresh, &f); err != nil {
+		return nil, fmt.Errorf("decode fresh: %w", err)
+	}
+	out := overlayStoredDoc(s, f, func(key string) bool { return consumedODataStoredWins[key] })
+	for i, e := range out {
+		if optional[e.Key] && !docHasKey(f, e.Key) {
+			if _, isString := e.Value.(string); isString {
+				out[i].Value = ""
+			}
+		}
+		if e.Key == "HttpConfiguration" {
+			sp, sok := docValue(s, e.Key).(bson.D)
+			fp, fok := docValue(f, e.Key).(bson.D)
+			if sok && fok {
+				out[i].Value = overlayStoredDoc(sp, fp, func(string) bool { return false })
+			}
+		}
+	}
+	return bson.Marshal(out)
+}
+
+// overlayStoredDoc returns stored with every key of fresh laid over it, except
+// the keys storedWins keeps. A list takes the fresh elements after the stored
+// marker: the marker is how Studio Pro types the array, and an empty list the
+// writer re-marks is a change nothing asked for.
+func overlayStoredDoc(stored, fresh bson.D, storedWins func(string) bool) bson.D {
+	out := make(bson.D, 0, len(stored)+len(fresh))
+	for _, e := range stored {
+		if storedWins(e.Key) || !docHasKey(fresh, e.Key) {
+			out = append(out, e)
+			continue
+		}
+		out = append(out, bson.E{Key: e.Key, Value: keepListMarker(e.Value, docValue(fresh, e.Key))})
+	}
+	for _, e := range fresh {
+		if !docHasKey(stored, e.Key) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// keepListMarker returns fresh with the stored list's leading marker when both
+// are lists that start with one; any other value is fresh unchanged.
+func keepListMarker(stored, fresh any) any {
+	sa, ok1 := stored.(bson.A)
+	fa, ok2 := fresh.(bson.A)
+	if !ok1 || !ok2 || len(sa) == 0 || len(fa) == 0 {
+		return fresh
+	}
+	sm, ok1 := sa[0].(int32)
+	_, ok2 = fa[0].(int32)
+	if !ok1 || !ok2 {
+		return fresh
+	}
+	out := append(bson.A{sm}, fa[1:]...)
+	return out
+}
+
+func docHasKey(d bson.D, key string) bool {
+	for _, e := range d {
+		if e.Key == key {
+			return true
+		}
+	}
+	return false
+}
+
+func docValue(d bson.D, key string) any {
+	for _, e := range d {
+		if e.Key == key {
+			return e.Value
+		}
+	}
+	return nil
 }
 
 func (b *Backend) DeleteConsumedODataService(id model.ID) error {
@@ -80,7 +230,25 @@ func (b *Backend) DeleteConsumedODataService(id model.ID) error {
 	return b.writer.DeleteUnit(string(id))
 }
 
-func consumedODataServiceToGen(svc *model.ConsumedODataService) element.Element {
+// encodeConsumedODataService serializes the service with version-appropriate
+// microflow BSON keys.
+func (b *Backend) encodeConsumedODataService(svc *model.ConsumedODataService) ([]byte, error) {
+	configKey, headersKey := b.microflowKeys()
+	return (&codec.Encoder{}).Encode(consumedODataServiceToGen(svc, configKey, headersKey))
+}
+
+// microflowKeys returns the version-appropriate BSON field names for the
+// consumed OData service's configuration and headers microflows (issue #728).
+// Defaults to the pre-11.10 keys when the project version is unknown.
+func (b *Backend) microflowKeys() (configKey, headersKey string) {
+	if pv := b.ProjectVersion(); pv != nil {
+		return model.ODataConfigMicroflowBSONKey(pv.MajorVersion, pv.MinorVersion),
+			model.ODataHeadersMicroflowBSONKey(pv.MajorVersion, pv.MinorVersion)
+	}
+	return "ConfigurationMicroflow", "ConfigurationMicroflow"
+}
+
+func consumedODataServiceToGen(svc *model.ConsumedODataService, configMicroflowKey, headersMicroflowKey string) element.Element {
 	g := newElem("Rest$ConsumedODataService", string(svc.ID))
 	addStr(g, "Name", svc.Name)
 	addStr(g, "Documentation", svc.Documentation)
@@ -104,7 +272,8 @@ func consumedODataServiceToGen(svc *model.ConsumedODataService) element.Element 
 
 	// Optional by-name / constant references — only emitted when set, matching the
 	// legacy writer (Studio Pro omits empties).
-	addStrIf(g, "ConfigurationMicroflow", svc.ConfigurationMicroflow)
+	addStrIf(g, configMicroflowKey, svc.ConfigurationMicroflow)
+	addStrIf(g, headersMicroflowKey, svc.HeadersMicroflow)
 	addStrIf(g, "ErrorHandlingMicroflow", svc.ErrorHandlingMicroflow)
 	addStrIf(g, "ProxyHost", svc.ProxyHost)
 	addStrIf(g, "ProxyPort", svc.ProxyPort)
@@ -170,7 +339,7 @@ func (b *Backend) CreatePublishedODataService(svc *model.PublishedODataService) 
 		svc.ID = model.ID(mmpr.GenerateID())
 	}
 	svc.TypeName = "ODataPublish$PublishedODataService2"
-	contents, err := (&codec.Encoder{}).Encode(publishedODataServiceToGen(svc))
+	contents, err := (&codec.Encoder{}).Encode(publishedODataServiceToGen(svc, b.publishesMemberTypes()))
 	if err != nil {
 		return fmt.Errorf("CreatePublishedODataService: encode: %w", err)
 	}
@@ -184,7 +353,7 @@ func (b *Backend) UpdatePublishedODataService(svc *model.PublishedODataService) 
 	if b.writer == nil {
 		return fmt.Errorf("UpdatePublishedODataService: not connected for writing")
 	}
-	contents, err := (&codec.Encoder{}).Encode(publishedODataServiceToGen(svc))
+	contents, err := (&codec.Encoder{}).Encode(publishedODataServiceToGen(svc, b.publishesMemberTypes()))
 	if err != nil {
 		return fmt.Errorf("UpdatePublishedODataService: encode: %w", err)
 	}
@@ -198,7 +367,19 @@ func (b *Backend) DeletePublishedODataService(id model.ID) error {
 	return b.writer.DeleteUnit(string(id))
 }
 
-func publishedODataServiceToGen(svc *model.PublishedODataService) element.Element {
+// publishesMemberTypes reports whether the project's metamodel declares the
+// derived member types a published OData service stores from 11.12.0 —
+// PublishedAttribute.EdmType and PublishedAssociationEnd.IsMany (measured with
+// `mx convert`: 11.11.0 strips both, 11.12.0 keeps them). Written to an older
+// project they are keys Studio Pro cannot open the document with
+// (mendixlabs/mxcli#1373); the storage layer would refuse them, since they
+// hold values. An unreadable version writes them, as before.
+func (b *Backend) publishesMemberTypes() bool {
+	pv := b.ProjectVersion()
+	return pv == nil || pv.MajorVersion == 0 || pv.IsAtLeast(11, 12)
+}
+
+func publishedODataServiceToGen(svc *model.PublishedODataService, memberTypes bool) element.Element {
 	g := newElem("ODataPublish$PublishedODataService2", string(svc.ID))
 	addStr(g, "Name", svc.Name)
 	addStr(g, "Documentation", svc.Documentation)
@@ -210,11 +391,30 @@ func publishedODataServiceToGen(svc *model.PublishedODataService) element.Elemen
 	addStr(g, "Summary", svc.Summary)
 	addStr(g, "Description", svc.Description)
 	addBool(g, "PublishAssociations", svc.PublishAssociations)
+	addBool(g, "SupportsGraphQL", svc.SupportsGraphQL)
 	addBool(g, "UseGeneralization", svc.UseGeneralization)
 	addStr(g, "AuthenticationMicroflow", svc.AuthMicroflow)
+	// AllowedModuleRoles is written unconditionally, marker 1, matching
+	// sdk/mpr/writer_odata.go. This document is serialized wholesale, so a key
+	// the serializer omits is not left alone — it is deleted, silently revoking
+	// the service's access on every `create or modify`. Grants are made by a
+	// separate statement (`grant access on odata service …`) and cannot be
+	// restated in the create script, so nothing in the script can put them back;
+	// the next build fails CE0307 "At least one allowed role must be selected".
+	//
+	// The §26 fix went into the mpr writer only, and this one had no reference to
+	// the field at all, so the bug survived here for a full release with a green
+	// suite (mxcli-formula1 §41).
+	addByNameRefList(g, "AllowedModuleRoles", "", svc.AllowedModuleRoles)
 	if len(svc.AuthenticationTypes) > 0 {
-		addByNameRefListV3(g, "AuthenticationTypes", svc.AuthenticationTypes)
+		// Marker 1: what Studio Pro writes on all three published services of
+		// ako/TestApp. The 3 this used matched the legacy writer, not Studio Pro,
+		// and churned every rewrite (#743).
+		addByNameRefList(g, "AuthenticationTypes", "", svc.AuthenticationTypes)
 	}
+	// Carried when stored, so a rewrite does not delete it; a service mxcli
+	// creates is written as before (#743).
+	addStrIf(g, "ExportLevel", svc.ExportLevel)
 
 	// Pre-assign entity-type IDs so entity sets can point at them by ID.
 	entityTypeIDByName := make(map[string]string, len(svc.EntityTypes))
@@ -224,7 +424,7 @@ func publishedODataServiceToGen(svc *model.PublishedODataService) element.Elemen
 			et.ID = model.ID(mmpr.GenerateID())
 		}
 		entityTypeIDByName[et.Entity] = string(et.ID)
-		etElems = append(etElems, publishedEntityTypeToGen(et))
+		etElems = append(etElems, publishedEntityTypeToGen(et, memberTypes))
 	}
 	if len(etElems) > 0 {
 		addPartList(g, "EntityTypes", etElems)
@@ -238,15 +438,93 @@ func publishedODataServiceToGen(svc *model.PublishedODataService) element.Elemen
 		addPartList(g, "EntitySets", esElems)
 	}
 
+	if len(svc.Microflows) > 0 {
+		mfElems := make([]element.Element, 0, len(svc.Microflows))
+		for _, pm := range svc.Microflows {
+			mfElems = append(mfElems, publishedMicroflowToGen(pm))
+		}
+		addPartList(g, "Microflows", mfElems)
+	}
+
 	addBool(g, "Excluded", svc.Excluded)
-	// Enumerations / Microflows: empty marker-3 (via TypeDefaults).
+	// Enumerations: empty marker-3 (via TypeDefaults). Microflows too when the
+	// service publishes no actions.
 	addBool(g, "IncludeMetadataByDefault", true)
 	addBool(g, "ReplaceIllegalChars", false)
 	addBool(g, "SupportsGraphQL", false)
 	return g
 }
 
-func publishedEntityTypeToGen(et *model.PublishedEntityType) element.Element {
+// publishedMicroflowToGen builds an ODataPublish$PublishedMicroflow — the
+// element Mendix turns into an ActionImport.
+//
+// Property names and kinds come from the generated metamodel
+// (modelsdk/gen/odatapublish): ExposedName, AlternativeExposedName, a BY_NAME
+// Microflow ref, a Parameters part list, a ReturnType part, Summary and
+// Description. The MicroflowParameter ref is Module.Microflow.Param — the shape
+// the published-REST writer already ships.
+func publishedMicroflowToGen(pm *model.PublishedMicroflow) element.Element {
+	g := newElem("ODataPublish$PublishedMicroflow", string(pm.ID))
+	addStr(g, "ExposedName", pm.ExposedName)
+	addStr(g, "AlternativeExposedName", "")
+	addStr(g, "Microflow", pm.Microflow)
+	// Written with no parameters too, as the empty list (registered mandatory
+	// in init): an action without the key and one with it are two
+	// property-name sets Mendix's merge engine refuses to compare
+	// (ako/mxcli#1805).
+	params := make([]element.Element, 0, len(pm.Parameters))
+	for _, p := range pm.Parameters {
+		params = append(params, publishedMicroflowParameterToGen(p))
+	}
+	addPartList(g, "Parameters", params)
+	if rt := dataTypeElement(pm.ReturnTypeKind, pm.ReturnTypeRef); rt != nil {
+		addPart(g, "ReturnType", rt)
+	}
+	addStr(g, "Summary", pm.Summary)
+	addStr(g, "Description", pm.Description)
+	return g
+}
+
+func publishedMicroflowParameterToGen(p *model.PublishedMicroflowParameter) element.Element {
+	g := newElem("ODataPublish$PublishedMicroflowParameter", string(p.ID))
+	addStr(g, "ExposedName", p.ExposedName)
+	addStr(g, "MicroflowParameter", p.MicroflowParameter)
+	if dt := dataTypeElement(p.DataTypeKind, p.DataTypeRef); dt != nil {
+		addPart(g, "DataType", dt)
+	}
+	addBool(g, "CanBeEmpty", p.CanBeEmpty)
+	addStr(g, "Summary", p.Summary)
+	addStr(g, "Description", p.Description)
+	return g
+}
+
+// dataTypeElement builds a DataTypes$* element from a kind and, where the kind
+// names something, its qualified name. The kind strings are the ones
+// microflows.DataType.GetTypeName() produces, so the two stay in step.
+func dataTypeElement(kind, ref string) element.Element {
+	if kind == "" {
+		return nil
+	}
+	switch kind {
+	case "Object":
+		e := newElem("DataTypes$ObjectType", "")
+		addStr(e, "Entity", ref)
+		return e
+	case "List":
+		e := newElem("DataTypes$ListType", "")
+		addStr(e, "Entity", ref)
+		return e
+	case "Enumeration":
+		e := newElem("DataTypes$EnumerationType", "")
+		addStr(e, "Enumeration", ref)
+		return e
+	default:
+		// Boolean, String, Integer, Long, Decimal, DateTime, Binary, Void …
+		return newElem("DataTypes$"+kind+"Type", "")
+	}
+}
+
+func publishedEntityTypeToGen(et *model.PublishedEntityType, memberTypes bool) element.Element {
 	g := newElem("ODataPublish$EntityType", string(et.ID))
 	addStr(g, "Entity", et.Entity)
 	addStr(g, "ExposedName", et.ExposedName)
@@ -254,7 +532,7 @@ func publishedEntityTypeToGen(et *model.PublishedEntityType) element.Element {
 	addStr(g, "Description", et.Description)
 	members := make([]element.Element, 0, len(et.Members))
 	for _, m := range et.Members {
-		members = append(members, publishedMemberToGen(m, et.Entity))
+		members = append(members, publishedMemberToGen(m, et.Entity, memberTypes))
 	}
 	if len(members) > 0 {
 		addPartList(g, "ChildMembers", members)
@@ -268,46 +546,55 @@ func publishedEntitySetToGen(es *model.PublishedEntitySet, entityTypeID string) 
 	addStr(g, "AlternativeExposedName", "")
 	addBool(g, "UsePaging", es.UsePaging)
 	addInt64(g, "PageSize", int64(es.PageSize))
+	// Query options default to true (Mendix's own defaults) and are only turned
+	// off when the author says so. Countable is not free: it forces the read
+	// microflow to take a System.ODataResponse parameter and compute a count.
+	// (mxcli-formula1 findings #10.3.)
 	qo := newElem("ODataPublish$QueryOptions", "")
-	addBool(qo, "Countable", true)
-	addBool(qo, "SkipSupported", true)
-	addBool(qo, "TopSupported", true)
+	addBool(qo, "Countable", boolOrDefault(es.Countable, true))
+	addBool(qo, "SkipSupported", boolOrDefault(es.SkipSupported, true))
+	addBool(qo, "TopSupported", boolOrDefault(es.TopSupported, true))
 	addPart(g, "QueryOptions", qo)
 	if entityTypeID != "" {
 		addIDRef(g, "EntityTypePointer", model.ID(entityTypeID))
 	}
-	if es.ReadMode != "" {
-		addPart(g, "ReadMode", odataReadModeToGen(es.ReadMode))
-	}
-	if es.InsertMode != "" {
-		addPart(g, "InsertMode", odataChangeModeToGen(es.InsertMode))
-	}
-	if es.UpdateMode != "" {
-		addPart(g, "UpdateMode", odataChangeModeToGen(es.UpdateMode))
-	}
-	if es.DeleteMode != "" {
-		addPart(g, "DeleteMode", odataChangeModeToGen(es.DeleteMode))
-	}
+	// All four modes, stated or not. Studio Pro writes every one on every entity
+	// set, so a set whose statement left one out had a property-name set Mendix's
+	// merge engine refuses to compare with its siblings' (ako/mxcli#1805). An
+	// unstated mode is the value Mendix gives the absent property — ReadSource
+	// and ChangeNotSupported, measured with `mx convert -p -s` on 10.24.24,
+	// 11.13.0 and 11.15.0, and what Studio Pro 11.14.0 creates — so writing it
+	// changes nothing the service does.
+	addPart(g, "ReadMode", odataReadModeToGen(es.ReadMode))
+	addPart(g, "InsertMode", odataChangeModeToGen(es.InsertMode))
+	addPart(g, "UpdateMode", odataChangeModeToGen(es.UpdateMode))
+	addPart(g, "DeleteMode", odataChangeModeToGen(es.DeleteMode))
 	return g
 }
 
-func publishedMemberToGen(m *model.PublishedMember, ownerQN string) element.Element {
+func publishedMemberToGen(m *model.PublishedMember, ownerQN string, memberTypes bool) element.Element {
 	memberID := string(m.ID)
 	switch m.Kind {
 	case "association":
 		g := newElem("ODataPublish$PublishedAssociationEnd", memberID)
 		addStr(g, "ExposedName", m.ExposedName)
-		addBool(g, "CanBeEmpty", !m.IsPartOfKey)
+		addBool(g, "CanBeEmpty", memberCanBeEmpty(m))
 		addStr(g, "Description", "")
 		addStr(g, "Summary", "")
 		addStr(g, "Association", qualifyAssociationName(m.Name, ownerQN))
 		addStr(g, "Entity", m.AssociationTargetEntity)
+		// IsMany is the exposed navigation's multiplicity; without it Studio Pro
+		// reports CE5022 ("changed multiplicity"). Verified against Studio Pro BSON.
+		// Declared from 11.12.0 only (publishesMemberTypes).
+		if memberTypes {
+			addBool(g, "IsMany", m.IsMany)
+		}
 		addStr(g, "ExposedAssociationName", m.ExposedAssociationName)
 		return g
 	case "id":
 		g := newElem("ODataPublish$PublishedId", memberID)
 		addStr(g, "ExposedName", m.ExposedName)
-		addBool(g, "CanBeEmpty", !m.IsPartOfKey)
+		addBool(g, "CanBeEmpty", memberCanBeEmpty(m))
 		addStr(g, "Description", "")
 		addStr(g, "Summary", "")
 		addStr(g, "Attribute", qualifyMemberName(m.Name, ownerQN))
@@ -318,14 +605,20 @@ func publishedMemberToGen(m *model.PublishedMember, ownerQN string) element.Elem
 	default: // attribute
 		g := newElem("ODataPublish$PublishedAttribute", memberID)
 		addStr(g, "ExposedName", m.ExposedName)
-		addBool(g, "CanBeEmpty", !m.IsPartOfKey)
+		addBool(g, "CanBeEmpty", memberCanBeEmpty(m))
 		addStr(g, "Description", "")
 		addStr(g, "Summary", "")
 		addStr(g, "Attribute", qualifyMemberName(m.Name, ownerQN))
+		// EdmType is the published OData type; without it Studio Pro reports
+		// CE5016 ("published as ."). Verified against Studio Pro's corrected BSON.
+		// Declared from 11.12.0 only (publishesMemberTypes).
+		if memberTypes {
+			addStr(g, "EdmType", m.EdmType)
+		}
 		addBool(g, "Filterable", m.Filterable)
 		addBool(g, "Sortable", m.Sortable)
 		addBool(g, "IsPartOfKey", m.IsPartOfKey)
-		addBool(g, "EnumerationAsString", false)
+		addBool(g, "EnumerationAsString", m.EnumerationAsString)
 		addBool(g, "StringAsGuid", false)
 		return g
 	}
@@ -391,12 +684,19 @@ func addStrIf(b *element.Base, name, val string) {
 	}
 }
 
-// addByNameRefListV3 adds a marker-3 reference-string list (qualified names),
-// the form Mendix uses for a published OData service's AuthenticationTypes.
-func addByNameRefListV3(b *element.Base, name string, qnames []string) {
-	p := property.NewByNameRefListV3[element.Element](name, "")
-	b.AddProperty(p, uint(len(b.Properties())))
-	for _, qn := range qnames {
-		p.Append(qn)
+// boolOrDefault resolves an optional bool: nil means "not specified".
+func boolOrDefault(v *bool, def bool) bool {
+	if v == nil {
+		return def
 	}
+	return *v
+}
+
+// memberCanBeEmpty is the stored CanBeEmpty when there is one (#743), else the
+// value derived from the key: a key member cannot be empty.
+func memberCanBeEmpty(m *model.PublishedMember) bool {
+	if m.CanBeEmpty != nil {
+		return *m.CanBeEmpty
+	}
+	return !m.IsPartOfKey
 }

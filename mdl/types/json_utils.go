@@ -12,6 +12,36 @@ import (
 	"unicode"
 )
 
+// occursUnbounded is the MaxOccurs value Mendix reads as "unbounded" (`0..*`).
+// Note that 0 is NOT a stand-in for "unspecified": Mendix reads MaxOccurs=0
+// literally as "never occurs", so an element written that way is silently
+// skipped by every import mapping bound to the structure (#841).
+const occursUnbounded = -1
+
+// rootMinOccurs is the MinOccurs written for the root element.
+//
+// It stays 0 even though a document root arguably "always occurs once", because
+// Mendix cross-validates a *mapping* element against its *schema* element and
+// the mapping serializers hardcode `MinOccurs: 0` (serExportMappingElement /
+// serImportMappingElement in both engines) — only MaxOccurs is propagated from
+// the schema. Writing 1 here makes the two sides disagree and every mapping
+// bound to the structure fails to build:
+//
+//	[error] [CE5015] "The mapping does not align with the underlying schema
+//	anymore. Details: Attribute 'MinOccurs' does not match schema element
+//	'(Object)'." at Object mapping element 'Root'
+//
+// That blocker is gone: #277/#279 made every mapping element mirror the bound
+// schema element's MinOccurs instead of hardcoding 0, in all three serializers.
+// With both sides agreeing, the root can carry the 1 Studio Pro writes — uniform
+// across all nine Studio Pro-authored structures pinned in the round-trip
+// fixture, and the last of ako/mxcli#272's measured differences that has a
+// well-founded target.
+//
+// Do NOT change this back without changing the mapping serializers with it: the
+// two sides are cross-validated and CE5015 is what disagreement looks like.
+const rootMinOccurs = 1
+
 // iso8601Pattern matches common ISO 8601 datetime strings that Mendix Studio Pro
 // recognizes as DateTime primitive types in JSON structures.
 var iso8601Pattern = regexp.MustCompile(
@@ -64,9 +94,16 @@ func normalizeDateTimeValue(s string) string {
 
 // BuildJsonElementsFromSnippet parses a JSON snippet and builds the element tree
 // that Mendix Studio Pro would generate. Returns the root element.
-// The optional customNameMap maps JSON keys to custom ExposedNames (as set in
-// Studio Pro's "Custom name" column). Unmapped keys use auto-generated names.
-func BuildJsonElementsFromSnippet(snippet string, customNameMap map[string]string) ([]*JsonElement, error) {
+//
+// customNameMap maps JSON keys to custom ExposedNames (Studio Pro's "Custom
+// name" column). itemNameMap does the same for an ARRAY's ITEM element, keyed by
+// the array's JSON key — an item is the anonymous `[…]` entry and has no key of
+// its own, so it is unreachable from customNameMap and its name was previously
+// derived and unspellable (ako/mxcli#272). "Root" addresses a root-level array's
+// item, which likewise has no key.
+//
+// Both are optional; unmapped elements use the generated names.
+func BuildJsonElementsFromSnippet(snippet string, customNameMap, itemNameMap map[string]string) ([]*JsonElement, error) {
 	// Validate JSON
 	if !json.Valid([]byte(snippet)) {
 		return nil, fmt.Errorf("invalid JSON snippet")
@@ -79,21 +116,23 @@ func BuildJsonElementsFromSnippet(snippet string, customNameMap map[string]strin
 		return nil, fmt.Errorf("failed to parse JSON snippet: %w", err)
 	}
 
-	b := &snippetBuilder{customNameMap: customNameMap}
+	b := &snippetBuilder{customNameMap: customNameMap, itemNameMap: itemNameMap}
 	tracker := &nameTracker{seen: make(map[string]int)}
 
 	switch tok {
 	case json.Delim('{'):
 		root := b.buildElementFromRawObject("Root", "(Object)", snippet, tracker)
-		root.MinOccurs = 0
-		root.MaxOccurs = 0
+		root.MinOccurs = rootMinOccurs
+		root.MaxOccurs = 1
 		root.Nillable = true
 		return []*JsonElement{root}, nil
 
 	case json.Delim('['):
 		root := b.buildElementFromRawRootArray("Root", "(Array)", snippet, tracker)
-		root.MinOccurs = 0
-		root.MaxOccurs = 0
+		// The array element itself occurs once; its item child carries the
+		// repetition, mirroring the nested-array case.
+		root.MinOccurs = rootMinOccurs
+		root.MaxOccurs = 1
 		root.Nillable = true
 		return []*JsonElement{root}, nil
 
@@ -102,30 +141,140 @@ func BuildJsonElementsFromSnippet(snippet string, customNameMap map[string]strin
 	}
 }
 
+// rootArrayItemKey is the key `item of` uses for a ROOT-level array, which has
+// no JSON key of its own. "Root" is the exposed name Studio Pro gives every root
+// element (9 of 9 pinned structures), and a root array has no keys at its own
+// level, so there is nothing for it to collide with.
+const rootArrayItemKey = "Root"
+
 // snippetBuilder holds state for building the element tree from a JSON snippet.
 type snippetBuilder struct {
 	customNameMap map[string]string // JSON key → custom ExposedName
+	itemNameMap   map[string]string // array's JSON key → its ITEM element's name
 }
 
-// reservedExposedNames are element names that Mendix rejects as ExposedName values.
-// Studio Pro handles these by prefixing with underscore and keeping original case.
+// itemName returns the name for the item element of the array reached by
+// jsonKey, or fallback when the script did not name it.
+func (b *snippetBuilder) itemName(jsonKey, fallback string) string {
+	if b.itemNameMap != nil {
+		if custom, ok := b.itemNameMap[jsonKey]; ok {
+			return custom
+		}
+	}
+	return fallback
+}
+
+// reservedExposedNames are element names Mendix will not accept as an
+// ExposedName. Studio Pro avoids them by prefixing an underscore and keeping the
+// key's ORIGINAL case — `id` becomes `_id`, `object` becomes `_object` (both
+// measured in OpenAI_API.JSON_OpenAI_Response) — which is what
+// resolveExposedName does.
+//
+// The list was only {Id, Type}, so an ordinary payload member like `owner` or
+// `class` produced a structure mxbuild REFUSES TO BUILD:
+//
+//	CE9524 "JSON element '(Object)/owner' has an invalid custom name 'Owner'.
+//	        Custom name should start with a letter or underscore followed by
+//	        either letters, digits or underscores."
+//
+// The message is a red herring — 'Owner' matches that pattern perfectly. The
+// real rule, measured against mxbuild 11.13 one name at a time, is a
+// case-insensitive reserved set:
+//
+//	every Java keyword and literal (53, each measured and rejected)
+//	the four system attribute names: Owner, ChangedDate, CreatedDate, ChangedBy
+//	CurrentUser and Guid
+//
+// It is NOT the entity-member reserved list: `Type` and `Id` are accepted by
+// mxbuild here, and are kept below only because Studio Pro avoids them too —
+// this list is "what Studio Pro avoids", a superset of "what mxbuild rejects".
+// `Object` is in the same category, added from the same reference document.
+//
+// Lookup is case-insensitive because Mendix's own check is: the member `class`
+// derives `Class`, which is not literally a Java keyword, and is still rejected.
 var reservedExposedNames = map[string]bool{
-	"Id": true, "Type": true,
+	// Studio Pro avoids these; mxbuild accepts them.
+	"id": true, "type": true, "object": true,
+
+	// Mendix system attribute names.
+	"owner": true, "changeddate": true, "createddate": true, "changedby": true,
+
+	// Mendix reserved.
+	"currentuser": true, "guid": true,
+
+	// Java keywords and literals.
+	"abstract": true, "assert": true, "boolean": true, "break": true, "byte": true,
+	"case": true, "catch": true, "char": true, "class": true, "const": true,
+	"continue": true, "default": true, "do": true, "double": true, "else": true,
+	"enum": true, "extends": true, "false": true, "final": true, "finally": true,
+	"float": true, "for": true, "goto": true, "if": true, "implements": true,
+	"import": true, "instanceof": true, "int": true, "interface": true, "long": true,
+	"native": true, "new": true, "null": true, "package": true, "private": true,
+	"protected": true, "public": true, "return": true, "short": true, "static": true,
+	"strictfp": true, "super": true, "switch": true, "synchronized": true, "this": true,
+	"throw": true, "throws": true, "transient": true, "true": true, "try": true,
+	"void": true, "volatile": true, "while": true,
 }
 
-// resolveExposedName returns the custom name if mapped, otherwise capitalizes the JSON key.
-// Reserved names (Id, Type) are prefixed with underscore to match Studio Pro behavior.
+// resolveExposedName returns the custom name if mapped, otherwise capitalizes the
+// JSON key. A name Mendix reserves is prefixed with an underscore, keeping the
+// key's original case, which is what Studio Pro stores.
 func (b *snippetBuilder) resolveExposedName(jsonKey string) string {
 	if b.customNameMap != nil {
 		if custom, ok := b.customNameMap[jsonKey]; ok {
 			return custom
 		}
 	}
-	name := capitalizeFirst(jsonKey)
-	if reservedExposedNames[name] {
-		return "_" + jsonKey
+	key := sanitizeExposedName(jsonKey)
+	name := capitalizeFirst(key)
+	if reservedExposedNames[strings.ToLower(name)] {
+		return "_" + key
 	}
 	return name
+}
+
+// sanitizeExposedName replaces every character Mendix will not accept in a
+// custom name with an underscore.
+//
+// Mendix rejects anything else outright:
+//
+//	CE9524 "JSON element '(Object)/$type' has an invalid custom name '$type'.
+//	        Custom name should start with a letter or underscore followed by
+//	        either letters, digits or underscores."
+//
+// and here — unlike the reserved-name case in ako/mxcli#300 — the message is
+// accurate. mxcli only capitalised, so an ordinary API member made the project
+// unbuildable: `$type` occurs 43 times in the demo apps, alongside
+// `research%3Aread` and `https%3A//sws.siemens.com/sam/claims/tenantId`.
+//
+// The rule is Studio Pro's, read off its own structures (Evora-FactoryManagement,
+// CRS_ModelSimulator):
+//
+//	confidence(No)                -> Confidence_No_
+//	Support Prediction            -> Support_Prediction
+//	first(Importance)_Payload (kg)-> First_Importance__Payload__kg_
+//	weights__base                 -> Weights__base
+//
+// A leading digit is prefixed rather than replaced: the name must START with a
+// letter or underscore, and turning "1st" into "_st" would lose a character
+// where "_1st" keeps it.
+func sanitizeExposedName(jsonKey string) string {
+	if jsonKey == "" {
+		return jsonKey
+	}
+	out := make([]rune, 0, len(jsonKey)+1)
+	for _, r := range jsonKey {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_':
+			out = append(out, r)
+		default:
+			out = append(out, '_')
+		}
+	}
+	if out[0] >= '0' && out[0] <= '9' {
+		out = append([]rune{'_'}, out...)
+	}
+	return string(out)
 }
 
 // nameTracker tracks used ExposedNames at each level to handle duplicates.
@@ -165,7 +314,7 @@ func (b *snippetBuilder) buildElementFromRawObject(exposedName, path, rawJSON st
 		ElementType:    "Object",
 		PrimitiveType:  "Unknown",
 		MinOccurs:      0,
-		MaxOccurs:      0,
+		MaxOccurs:      1,
 		Nillable:       true,
 		MaxLength:      -1,
 		FractionDigits: -1,
@@ -256,7 +405,7 @@ func (b *snippetBuilder) buildElementFromRawRootArray(exposedName, path, rawJSON
 		ElementType:    "Array",
 		PrimitiveType:  "Unknown",
 		MinOccurs:      0,
-		MaxOccurs:      0,
+		MaxOccurs:      1,
 		Nillable:       true,
 		MaxLength:      -1,
 		FractionDigits: -1,
@@ -276,16 +425,20 @@ func (b *snippetBuilder) buildElementFromRawRootArray(exposedName, path, rawJSON
 		itemPath := path + "|(Object)"
 		trimmed := strings.TrimSpace(string(firstItem))
 
+		// A root array has no JSON key, so `item of 'Root'` addresses its item —
+		// Root being the fixed exposed name of the root element.
+		rootItemName := b.itemName(rootArrayItemKey, "JsonObject")
+
 		if len(trimmed) > 0 && trimmed[0] == '{' {
-			itemElem := b.buildElementFromRawObject("JsonObject", itemPath, trimmed, tracker)
+			itemElem := b.buildElementFromRawObject(rootItemName, itemPath, trimmed, tracker)
 			itemElem.MinOccurs = 0
-			itemElem.MaxOccurs = 0
+			itemElem.MaxOccurs = occursUnbounded
 			itemElem.Nillable = true
 			arrayElem.Children = append(arrayElem.Children, itemElem)
 		} else {
-			child := b.buildElementFromRawValue("JsonObject", itemPath, "", firstItem, tracker)
+			child := b.buildElementFromRawValue(rootItemName, itemPath, "", firstItem, tracker)
 			child.MinOccurs = 0
-			child.MaxOccurs = 0
+			child.MaxOccurs = occursUnbounded
 			arrayElem.Children = append(arrayElem.Children, child)
 		}
 	}
@@ -302,7 +455,7 @@ func (b *snippetBuilder) buildElementFromRawArray(exposedName, path, jsonKey, ra
 		ElementType:    "Array",
 		PrimitiveType:  "Unknown",
 		MinOccurs:      0,
-		MaxOccurs:      0,
+		MaxOccurs:      1,
 		Nillable:       true,
 		MaxLength:      -1,
 		FractionDigits: -1,
@@ -323,34 +476,44 @@ func (b *snippetBuilder) buildElementFromRawArray(exposedName, path, jsonKey, ra
 		trimmed := strings.TrimSpace(string(firstItem))
 
 		if len(trimmed) > 0 && trimmed[0] == '{' {
-			// Object array: child is NameItem object
-			itemName := exposedName + "Item"
+			// Object array: child is NameItem object unless the script named it
+			itemName := b.itemName(jsonKey, exposedName+"Item")
 			itemPath := path + "|(Object)"
 			itemElem := b.buildElementFromRawObject(itemName, itemPath, trimmed, tracker)
 			itemElem.MinOccurs = 0
-			itemElem.MaxOccurs = -1
+			itemElem.MaxOccurs = occursUnbounded
 			itemElem.Nillable = true
 			arrayElem.Children = append(arrayElem.Children, itemElem)
 		} else {
 			// Primitive array: Studio Pro wraps in a Wrapper element with singular name
 			// e.g., tags: ["a","b"] → Tag (Wrapper) → Value (String)
-			wrapperName := singularize(exposedName)
-			wrapperPath := path + "|(Object)"
+			// The Wrapper IS the item element here — one per array entry — so
+			// `item of` names it too, rather than there being a second spelling
+			// for the primitive case.
+			wrapperName := b.itemName(jsonKey, singularize(exposedName))
+			// The markers are "(Wrapper)" and "(Value)", not the object array's
+			// "(Object)" — measured on Studio Pro's KrogerAPI.JSON_ProductList,
+			// whose primitive array is
+			//   …|categories|(Wrapper)        Wrapper
+			//   …|categories|(Wrapper)|(Value) Value
+			// mxcli wrote "…|(Object)" and a value path ending in a bare "|",
+			// which no mapping could resolve against (#268).
+			wrapperPath := path + "|(Wrapper)"
 			wrapper := &JsonElement{
 				ExposedName:    wrapperName,
 				Path:           wrapperPath,
 				ElementType:    "Wrapper",
 				PrimitiveType:  "Unknown",
 				MinOccurs:      0,
-				MaxOccurs:      0,
+				MaxOccurs:      occursUnbounded,
 				Nillable:       true,
 				MaxLength:      -1,
 				FractionDigits: -1,
 				TotalDigits:    -1,
 			}
-			valueElem := b.buildElementFromRawValue("Value", wrapperPath+"|", jsonKey, firstItem, tracker)
+			valueElem := b.buildElementFromRawValue("Value", wrapperPath+"|(Value)", jsonKey, firstItem, tracker)
 			valueElem.MinOccurs = 0
-			valueElem.MaxOccurs = 0
+			valueElem.MaxOccurs = 1
 			wrapper.Children = append(wrapper.Children, valueElem)
 			arrayElem.Children = append(arrayElem.Children, wrapper)
 		}
@@ -358,6 +521,51 @@ func (b *snippetBuilder) buildElementFromRawArray(exposedName, path, jsonKey, ra
 
 	return arrayElem
 }
+
+// SnippetKeys reports which JSON keys a snippet contains, and which of those
+// reach an ARRAY — the two things a CUSTOM NAME MAP entry can address.
+//
+// It builds the same element tree the writer does rather than re-walking the
+// JSON, so the answer cannot drift from what the names would actually be applied
+// to. rootIsArray says whether `item of "Root"` is meaningful.
+func SnippetKeys(snippet string) (keys, arrayKeys map[string]bool, rootIsArray bool, err error) {
+	elems, err := BuildJsonElementsFromSnippet(snippet, nil, nil)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	keys = map[string]bool{}
+	arrayKeys = map[string]bool{}
+	var walk func(e *JsonElement)
+	walk = func(e *JsonElement) {
+		parts := strings.Split(e.Path, "|")
+		last := parts[len(parts)-1]
+		if last != "" && last[0] != '(' {
+			keys[last] = true
+			if e.ElementType == "Array" {
+				arrayKeys[last] = true
+			}
+		}
+		for _, c := range e.Children {
+			walk(c)
+		}
+	}
+	for _, e := range elems {
+		walk(e)
+		if e.ElementType == "Array" {
+			rootIsArray = true
+			arrayKeys[rootArrayItemKey] = true
+		}
+	}
+	return keys, arrayKeys, rootIsArray, nil
+}
+
+// SingularizeExposedName exposes the primitive-array wrapper's default name so
+// DESCRIBE can tell a generated name from a chosen one.
+func SingularizeExposedName(s string) string { return singularize(s) }
+
+// rootArrayItemKeyExported lets other packages spell the root sentinel without
+// duplicating the literal.
+const RootArrayItemKey = rootArrayItemKey
 
 // singularize returns a naive singular form by stripping trailing "s".
 // Handles common cases: Tags→Tag, Items→Item. Known-incorrect for some words
@@ -380,7 +588,7 @@ func buildValueElement(exposedName, path, primitiveType, originalValue string) *
 		ElementType:    "Value",
 		PrimitiveType:  primitiveType,
 		MinOccurs:      0,
-		MaxOccurs:      0,
+		MaxOccurs:      1,
 		Nillable:       true,
 		MaxLength:      maxLength,
 		FractionDigits: -1,

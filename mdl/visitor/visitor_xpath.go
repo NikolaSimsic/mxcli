@@ -122,6 +122,23 @@ func buildXPathValueExpr(ctx parser.IXpathValueExprContext) ast.Expression {
 		return buildXPathFunctionCall(fc)
 	}
 
+	// Unary minus: -7, -12.5, -(expr). The grammar admits this so that a
+	// negative numeric literal can be written unquoted inside a constraint
+	// (issuetracker finding #18); without a case here the operand is dropped
+	// and `[Amount > -7]` serializes to `[Amount > ]`.
+	if valCtx.MINUS() != nil {
+		return &ast.UnaryExpr{
+			Operator: "-",
+			Operand:  buildXPathValueExpr(valCtx.XpathValueExpr()),
+		}
+	}
+
+	// Constant: @Module.Constant (ako/mxcli#1685). Before it had a rule, `@`
+	// parsed as an attribute name and the constant was dropped on re-render.
+	if c := valCtx.XpathConstantRef(); c != nil {
+		return buildXPathConstantRef(c)
+	}
+
 	// Path: step/step/step
 	if path := valCtx.XpathPath(); path != nil {
 		return buildXPathPath(path)
@@ -157,7 +174,7 @@ func buildXPathPath(ctx parser.IXpathPathContext) ast.Expression {
 	}
 
 	// Optimization: single step without predicate → return the inner expression directly
-	if len(xpathSteps) == 1 && xpathSteps[0].Predicate == nil {
+	if len(xpathSteps) == 1 && len(xpathSteps[0].Predicates) == 0 {
 		return xpathSteps[0].Expr
 	}
 
@@ -172,9 +189,10 @@ func buildXPathStep(ctx parser.IXpathStepContext) ast.XPathStep {
 		Expr: buildXPathStepValue(stepCtx.XpathStepValue()),
 	}
 
-	// Check for nested predicate [expr]
-	if stepCtx.LBRACKET() != nil {
-		step.Predicate = buildXPathExpr(stepCtx.XpathExpr())
+	// Nested predicates [expr][expr]…, kept apart rather than and-ed together:
+	// `[reversed()]` is a step predicate too, and is not a condition.
+	for _, pred := range stepCtx.AllXpathExpr() {
+		step.Predicates = append(step.Predicates, buildXPathExpr(pred))
 	}
 
 	return step
@@ -194,7 +212,7 @@ func buildXPathStepValue(ctx parser.IXpathStepValueContext) ast.Expression {
 		return &ast.VariableExpr{Name: strings.TrimPrefix(v.GetText(), "$")}
 	}
 	if sl := svCtx.STRING_LITERAL(); sl != nil {
-		return &ast.LiteralExpr{Value: unquoteString(sl.GetText()), Kind: ast.LiteralString}
+		return &ast.LiteralExpr{Value: unquoteStringLit(sl), Kind: ast.LiteralString}
 	}
 	if nl := svCtx.NUMBER_LITERAL(); nl != nil {
 		text := nl.GetText()
@@ -226,24 +244,31 @@ func buildXPathQualifiedName(ctx parser.IXpathQualifiedNameContext) ast.Expressi
 	words := qnCtx.AllXpathWord()
 
 	if len(words) == 1 {
-		text := words[0].GetText()
-		// Handle special XPath values
-		switch strings.ToLower(text) {
-		case "empty":
-			return &ast.LiteralExpr{Value: nil, Kind: ast.LiteralEmpty}
-		case "true":
-			return &ast.LiteralExpr{Value: true, Kind: ast.LiteralBoolean}
-		case "false":
-			return &ast.LiteralExpr{Value: false, Kind: ast.LiteralBoolean}
+		raw := words[0].GetText()
+		// Strip identifier quotes so a keyword-escaped attribute like "Status"
+		// becomes the member name Status, not the string literal 'Status' (which
+		// Mendix would compare as an always-false constant — silent zero rows).
+		text := unquoteIdentifier(raw)
+		// The special XPath values are only special when written UNquoted; a
+		// quoted "empty"/"true"/"false" is an ordinary (keyword-escaped) name.
+		if raw == text {
+			switch strings.ToLower(text) {
+			case "empty":
+				return &ast.LiteralExpr{Value: nil, Kind: ast.LiteralEmpty}
+			case "true":
+				return &ast.LiteralExpr{Value: true, Kind: ast.LiteralBoolean}
+			case "false":
+				return &ast.LiteralExpr{Value: false, Kind: ast.LiteralBoolean}
+			}
 		}
 		return &ast.IdentifierExpr{Name: text}
 	}
 
 	// Multi-part: first part is module, rest joined as name
-	module := words[0].GetText()
+	module := unquoteIdentifier(words[0].GetText())
 	remaining := make([]string, len(words)-1)
 	for i, w := range words[1:] {
-		remaining[i] = w.GetText()
+		remaining[i] = unquoteIdentifier(w.GetText())
 	}
 	return &ast.QualifiedNameExpr{
 		QualifiedName: ast.QualifiedName{
@@ -251,6 +276,29 @@ func buildXPathQualifiedName(ctx parser.IXpathQualifiedNameContext) ast.Expressi
 			Name:   strings.Join(remaining, "."),
 		},
 	}
+}
+
+// buildXPathConstantRef builds a ConstantRefExpr from xpathConstantRef, split
+// the way an expression's `@Module.Name` is: the first word is the module.
+// A recovered parse may hand over the `@` alone; that yields an empty name
+// rather than a nil dereference (see the-visitor-walks-a-failed-parse).
+func buildXPathConstantRef(ctx parser.IXpathConstantRefContext) ast.Expression {
+	ref := &ast.ConstantRefExpr{}
+	c, ok := ctx.(*parser.XpathConstantRefContext)
+	if !ok || c.XpathQualifiedName() == nil {
+		return ref
+	}
+	words := c.XpathQualifiedName().(*parser.XpathQualifiedNameContext).AllXpathWord()
+	parts := make([]string, len(words))
+	for i, w := range words {
+		parts[i] = unquoteIdentifier(w.GetText())
+	}
+	if len(parts) == 1 {
+		ref.QualifiedName.Name = parts[0]
+	} else if len(parts) > 1 {
+		ref.QualifiedName = ast.QualifiedName{Module: parts[0], Name: strings.Join(parts[1:], ".")}
+	}
+	return ref
 }
 
 // buildXPathFunctionCall builds a FunctionCallExpr from xpathFunctionCall.

@@ -3,11 +3,13 @@
 package visitor
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/antlr4-go/antlr/v4"
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/deprecation"
 	"github.com/mendixlabs/mxcli/mdl/grammar/parser"
 )
 
@@ -27,6 +29,7 @@ func (b *Builder) ExitCreateEntityStatement(ctx *parser.CreateEntityStatementCon
 	if ctx.NON_PERSISTENT() != nil {
 		stmt.Kind = ast.EntityNonPersistent
 	}
+	stmt.KindStated = ctx.PERSISTENT() != nil || ctx.NON_PERSISTENT() != nil
 
 	// Navigate to parent CreateStatement to get annotations and doc comment
 	createStmt := findParentCreateStatement(ctx)
@@ -55,7 +58,7 @@ func (b *Builder) ExitCreateEntityStatement(ctx *parser.CreateEntityStatementCon
 		}
 
 	}
-	stmt.Documentation = findDocCommentText(ctx)
+	stmt.Documentation, stmt.DocumentationSet = findDocComment(ctx)
 
 	// Generalization clause (EXTENDS/GENERALIZATION before entity body)
 	if genClause := ctx.GeneralizationClause(); genClause != nil {
@@ -73,14 +76,11 @@ func (b *Builder) ExitCreateEntityStatement(ctx *parser.CreateEntityStatementCon
 			stmt.Attributes = buildAttributes(attrList, b)
 		}
 
-		// Options (comment, extends, indexes, system attributes, etc.)
+		// Options (extends, indexes, system attributes, etc.)
 		if opts := bodyCtx.EntityOptions(); opts != nil {
 			optsCtx := opts.(*parser.EntityOptionsContext)
 			for _, opt := range optsCtx.AllEntityOption() {
 				optCtx := opt.(*parser.EntityOptionContext)
-				if optCtx.COMMENT() != nil && optCtx.STRING_LITERAL() != nil {
-					stmt.Comment = unquoteString(optCtx.STRING_LITERAL().GetText())
-				}
 				// Handle INDEX option
 				if optCtx.INDEX() != nil && optCtx.IndexDefinition() != nil {
 					stmt.Indexes = append(stmt.Indexes, buildIndex(optCtx.IndexDefinition()))
@@ -90,6 +90,9 @@ func (b *Builder) ExitCreateEntityStatement(ctx *parser.CreateEntityStatementCon
 					if eh := buildEventHandler(ehCtx); eh != nil {
 						stmt.EventHandlers = append(stmt.EventHandlers, *eh)
 					}
+				}
+				if el := optCtx.MicroflowExportLevelClause(); el != nil {
+					stmt.ExportLevel = exportLevelOf(el.(*parser.MicroflowExportLevelClauseContext))
 				}
 			}
 		}
@@ -151,11 +154,12 @@ func (b *Builder) buildViewEntity(ctx *parser.CreateEntityStatementContext) {
 	createStmt := findParentCreateStatement(ctx)
 	if createStmt != nil {
 		// Check for CREATE OR MODIFY / CREATE OR REPLACE
+		// `or replace` means `or modify` from mdl 1 on; under mdl 0 it keeps
+		// its delete-and-recreate meaning (viewEntityReplaceIsModify).
 		if createStmt.OR() != nil {
-			if createStmt.MODIFY() != nil {
+			if createStmt.MODIFY() != nil || b.replaceMeansModify(createStmt) {
 				stmt.CreateOrModify = true
-			}
-			if createStmt.REPLACE() != nil {
+			} else if createStmt.REPLACE() != nil {
 				stmt.CreateOrReplace = true
 			}
 		}
@@ -178,7 +182,7 @@ func (b *Builder) buildViewEntity(ctx *parser.CreateEntityStatementContext) {
 		}
 
 	}
-	stmt.Documentation = findDocCommentText(ctx)
+	stmt.Documentation, stmt.DocumentationSet = findDocComment(ctx)
 
 	// Entity body (view attributes)
 	if body := ctx.EntityBody(); body != nil {
@@ -186,11 +190,18 @@ func (b *Builder) buildViewEntity(ctx *parser.CreateEntityStatementContext) {
 		if attrList := bodyCtx.AttributeDefinitionList(); attrList != nil {
 			stmt.Attributes = buildViewAttributes(attrList)
 		}
+		if opts := bodyCtx.EntityOptions(); opts != nil {
+			for _, opt := range opts.(*parser.EntityOptionsContext).AllEntityOption() {
+				if el := opt.(*parser.EntityOptionContext).MicroflowExportLevelClause(); el != nil {
+					stmt.ExportLevel = exportLevelOf(el.(*parser.MicroflowExportLevelClauseContext))
+				}
+			}
+		}
 	}
 
 	// OQL Query - use token stream to preserve whitespace, and walk parse tree for structured data
 	if oqlCtx := ctx.OqlQuery(); oqlCtx != nil {
-		raw := extractOriginalText(oqlCtx)
+		raw := viewQueryText(ctx, oqlCtx)
 		stmt.Query = ast.OQLQuery{
 			RawQuery: raw,
 			Parsed:   buildOQLParsed(oqlCtx.(*parser.OqlQueryContext), raw),
@@ -198,6 +209,192 @@ func (b *Builder) buildViewEntity(ctx *parser.CreateEntityStatementContext) {
 	}
 
 	b.statements = append(b.statements, stmt)
+}
+
+// viewQueryText is the text a view entity stores for its query: from the query's
+// first token to its last, widened over any comment between `as (` and the
+// first token and between the last token and `)`, then dedented (#653).
+//
+// The lexer skips comments, so the rule's own token span cannot see them: a
+// comment heading or closing the query was dropped from every script, and from
+// every describe → exec into another project, where there is no stored text to
+// keep (ako/mxcli#1632). Only comments widen the span — the whitespace outside
+// it is the script's layout, which is what the dedent already accounts for.
+func viewQueryText(ctx *parser.CreateEntityStatementContext, oqlCtx parser.IOqlQueryContext) string {
+	q := oqlCtx.(antlr.ParserRuleContext)
+	start, stop := q.GetStart(), q.GetStop()
+	if start == nil || stop == nil || start.GetInputStream() == nil ||
+		start.GetStart() < 0 || stop.GetStop() < start.GetStart() {
+		firstIndent, firstIsIndent := leadingLineWhitespace(q)
+		return dedentOQL(extractOriginalText(q), firstIndent, firstIsIndent)
+	}
+	is := start.GetInputStream()
+	from, to := start.GetStart(), stop.GetStop()
+
+	// Before the query: back to the `(`, or to `as` when there is none.
+	open := ctx.LPAREN()
+	if open == nil {
+		open = ctx.AS()
+	}
+	if open != nil {
+		if p := open.GetSymbol().GetStop() + 1; p < from {
+			if c := firstOuterComment([]rune(is.GetText(p, from-1))); c >= 0 {
+				from = p + c
+			}
+		}
+	}
+	// After it: up to the `)`. Without one the statement's terminator follows
+	// directly, so there is no region a comment could sit in.
+	if closing := ctx.RPAREN(); closing != nil {
+		if p := closing.GetSymbol().GetStart() - 1; p > to {
+			if e := lastOuterCommentEnd([]rune(is.GetText(to+1, p))); e >= 0 {
+				to = to + 1 + e
+			}
+		}
+	}
+
+	firstIndent, firstIsIndent := lineIndentBefore(is, from)
+	return dedentOQL(is.GetText(from, to), firstIndent, firstIsIndent)
+}
+
+// firstOuterComment returns the index of the first comment in a region that
+// holds only whitespace and comments, or -1 when it holds no comment or holds
+// anything else (then the span is left as it was).
+func firstOuterComment(region []rune) int {
+	for i := 0; i < len(region); i++ {
+		switch {
+		case isOQLSpace(region[i]):
+			continue
+		case startsComment(region, i):
+			return i
+		default:
+			return -1
+		}
+	}
+	return -1
+}
+
+// lastOuterCommentEnd returns the index of the last character of the last
+// comment in a region that holds only whitespace and comments, or -1.
+func lastOuterCommentEnd(region []rune) int {
+	last := -1
+	for i := 0; i < len(region); {
+		switch {
+		case isOQLSpace(region[i]):
+			i++
+		case i+1 < len(region) && region[i] == '-' && region[i+1] == '-':
+			j := i
+			for j < len(region) && region[j] != '\n' && region[j] != '\r' {
+				if !isOQLSpace(region[j]) {
+					last = j
+				}
+				j++
+			}
+			i = j
+		case i+1 < len(region) && region[i] == '/' && region[i+1] == '*':
+			end := -1
+			for j := i + 2; j+1 < len(region); j++ {
+				if region[j] == '*' && region[j+1] == '/' {
+					end = j + 1
+					break
+				}
+			}
+			if end < 0 {
+				return -1
+			}
+			last, i = end, end+1
+		default:
+			return -1
+		}
+	}
+	return last
+}
+
+func startsComment(r []rune, i int) bool {
+	return i+1 < len(r) && ((r[i] == '-' && r[i+1] == '-') || (r[i] == '/' && r[i+1] == '*'))
+}
+
+func isOQLSpace(r rune) bool {
+	return r == ' ' || r == '\t' || r == '\r' || r == '\n' || r == '\v' || r == '\f'
+}
+
+// lineIndentBefore returns the text between the start of pos's line and pos,
+// and whether it is all whitespace — leadingLineWhitespace for a position that
+// is not a token's.
+func lineIndentBefore(is antlr.CharStream, pos int) (string, bool) {
+	lineStart := pos
+	for lineStart > 0 && is.GetText(lineStart-1, lineStart-1) != "\n" {
+		lineStart--
+	}
+	if lineStart == pos {
+		return "", true
+	}
+	prefix := is.GetText(lineStart, pos-1)
+	return prefix, strings.TrimLeft(prefix, " \t") == ""
+}
+
+// leadingLineWhitespace returns the text between the start of the line holding
+// ctx's first token and that token, and whether it is all whitespace. It is the
+// indentation of the query's first line, which extractOriginalText drops.
+func leadingLineWhitespace(ctx antlr.ParserRuleContext) (string, bool) {
+	start := ctx.GetStart()
+	if start == nil || start.GetInputStream() == nil || start.GetStart() < 0 {
+		return "", false
+	}
+	col := start.GetColumn()
+	if col <= 0 {
+		return "", true
+	}
+	prefix := start.GetInputStream().GetText(start.GetStart()-col, start.GetStart()-1)
+	return prefix, strings.TrimLeft(prefix, " \t") == ""
+}
+
+// dedentOQL removes the indentation a view entity's query carries only because
+// of where it sits in the script, so what is stored is the query itself.
+//
+// DESCRIBE indents every stored line by two spaces inside `as (…)`. The source
+// text starts at the first token, so line 1 arrives without its indentation and
+// lines 2…n with all of it; storing that verbatim added two spaces to lines 2…n
+// on every describe → exec cycle (ako/mxcli#653). The common leading-whitespace
+// prefix of the non-blank lines — line 1 counted at its position in the script
+// when only whitespace precedes it — is stripped from lines 2…n. Nothing else
+// is touched: relative indentation, comments and line breaks are the author's.
+func dedentOQL(raw string, firstIndent string, firstIsIndent bool) string {
+	lines := strings.Split(raw, "\n")
+	if len(lines) < 2 {
+		return raw
+	}
+	common, have := "", false
+	if firstIsIndent {
+		common, have = firstIndent, true
+	}
+	for _, line := range lines[1:] {
+		trimmed := strings.TrimLeft(line, " \t")
+		if trimmed == "" || trimmed == "\r" {
+			continue
+		}
+		indent := line[:len(line)-len(trimmed)]
+		if !have {
+			common, have = indent, true
+			continue
+		}
+		n := 0
+		for n < len(common) && n < len(indent) && common[n] == indent[n] {
+			n++
+		}
+		common = common[:n]
+	}
+	if common == "" {
+		return raw
+	}
+	for i := 1; i < len(lines); i++ {
+		if strings.HasPrefix(lines[i], common) {
+			lines[i] = lines[i][len(common):]
+		} else if strings.HasPrefix(common, lines[i]) {
+			lines[i] = "" // a blank line shorter than the indentation
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // buildOQLParsed walks the ANTLR OQL parse tree and returns a structured OQLParsed.
@@ -342,11 +539,24 @@ func buildOQLFromTable(ctx *parser.TableReferenceContext) ast.OQLTableRef {
 		}
 	}
 
-	if id := ctx.IDENTIFIER(); id != nil {
-		ref.Alias = id.GetText()
-	}
+	ref.Alias = oqlSourceAliasText(ctx.OqlSourceAlias())
 
 	return ref
+}
+
+// oqlSourceAliasText returns the alias an oqlSourceAlias names, without the AS.
+func oqlSourceAliasText(ctx parser.IOqlSourceAliasContext) string {
+	if ctx == nil {
+		return ""
+	}
+	a := ctx.(*parser.OqlSourceAliasContext)
+	if id := a.IDENTIFIER(); id != nil {
+		return id.GetText()
+	}
+	if kw := a.Keyword(); kw != nil {
+		return kw.GetText()
+	}
+	return ""
 }
 
 // buildOQLJoinTable converts a JoinClauseContext into an OQLTableRef.
@@ -370,9 +580,7 @@ func buildOQLJoinTable(ctx *parser.JoinClauseContext) ast.OQLTableRef {
 				ref.Entity = sub.Tables[0].Entity
 			}
 		}
-		if id := tr.IDENTIFIER(); id != nil {
-			ref.Alias = id.GetText()
-		}
+		ref.Alias = oqlSourceAliasText(tr.OqlSourceAlias())
 	} else if assocPath := ctx.AssociationPath(); assocPath != nil {
 		// Association path JOIN
 		ap := assocPath.(*parser.AssociationPathContext)
@@ -385,10 +593,8 @@ func buildOQLJoinTable(ctx *parser.JoinClauseContext) ast.OQLTableRef {
 			ref.Entity = getQualifiedNameText(lastQN)
 		}
 
-		// Alias is the IDENTIFIER on the JoinClause (not on AssociationPath)
-		if id := ctx.IDENTIFIER(); id != nil {
-			ref.Alias = id.GetText()
-		}
+		// Alias is on the JoinClause (not on AssociationPath)
+		ref.Alias = oqlSourceAliasText(ctx.OqlSourceAlias())
 	}
 
 	// ON condition
@@ -443,6 +649,13 @@ func buildViewAttributes(attrList parser.IAttributeDefinitionListContext) []ast.
 		if dt := defCtx.DataType(); dt != nil {
 			attr.Type = buildDataType(dt)
 		}
+		for _, c := range defCtx.AllAttributeConstraint() {
+			cc := c.(*parser.AttributeConstraintContext)
+			applyLocalizeConstraint(&attr.Type, cc)
+			if el := cc.MicroflowExportLevelClause(); el != nil {
+				attr.ExportLevel = exportLevelOf(el.(*parser.MicroflowExportLevelClauseContext))
+			}
+		}
 		attrs = append(attrs, attr)
 	}
 	return attrs
@@ -451,19 +664,33 @@ func buildViewAttributes(attrList parser.IAttributeDefinitionListContext) []ast.
 // findDocCommentText extracts the documentation comment text for a create statement.
 // The docComment can appear either on the createStatement itself or on the parent statement rule.
 func findDocCommentText(ctx antlr.RuleContext) string {
+	text, _ := findDocComment(ctx)
+	return text
+}
+
+// findDocComment returns the statement's doc comment and whether one was
+// written at all. The two are different facts and the caller needs both:
+// an ABSENT comment on a rewrite must preserve whatever is stored, while an
+// explicitly EMPTY one (`/** */`) must clear it.
+//
+// Without the second return value they are indistinguishable — both yield "" —
+// and a rewrite that says nothing about documentation silently deletes it
+// (mendixlabs/mxcli#1018). There is no `ALTER MICROFLOW … SET DOCUMENTATION` to
+// fall back on, so the empty comment is the only clearing spelling available.
+func findDocComment(ctx antlr.RuleContext) (string, bool) {
 	createStmt := findParentCreateStatement(ctx)
 	if createStmt != nil {
 		if docCtx := createStmt.DocComment(); docCtx != nil {
-			return extractDocComment(docCtx.GetText())
+			return extractDocComment(docCtx.GetText()), true
 		}
 	}
 	stmtCtx := findParentStatement(ctx)
 	if stmtCtx != nil {
 		if docCtx := stmtCtx.DocComment(); docCtx != nil {
-			return extractDocComment(docCtx.GetText())
+			return extractDocComment(docCtx.GetText()), true
 		}
 	}
-	return ""
+	return "", false
 }
 
 // findParentCreateStatement navigates up the parse tree to find the CreateStatement parent.
@@ -516,6 +743,9 @@ func parseAnnotationParamInt(ctx parser.IAnnotationParamContext) int {
 
 // ExitAlterEntityAction handles ALTER ENTITY ... ADD/DROP/RENAME/MODIFY ATTRIBUTE ...
 func (b *Builder) ExitAlterEntityAction(ctx *parser.AlterEntityActionContext) {
+	// R3 respellings (visitor_r3_property_lists.go).
+	b.recordAllowCreateChangeLocally(ctx)
+	b.recordModifyAttributeColon(ctx)
 	// Walk up to the parent AlterStatement to get the entity's qualified name
 	parent := ctx.GetParent()
 	for parent != nil {
@@ -531,14 +761,25 @@ func (b *Builder) ExitAlterEntityAction(ctx *parser.AlterEntityActionContext) {
 			attrNames := ctx.AllAttributeName()
 
 			// ADD ATTRIBUTE / ADD COLUMN
-			if ctx.ADD() != nil && (ctx.ATTRIBUTE() != nil || ctx.COLUMN() != nil) {
+			if ctx.ADD() != nil && ctx.AttributeKw() != nil {
 				if attrDef := ctx.AttributeDefinition(); attrDef != nil {
 					attr := buildSingleAttribute(attrDef.(*parser.AttributeDefinitionContext))
+					// A `/** … */` doc comment written BETWEEN clauses (before the
+					// ADD ATTRIBUTE keyword) documents the added attribute — same as a
+					// doc comment on a CREATE ENTITY attribute. `--` line comments are
+					// NOT an equivalent: they are discarded, whereas a doc comment is
+					// persisted as the attribute's Mendix documentation. (traceops #27)
+					if attr != nil && attr.Documentation == "" {
+						if docCtx := ctx.DocComment(); docCtx != nil {
+							attr.Documentation = extractDocComment(docCtx.GetText())
+						}
+					}
 					if attr != nil {
 						b.statements = append(b.statements, &ast.AlterEntityStmt{
-							Name:      name,
-							Operation: ast.AlterEntityAddAttribute,
-							Attribute: attr,
+							Name:        name,
+							Operation:   ast.AlterEntityAddAttribute,
+							Attribute:   attr,
+							IfNotExists: ctx.IfNotExists() != nil,
 						})
 					}
 				}
@@ -546,7 +787,7 @@ func (b *Builder) ExitAlterEntityAction(ctx *parser.AlterEntityActionContext) {
 			}
 
 			// RENAME ATTRIBUTE / RENAME COLUMN
-			if ctx.RENAME() != nil && (ctx.ATTRIBUTE() != nil || ctx.COLUMN() != nil) && len(attrNames) >= 2 {
+			if ctx.RENAME() != nil && ctx.AttributeKw() != nil && len(attrNames) >= 2 {
 				b.statements = append(b.statements, &ast.AlterEntityStmt{
 					Name:          name,
 					Operation:     ast.AlterEntityRenameAttribute,
@@ -557,7 +798,7 @@ func (b *Builder) ExitAlterEntityAction(ctx *parser.AlterEntityActionContext) {
 			}
 
 			// MODIFY ATTRIBUTE / MODIFY COLUMN
-			if ctx.MODIFY() != nil && (ctx.ATTRIBUTE() != nil || ctx.COLUMN() != nil) && len(attrNames) >= 1 {
+			if ctx.MODIFY() != nil && ctx.AttributeKw() != nil && len(attrNames) >= 1 {
 				dt := buildDataType(ctx.DataType())
 				stmt := &ast.AlterEntityStmt{
 					Name:          name,
@@ -565,27 +806,66 @@ func (b *Builder) ExitAlterEntityAction(ctx *parser.AlterEntityActionContext) {
 					AttributeName: attributeNameText(attrNames[0]),
 					DataType:      dt,
 				}
-				// Capture CALCULATED constraint if present
+				// Capture constraints. MODIFY applies the constraints you
+				// specify and preserves the ones you don't (Bug 12a). NULLABLE
+				// explicitly clears NOT NULL; NOT NULL / REQUIRED set it.
+				true_, false_ := true, false
 				for _, constraintCtx := range ctx.AllAttributeConstraint() {
 					c := constraintCtx.(*parser.AttributeConstraintContext)
-					if c.CALCULATED() != nil {
+					switch {
+					case c.NULLABLE() != nil:
+						stmt.ModifyNotNull = &false_
+					case c.NOT_NULL() != nil || (c.NOT() != nil && c.NULL() != nil) || c.REQUIRED() != nil:
+						stmt.ModifyNotNull = &true_
+						if c.ConstraintErrorKeyword() != nil && c.STRING_LITERAL() != nil {
+							stmt.ModifyNotNullError = unquoteStringLit(c.STRING_LITERAL())
+						}
+					case c.UNIQUE() != nil:
+						stmt.ModifyUnique = &true_
+						if c.ConstraintErrorKeyword() != nil && c.STRING_LITERAL() != nil {
+							stmt.ModifyUniqueError = unquoteStringLit(c.STRING_LITERAL())
+						}
+					case c.DEFAULT() != nil:
+						stmt.ModifyHasDefault = true
+						if lit := c.Literal(); lit != nil {
+							stmt.ModifyDefaultValue = extractLiteralValue(lit)
+						} else if expr := c.Expression(); expr != nil {
+							stmt.ModifyDefaultValue = unquoteQualifiedName(expr.GetText())
+						}
+					case c.CALCULATED() != nil:
 						stmt.Calculated = true
 						if qn := c.QualifiedName(); qn != nil {
 							calcName := buildQualifiedName(qn)
 							stmt.CalculatedMicroflow = &calcName
 						}
+					case c.LOCALIZED() != nil:
+						applyLocalizeConstraint(&stmt.DataType, c)
+					case c.MicroflowExportLevelClause() != nil:
+						stmt.ModifyExportLevel = exportLevelOf(c.MicroflowExportLevelClause().(*parser.MicroflowExportLevelClauseContext))
 					}
 				}
 				b.statements = append(b.statements, stmt)
 				return
 			}
 
+			// DROP DEFAULT ON ATTRIBUTE — checked before DROP ATTRIBUTE, which
+			// also matches DROP + ATTRIBUTE and would otherwise swallow it.
+			if ctx.DROP() != nil && ctx.DEFAULT() != nil && ctx.ATTRIBUTE() != nil && len(attrNames) >= 1 {
+				b.statements = append(b.statements, &ast.AlterEntityStmt{
+					Name:          name,
+					Operation:     ast.AlterEntityDropDefault,
+					AttributeName: attributeNameText(attrNames[0]),
+				})
+				return
+			}
+
 			// DROP ATTRIBUTE / DROP COLUMN
-			if ctx.DROP() != nil && (ctx.ATTRIBUTE() != nil || ctx.COLUMN() != nil) && len(attrNames) >= 1 {
+			if ctx.DROP() != nil && ctx.AttributeKw() != nil && len(attrNames) >= 1 {
 				b.statements = append(b.statements, &ast.AlterEntityStmt{
 					Name:          name,
 					Operation:     ast.AlterEntityDropAttribute,
 					AttributeName: attributeNameText(attrNames[0]),
+					IfExists:      ctx.IfExists() != nil,
 				})
 				return
 			}
@@ -595,17 +875,29 @@ func (b *Builder) ExitAlterEntityAction(ctx *parser.AlterEntityActionContext) {
 				b.statements = append(b.statements, &ast.AlterEntityStmt{
 					Name:          name,
 					Operation:     ast.AlterEntitySetDocumentation,
-					Documentation: unquoteString(ctx.STRING_LITERAL().GetText()),
+					Documentation: unquoteStringLit(ctx.STRING_LITERAL()),
 				})
 				return
 			}
 
-			// SET COMMENT
+			// SET COMMENT: the deprecated spelling of SET DOCUMENTATION (R9,
+			// MDL-DEPR135), and the same statement.
 			if ctx.SET() != nil && ctx.COMMENT() != nil && ctx.STRING_LITERAL() != nil {
+				b.recordDeprecation(deprecation.SetComment, ctx.COMMENT().GetSymbol(), "")
 				b.statements = append(b.statements, &ast.AlterEntityStmt{
-					Name:      name,
-					Operation: ast.AlterEntitySetComment,
-					Comment:   unquoteString(ctx.STRING_LITERAL().GetText()),
+					Name:          name,
+					Operation:     ast.AlterEntitySetDocumentation,
+					Documentation: unquoteStringLit(ctx.STRING_LITERAL()),
+				})
+				return
+			}
+
+			// SET EXPORT LEVEL API | HIDDEN
+			if el := ctx.MicroflowExportLevelClause(); ctx.SET() != nil && el != nil {
+				b.statements = append(b.statements, &ast.AlterEntityStmt{
+					Name:        name,
+					Operation:   ast.AlterEntitySetExportLevel,
+					ExportLevel: *exportLevelOf(el.(*parser.MicroflowExportLevelClauseContext)),
 				})
 				return
 			}
@@ -630,21 +922,34 @@ func (b *Builder) ExitAlterEntityAction(ctx *parser.AlterEntityActionContext) {
 				if idxDef := ctx.IndexDefinition(); idxDef != nil {
 					idx := buildIndex(idxDef)
 					b.statements = append(b.statements, &ast.AlterEntityStmt{
-						Name:      name,
-						Operation: ast.AlterEntityAddIndex,
-						Index:     &idx,
+						Name:        name,
+						Operation:   ast.AlterEntityAddIndex,
+						Index:       &idx,
+						IfNotExists: ctx.IfNotExists() != nil,
 					})
 				}
 				return
 			}
 
-			// DROP INDEX
-			if ctx.DROP() != nil && ctx.INDEX() != nil && ctx.IDENTIFIER() != nil {
-				b.statements = append(b.statements, &ast.AlterEntityStmt{
+			// DROP INDEX. The column-list form is preferred and is the only one
+			// `describe entity` can round-trip — a Mendix index has no stored
+			// name, so the ordinal form ("idx1") names a position that shifts
+			// when an earlier index is dropped.
+			if ctx.DROP() != nil && ctx.INDEX() != nil {
+				stmt := &ast.AlterEntityStmt{
 					Name:      name,
 					Operation: ast.AlterEntityDropIndex,
-					IndexName: ctx.IDENTIFIER().GetText(),
-				})
+					IfExists:  ctx.IfExists() != nil,
+				}
+				if idxDef := ctx.IndexDefinition(); idxDef != nil {
+					idx := buildIndex(idxDef)
+					stmt.Index = &idx
+				} else if ctx.IDENTIFIER() != nil {
+					stmt.IndexName = ctx.IDENTIFIER().GetText()
+				} else {
+					return
+				}
+				b.statements = append(b.statements, stmt)
 				return
 			}
 
@@ -656,13 +961,14 @@ func (b *Builder) ExitAlterEntityAction(ctx *parser.AlterEntityActionContext) {
 							Name:         name,
 							Operation:    ast.AlterEntityAddEventHandler,
 							EventHandler: eh,
+							IfNotExists:  ctx.IfNotExists() != nil,
 						})
 					}
 				}
 				return
 			}
 
-			// DROP EVENT HANDLER ON Moment Type
+			// DROP EVENT HANDLER ON Moment Type [CALL Mod.Microflow]
 			if ctx.DROP() != nil && ctx.EVENT() != nil && ctx.HANDLER() != nil {
 				eh := &ast.EventHandlerDef{}
 				if m := ctx.EventMoment(); m != nil {
@@ -681,10 +987,14 @@ func (b *Builder) ExitAlterEntityAction(ctx *parser.AlterEntityActionContext) {
 						eh.Event = "RollBack"
 					}
 				}
+				if qn := ctx.QualifiedName(); qn != nil {
+					eh.Microflow = buildQualifiedName(qn)
+				}
 				b.statements = append(b.statements, &ast.AlterEntityStmt{
 					Name:         name,
 					Operation:    ast.AlterEntityDropEventHandler,
 					EventHandler: eh,
+					IfExists:     ctx.IfExists() != nil,
 				})
 				return
 			}
@@ -711,13 +1021,48 @@ func (b *Builder) ExitAlterEntityAction(ctx *parser.AlterEntityActionContext) {
 
 // ExitDropStatement handles DROP ENTITY/ASSOCIATION/ENUMERATION/MODULE/MICROFLOW/PAGE/SNIPPET
 func (b *Builder) ExitDropStatement(ctx *parser.DropStatementContext) {
+	// IF EXISTS is one grammar rule shared by every document-level alternative,
+	// so it is applied here once, to whichever statement the chain below builds,
+	// rather than in each branch where the next doctype would forget it (#531).
+	built := len(b.statements)
+	defer func() {
+		if ctx.IfExists() == nil || len(b.statements) == built {
+			return
+		}
+		if g, ok := b.statements[len(b.statements)-1].(ast.IfExistsDrop); ok {
+			g.SetDropIfExists(true)
+		}
+	}()
+
 	// DROP CONFIGURATION uses STRING_LITERAL, not qualifiedName — handle first
 	if ctx.CONFIGURATION() != nil {
 		if sl := ctx.STRING_LITERAL(); sl != nil {
 			b.statements = append(b.statements, &ast.DropConfigurationStmt{
-				Name: unquoteString(sl.GetText()),
+				Name: unquoteStringLit(sl),
 			})
 		}
+		return
+	}
+
+	// DROP ANNOTATION addresses a note by caption or position, not by a
+	// qualified name — an annotation has no name — so it must be handled before
+	// the guard below, which returns silently when there is no qualifiedName.
+	// Placed after it, the statement parsed, executed nothing, and exited 0.
+	if ctx.ANNOTATION() != nil {
+		stmt := &ast.DropAnnotationStmt{}
+		if id := ctx.IdentifierOrKeyword(); id != nil {
+			stmt.Module = unquoteIdentifier(id.GetText())
+		}
+		if nums := ctx.AllNUMBER_LITERAL(); ctx.AT_KW() != nil && len(nums) >= 2 {
+			x, errX := strconv.Atoi(nums[0].GetText())
+			y, errY := strconv.Atoi(nums[1].GetText())
+			if errX == nil && errY == nil {
+				stmt.Position = &ast.Position{X: x, Y: y}
+			}
+		} else if lit := ctx.STRING_LITERAL(); lit != nil {
+			stmt.Title = unquoteStringLit(lit)
+		}
+		b.statements = append(b.statements, stmt)
 		return
 	}
 
@@ -729,8 +1074,22 @@ func (b *Builder) ExitDropStatement(ctx *parser.DropStatementContext) {
 
 	if ctx.ENTITY() != nil {
 		b.statements = append(b.statements, &ast.DropEntityStmt{
+			Name:     buildQualifiedName(names[0]),
+			External: ctx.EXTERNAL() != nil,
+		})
+	} else if ctx.DATABASE() != nil && ctx.CONNECTION() != nil {
+		b.statements = append(b.statements, &ast.DropDatabaseConnectionStmt{
 			Name: buildQualifiedName(names[0]),
 		})
+	} else if ctx.VALIDATION() != nil {
+		stmt := &ast.DropValidationRuleStmt{Attribute: buildQualifiedName(names[0])}
+		switch {
+		case ctx.REGEX() != nil:
+			stmt.Kind = ast.ValidationRuleRegEx
+		case ctx.RANGE() != nil:
+			stmt.Kind = ast.ValidationRuleRange
+		}
+		b.statements = append(b.statements, stmt)
 	} else if ctx.ASSOCIATION() != nil {
 		b.statements = append(b.statements, &ast.DropAssociationStmt{
 			Name: buildQualifiedName(names[0]),
@@ -756,23 +1115,39 @@ func (b *Builder) ExitDropStatement(ctx *parser.DropStatementContext) {
 		b.statements = append(b.statements, &ast.DropNanoflowStmt{
 			Name: buildQualifiedName(names[0]),
 		})
+	} else if ctx.RULE() != nil {
+		b.statements = append(b.statements, &ast.DropRuleStmt{
+			Name: buildQualifiedName(names[0]),
+		})
 	} else if ctx.PAGE() != nil {
 		b.statements = append(b.statements, &ast.DropPageStmt{
+			Name: buildQualifiedName(names[0]),
+		})
+	} else if ctx.LAYOUT() != nil {
+		b.statements = append(b.statements, &ast.DropLayoutStmt{
 			Name: buildQualifiedName(names[0]),
 		})
 	} else if ctx.SNIPPET() != nil {
 		b.statements = append(b.statements, &ast.DropSnippetStmt{
 			Name: buildQualifiedName(names[0]),
 		})
+	} else if ctx.MENU_KW() != nil {
+		b.statements = append(b.statements, &ast.DropMenuStmt{
+			Name: buildQualifiedName(names[0]),
+		})
+	} else if ctx.JAVASCRIPT() != nil && ctx.ACTION() != nil {
+		b.statements = append(b.statements, &ast.DropJavaScriptActionStmt{
+			Name: buildQualifiedName(names[0]),
+		})
 	} else if ctx.JAVA() != nil && ctx.ACTION() != nil {
 		b.statements = append(b.statements, &ast.DropJavaActionStmt{
 			Name: buildQualifiedName(names[0]),
 		})
-	} else if ctx.ODATA() != nil && ctx.CLIENT() != nil {
+	} else if ctx.ConsumedODataServiceKw() != nil {
 		b.statements = append(b.statements, &ast.DropODataClientStmt{
 			Name: buildQualifiedName(names[0]),
 		})
-	} else if ctx.ODATA() != nil && ctx.SERVICE() != nil {
+	} else if ctx.PublishedODataServiceKw() != nil {
 		b.statements = append(b.statements, &ast.DropODataServiceStmt{
 			Name: buildQualifiedName(names[0]),
 		})
@@ -788,12 +1163,28 @@ func (b *Builder) ExitDropStatement(ctx *parser.DropStatementContext) {
 		b.statements = append(b.statements, &ast.DropImageCollectionStmt{
 			Name: buildQualifiedName(names[0]),
 		})
-	} else if ctx.MODEL() != nil {
+	} else if ctx.TaskQueueKw() != nil {
+		b.statements = append(b.statements, &ast.DropQueueStmt{
+			Name: buildQualifiedName(names[0]),
+		})
+	} else if ctx.SCHEDULED() != nil && ctx.EVENT() != nil {
+		b.statements = append(b.statements, &ast.DropScheduledEventStmt{
+			Name: buildQualifiedName(names[0]),
+		})
+	} else if ctx.REGULAR() != nil && ctx.EXPRESSION() != nil {
+		b.statements = append(b.statements, &ast.DropRegularExpressionStmt{
+			Name: buildQualifiedName(names[0]),
+		})
+	} else if ctx.AiModelKw() != nil {
 		b.statements = append(b.statements, &ast.DropModelStmt{
 			Name: buildQualifiedName(names[0]),
 		})
 	} else if ctx.CONSUMED() != nil && ctx.MCP() != nil && ctx.SERVICE() != nil {
 		b.statements = append(b.statements, &ast.DropConsumedMCPServiceStmt{
+			Name: buildQualifiedName(names[0]),
+		})
+	} else if ctx.PUBLISHED() != nil && ctx.MCP() != nil && ctx.SERVICE() != nil {
+		b.statements = append(b.statements, &ast.DropPublishedMCPServiceStmt{
 			Name: buildQualifiedName(names[0]),
 		})
 	} else if ctx.KNOWLEDGE() != nil && ctx.BASE() != nil {
@@ -808,12 +1199,20 @@ func (b *Builder) ExitDropStatement(ctx *parser.DropStatementContext) {
 		b.statements = append(b.statements, &ast.DropPublishedRestServiceStmt{
 			Name: buildQualifiedName(names[0]),
 		})
-	} else if ctx.REST() != nil && ctx.CLIENT() != nil {
+	} else if ctx.ConsumedRestServiceKw() != nil {
 		b.statements = append(b.statements, &ast.DropRestClientStmt{
 			Name: buildQualifiedName(names[0]),
 		})
 	} else if ctx.JSON() != nil && ctx.STRUCTURE() != nil {
 		b.statements = append(b.statements, &ast.DropJsonStructureStmt{
+			Name: buildQualifiedName(names[0]),
+		})
+	} else if ctx.MESSAGE() != nil && ctx.DEFINITION() != nil && ctx.COLLECTION() != nil {
+		b.statements = append(b.statements, &ast.DropMessageDefinitionCollectionStmt{
+			Name: buildQualifiedName(names[0]),
+		})
+	} else if ctx.MESSAGE() != nil && ctx.DEFINITION() != nil {
+		b.statements = append(b.statements, &ast.DropMessageDefinitionStmt{
 			Name: buildQualifiedName(names[0]),
 		})
 	} else if ctx.IMPORT() != nil && ctx.MAPPING() != nil {
@@ -829,7 +1228,7 @@ func (b *Builder) ExitDropStatement(ctx *parser.DropStatementContext) {
 			Name: buildQualifiedName(names[0]),
 		})
 	} else if ctx.FOLDER() != nil {
-		folderPath := unquoteString(ctx.STRING_LITERAL().GetText())
+		folderPath := unquoteStringLit(ctx.STRING_LITERAL())
 		// Module can be a qualifiedName or IDENTIFIER
 		var moduleName string
 		if len(names) > 0 {
@@ -894,12 +1293,15 @@ func (b *Builder) ExitMoveStatement(ctx *parser.MoveStatementContext) {
 		return
 	}
 
-	// Handle MOVE FOLDER separately — different AST type
-	// MOVE FOLDER is identified by having FOLDER as the first token after MOVE (no document type keyword)
-	if len(ctx.AllFOLDER()) > 0 && ctx.PAGE() == nil && ctx.MICROFLOW() == nil &&
-		ctx.SNIPPET() == nil && ctx.NANOFLOW() == nil && ctx.ENTITY() == nil &&
-		ctx.ENUMERATION() == nil && ctx.CONSTANT() == nil && ctx.DATABASE() == nil {
-		b.exitMoveFolderStatement(ctx, names)
+	// MOVE FOLDER is a different AST type, and is told apart by the ABSENCE of a
+	// doctype. That is one check because moveDocumentType is a grammar rule: the
+	// discriminator used to be a hand-written negation of every doctype keyword,
+	// so every doctype added to MOVE had to be added here too or a folder move
+	// silently started parsing as a document move (mxcli-formula1 #32).
+	if ctx.MoveDocumentType() == nil && ctx.ENTITY() == nil {
+		if len(ctx.AllFOLDER()) > 0 {
+			b.exitMoveFolderStatement(ctx, names)
+		}
 		return
 	}
 
@@ -907,28 +1309,23 @@ func (b *Builder) ExitMoveStatement(ctx *parser.MoveStatementContext) {
 		Name: buildQualifiedName(names[0]),
 	}
 
-	// Determine document type
-	if ctx.PAGE() != nil {
-		stmt.DocumentType = ast.DocumentTypePage
-	} else if ctx.MICROFLOW() != nil {
-		stmt.DocumentType = ast.DocumentTypeMicroflow
-	} else if ctx.SNIPPET() != nil {
-		stmt.DocumentType = ast.DocumentTypeSnippet
-	} else if ctx.NANOFLOW() != nil {
-		stmt.DocumentType = ast.DocumentTypeNanoflow
-	} else if ctx.ENTITY() != nil {
+	if ctx.ENTITY() != nil {
 		stmt.DocumentType = ast.DocumentTypeEntity
-	} else if ctx.ENUMERATION() != nil {
-		stmt.DocumentType = ast.DocumentTypeEnumeration
-	} else if ctx.CONSTANT() != nil {
-		stmt.DocumentType = ast.DocumentTypeConstant
-	} else if ctx.DATABASE() != nil {
-		stmt.DocumentType = ast.DocumentTypeDatabaseConnection
+	} else {
+		docType, ok := moveDocumentTypeFor(ctx.MoveDocumentType().GetText())
+		if !ok {
+			// A doctype in the grammar with no AST constant would otherwise move
+			// whatever the name resolved to under an empty type. Refuse loudly:
+			// the grammar and this table are meant to be added to together.
+			b.addError(fmt.Errorf("MOVE does not support document type %q", ctx.MoveDocumentType().GetText()))
+			return
+		}
+		stmt.DocumentType = docType
 	}
 
 	// Parse folder path if specified
 	if len(ctx.AllFOLDER()) > 0 && ctx.STRING_LITERAL() != nil {
-		stmt.Folder = unquoteString(ctx.STRING_LITERAL().GetText())
+		stmt.Folder = unquoteStringLit(ctx.STRING_LITERAL())
 	}
 
 	// Parse target module if specified (IN Module or just Module)
@@ -955,7 +1352,7 @@ func (b *Builder) exitMoveFolderStatement(ctx *parser.MoveStatementContext, name
 	// Parse target: either FOLDER 'path' [IN Module] or just Module
 	if ctx.STRING_LITERAL() != nil {
 		// MOVE FOLDER ... TO FOLDER 'path' [IN Module]
-		stmt.TargetFolder = unquoteString(ctx.STRING_LITERAL().GetText())
+		stmt.TargetFolder = unquoteStringLit(ctx.STRING_LITERAL())
 		if len(names) > 1 {
 			stmt.TargetModule = getQualifiedNameText(names[1])
 		} else if ctx.IDENTIFIER() != nil {
@@ -976,3 +1373,95 @@ func (b *Builder) exitMoveFolderStatement(ctx *parser.MoveStatementContext, name
 // ----------------------------------------------------------------------------
 
 // ExitCreateAssociationStatement is called when exiting the createAssociationStatement production.
+
+// moveDocumentTypeFor maps a moveDocumentType rule's text to its AST constant.
+//
+// The table lives in the ast package because the executor reads it too: it has
+// to decide whether the document it found is the kind the statement named, and
+// a second copy of the doctype list is exactly how the MOVE FOLDER
+// discriminator drifted out of step with the grammar before.
+func moveDocumentTypeFor(ruleText string) (ast.DocumentType, bool) {
+	docType, ok := ast.MoveDocumentTypeByKeyword[strings.ToUpper(ruleText)]
+	return docType, ok
+}
+
+// ExitCreateIndexStatement handles the standalone SQL spelling,
+// `create index IdxRowCol on Mod.Cell (Row, Col DESC)`.
+//
+// The rule has been in the grammar since indexes were added, with no listener
+// behind it — so the statement parsed, produced no AST node, and `exec` reported
+// nothing and did nothing, even when the entity did not exist. That is worse
+// than a parse error: the author reads "Syntax OK" and believes the index was
+// created. Found while fixing sudoku finding #4, which is the same question
+// asked from the other side ("where does an index go?").
+//
+// It carries exactly the meaning of `alter entity Mod.Cell add index (…)`, so it
+// lowers to that statement rather than growing a second code path. The index
+// name is accepted but not stored, as in every other spelling: a Mendix index
+// is anonymous, identified by its column list. It is carried on the AST only
+// so `check` can say so (MDL-IDX01).
+func (b *Builder) ExitCreateIndexStatement(ctx *parser.CreateIndexStatementContext) {
+	qn := ctx.QualifiedName()
+	if qn == nil {
+		return
+	}
+	idx := &ast.Index{Columns: buildIndexColumns(ctx.IndexAttributeList())}
+	if n := ctx.IDENTIFIER(); n != nil {
+		idx.Name = n.GetText()
+	}
+	b.statements = append(b.statements, &ast.AlterEntityStmt{
+		Name:      buildQualifiedName(qn),
+		Operation: ast.AlterEntityAddIndex,
+		Index:     idx,
+	})
+}
+
+// ExitAlterEntitiesStatement handles the bulk form,
+// ALTER ENTITIES [IN <module>] ADD ATTRIBUTE ... [WHERE PERSISTENT|NON-PERSISTENT].
+//
+// Each action is built into an ordinary AlterEntityStmt with an EMPTY Name: the
+// executor resolves the target set and fills the name in per entity, so a bulk
+// add and a single add run the identical code path and cannot diverge.
+func (b *Builder) ExitAlterEntitiesStatement(ctx *parser.AlterEntitiesStatementContext) {
+	stmt := &ast.AlterEntitiesStmt{}
+
+	if mod := ctx.IdentifierOrKeyword(); mod != nil {
+		stmt.Module = unquoteIdentifier(mod.GetText())
+	}
+
+	if f := ctx.EntityPersistenceFilter(); f != nil {
+		fc := f.(*parser.EntityPersistenceFilterContext)
+		switch {
+		case fc.NON_PERSISTENT() != nil:
+			stmt.Filter = ast.EntityFilterNonPersistent
+		case fc.PERSISTENT() != nil:
+			stmt.Filter = ast.EntityFilterPersistent
+		}
+	}
+
+	for _, act := range ctx.AllAlterEntitiesAction() {
+		ac := act.(*parser.AlterEntitiesActionContext)
+		attrDef := ac.AttributeDefinition()
+		if attrDef == nil {
+			continue
+		}
+		attr := buildSingleAttribute(attrDef.(*parser.AttributeDefinitionContext))
+		if attr == nil {
+			continue
+		}
+		if attr.Documentation == "" {
+			if docCtx := ac.DocComment(); docCtx != nil {
+				attr.Documentation = extractDocComment(docCtx.GetText())
+			}
+		}
+		stmt.Actions = append(stmt.Actions, &ast.AlterEntityStmt{
+			Operation:   ast.AlterEntityAddAttribute,
+			Attribute:   attr,
+			IfNotExists: ac.IfNotExists() != nil,
+		})
+	}
+
+	if len(stmt.Actions) > 0 {
+		b.statements = append(b.statements, stmt)
+	}
+}

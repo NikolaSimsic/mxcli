@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mendixlabs/mxcli/cmd/mxcli/docker"
 	"github.com/mendixlabs/mxcli/cmd/mxcli/playwright"
 	"github.com/spf13/cobra"
 )
@@ -49,6 +50,10 @@ Examples:
 
   # Custom app URL
   mxcli playwright verify tests/ --base-url http://localhost:9090
+
+  # Leave the browser open so the next run reuses a warm, logged-in session
+  # (the generate -> verify -> fix loop)
+  mxcli playwright verify tests/ -p app.mpr --keep-open
 `,
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -56,8 +61,8 @@ Examples:
 		junitOutput, _ := cmd.Flags().GetString("junit")
 		verbose, _ := cmd.Flags().GetBool("verbose")
 		color, _ := cmd.Flags().GetBool("color")
-		baseURL, _ := cmd.Flags().GetString("base-url")
 		skipHealth, _ := cmd.Flags().GetBool("skip-health-check")
+		keepOpen, _ := cmd.Flags().GetBool("keep-open")
 		timeoutStr, _ := cmd.Flags().GetString("timeout")
 		projectPath, _ := cmd.Flags().GetString("project")
 
@@ -67,12 +72,7 @@ Examples:
 			os.Exit(1)
 		}
 
-		// Auto-detect port from .docker/.env when --base-url is not explicitly set
-		if !cmd.Flags().Changed("base-url") && projectPath != "" {
-			if port := readAppPort(projectPath); port != "" {
-				baseURL = fmt.Sprintf("http://localhost:%s", port)
-			}
-		}
+		baseURL := resolveBaseURL(cmd, projectPath)
 
 		if list {
 			if err := playwright.ListScripts(args, os.Stdout); err != nil {
@@ -91,6 +91,7 @@ Examples:
 			Color:           color,
 			Verbose:         verbose,
 			SkipHealthCheck: skipHealth,
+			KeepOpen:        keepOpen,
 			Stdout:          os.Stdout,
 			Stderr:          os.Stderr,
 		}
@@ -107,6 +108,186 @@ Examples:
 	},
 }
 
+var playwrightOpenCmd = &cobra.Command{
+	Use:   "open [url]",
+	Short: "Open (or attach to) the browser session for interactive use",
+	Long: `Launch a playwright-cli browser session, or attach to a live one on the same
+origin, so you can drive the app across separate commands (and reuse it with
+'mxcli playwright verify --keep-open').
+
+The URL is resolved from the positional argument, else --base-url, else APP_PORT
+in .docker/.env, else http://localhost:8080.
+
+Examples:
+  mxcli playwright open -p app.mpr
+  mxcli playwright open http://localhost:9090`,
+	Args: cobra.MaximumNArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		projectPath, _ := cmd.Flags().GetString("project")
+		baseURL := resolveBaseURL(cmd, projectPath)
+		if len(args) == 1 {
+			baseURL = args[0]
+		}
+		if err := playwright.OpenSession(playwright.SessionOptions{
+			BaseURL:     baseURL,
+			ProjectPath: projectPath,
+			Stdout:      os.Stdout,
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	},
+}
+
+var playwrightStatusCmd = &cobra.Command{
+	Use:   "status",
+	Short: "Report whether a browser session is live and what page it is on",
+	Run: func(cmd *cobra.Command, args []string) {
+		if err := playwright.SessionStatus(os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	},
+}
+
+var playwrightCloseCmd = &cobra.Command{
+	Use:   "close",
+	Short: "Close the current browser session",
+	Run: func(cmd *cobra.Command, args []string) {
+		all, _ := cmd.Flags().GetBool("all")
+		if err := playwright.CloseSession(all, os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	},
+}
+
+var playwrightCheckCmd = &cobra.Command{
+	Use:   "check [path-or-url...]",
+	Short: "Text verdict for pages of a running app (logs in when needed; no screenshot)",
+	Long: `Load each page of an already running Mendix app in one headless browser and
+print a one-line text verdict per page — the same verdict as 'mxcli run --page-check':
+title, first heading, rows rendered, visible text, error banners, console errors,
+failed requests. Use it instead of hand-written playwright-cli open/fill/click/
+goto/sleep/eval/screenshot sequences, and instead of reading a screenshot.
+
+Pages are paths relative to the app root (/p/customers) or full URLs; none means
+the root. The app URL is --base-url, else the port of a live 'mxcli run --local'
+for -p, else APP_PORT in .docker/.env, else http://localhost:8080.
+
+Login: --user/--password, or --role R to sign in as the project's demo user with
+that user role (needs -p). With only -p, a secured app is signed into as one of
+the project's demo users (an administrator first). The sign-in happens on the
+host of the pages checked — a session signed in on localhost is not sent to
+127.0.0.1 or to another name for the same app — and is saved per host and user
+under <project>/.mxcli/playwright-check/, where later checks reuse it: one
+session however many checks run. It is renewed automatically when the runtime
+has forgotten it (after a restart). --fresh-login signs the saved session out
+before signing in again; --sign-out ends the run signed out, keeping nothing.
+A session that got no page past the sign-in form is signed out, not kept. A page
+the signed-in user's roles may not open fails as ACCESS DENIED (the client lands
+on /login.html?messageCode=403); its session is valid, so it is kept. When
+a sign-in is refused, the runtime log (<project>/.mxcli/runtime.log) is read for
+the cause: the unlicensed local runtime caps concurrent sessions, and its sign-in
+page reports that as a wrong password.
+
+A page is measured once it has settled: no request to the app open for half a
+second, no progress indicator, and its text no longer changing. Waiting for the
+requests matters because a list view shows nothing while its data source runs —
+no spinner, no placeholder — so a page caught then looks finished and empty. A
+page that has not settled within --wait is reported STILL LOADING, naming the
+requests it was waiting for, and fails. A page with a list view or grid always
+reports its rows, rows=0 included.
+
+When the browser ends somewhere other than the URL it was sent to, the verdict
+says where (url=...), and the title and heading describe that page. A /p/ URL
+that ends elsewhere fails: the client sends a /p/ URL it has no page for to the
+home page, with HTTP 200, so without this an unknown page passed as the home page.
+
+Exit status: 0 every page passed; 1 a page failed (still loading when measured,
+HTTP error, access denied to the signed-in user, sign-in form instead of the
+page, a /p/ URL that ended elsewhere, error banner or dialog, console error,
+failed same-origin request, or a failed assertion); 2 the check could not run.
+
+Examples:
+  mxcli playwright check /p/customers /p/orders -p app.mpr
+  mxcli playwright check /p/customers -p app.mpr --role User
+  mxcli playwright check http://localhost:8080/p/items --user demo_user --password '...'
+  mxcli playwright check /p/customers -p app.mpr --assert-text 'Customer overview' \
+      --assert-count '.mx-name-dgCustomers [role=row]>=2'
+  # take a picture only when the question is visual — the path is printed, read it once
+  mxcli playwright check /p/customers -p app.mpr --screenshot /tmp/customers.png`,
+	Run: func(cmd *cobra.Command, args []string) {
+		projectPath, _ := cmd.Flags().GetString("project")
+		user, _ := cmd.Flags().GetString("user")
+		password, _ := cmd.Flags().GetString("password")
+		role, _ := cmd.Flags().GetString("role")
+		texts, _ := cmd.Flags().GetStringArray("assert-text")
+		counts, _ := cmd.Flags().GetStringArray("assert-count")
+		shot, _ := cmd.Flags().GetString("screenshot")
+		wait, _ := cmd.Flags().GetDuration("wait")
+		fresh, _ := cmd.Flags().GetBool("fresh-login")
+		signOut, _ := cmd.Flags().GetBool("sign-out")
+		allowConsole, _ := cmd.Flags().GetBool("allow-console-errors")
+
+		if user != "" && role != "" {
+			fmt.Fprintln(os.Stderr, "Error: --user and --role are alternatives; pass one")
+			os.Exit(2)
+		}
+		spec := docker.CheckSpec{Texts: texts, AllowConsoleErrors: allowConsole}
+		for _, c := range counts {
+			ca, err := docker.ParseCountAssertion(c)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(2)
+			}
+			spec.Counts = append(spec.Counts, ca)
+		}
+
+		res, err := docker.RunPageCheck(docker.PageCheckOptions{
+			BaseURL:     checkBaseURL(cmd, projectPath),
+			Targets:     args,
+			ProjectPath: projectPath,
+			User:        user,
+			Password:    password,
+			Role:        role,
+			FreshLogin:  fresh,
+			SignOut:     signOut,
+			Spec:        spec,
+			Screenshot:  shot,
+			WaitMs:      int(wait.Milliseconds()),
+			Stdout:      os.Stdout,
+			Stderr:      os.Stderr,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(2)
+		}
+		os.Exit(checkExitCode(res))
+	},
+}
+
+// checkBaseURL is resolveBaseURL, except that a live `mxcli run --local` for the
+// project wins over .docker/.env: its handshake records the port it is really
+// serving on, which need not be the default.
+func checkBaseURL(cmd *cobra.Command, projectPath string) string {
+	if !cmd.Flags().Changed("base-url") && projectPath != "" {
+		if hs, err := readDevLoopHandshake(projectPath); err == nil && hs.AppPort > 0 {
+			return fmt.Sprintf("http://localhost:%d", hs.AppPort)
+		}
+	}
+	return resolveBaseURL(cmd, projectPath)
+}
+
+// checkExitCode maps a check result to the process exit status: 0 when every
+// page passed, 1 when any failed. (2, "could not check", is the error path.)
+func checkExitCode(res docker.PageCheckResult) int {
+	if res.Failed > 0 {
+		return 1
+	}
+	return 0
+}
+
 func init() {
 	playwrightVerifyCmd.Flags().BoolP("list", "l", false, "List test scripts without executing")
 	playwrightVerifyCmd.Flags().StringP("junit", "j", "", "Write JUnit XML results to file")
@@ -115,8 +296,44 @@ func init() {
 	playwrightVerifyCmd.Flags().StringP("timeout", "t", "2m", "Timeout per script execution")
 	playwrightVerifyCmd.Flags().StringP("base-url", "", "http://localhost:8080", "Mendix app base URL")
 	playwrightVerifyCmd.Flags().BoolP("skip-health-check", "", false, "Skip app reachability check")
+	playwrightVerifyCmd.Flags().BoolP("keep-open", "", false, "Leave the browser session open after the run so the next verify reuses it")
 
+	playwrightOpenCmd.Flags().StringP("base-url", "", "http://localhost:8080", "Mendix app base URL")
+	playwrightCloseCmd.Flags().BoolP("all", "", false, "Close all browser sessions")
+
+	playwrightCheckCmd.Flags().String("base-url", "http://localhost:8080", "Mendix app base URL")
+	playwrightCheckCmd.Flags().String("user", "", "Sign in as this user")
+	playwrightCheckCmd.Flags().String("password", "", "Password for --user")
+	playwrightCheckCmd.Flags().String("role", "", "Sign in as the project's demo user with this user role (needs -p)")
+	playwrightCheckCmd.Flags().StringArray("assert-text", nil, "Fail unless the page text contains this (repeatable)")
+	playwrightCheckCmd.Flags().StringArray("assert-count", nil, "Fail unless SELECTOR OP N holds, e.g. '.mx-listview li>=1' (ops >= <= == != > <; bare selector = >=1; repeatable)")
+	playwrightCheckCmd.Flags().String("screenshot", "", "Also write a full-page PNG here (per-page suffix for several pages); only the path is printed")
+	playwrightCheckCmd.Flags().Duration("wait", time.Duration(docker.DefaultPageWaitMs)*time.Millisecond, "Longest a page may keep loading after it mounts (open requests, changing text) before it is measured; a page still loading then fails as STILL LOADING")
+	playwrightCheckCmd.Flags().Bool("fresh-login", false, "Sign the saved session out and sign in again")
+	playwrightCheckCmd.Flags().Bool("sign-out", false, "Sign out when the check is done instead of keeping the session for the next check")
+	playwrightCheckCmd.Flags().Bool("allow-console-errors", false, "Report console errors but do not fail on them")
+
+	playwrightCmd.AddCommand(playwrightCheckCmd)
 	playwrightCmd.AddCommand(playwrightVerifyCmd)
+	playwrightCmd.AddCommand(playwrightOpenCmd)
+	playwrightCmd.AddCommand(playwrightStatusCmd)
+	playwrightCmd.AddCommand(playwrightCloseCmd)
+}
+
+// resolveBaseURL resolves the Mendix app base URL for playwright commands:
+// an explicit --base-url wins, otherwise APP_PORT from .docker/.env (relative to
+// the project), otherwise the default localhost:8080. Shared by verify and open.
+func resolveBaseURL(cmd *cobra.Command, projectPath string) string {
+	baseURL, _ := cmd.Flags().GetString("base-url")
+	if baseURL == "" {
+		baseURL = "http://localhost:8080"
+	}
+	if !cmd.Flags().Changed("base-url") && projectPath != "" {
+		if port := readAppPort(projectPath); port != "" {
+			baseURL = fmt.Sprintf("http://localhost:%s", port)
+		}
+	}
+	return baseURL
 }
 
 // readAppPort reads APP_PORT from .docker/.env relative to the project file.

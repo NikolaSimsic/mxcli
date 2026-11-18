@@ -16,10 +16,35 @@ import (
 	"embed"
 )
 
-// Embed all skill files from the synced directory
+// Embed all skill files from the synced directory.
 //
-//go:embed skills/*.md
+// Skills are directory-shaped — `<name>/SKILL.md` per the Agent Skills standard
+// — so this embeds a tree, and `all:` is required for the same reason it is on
+// skillpacks below: a plain go:embed of a directory skips `_`- and `.`-prefixed
+// files, and a skill may carry references or assets beside its SKILL.md.
+//
+//go:embed all:skills
 var skillsFS embed.FS
+
+// Embed skill packs from the synced directory — skills that carry assets, not
+// just prose (references/, specs/, scripts/, mdl/).
+//
+// `all:` is load-bearing rather than defensive. A plain go:embed of a directory
+// skips `_`- and `.`-prefixed files, and cmd/mxcli/theme/assets.go carries the
+// same prefix for exactly this reason: `_partial.scss` is how SCSS spells a
+// partial, and the theme package lost them once already. A pack is just as
+// likely to ship a `_helper.mjs` or an `.eslintrc`.
+//
+//go:embed all:skillpacks
+var skillPacksFS embed.FS
+
+// Embed the Claude Code mods from the synced directory (mods/ in the repo):
+// plugin folders written into a project's .claude/skills/ by init_companion.go.
+// `all:` because a plugin's manifest lives in `.claude-plugin/`, which a plain
+// go:embed of a directory skips.
+//
+//go:embed all:mods
+var modsFS embed.FS
 
 // Embed all command files from the synced directory
 //

@@ -20,7 +20,10 @@ By default, when -p is set, the request is routed through "docker compose exec"
 to reach the container's admin API (which binds to localhost inside the container).
 Use --direct to bypass docker exec and connect via HTTP directly.
 
-Connection settings are resolved in order: flags > environment variables > .docker/.env > defaults.
+Connection settings are resolved in order: flags > the 'mxcli run --local' serving
+the project (.mxcli/run-local.json) > environment variables > .docker/.env > defaults.
+A live 'run --local' is reached over loopback HTTP on the admin port it recorded,
+so a loop started with --admin-port needs no --port here.
 
 Examples:
   # Query with project path (reads .docker/.env for credentials)
@@ -42,19 +45,26 @@ Examples:
 		jsonOutput, _ := cmd.Flags().GetBool("json")
 		direct, _ := cmd.Flags().GetBool("direct")
 
+		// A `mxcli run --local` serving this project records its admin port and
+		// password; use them unless the flags say otherwise (ako/mxcli#982).
+		set := adminFlagsSet{host: host != "", port: port != 0, token: token != ""}
+		admin := devLoopAdminOptions(projectPath,
+			docker.M2EEOptions{Host: host, Port: port, Token: token, ProjectPath: projectPath, Direct: direct}, set)
+
 		opts := docker.OQLOptions{
-			Host:        host,
-			Port:        port,
-			Token:       token,
+			Host:        admin.Host,
+			Port:        admin.Port,
+			Token:       admin.Token,
 			ProjectPath: projectPath,
-			Direct:      direct,
+			Direct:      admin.Direct,
 			Stdout:      os.Stdout,
 			Stderr:      os.Stderr,
 		}
 
 		result, err := docker.ExecuteOQL(opts, query)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			// A 403 with no run-local.json is a stopped run, not a bad password.
+			fmt.Fprintf(os.Stderr, "Error: %v\n%s", err, devLoopAdminHint(projectPath, set, err))
 			os.Exit(1)
 		}
 

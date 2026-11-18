@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package modelsdkbackend
+
+import (
+	"fmt"
+	"strings"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
+
+	"github.com/mendixlabs/mxcli/mdl/types"
+	"github.com/mendixlabs/mxcli/model"
+)
+
+// AddNavigationProfile appends a new web navigation profile to the navigation
+// document. It is the half `CREATE OR REPLACE NAVIGATION` was missing: the
+// statement could only ever replace a profile that already existed, so a
+// device-specific front end — the whole reason Phone and Tablet profiles exist —
+// could not be built from MDL at all (ako/mxcli-maintenance §7).
+//
+// The shape is pinned against Studio Pro 11.14 over PED, and the measurement that
+// matters was taken by adding a profile through Studio Pro's OWN model API and
+// reading back what it materialised, rather than by copying a profile the user
+// had already configured:
+//
+//	                            a profile Studio Pro has just created
+//	ProgressiveWebAppSettings   null
+//	OfflineEntityConfigs        []
+//	ThrowPartialSyncError       true
+//	AppIcon                     ""
+//
+// That distinction is the whole point. The reference project's Phone and
+// TabletOffline profiles both carry {Precaching: true, InstallPrompt: true} — but
+// the schema's default for Precaching is FALSE and ProgressiveWebAppSettings is
+// optional, so those values are the user's choices, not Studio Pro's. Copying
+// them would have shipped every Phone profile with precaching silently on.
+//
+// Every kind stores the same fourteen keys; only Kind and Name differ. An offline
+// profile is not a different document — what changes is what Mendix then demands
+// of the pages it reaches (CE6206), which is why creating one runs MDL-OFFLINE01
+// over the project instead of just writing the profile.
+func (b *Backend) AddNavigationProfile(navDocID model.ID, name string) error {
+	if b.writer == nil {
+		return fmt.Errorf("AddNavigationProfile: not connected for writing")
+	}
+	kind, ok := types.CanonicalProfileKind(name)
+	if !ok {
+		return fmt.Errorf("cannot create navigation profile %q: Mendix's web profiles are %s", name, strings.Join(types.WebProfileKindNames(), ", "))
+	}
+
+	raw, err := b.reader.GetRawUnitBytes(string(navDocID))
+	if err != nil {
+		return fmt.Errorf("AddNavigationProfile: load unit: %w", err)
+	}
+	var doc bson.D
+	if err := bson.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("AddNavigationProfile: unmarshal: %w", err)
+	}
+
+	profiles := navGetArray(doc, "Profiles")
+	if profiles == nil {
+		return fmt.Errorf("no Profiles array found in navigation document")
+	}
+	for _, item := range profiles {
+		p, ok := item.(bson.D)
+		if !ok {
+			continue // the leading typed-array marker
+		}
+		if strings.EqualFold(navGetString(p, "Name"), kind) {
+			return fmt.Errorf("navigation profile %s already exists", kind)
+		}
+	}
+
+	profile := newWebProfileBson(kind)
+	if !b.declaresThrowPartialSyncError() {
+		profile = withoutKey(profile, "ThrowPartialSyncError")
+	}
+	doc = navSetField(doc, "Profiles", append(profiles, profile))
+	out, err := bson.Marshal(doc)
+	if err != nil {
+		return fmt.Errorf("AddNavigationProfile: marshal: %w", err)
+	}
+	return b.writer.UpdateRawUnit(string(navDocID), out)
+}
+
+// declaresThrowPartialSyncError reports whether the project's metamodel has
+// NavigationProfile.ThrowPartialSyncError — from 11.12.0 (measured: the profile
+// `mx create-project` writes carries it on 11.12.0 and not on 11.11.0). On an
+// older project the key is one Studio Pro cannot open the document with
+// (mendixlabs/mxcli#1373), and the storage layer refuses it, since a new profile
+// sets it true. An unreadable version writes it, as before.
+func (b *Backend) declaresThrowPartialSyncError() bool {
+	pv := b.ProjectVersion()
+	return pv == nil || pv.MajorVersion == 0 || pv.IsAtLeast(11, 12)
+}
+
+// withoutKey returns d without its top-level key.
+func withoutKey(d bson.D, key string) bson.D {
+	out := make(bson.D, 0, len(d))
+	for _, e := range d {
+		if e.Key != key {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// newWebProfileBson builds an empty profile of the given kind, with every key a
+// Studio Pro-authored one carries and nothing it does not.
+//
+// The empty sub-elements are written rather than omitted because that is what
+// the reference document has: a profile Studio Pro has just added already holds
+// an empty HomePage, AppTitle, LoginPageSettings and MenuItemCollection. The
+// caller then fills them through the ordinary UpdateNavigationProfile path, so
+// this function deliberately knows nothing about menus or home pages.
+func newWebProfileBson(kind string) bson.D {
+	return bson.D{
+		{Key: "$ID", Value: navID()},
+		{Key: "$Type", Value: "Navigation$NavigationProfile"},
+		{Key: "AppIcon", Value: ""},
+		{Key: "AppTitle", Value: bson.D{
+			{Key: "$ID", Value: navID()},
+			{Key: "$Type", Value: "Texts$Text"},
+			{Key: "Items", Value: bson.A{int32(3)}},
+		}},
+		// 2, not the 3 the PED session this profile shape was pinned against
+		// recorded: ako/TestApp's Studio Pro-authored profile carries
+		// HomeItems [marker 2] with two RoleBasedHomePages in it. See
+		// navMarkerHomeItems.
+		{Key: "HomeItems", Value: bson.A{navMarkerHomeItems}},
+		{Key: "HomePage", Value: bson.D{
+			{Key: "$ID", Value: navID()},
+			{Key: "$Type", Value: "Navigation$HomePage"},
+			{Key: "Microflow", Value: ""},
+			{Key: "Page", Value: ""},
+		}},
+		{Key: "Kind", Value: kind},
+		{Key: "LoginPageSettings", Value: navFormSettingsBson("")},
+		{Key: "Menu", Value: bson.D{
+			{Key: "$ID", Value: navID()},
+			{Key: "$Type", Value: "Menus$MenuItemCollection"},
+			// Menus$MenuItemCollection.Items is 3 in every Studio Pro document
+			// (153 occurrences); this was the one list here still on 1.
+			{Key: "Items", Value: bson.A{navMarkerItems}},
+		}},
+		{Key: "Name", Value: kind},
+		{Key: "NotFoundHomepage", Value: nil},
+		{Key: "OfflineEntityConfigs", Value: bson.A{int32(3)}},
+		// Optional in the schema, and null on every profile Studio Pro has just
+		// created — including the offline kinds, which is the opposite of what the
+		// reference project suggested. Turning a PWA on is a user decision.
+		{Key: "ProgressiveWebAppSettings", Value: nil},
+		{Key: "ThrowPartialSyncError", Value: true},
+	}
+}

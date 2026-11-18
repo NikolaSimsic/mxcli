@@ -1,3 +1,8 @@
+---
+description: Create a structured feature proposal in docs/11-proposals/
+argument-hint: <feature name>
+---
+
 # /mxcli-dev:proposal — Create Feature Proposal
 
 Guide the contributor through creating a well-structured feature proposal for
@@ -15,12 +20,12 @@ Ask the user:
 1. **What** do you want to add? (one sentence)
 2. **Why** — what problem does this solve, or what user story does it enable?
 3. **Which Mendix version** introduced this capability? (affects version-gating)
-4. **Does this add MDL syntax?** (CREATE/ALTER/DROP/SHOW/DESCRIBE statements)
+4. **Does this add MDL syntax?** (create/alter/drop/list/describe statements, or a microflow/nanoflow activity)
 5. **Does this touch BSON serialization?** (reading or writing Mendix documents)
 
 If the user isn't sure about version or BSON, help them find out:
-- Version: check `reference/mendixmodellib/reflection-data/` or Mendix release notes
-- BSON: check if similar features exist in `sdk/mpr/parser*.go` or `sdk/mpr/writer*.go`
+- Version: check the Mendix release notes
+- BSON: check if similar features exist in `mdl/backend/modelsdk/*_read.go` or `*_write.go`
 
 ### Phase 2: BSON Investigation (if applicable)
 
@@ -46,7 +51,7 @@ in Studio Pro that are painful to debug.
    ```
 
 3. **Document the BSON structure** in the proposal:
-   - Storage name (`$Type` field) — verify against `reference/mendixmodellib/reflection-data/`
+   - Storage name (`$Type` field) — verify against `modelsdk/gen/<domain>/types.go` and the dumped document
    - All fields with types and observed values
    - Any fields that use Mendix-internal IDs (pointers to other documents)
    - Note any counter-intuitive naming (like Parent/Child pointer inversion)
@@ -64,7 +69,7 @@ Before writing the proposal, search for existing work:
 ls docs/11-proposals/ | grep -i <feature>
 
 # Existing implementations
-grep -r "<feature>" mdl/executor/ sdk/mpr/ --include="*.go" -l
+grep -r "<feature>" mdl/executor/ mdl/backend/modelsdk/ --include="*.go" -l
 
 # Existing test coverage
 ls mdl-examples/doctype-tests/ | grep -i <feature>
@@ -78,7 +83,11 @@ or start fresh.
 If the feature adds MDL statements, read `.claude/skills/design-mdl-syntax.md`
 first, then design syntax that follows these principles:
 
-- Uses standard verbs: `CREATE`, `ALTER`, `DROP`, `SHOW`, `DESCRIBE`
+- Uses standard verbs: `create`, `alter`, `drop`, `list`, `describe` (a microflow/nanoflow
+  activity uses its Studio Pro verb instead)
+- A microflow/nanoflow activity follows ADR-0013: words for the verb, `$x =`, the
+  main operand, `returns` and `on error`; the dialog's settings in ONE
+  `( Key: value, … )` list after the operand, keyed as the matching document property
 - Reads as English — a business analyst understands it
 - Uses `Module.Element` qualified names everywhere
 - Property format: `( Key: value, ... )` with colon separators

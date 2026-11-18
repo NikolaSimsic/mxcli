@@ -17,9 +17,13 @@ var _ backend.PageMutator = (*MockPageMutator)(nil)
 // nil error (never panics). ContainerType defaults to ContainerPage when unset;
 // all other methods return zero values.
 type MockPageMutator struct {
+	MoveWidgetFunc                 func(widgetRef, destRef string, position backend.InsertPosition) error
 	ContainerTypeFunc              func() backend.ContainerKind
+	ResolveAlterTargetFunc         func(t backend.AlterTarget) (backend.AlterTargetMatch, error)
 	SetWidgetPropertyFunc          func(widgetRef string, prop string, value any) error
 	SetWidgetDataSourceFunc        func(widgetRef string, ds pages.DataSource) error
+	SetWidgetActionFunc            func(widgetRef string, action pages.ClientAction) error
+	SetWidgetNamedActionFunc       func(widgetRef string, propertyKey string, action pages.ClientAction) error
 	SetColumnPropertyFunc          func(gridRef string, columnRef string, prop string, value any) error
 	SetDesignPropertyFunc          func(widgetRef string, key string, valueType string, option string) error
 	RemoveDesignPropertyFunc       func(widgetRef string, key string) error
@@ -28,14 +32,24 @@ type MockPageMutator struct {
 	DropWidgetFunc                 func(refs []backend.WidgetRef) error
 	ReplaceWidgetFunc              func(widgetRef string, columnRef string, widgets []pages.Widget) error
 	InsertColumnsFunc              func(gridRef, afterColumnRef string, position backend.InsertPosition, columns []*backend.DataGridColumnSpec) error
+	InsertListViewTemplatesFunc    func(listViewRef string, templates []*pages.ListViewTemplate) error
+	InsertTabPagesFunc             func(targetRef string, position backend.InsertPosition, tabPages []*pages.TabPage) error
+	InsertLayoutGridRowsFunc       func(gridRef string, rows []*pages.LayoutGridRow) error
+	InsertNavigationListItemsFunc  func(targetRef string, position backend.InsertPosition, items []*pages.NavigationListItem) error
+	ReplaceNavigationListItemFunc  func(targetRef string, items []*pages.NavigationListItem) error
+	DropListViewTemplateFunc       func(listViewRef, specialization string) error
 	ReplaceColumnFunc              func(gridRef, columnRef string, columns []*backend.DataGridColumnSpec) error
 	FindWidgetFunc                 func(name string) bool
 	AddVariableFunc                func(name, dataType, defaultValue string) error
 	DropVariableFunc               func(name string) error
+	AddParameterFunc               func(param backend.PageParameterSpec) error
+	DropParameterFunc              func(name string) error
 	SetLayoutFunc                  func(newLayout string, paramMappings map[string]string) error
+	BoundPlaceholdersFunc          func() []string
 	SetPluggablePropertyFunc       func(widgetRef string, propKey string, op backend.PluggablePropertyOp, ctx backend.PluggablePropertyContext) error
 	EnclosingEntityFunc            func(widgetRef string) string
 	EnclosingEntityForChildrenFunc func(widgetRef string) string
+	EnclosingDataSourceFlowFunc    func(widgetRef string, forChildren bool) (string, string)
 	WidgetScopeFunc                func() map[string]model.ID
 	ParamScopeFunc                 func() (map[string]model.ID, map[string]string)
 	SaveFunc                       func() error
@@ -58,6 +72,20 @@ func (m *MockPageMutator) SetWidgetProperty(widgetRef string, prop string, value
 func (m *MockPageMutator) SetWidgetDataSource(widgetRef string, ds pages.DataSource) error {
 	if m.SetWidgetDataSourceFunc != nil {
 		return m.SetWidgetDataSourceFunc(widgetRef, ds)
+	}
+	return nil
+}
+
+func (m *MockPageMutator) SetWidgetAction(widgetRef string, action pages.ClientAction) error {
+	if m.SetWidgetActionFunc != nil {
+		return m.SetWidgetActionFunc(widgetRef, action)
+	}
+	return nil
+}
+
+func (m *MockPageMutator) SetWidgetNamedAction(widgetRef string, propertyKey string, action pages.ClientAction) error {
+	if m.SetWidgetNamedActionFunc != nil {
+		return m.SetWidgetNamedActionFunc(widgetRef, propertyKey, action)
 	}
 	return nil
 }
@@ -104,6 +132,13 @@ func (m *MockPageMutator) DropWidget(refs []backend.WidgetRef) error {
 	return nil
 }
 
+func (m *MockPageMutator) MoveWidget(widgetRef, destRef string, position backend.InsertPosition) error {
+	if m.MoveWidgetFunc != nil {
+		return m.MoveWidgetFunc(widgetRef, destRef, position)
+	}
+	return nil
+}
+
 func (m *MockPageMutator) ReplaceWidget(widgetRef string, columnRef string, widgets []pages.Widget) error {
 	if m.ReplaceWidgetFunc != nil {
 		return m.ReplaceWidgetFunc(widgetRef, columnRef, widgets)
@@ -116,6 +151,48 @@ func (m *MockPageMutator) InsertColumns(gridRef, afterColumnRef string, position
 		return m.InsertColumnsFunc(gridRef, afterColumnRef, position, columns)
 	}
 	return fmt.Errorf("MockBackend.InsertColumns not configured")
+}
+
+func (m *MockPageMutator) InsertListViewTemplates(listViewRef string, templates []*pages.ListViewTemplate) error {
+	if m.InsertListViewTemplatesFunc != nil {
+		return m.InsertListViewTemplatesFunc(listViewRef, templates)
+	}
+	return fmt.Errorf("MockBackend.InsertListViewTemplates not configured")
+}
+
+func (m *MockPageMutator) InsertLayoutGridRows(gridRef string, rows []*pages.LayoutGridRow) error {
+	if m.InsertLayoutGridRowsFunc != nil {
+		return m.InsertLayoutGridRowsFunc(gridRef, rows)
+	}
+	return fmt.Errorf("MockBackend.InsertLayoutGridRows not configured")
+}
+
+func (m *MockPageMutator) InsertTabPages(targetRef string, position backend.InsertPosition, tabPages []*pages.TabPage) error {
+	if m.InsertTabPagesFunc != nil {
+		return m.InsertTabPagesFunc(targetRef, position, tabPages)
+	}
+	return fmt.Errorf("MockBackend.InsertTabPages not configured")
+}
+
+func (m *MockPageMutator) InsertNavigationListItems(targetRef string, position backend.InsertPosition, items []*pages.NavigationListItem) error {
+	if m.InsertNavigationListItemsFunc != nil {
+		return m.InsertNavigationListItemsFunc(targetRef, position, items)
+	}
+	return fmt.Errorf("MockBackend.InsertNavigationListItems not configured")
+}
+
+func (m *MockPageMutator) ReplaceNavigationListItem(targetRef string, items []*pages.NavigationListItem) error {
+	if m.ReplaceNavigationListItemFunc != nil {
+		return m.ReplaceNavigationListItemFunc(targetRef, items)
+	}
+	return fmt.Errorf("MockBackend.ReplaceNavigationListItem not configured")
+}
+
+func (m *MockPageMutator) DropListViewTemplate(listViewRef, specialization string) error {
+	if m.DropListViewTemplateFunc != nil {
+		return m.DropListViewTemplateFunc(listViewRef, specialization)
+	}
+	return fmt.Errorf("MockBackend.DropListViewTemplate not configured")
 }
 
 func (m *MockPageMutator) ReplaceColumn(gridRef, columnRef string, columns []*backend.DataGridColumnSpec) error {
@@ -142,6 +219,20 @@ func (m *MockPageMutator) AddVariable(name, dataType, defaultValue string) error
 func (m *MockPageMutator) DropVariable(name string) error {
 	if m.DropVariableFunc != nil {
 		return m.DropVariableFunc(name)
+	}
+	return nil
+}
+
+func (m *MockPageMutator) AddParameter(param backend.PageParameterSpec) error {
+	if m.AddParameterFunc != nil {
+		return m.AddParameterFunc(param)
+	}
+	return nil
+}
+
+func (m *MockPageMutator) DropParameter(name string) error {
+	if m.DropParameterFunc != nil {
+		return m.DropParameterFunc(name)
 	}
 	return nil
 }
@@ -177,6 +268,13 @@ func (m *MockPageMutator) EnclosingEntityForChildren(widgetRef string) string {
 	return ""
 }
 
+func (m *MockPageMutator) EnclosingDataSourceFlow(widgetRef string, forChildren bool) (string, string) {
+	if m.EnclosingDataSourceFlowFunc != nil {
+		return m.EnclosingDataSourceFlowFunc(widgetRef, forChildren)
+	}
+	return "", ""
+}
+
 func (m *MockPageMutator) WidgetScope() map[string]model.ID {
 	if m.WidgetScopeFunc != nil {
 		return m.WidgetScopeFunc()
@@ -196,4 +294,21 @@ func (m *MockPageMutator) Save() error {
 		return m.SaveFunc()
 	}
 	return nil
+}
+
+func (m *MockPageMutator) BoundPlaceholders() []string {
+	if m.BoundPlaceholdersFunc != nil {
+		return m.BoundPlaceholdersFunc()
+	}
+	return nil
+}
+
+// ResolveAlterTarget resolves every target unless ResolveAlterTargetFunc says
+// otherwise, so a test that does not care about resolution exercises the
+// operation behind it.
+func (m *MockPageMutator) ResolveAlterTarget(t backend.AlterTarget) (backend.AlterTargetMatch, error) {
+	if m.ResolveAlterTargetFunc != nil {
+		return m.ResolveAlterTargetFunc(t)
+	}
+	return backend.AlterTargetMatch{Kind: "widget", Name: t.String()}, nil
 }

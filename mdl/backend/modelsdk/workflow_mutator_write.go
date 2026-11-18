@@ -5,10 +5,11 @@ package modelsdkbackend
 import (
 	"fmt"
 
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/mendixlabs/mxcli/mdl/backend"
 	"github.com/mendixlabs/mxcli/mdl/backend/wfmutator"
+	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/modelsdk/codec"
 	"github.com/mendixlabs/mxcli/sdk/workflows"
@@ -33,23 +34,13 @@ func (b *Backend) OpenWorkflowForMutation(unitID model.ID) (backend.WorkflowMuta
 	return wfmutator.New(d, unitID, codecWorkflowDeps{b: b}), nil
 }
 
-// SerializeWorkflowActivity converts a domain WorkflowActivity to its raw bson.D
-// form via the codec converters (used by the ALTER WORKFLOW insert/replace paths).
-func (b *Backend) SerializeWorkflowActivity(a workflows.WorkflowActivity) (any, error) {
-	d := serializeWorkflowActivityToBSON(a)
-	if d == nil {
-		return nil, fmt.Errorf("SerializeWorkflowActivity: unsupported activity %T", a)
-	}
-	return d, nil
-}
-
 // codecWorkflowDeps implements wfmutator.Deps for the modelsdk (codec) backend.
 type codecWorkflowDeps struct{ b *Backend }
 
 var _ wfmutator.Deps = codecWorkflowDeps{}
 
 func (d codecWorkflowDeps) SerializeWorkflowActivity(a workflows.WorkflowActivity) bson.D {
-	return serializeWorkflowActivityToBSON(a)
+	return serializeWorkflowActivityToBSON(a, d.b.ProjectVersion())
 }
 
 func (d codecWorkflowDeps) SaveUnit(unitID string, contents []byte) error {
@@ -60,11 +51,12 @@ func (d codecWorkflowDeps) SaveUnit(unitID string, contents []byte) error {
 // codec (activityToGen → Encode) and decodes the result to bson.D, so the shared
 // wfmutator can splice it into the raw workflow tree. Returns nil for unsupported
 // activity types.
-func serializeWorkflowActivityToBSON(a workflows.WorkflowActivity) bson.D {
+func serializeWorkflowActivityToBSON(a workflows.WorkflowActivity, pv *types.ProjectVersion) bson.D {
 	el := activityToGen(a)
 	if el == nil {
 		return nil
 	}
+	applyCallMicroflowStorageName(el, usesCallMicroflowActivityName(pv))
 	raw, err := (&codec.Encoder{}).Encode(el)
 	if err != nil {
 		return nil
@@ -72,6 +64,11 @@ func serializeWorkflowActivityToBSON(a workflows.WorkflowActivity) bson.D {
 	var d bson.D
 	if err := bson.Unmarshal(raw, &d); err != nil {
 		return nil
+	}
+	if !workflowDeclaresActivityGeometry(pv) {
+		// The unit's own activities have none below 11.1; an inserted one
+		// carried them (ako/mxcli#1754).
+		d = withoutWorkflowActivityGeometry(d)
 	}
 	return d
 }

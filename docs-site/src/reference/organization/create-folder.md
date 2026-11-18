@@ -45,16 +45,31 @@ END;
 ### Use a folder when creating a page
 
 ```sql
-CREATE PAGE MyModule.Order_Edit
+CREATE PAGE MyModule.Order_Edit FOLDER 'Orders'
 (
   Title: 'Edit Order',
-  Layout: Atlas_Core.PopupLayout,
-  Folder: 'Orders'
+  Layout: Atlas_Core.PopupLayout
 )
 {
-  CONTAINER main () {}
-}
+  CONTAINER main {}
+};
 ```
+
+### A folder whose name contains `/`
+
+Studio Pro allows `/` inside a folder name, so in a `FOLDER '…'` path a slash
+that belongs to the name is written `\/` (and a backslash `\\`). This is one
+folder, `Private - String en/de-cryption`, holding `Apis`:
+
+```sql
+CREATE CONSTANT Encryption.EncryptionKey FOLDER 'Private - String en\/de-cryption/Apis' (
+  Type: String,
+  DefaultValue: ''
+);
+```
+
+`DESCRIBE` writes the escape for you, so its output files the document back
+where it was. A backslash before any other character is an ordinary character.
 
 ## See Also
 

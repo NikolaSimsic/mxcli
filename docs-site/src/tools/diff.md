@@ -4,7 +4,8 @@ mxcli provides two diff commands for comparing MDL scripts against project state
 
 ## mxcli diff
 
-Compares an MDL script against the current project state, showing what would change if the script were executed. This is a dry-run preview.
+Shows what `mxcli exec` would change in the project if it ran the script, without
+changing the project.
 
 **Usage:**
 
@@ -12,12 +13,89 @@ Compares an MDL script against the current project state, showing what would cha
 mxcli diff -p app.mpr changes.mdl
 ```
 
-This shows:
-- Elements that would be created (new entities, microflows, pages)
-- Elements that would be modified (changed attributes, altered properties)
-- Elements that would be removed (DROP statements)
+### How it works: diff runs exec
 
-Use `mxcli diff` to review changes before applying them, especially when working with AI-generated scripts.
+`diff` copies the project to a scratch folder, runs the script there with exec's
+own code — the same pre-flight checks, the statements in order, under the
+script's language header — and then compares the copy with the project unit by
+unit. What it reports is therefore exactly what `exec` would write: there is no
+second judgement to disagree with exec's. The project itself is only read, and
+the scratch copy is deleted afterwards (it leaves out `.git`, `deployment`,
+`releases` and `node_modules`).
+
+Each unit exec would add, rewrite, move or remove is shown as the `describe` of
+the document before and after. A domain model is shown per entity and
+association, module security per module role, and project security per user
+role and demo user. This covers every document kind — pages, snippets,
+layouts, navigation, settings, security, folders — and statements of every
+kind, including `grant`, `alter`, `move` and `drop`.
+
+```
+--- Page.MyFirstModule.Home_Web (current)
++++ Page.MyFirstModule.Home_Web (script)
+@@ -1,6 +1,6 @@
+ create or modify page MyFirstModule.Home_Web (
+   Title: 'Homepage',
+-  Layout: Atlas_Core.Atlas_TopBar,
++  Layout: Atlas_Core.Atlas_Default,
+   PopupResizable: true
+ ) {
+
+Summary: 0 new, 1 modified, 0 removed — exec would write 1 unit(s)
+```
+
+A unit exec rewrites although its description does not change — a property
+`describe` does not print, a translation, a move to another folder — is listed
+on one line with what changes, so a write is never hidden behind identical MDL:
+
+```
+Modified: Page MyFirstModule.Home_Web: changed: CanvasHeight, CanvasWidth
+Modified: Microflow Shop.ACT_Apply: moved to 'Shop/Archive'
+```
+
+Files exec writes next to the model (Java sources, theme files) are listed as
+`New file:` / `Modified file:`.
+
+### What diff no longer reports
+
+Because the verdict is exec's own, a script exec has already applied diffs as
+`exec would write nothing`. Before (ako/mxcli#907), diff compared the script's
+text with the stored document's description and reported phantom changes
+exec never makes — `Boolean` against the stored `Boolean default false`,
+`String` against `String(unlimited)`, a position, a re-laid-out flow — and
+did not compare pages, translations or layouts at all.
+
+### Refusals and errors
+
+- A script exec's pre-flight refuses (a `check` error, an unresolved
+  reference, a name clash) is reported as **Refused**, with the same report
+  exec prints, and nothing is written. `--no-check` skips the pre-flight, as
+  it does for exec.
+- A statement exec stops at — a plain `create` of a document that exists
+  (ako/mxcli#807), a `create or modify` of a flow the splice cannot make
+  under `mdl 1;` — is reported as **Refused** with exec's error, after the
+  changes exec makes before it. `--continue-on-error` runs every statement,
+  as it does for exec.
+- Statements that depend on earlier ones (a flow calling a microflow the
+  script creates first) are diffed like any other, because the earlier ones
+  run first (ako/mxcli#856).
+
+```
+Refused: exec would stop at this error, having written nothing: entity already exists: Shop.Order — …
+
+Summary: 0 new, 0 modified, 0 removed — exec would write nothing
+```
+
+`diff` always runs the script with the file engine on the scratch copy, also
+under `--mcp`: the script is executed for real, and only the copy may receive
+it. `--exec-output` prints what exec reports while it runs.
+
+For the same reason a script may not reach past the copy. A `connect` to the
+`-p` project (a headerless script may hold one, and so may a script it runs
+with `execute script`) is followed on the copy; a `connect` to any other
+project, a `sql <alias> <query>` and an `import from` are refused with an error,
+because diff has no copy of that project or database and does not run them for
+real.
 
 ## mxcli diff-local
 
@@ -40,6 +118,31 @@ mxcli diff-local -p app.mpr --ref main..feature-branch
 
 # Three-dot range (changes since common ancestor)
 mxcli diff-local -p app.mpr --ref main...feature-branch
+```
+
+With three dots the old side is the merge base of the two revisions, labelled
+`(merge base of main and feature-branch)`, so the diff shows only what the
+branch changed. With two dots it is `main`'s tip, so anything `main` changed
+since the branch split also shows up, reversed. An empty side means `HEAD`, as
+it does to git (`--ref main..` is `main..HEAD`).
+
+### What diff-local shows
+
+Each changed `.mxunit` is rendered as MDL at both revisions and the two
+renderings are diffed. Domain models, microflows, nanoflows, pages, snippets,
+layouts, enumerations, modules and the project settings render as MDL — a
+domain model's entity access rules as the `grant` statements `describe entity`
+prints, the settings as `describe settings` prints them, except that configuration
+constant values are masked, since they often hold secrets. A changed value
+still shows, as `value <masked: old value>` against `value <masked: new value>`.
+
+A unit that changed only in properties its rendering leaves out — navigation,
+project or module security, a page's allowed roles, an entity index — is
+printed as one line naming the properties that changed, never their values,
+rather than counted in the summary and left blank:
+
+```
+Modified: ModuleSecurity MyFirstModule: changed in properties the MDL rendering does not show: ModuleRoles (1 -> 2 items)
 ```
 
 ### MPR v2 Requirement

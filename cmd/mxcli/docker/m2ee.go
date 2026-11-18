@@ -47,6 +47,40 @@ type M2EEOptions struct {
 	Timeout time.Duration
 }
 
+// ErrAdminAuth marks the admin API refusing the credentials (HTTP 401/403).
+// Against a `mxcli run --local` that usually means the credentials were not
+// that run's — its .mxcli/run-local.json was missing — rather than a wrong
+// password, so a caller that knows the project can say so (ako/mxcli#1542).
+var ErrAdminAuth = errors.New("admin API refused the credentials")
+
+// adminError keeps an admin-API failure's text while letting errors.Is see
+// what kind of failure it was.
+type adminError struct {
+	msg  string
+	kind error
+	// timedOut marks a request the admin API accepted and did not answer in
+	// time, as opposed to one it never received.
+	timedOut bool
+}
+
+// isAdminTimeout reports whether err is an admin call that ran out of time.
+func isAdminTimeout(err error) bool {
+	var ae *adminError
+	return errors.As(err, &ae) && ae.timedOut
+}
+
+func (e *adminError) Error() string        { return e.msg }
+func (e *adminError) Is(target error) bool { return target == e.kind }
+
+func adminAuthFailed(status int) error {
+	return &adminError{kind: ErrAdminAuth,
+		msg: fmt.Sprintf("authentication failed (HTTP %d) -- check the admin password (--token or M2EE_ADMIN_PASS)", status)}
+}
+
+func adminUnreachable(msg string) error {
+	return &adminError{kind: ErrAdminUnreachable, msg: msg}
+}
+
 // M2EEResponse is the parsed envelope from the admin API.
 type M2EEResponse struct {
 	Result      int             `json:"result"`
@@ -117,12 +151,19 @@ func callM2EEDirect(opts M2EEOptions, action string, params map[string]any) (*M2
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("cannot connect to Mendix admin API at %s:%d -- is the app running? Start with 'mxcli docker up'", opts.Host, opts.Port)
+		if isTimeout(err) {
+			// It accepted the request and is still working on it: "cannot
+			// connect ... is the app running?" sent a user hunting for a dead
+			// process while a slow after-startup microflow ran (#1818).
+			return nil, &adminError{kind: ErrAdminUnreachable, timedOut: true,
+				msg: fmt.Sprintf("Mendix admin API at %s:%d did not answer %q within %s", opts.Host, opts.Port, action, timeout)}
+		}
+		return nil, adminUnreachable(fmt.Sprintf("cannot connect to Mendix admin API at %s:%d -- is the app running? Start with 'mxcli docker up'", opts.Host, opts.Port))
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, fmt.Errorf("authentication failed (HTTP %d) -- check the admin password (--token or M2EE_ADMIN_PASS)", resp.StatusCode)
+		return nil, adminAuthFailed(resp.StatusCode)
 	}
 
 	if resp.StatusCode != http.StatusOK {
@@ -173,6 +214,12 @@ func callM2EEViaDocker(opts M2EEOptions, dockerDir string, action string, params
 
 	if err := cmd.Run(); err != nil {
 		stderrStr := strings.TrimSpace(stderr.String())
+		// docker compose reports a stopped/absent container as
+		// `service "mendix" is not running` / `no such service`. Translate that
+		// into an actionable hint instead of surfacing the raw compose error.
+		if strings.Contains(stderrStr, "is not running") || strings.Contains(stderrStr, "no such service") {
+			return nil, fmt.Errorf("Mendix container is not running -- start it with 'mxcli docker up'")
+		}
 		if stderrStr != "" {
 			return nil, fmt.Errorf("docker compose exec failed: %s", stderrStr)
 		}
@@ -246,7 +293,7 @@ func previewOQLDevDirect(opts M2EEOptions, bodyBytes []byte) (json.RawMessage, e
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("cannot connect to Mendix admin API at %s:%d -- is the app running? Start with 'mxcli docker up'", opts.Host, opts.Port)
+		return nil, adminUnreachable(fmt.Sprintf("cannot connect to Mendix admin API at %s:%d -- is the app running? Start with 'mxcli docker up'", opts.Host, opts.Port))
 	}
 	defer resp.Body.Close()
 
@@ -254,7 +301,7 @@ func previewOQLDevDirect(opts M2EEOptions, bodyBytes []byte) (json.RawMessage, e
 	case resp.StatusCode == http.StatusNotFound:
 		return nil, errDevEndpointNotFound
 	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		return nil, fmt.Errorf("authentication failed (HTTP %d) -- check the admin password (--token or M2EE_ADMIN_PASS)", resp.StatusCode)
+		return nil, adminAuthFailed(resp.StatusCode)
 	case resp.StatusCode != http.StatusOK:
 		return nil, fmt.Errorf("unexpected HTTP %d from admin API", resp.StatusCode)
 	}
@@ -294,13 +341,13 @@ func previewOQLDevDocker(opts M2EEOptions, dockerDir string, bodyBytes []byte) (
 
 	body, status, ok := splitCurlStatus(stdout.Bytes())
 	if !ok || status == 0 {
-		return nil, fmt.Errorf("cannot connect to Mendix admin API -- is the app running? Start with 'mxcli docker up'")
+		return nil, adminUnreachable("cannot connect to Mendix admin API -- is the app running? Start with 'mxcli docker up'")
 	}
 	switch status {
 	case http.StatusNotFound:
 		return nil, errDevEndpointNotFound
 	case http.StatusUnauthorized, http.StatusForbidden:
-		return nil, fmt.Errorf("authentication failed (HTTP %d) -- check the admin password (--token or M2EE_ADMIN_PASS)", status)
+		return nil, adminAuthFailed(status)
 	case http.StatusOK:
 		return body, nil
 	default:
@@ -367,7 +414,17 @@ func resolveM2EEDefaults(opts *M2EEOptions) error {
 		}
 	}
 
-	// Token: flag > env > .env > error
+	// Token: flag > env > .env > local dev default.
+	//
+	// A `mxcli run --local` app has no .docker/.env and never prints the password
+	// it used, so before this fallback `mxcli oql` against a local run failed with
+	// "admin password required" (findings #36). The local runtime always boots
+	// with defaultLocalAdminPass, and the admin API binds to loopback only, so
+	// using it as the last resort makes `mxcli oql` work against `run --local`
+	// with no configuration. A docker app that genuinely uses a different password
+	// records it in .docker/.env (loaded above); if it somehow doesn't, the wrong
+	// password surfaces as a clear "authentication failed" rather than a silent
+	// miss.
 	if opts.Token == "" {
 		if v := os.Getenv("M2EE_ADMIN_PASS"); v != "" {
 			opts.Token = v
@@ -376,7 +433,7 @@ func resolveM2EEDefaults(opts *M2EEOptions) error {
 		}
 	}
 	if opts.Token == "" {
-		return fmt.Errorf("admin password required: set --token, M2EE_ADMIN_PASS env var, or configure .docker/.env")
+		opts.Token = defaultLocalAdminPass
 	}
 
 	return nil

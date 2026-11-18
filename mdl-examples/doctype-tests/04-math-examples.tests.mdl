@@ -1,3 +1,4 @@
+mdl 1;
 -- ============================================================================
 -- MathTest.IsPrime Tests
 -- ============================================================================
@@ -14,13 +15,12 @@
 create microflow MathTest.UT_IsPrime_17_ReturnsTrue ()
 returns string as $TestResult
 folder 'Tests/Math'
-comment'UT_IsPrime_17_ReturnsTrue'
 begin
   declare $TestResult string = empty;
   declare $Input integer = 17;
   declare $Expected boolean = true;
 
-  $Actual = call microflow MathTest.IsPrime($Number = $Input);
+  $Actual = call microflow MathTest.IsPrime(Number = $Input);
 
   if $Actual = $Expected then
     set $TestResult = 'PASS: IsPrime(17) returned true as expected';
@@ -31,7 +31,6 @@ begin
 
   return $TestResult;
 end;
-/
 
 /**
  * Unit test for MathTest.IsPrime
@@ -45,13 +44,12 @@ end;
 create microflow MathTest.UT_IsPrime_20_ReturnsFalse ()
 returns string as $TestResult
 folder 'Tests/Math'
-comment'UT_IsPrime_20_ReturnsFalse'
 begin
   declare $TestResult string = empty;
   declare $Input integer = 20;
   declare $Expected boolean = false;
 
-  $Actual = call microflow MathTest.IsPrime($Number = $Input);
+  $Actual = call microflow MathTest.IsPrime(Number = $Input);
 
   if $Actual = $Expected then
     set $TestResult = 'PASS: IsPrime(20) returned false as expected';
@@ -62,7 +60,6 @@ begin
 
   return $TestResult;
 end;
-/
 
 /**
  * Unit test for MathTest.IsPrime
@@ -76,13 +73,12 @@ end;
 create microflow MathTest.UT_IsPrime_2_ReturnsTrue ()
 returns string as $TestResult
 folder 'Tests/Math'
-comment'UT_IsPrime_2_ReturnsTrue'
 begin
   declare $TestResult string = empty;
   declare $Input integer = 2;
   declare $Expected boolean = true;
 
-  $Actual = call microflow MathTest.IsPrime($Number = $Input);
+  $Actual = call microflow MathTest.IsPrime(Number = $Input);
 
   if $Actual = $Expected then
     set $TestResult = 'PASS: IsPrime(2) returned true as expected';
@@ -93,7 +89,6 @@ begin
 
   return $TestResult;
 end;
-/
 
 /**
  * Unit test for MathTest.IsPrime
@@ -107,13 +102,12 @@ end;
 create microflow MathTest.UT_IsPrime_1_ReturnsFalse ()
 returns string as $TestResult
 folder 'Tests/Math'
-comment'UT_IsPrime_1_ReturnsFalse'
 begin
   declare $TestResult string = empty;
   declare $Input integer = 1;
   declare $Expected boolean = false;
 
-  $Actual = call microflow MathTest.IsPrime($Number = $Input);
+  $Actual = call microflow MathTest.IsPrime(Number = $Input);
 
   if $Actual = $Expected then
     set $TestResult = 'PASS: IsPrime(1) returned false as expected';
@@ -124,7 +118,6 @@ begin
 
   return $TestResult;
 end;
-/
 
 /**
  * Unit test for MathTest.IsPrime
@@ -138,13 +131,12 @@ end;
 create microflow MathTest.UT_IsPrime_0_ReturnsFalse ()
 returns string as $TestResult
 folder 'Tests/Math'
-comment'UT_IsPrime_0_ReturnsFalse'
 begin
   declare $TestResult string = empty;
   declare $Input integer = 0;
   declare $Expected boolean = false;
 
-  $Actual = call microflow MathTest.IsPrime($Number = $Input);
+  $Actual = call microflow MathTest.IsPrime(Number = $Input);
 
   if $Actual = $Expected then
     set $TestResult = 'PASS: IsPrime(0) returned false as expected';
@@ -155,7 +147,6 @@ begin
 
   return $TestResult;
 end;
-/
 
 /**
  * Unit test for MathTest.IsPrime
@@ -169,13 +160,12 @@ end;
 create microflow MathTest.UT_IsPrime_Negative_ReturnsFalse ()
 returns string as $TestResult
 folder 'Tests/Math'
-comment'UT_IsPrime_Negative_ReturnsFalse'
 begin
   declare $TestResult string = empty;
   declare $Input integer = -5;
   declare $Expected boolean = false;
 
-  $Actual = call microflow MathTest.IsPrime($Number = $Input);
+  $Actual = call microflow MathTest.IsPrime(Number = $Input);
 
   if $Actual = $Expected then
     set $TestResult = 'PASS: IsPrime(-5) returned false as expected';
@@ -186,7 +176,6 @@ begin
 
   return $TestResult;
 end;
-/
 
 /**
  * Test Suite: All tests for MathTest.IsPrime
@@ -197,7 +186,6 @@ end;
 create microflow MathTest.TestSuite_IsPrime ()
 returns string as $Summary
 folder 'Tests/Math'
-comment'TestSuite_IsPrime'
 begin
   declare $TestsPassed integer = 0;
   declare $TotalTests integer = 6;
@@ -239,7 +227,6 @@ begin
 
   return $Summary;
 end;
-/
 
 -- ============================================================================
 -- MathTest.Fibonacci Tests
@@ -257,13 +244,12 @@ end;
 create microflow MathTest.UT_Fibonacci_0_Returns0 ()
 returns string as $TestResult
 folder 'Tests/Math'
-comment'UT_Fibonacci_0_Returns0'
 begin
   declare $TestResult string = empty;
   declare $Input integer = 0;
   declare $Expected long = 0;
 
-  $Actual = call microflow MathTest.Fibonacci($N = $Input);
+  $Actual = call microflow MathTest.Fibonacci(N = $Input);
 
   if $Actual = $Expected then
     set $TestResult = 'PASS: Fibonacci(0) returned 0 as expected';
@@ -274,7 +260,6 @@ begin
 
   return $TestResult;
 end;
-/
 
 /**
  * Unit test for MathTest.Fibonacci
@@ -288,13 +273,12 @@ end;
 create microflow MathTest.UT_Fibonacci_1_Returns1 ()
 returns string as $TestResult
 folder 'Tests/Math'
-comment'UT_Fibonacci_1_Returns1'
 begin
   declare $TestResult string = empty;
   declare $Input integer = 1;
   declare $Expected long = 1;
 
-  $Actual = call microflow MathTest.Fibonacci($N = $Input);
+  $Actual = call microflow MathTest.Fibonacci(N = $Input);
 
   if $Actual = $Expected then
     set $TestResult = 'PASS: Fibonacci(1) returned 1 as expected';
@@ -305,7 +289,6 @@ begin
 
   return $TestResult;
 end;
-/
 
 /**
  * Unit test for MathTest.Fibonacci
@@ -319,13 +302,12 @@ end;
 create microflow MathTest.UT_Fibonacci_10_Returns55 ()
 returns string as $TestResult
 folder 'Tests/Math'
-comment'UT_Fibonacci_10_Returns55'
 begin
   declare $TestResult string = empty;
   declare $Input integer = 10;
   declare $Expected long = 55;
 
-  $Actual = call microflow MathTest.Fibonacci($N = $Input);
+  $Actual = call microflow MathTest.Fibonacci(N = $Input);
 
   if $Actual = $Expected then
     set $TestResult = 'PASS: Fibonacci(10) returned 55 as expected';
@@ -336,7 +318,6 @@ begin
 
   return $TestResult;
 end;
-/
 
 /**
  * Unit test for MathTest.Fibonacci
@@ -350,13 +331,12 @@ end;
 create microflow MathTest.UT_Fibonacci_20_Returns6765 ()
 returns string as $TestResult
 folder 'Tests/Math'
-comment'UT_Fibonacci_20_Returns6765'
 begin
   declare $TestResult string = empty;
   declare $Input integer = 20;
   declare $Expected long = 6765;
 
-  $Actual = call microflow MathTest.Fibonacci($N = $Input);
+  $Actual = call microflow MathTest.Fibonacci(N = $Input);
 
   if $Actual = $Expected then
     set $TestResult = 'PASS: Fibonacci(20) returned 6765 as expected';
@@ -367,7 +347,6 @@ begin
 
   return $TestResult;
 end;
-/
 
 /**
  * Unit test for MathTest.Fibonacci
@@ -381,13 +360,12 @@ end;
 create microflow MathTest.UT_Fibonacci_Negative_Returns0 ()
 returns string as $TestResult
 folder 'Tests/Math'
-comment'UT_Fibonacci_Negative_Returns0'
 begin
   declare $TestResult string = empty;
   declare $Input integer = -5;
   declare $Expected long = 0;
 
-  $Actual = call microflow MathTest.Fibonacci($N = $Input);
+  $Actual = call microflow MathTest.Fibonacci(N = $Input);
 
   if $Actual = $Expected then
     set $TestResult = 'PASS: Fibonacci(-5) returned 0 as expected (error case)';
@@ -398,7 +376,6 @@ begin
 
   return $TestResult;
 end;
-/
 
 /**
  * Test Suite: All tests for MathTest.Fibonacci
@@ -409,7 +386,6 @@ end;
 create microflow MathTest.TestSuite_Fibonacci ()
 returns string as $Summary
 folder 'Tests/Math'
-comment'TestSuite_Fibonacci'
 begin
   declare $TestsPassed integer = 0;
   declare $TotalTests integer = 5;
@@ -446,7 +422,6 @@ begin
 
   return $Summary;
 end;
-/
 
 -- ============================================================================
 -- Master Test Suite
@@ -460,7 +435,6 @@ end;
 create microflow MathTest.TestSuite_All ()
 returns string as $Summary
 folder 'Tests/Math'
-comment'TestSuite_All'
 begin
   declare $Summary string = '';
 
@@ -475,7 +449,6 @@ begin
 
   return $Summary;
 end;
-/
 
 -- ============================================================================
 -- Test Runner Page
@@ -486,69 +459,67 @@ end;
  *
  * A dashboard to run all Math test microflows and view results.
  */
-create page MathTest.MathTestRunner
+create page MathTest.MathTestRunner folder 'Tests/Math'
 (
   title: 'Math Test Runner',
   layout: Atlas_Core.Atlas_Default,
-  url: 'mathtestrunner',
-  folder: 'Tests/Math'
+  url: 'mathtestrunner'
 )
 {
   layoutgrid gridMain {
-    row rowTitle {
-      column colTitle (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext titleHeader (content: 'Math Microflow Test Runner', rendermode: H2)
         dynamictext textDescription (content: 'Run unit tests for MathTest.IsPrime and MathTest.Fibonacci microflows', rendermode: paragraph)
       }
     }
-    row rowAll {
-      column colAll (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext sectionAll (content: 'Run All Tests', rendermode: H4)
       }
     }
-    row rowAllBtn {
-      column colAllBtn (desktopwidth: 4) {
-        actionbutton btnRunAll (caption: 'Run All Math Tests', action: microflow MathTest.TestSuite_All, buttonstyle: primary)
+    row {
+      column (desktopwidth: 4) {
+        actionbutton btnRunAll (caption: 'Run All Math Tests', action: call microflow MathTest.TestSuite_All, buttonstyle: primary)
       }
     }
-    row rowPrimeHeader {
-      column colPrimeHeader (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext sectionIsPrime (content: 'IsPrime Tests', rendermode: H4)
       }
     }
-    row rowPrimeTests {
-      column colPrimeSuite (desktopwidth: 3) {
-        actionbutton btnIsPrimeSuite (caption: 'Run IsPrime Suite', action: microflow MathTest.TestSuite_IsPrime, buttonstyle: primary)
+    row {
+      column (desktopwidth: 3) {
+        actionbutton btnIsPrimeSuite (caption: 'Run IsPrime Suite', action: call microflow MathTest.TestSuite_IsPrime, buttonstyle: primary)
       }
-      column colPrime17 (desktopwidth: 3) {
-        actionbutton btnIsPrime17 (caption: 'Test: 17 is prime', action: microflow MathTest.UT_IsPrime_17_ReturnsTrue, buttonstyle: default)
+      column (desktopwidth: 3) {
+        actionbutton btnIsPrime17 (caption: 'Test: 17 is prime', action: call microflow MathTest.UT_IsPrime_17_ReturnsTrue, buttonstyle: default)
       }
-      column colPrime20 (desktopwidth: 3) {
-        actionbutton btnIsPrime20 (caption: 'Test: 20 not prime', action: microflow MathTest.UT_IsPrime_20_ReturnsFalse, buttonstyle: default)
+      column (desktopwidth: 3) {
+        actionbutton btnIsPrime20 (caption: 'Test: 20 not prime', action: call microflow MathTest.UT_IsPrime_20_ReturnsFalse, buttonstyle: default)
       }
-      column colPrime2 (desktopwidth: 3) {
-        actionbutton btnIsPrime2 (caption: 'Test: 2 is prime', action: microflow MathTest.UT_IsPrime_2_ReturnsTrue, buttonstyle: default)
+      column (desktopwidth: 3) {
+        actionbutton btnIsPrime2 (caption: 'Test: 2 is prime', action: call microflow MathTest.UT_IsPrime_2_ReturnsTrue, buttonstyle: default)
       }
     }
-    row rowFibHeader {
-      column colFibHeader (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext sectionFibonacci (content: 'Fibonacci Tests', rendermode: H4)
       }
     }
-    row rowFibTests {
-      column colFibSuite (desktopwidth: 3) {
-        actionbutton btnFibSuite (caption: 'Run Fibonacci Suite', action: microflow MathTest.TestSuite_Fibonacci, buttonstyle: primary)
+    row {
+      column (desktopwidth: 3) {
+        actionbutton btnFibSuite (caption: 'Run Fibonacci Suite', action: call microflow MathTest.TestSuite_Fibonacci, buttonstyle: primary)
       }
-      column colFib0 (desktopwidth: 3) {
-        actionbutton btnFib0 (caption: 'Test: F(0) = 0', action: microflow MathTest.UT_Fibonacci_0_Returns0, buttonstyle: default)
+      column (desktopwidth: 3) {
+        actionbutton btnFib0 (caption: 'Test: F(0) = 0', action: call microflow MathTest.UT_Fibonacci_0_Returns0, buttonstyle: default)
       }
-      column colFib10 (desktopwidth: 3) {
-        actionbutton btnFib10 (caption: 'Test: F(10) = 55', action: microflow MathTest.UT_Fibonacci_10_Returns55, buttonstyle: default)
+      column (desktopwidth: 3) {
+        actionbutton btnFib10 (caption: 'Test: F(10) = 55', action: call microflow MathTest.UT_Fibonacci_10_Returns55, buttonstyle: default)
       }
-      column colFib20 (desktopwidth: 3) {
-        actionbutton btnFib20 (caption: 'Test: F(20) = 6765', action: microflow MathTest.UT_Fibonacci_20_Returns6765, buttonstyle: default)
+      column (desktopwidth: 3) {
+        actionbutton btnFib20 (caption: 'Test: F(20) = 6765', action: call microflow MathTest.UT_Fibonacci_20_Returns6765, buttonstyle: default)
       }
     }
   }
 };
-/

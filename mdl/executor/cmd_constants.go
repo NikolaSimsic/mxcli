@@ -110,29 +110,36 @@ func outputConstantMDL(ctx *ExecContext, c *model.Constant, moduleName string) e
 	// Format default value based on type
 	defaultValueStr := formatDefaultValue(c.Type, c.DefaultValue)
 
-	fmt.Fprintf(ctx.Output, "create or modify constant %s.%s\n", moduleName, c.Name)
-	fmt.Fprintf(ctx.Output, "  type %s\n", formatConstantTypeForMDL(c.Type))
-	fmt.Fprintf(ctx.Output, "  default %s", defaultValueStr)
-
-	// Add folder if present
-	h, _ := getHierarchy(ctx)
-	if h != nil {
-		if folderPath := h.BuildFolderPath(c.ContainerID); folderPath != "" {
-			fmt.Fprintf(ctx.Output, "\n  folder '%s'", folderPath)
+	// Documentation is a doc comment (R9); `comment '…'` is its deprecated
+	// alias, kept for a text with `*/` in it, which would end a doc comment
+	// early and leave a statement that does not parse. (A doc comment also
+	// trims each line and drops blank ones, as for every other document; that
+	// normalisation is accepted here, as it is there.)
+	docClause := false
+	if c.Documentation != "" {
+		if !strings.Contains(c.Documentation, "*/") {
+			fmt.Fprintf(ctx.Output, "/**\n * %s\n */\n", strings.ReplaceAll(c.Documentation, "\n", "\n * "))
+		} else {
+			docClause = true
 		}
 	}
-
-	// Add options if present
-	if c.Documentation != "" {
-		escaped := strings.ReplaceAll(c.Documentation, "'", "''")
-		fmt.Fprintf(ctx.Output, "\n  comment '%s'", escaped)
-	}
+	// The folder is a clause right after the name (R9).
+	folder := describeFolderClause(ctx, c.ContainerID)
+	// The properties are a ( Key: value ) list with Studio Pro's names
+	// (phase 3.6, ako/mxcli#755); ExposedToClient is omitted at its default.
+	fmt.Fprintf(ctx.Output, "create or modify constant %s.%s%s (\n", moduleName, c.Name, folder)
+	fmt.Fprintf(ctx.Output, "  Type: %s,\n", formatConstantTypeForMDL(c.Type))
+	fmt.Fprintf(ctx.Output, "  DefaultValue: %s", defaultValueStr)
 	if c.ExposedToClient {
-		fmt.Fprintf(ctx.Output, "\n  exposed to client")
+		fmt.Fprintf(ctx.Output, ",\n  ExposedToClient: true")
+	}
+	fmt.Fprint(ctx.Output, "\n)")
+
+	if docClause {
+		fmt.Fprintf(ctx.Output, "\n  comment '%s'", strings.ReplaceAll(c.Documentation, "'", "''"))
 	}
 
 	fmt.Fprintln(ctx.Output, ";")
-	fmt.Fprintln(ctx.Output, "/")
 
 	return nil
 }
@@ -252,6 +259,22 @@ func formatDefaultValue(dt model.ConstantDataType, value string) string {
 	}
 }
 
+// storedConstantDefault puts a default value into the form Studio Pro stores. A
+// Boolean is "True" / "False": Studio Pro's constant dialog reads a stored "true" as
+// False while the runtime reads it as true, so the literal `true` (rendered by fmt
+// as "true") made the app run with a value the developer never sees (#1321).
+func storedConstantDefault(dt model.ConstantDataType, value string) string {
+	if dt.Kind == "Boolean" {
+		switch {
+		case strings.EqualFold(value, "true"):
+			return "True"
+		case strings.EqualFold(value, "false"):
+			return "False"
+		}
+	}
+	return value
+}
+
 // createConstant handles CREATE CONSTANT command.
 func createConstant(ctx *ExecContext, stmt *ast.CreateConstantStmt) error {
 	if !ctx.ConnectedForWrite() {
@@ -277,6 +300,7 @@ func createConstant(ctx *ExecContext, stmt *ast.CreateConstantStmt) error {
 	if stmt.DefaultValue != nil {
 		defaultValue = fmt.Sprintf("%v", stmt.DefaultValue)
 	}
+	defaultValue = storedConstantDefault(constType, defaultValue)
 
 	// Check if constant already exists in this module
 	existingConstants, err := ctx.Backend.ListConstants()
@@ -287,20 +311,27 @@ func createConstant(ctx *ExecContext, stmt *ast.CreateConstantStmt) error {
 			modName := h.GetModuleName(modID)
 			if strings.EqualFold(modName, stmt.Name.Module) && strings.EqualFold(c.Name, stmt.Name.Name) {
 				if stmt.CreateOrModify {
-					// Update existing constant — COMMENT takes precedence over doc-comment
-					if stmt.Comment != "" {
-						c.Documentation = stmt.Comment
-					} else {
-						c.Documentation = stmt.Documentation
-					}
+					// Update existing constant — a rewrite that states no
+					// documentation keeps what is stored (#1018). The
+					// `comment '…'` clause is folded into Documentation by
+					// the visitor (R9).
+					c.Documentation = carriedDocumentation(
+						stmt.DocumentationSet, stmt.Documentation, c.Documentation)
 					c.Type = constType
 					c.DefaultValue = defaultValue
 					c.ExposedToClient = stmt.ExposedToClient
 					if err := ctx.Backend.UpdateConstant(c); err != nil {
 						return mdlerrors.NewBackend("update constant", err)
 					}
+					target, err := resolveRequestedFolder(ctx, module.ID, stmt.Folder)
+					if err != nil {
+						return err
+					}
+					if _, err := applyDocumentFolder(ctx, c.ID, c.ContainerID, target); err != nil {
+						return err
+					}
 					invalidateHierarchy(ctx)
-					fmt.Fprintf(ctx.Output, "Modified constant: %s.%s\n", modName, c.Name)
+					ctx.ReportMutation("Modified", "constant: %s.%s", modName, c.Name)
 					return nil
 				}
 				return mdlerrors.NewAlreadyExistsMsg("constant", modName+"."+c.Name, fmt.Sprintf("constant already exists: %s.%s (use create or modify to update)", modName, c.Name))
@@ -308,11 +339,7 @@ func createConstant(ctx *ExecContext, stmt *ast.CreateConstantStmt) error {
 		}
 	}
 
-	// COMMENT 'text' takes precedence; fall back to /** */ doc-comment
-	doc := stmt.Comment
-	if doc == "" {
-		doc = stmt.Documentation
-	}
+	doc := stmt.Documentation
 
 	containerID := module.ID
 	if stmt.Folder != "" {
@@ -339,6 +366,11 @@ func createConstant(ctx *ExecContext, stmt *ast.CreateConstantStmt) error {
 	fmt.Fprintf(ctx.Output, "Created constant: %s.%s\n", stmt.Name.Module, stmt.Name.Name)
 	return nil
 }
+
+// privateValueLabel marks a constant override whose value is private: stored on the
+// developer's workstation rather than in the shared model, so mxcli can report that
+// the override exists but never its value.
+const privateValueLabel = "(private)"
 
 // listConstantValues handles SHOW CONSTANT VALUES command.
 // Displays one row per constant per configuration for easy comparison.
@@ -395,6 +427,14 @@ func listConstantValues(ctx *ExecContext, moduleName string) error {
 			configNames = append(configNames, cfg.Name)
 			m := make(map[string]string)
 			for _, cv := range cfg.ConstantValues {
+				// A private override's value is on the developer's workstation, not in
+				// the model, so cv.Value is always "". Rendering that as an empty cell
+				// would be indistinguishable from an override deliberately set to the
+				// empty string — say which it is.
+				if cv.IsPrivate {
+					m[cv.ConstantId] = privateValueLabel
+					continue
+				}
 				m[cv.ConstantId] = cv.Value
 			}
 			configValues[cfg.Name] = m

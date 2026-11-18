@@ -4,6 +4,9 @@
 package microflows
 
 import (
+	"unicode/utf8"
+
+	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 )
 
@@ -16,6 +19,66 @@ type Microflow struct {
 	AllowConcurrentExecution bool     `json:"allowConcurrentExecution"`
 	MarkAsUsed               bool     `json:"markAsUsed"`
 	Excluded                 bool     `json:"excluded"`
+	// ApplyEntityAccess makes the microflow run under the current user's entity
+	// access rules instead of with full access — Studio Pro's "Apply entity
+	// access" checkbox.
+	//
+	// It is a SECURITY setting and it is only ever narrowing, so losing it
+	// widens what the microflow may read and write with nothing to show for it:
+	// the model stays valid, the app builds, and only a constrained user
+	// behaves differently. Both writers used to hardcode false and this struct
+	// had no field at all, so every rewrite cleared it — the third property in
+	// this struct to go that way, after AllowConcurrentExecution and
+	// MarkAsUsed (#723 §A).
+	ApplyEntityAccess bool `json:"applyEntityAccess"`
+
+	// ConcurrencyErrorMessage and ConcurrencyErrorMicroflow are what Mendix does
+	// when a second invocation arrives while one is already running and
+	// AllowConcurrentExecution is false — show this (translatable) message, or
+	// run this microflow. Mendix requires one of them in that case (CE4899).
+	//
+	// Neither has MDL syntax, and neither did AllowConcurrentExecution or
+	// MarkAsUsed, so the executor's rebuild wrote its own defaults over all
+	// four. The direction matters: the rebuild hardcoded `true`, so a microflow
+	// that DISALLOWED concurrent execution came back allowing it — the app's
+	// concurrency protection removed — and because "allow" needs no error
+	// message, CE4899 does not fire and nothing reports it. The error message
+	// and microflow went with it, translations included.
+	ConcurrencyErrorMessage   *model.Text `json:"concurrencyErrorMessage,omitempty"`
+	ConcurrencyErrorMicroflow string      `json:"concurrencyErrorMicroflow,omitempty"`
+
+	// ExportLevel is Studio Pro's "Export level" — `Hidden` or `API`, the two
+	// members MicroflowsExportLevel declares. It decides whether the microflow
+	// is part of the module's public surface when the module is exported as a
+	// package, so losing it makes a protected module's API silently smaller.
+	//
+	// Carried, not authored: MDL has no syntax for it. Empty means "the stored
+	// document said nothing", and the writer defaults that to `Hidden` — never
+	// to the empty string, which is not a member of the enum.
+	//
+	// Measured across three real marketplace modules (Business Events 3.12.0,
+	// External Database Connector 6.2.3 and 6.3.0): every document of every
+	// type stores `Hidden`, because all three export at module level `Source`.
+	// So `Hidden` is the overwhelmingly common value and the right default —
+	// but it is a default, not the only value, and hardcoding it is what made
+	// this a drop rather than a no-op (#1120 follow-up).
+	ExportLevel string `json:"exportLevel,omitempty"`
+
+	// URL is the microflow's deep link (Mendix 10.6+) — Studio Pro's "URL"
+	// field, e.g. `item/{Key}`. MDL has no syntax for it, so it is carried
+	// across a rewrite rather than authored.
+	//
+	// The fourth property in this struct to be lost the way #723 §A describes,
+	// after AllowConcurrentExecution, MarkAsUsed and ApplyEntityAccess: the
+	// writer hardcoded "" and this struct had no field, so every rewrite
+	// deleted the deep link. Nothing reports it — `mxcli check` and `mx check`
+	// both pass, because a microflow without a URL is perfectly valid; the loss
+	// is only visible in Studio Pro, which is how it reached a user (#1120).
+	URL string `json:"url,omitempty"`
+	// URLSearchParameters names the microflow parameters supplied as query-string
+	// arguments of the deep link, as qualified names. Stored beside URL and lost
+	// with it.
+	URLSearchParameters []string `json:"urlSearchParameters,omitempty"`
 
 	// Return type
 	ReturnType         DataType `json:"returnType,omitempty"`
@@ -30,8 +93,18 @@ type Microflow struct {
 	// Allowed module roles for execution
 	AllowedModuleRoles []model.ID `json:"allowedModuleRoles,omitempty"`
 
-	// Concurrent execution settings
+	// Deprecated: never read and never written, and it does not describe what
+	// Mendix stores — there is no thread count in the model. The real
+	// concurrency state is AllowConcurrentExecution plus the two
+	// ConcurrencyError fields above. Kept only because the type is exported.
 	ConcurrentExecutionSettings *ConcurrentExecutionSettings `json:"concurrentExecutionSettings,omitempty"`
+
+	// Toolbox entries. A microflow can be exposed twice — once for the microflow
+	// editor's toolbox and once for the workflow editor's — and Mendix stores the
+	// two under different keys with the same element type. Whoever drags the
+	// result in does not need to know it is a microflow, which is the point.
+	MicroflowActionInfo *types.MicroflowActionInfo `json:"microflowActionInfo,omitempty"`
+	WorkflowActionInfo  *types.MicroflowActionInfo `json:"workflowActionInfo,omitempty"`
 }
 
 // GetName returns the microflow's name.
@@ -57,6 +130,12 @@ type Nanoflow struct {
 
 	// Return type
 	ReturnType DataType `json:"returnType,omitempty"`
+	// ReturnVariableName is the `as $Var` of `returns T as $Var`. Empty on a
+	// write means "not authored": the backend then carries the stored value.
+	ReturnVariableName string `json:"returnVariableName,omitempty"`
+	// ExportLevel is `Hidden` or `API`, as on a Microflow. Empty on a write
+	// means "not authored": the backend then carries the stored value.
+	ExportLevel string `json:"exportLevel,omitempty"`
 
 	// Parameters
 	Parameters []*MicroflowParameter `json:"parameters,omitempty"`
@@ -75,14 +154,28 @@ func (n *Nanoflow) GetContainerID() model.ID {
 	return n.ContainerID
 }
 
-// Rule represents a rule in the Mendix model.
+// Rule represents a rule (Microflows$Rule) in the Mendix model — Mendix's own
+// reference calls it "a special kind of microflow" that returns a Boolean or an
+// enumeration and may only be used from a decision.
+//
+// The fields are the ten properties a rule document stores, measured against two
+// Studio Pro-authored rules (ako/TestApp, Mendix 11.13.0). A rule is a microflow
+// minus nine properties, and the nine are the ones a rule has no concept of:
+// AllowedModuleRoles (a rule is not independently callable, so there is nothing
+// to grant), the concurrency group, Url/UrlSearchParameters, StableId, and the
+// two action-info slots.
 type Rule struct {
 	model.BaseElement
-	ContainerID   model.ID `json:"containerId"`
-	Name          string   `json:"name"`
-	Documentation string   `json:"documentation,omitempty"`
+	ContainerID        model.ID `json:"containerId"`
+	Name               string   `json:"name"`
+	Documentation      string   `json:"documentation,omitempty"`
+	Excluded           bool     `json:"excluded"`
+	MarkAsUsed         bool     `json:"markAsUsed"`
+	ApplyEntityAccess  bool     `json:"applyEntityAccess"`
+	ReturnVariableName string   `json:"returnVariableName,omitempty"`
 
-	// Return type (always boolean)
+	// Return type — Boolean or an enumeration. Not "always boolean": Rules.Rule2
+	// in the reference app returns Rules.RuleResult.
 	ReturnType DataType `json:"returnType,omitempty"`
 
 	// Parameters
@@ -109,6 +202,79 @@ type MicroflowParameter struct {
 	Name          string   `json:"name"`
 	Documentation string   `json:"documentation,omitempty"`
 	Type          DataType `json:"type"`
+
+	// Position is the parameter's place on the canvas, set only when those
+	// coordinates say something DerivedParameterPosition would not have
+	// produced — see that function for why the distinction is the whole point.
+	// nil means "wherever the layout puts it", which is why this is a pointer:
+	// 0;0 is a position a person can choose, and two flows in the reference
+	// project use it.
+	Position *model.Point `json:"position,omitempty"`
+}
+
+// DerivedParameterPosition returns where mxcli's own layout puts the parameter
+// at index idx: a row of boxes along the top of the canvas, one spacing unit
+// apart. Both writers used to compute this inline and unconditionally, which is
+// why a hand-placed parameter did not survive a rewrite (#993).
+//
+// It exists so that both readers can tell an authored position from mxcli's own
+// arithmetic handed back. A parameter sitting exactly here carries no intent and
+// is re-derived on the next write; one anywhere else was put there by a person
+// and is kept. This is the arbitration authoredStartPosition makes for the
+// StartEvent, and it is made for the same reason: carrying stored coordinates
+// over UNCONDITIONALLY pins the node, so inserting a parameter would leave the
+// existing ones stranded on the old grid while the new one lands on top of them
+// (the shape of #951, one node family over).
+//
+// A person who places a parameter exactly where the layout would have is
+// indistinguishable from the layout — and re-deriving gives back the same point,
+// so the ambiguity costs nothing.
+//
+// The row is spaced by the widest name among params (ParameterPitch), so the
+// position depends on the whole list, not the index alone.
+func DerivedParameterPosition(idx int, params []*MicroflowParameter) model.Point {
+	return model.Point{X: 200 + idx*ParameterPitch(params), Y: 53}
+}
+
+// ParameterPitch is the distance between neighbouring parameters on the derived
+// row: wide enough for the widest name at about 7px a character, rounded up to
+// 10px, and never under the 100px the row always had.
+//
+// It was 100px whatever the names, so 20-22 character names overlapped
+// (mendixlabs/mxcli#1598, case 5). The rate is fitted to Studio Pro authors'
+// own rows: in 95 Studio Pro-authored parameter rows the median pitch is 95px
+// for names of 5-9 characters, 106px for 10-14, 125px for 15-19 and 160px for
+// 20-24. Names under 15 characters keep the old 100px row exactly, so an
+// ordinary flow's parameters do not move.
+func ParameterPitch(params []*MicroflowParameter) int {
+	widest := 0
+	for _, p := range params {
+		if p != nil {
+			widest = max(widest, utf8.RuneCountInString(p.Name))
+		}
+	}
+	return max(100, (widest*7+9)/10*10)
+}
+
+// legacyParameterPosition is the fixed 100px row every mxcli before
+// ParameterPitch wrote. It is mxcli's arithmetic as much as the current row is.
+func legacyParameterPosition(idx int) model.Point {
+	return model.Point{X: 200 + idx*100, Y: 53}
+}
+
+// AuthoredParameterPosition returns stored, or nil when stored is the point the
+// layout would have derived for index idx of params. Readers call this so that
+// everything downstream can treat a non-nil Position as intent.
+//
+// The old 100px row counts as derived too. Otherwise every long-named
+// parameter an earlier mxcli wrote would read as hand-placed, be pinned there,
+// and keep the overlap the wider row exists to remove.
+func AuthoredParameterPosition(stored model.Point, idx int, params []*MicroflowParameter) *model.Point {
+	if stored == DerivedParameterPosition(idx, params) || stored == legacyParameterPosition(idx) {
+		return nil
+	}
+	p := stored
+	return &p
 }
 
 // GetName returns the parameter's name.
@@ -142,6 +308,16 @@ type BaseMicroflowObject struct {
 	Position       model.Point `json:"position"`
 	Size           model.Size  `json:"size,omitempty"`
 	RelativeMiddle model.Point `json:"relativeMiddle,omitempty"`
+}
+
+// GetSize returns the object's box size.
+func (o *BaseMicroflowObject) GetSize() model.Size {
+	return o.Size
+}
+
+// SetSize sets the object's box size.
+func (o *BaseMicroflowObject) SetSize(s model.Size) {
+	o.Size = s
 }
 
 // GetPosition returns the object's position.
@@ -223,6 +399,28 @@ type AnnotationFlow struct {
 	model.BaseElement
 	OriginID      model.ID `json:"originId"`
 	DestinationID model.ID `json:"destinationId"`
+	// Sides is where the line attaches at each end: the note's side and the
+	// object's. nil means nothing chose them, and the writer draws the line as
+	// for a note sitting above its object.
+	Sides *ConnectionSides `json:"sides,omitempty"`
+}
+
+// SidesOrDefault returns Sides, or — when nothing chose them — the drawing for
+// a note sitting above its object: out of the note's bottom edge, into the
+// object's top. Every writer uses it, so the engines agree on the default.
+func (f *AnnotationFlow) SidesOrDefault() ConnectionSides {
+	if f.Sides != nil {
+		return *f.Sides
+	}
+	return ConnectionSides{Origin: 2, Destination: 0}
+}
+
+// ConnectionSides is the pair of connection indexes a flow attaches at, in the
+// numbering a SequenceFlow uses for an activity — 0 top, 1 right, 2 bottom,
+// 3 left. Studio Pro numbers a note's sides the same way.
+type ConnectionSides struct {
+	Origin      int `json:"origin"`
+	Destination int `json:"destination"`
 }
 
 // Events
@@ -320,6 +518,9 @@ type LoopSource interface {
 // LoopedActivity represents a loop construct (FOR EACH or WHILE).
 type LoopedActivity struct {
 	BaseMicroflowObject
+	// Caption is NOT storable: generated/metamodel declares no Caption on
+	// Microflows$LoopedActivity, so a value here is dropped at the gen boundary.
+	// Nothing sets it; `mxcli check` reports MDL042 instead (mendixlabs/mxcli#1187).
 	Caption           string                     `json:"caption,omitempty"`
 	Documentation     string                     `json:"documentation,omitempty"`
 	LoopSource        LoopSource                 `json:"loopSource,omitempty"`
@@ -384,6 +585,9 @@ type ActionActivity struct {
 }
 
 // ConcurrentExecutionSettings represents settings for concurrent execution.
+// Deprecated: a fiction — nothing reads or writes it, and Mendix stores no
+// thread count. See Microflow.AllowConcurrentExecution and its
+// ConcurrencyErrorMessage / ConcurrencyErrorMicroflow siblings.
 type ConcurrentExecutionSettings struct {
 	model.BaseElement
 	Enabled         bool `json:"enabled"`

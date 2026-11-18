@@ -5,6 +5,8 @@ package main
 
 import (
 	"fmt"
+	"gopkg.in/yaml.v3"
+	"path/filepath"
 	"strings"
 )
 
@@ -17,14 +19,41 @@ func yamlSingleQuote(s string) string {
 	return "'" + s + "'"
 }
 
-// wrapSkillContent prepends OpenCode-compatible YAML frontmatter to a skill file.
-// OpenCode requires each skill to live in its own subdirectory as SKILL.md and
-// the file must start with YAML frontmatter containing name, description, and
-// compatibility fields.
+// wrapSkillContent gives a skill the frontmatter OpenCode reads: its name, its
+// description, and the opencode marker. A skill that already has frontmatter
+// (the Agent Skills layout every bundled skill uses) keeps its own description
+// and is given ONE block: prepending a second one, described by the skill's
+// first heading, made OpenCode read "Agents" where the skill says "… Use when
+// adding GenAI features", and the description is what decides whether a skill
+// is invoked at all (ako/mxcli#1822).
 func wrapSkillContent(skillName string, content []byte) []byte {
-	description := extractSkillDescription(content)
+	description, body := splitSkillFrontmatter(content)
+	if description == "" {
+		description = extractSkillDescription(body)
+	}
 	frontmatter := fmt.Sprintf("---\nname: %s\ndescription: %s\ncompatibility: opencode\n---\n\n", yamlSingleQuote(skillName), yamlSingleQuote(description))
-	return append([]byte(frontmatter), content...)
+	return append([]byte(frontmatter), body...)
+}
+
+// splitSkillFrontmatter returns the description a skill's leading YAML
+// frontmatter declares ("" when it has none, or none readable) and the content
+// after that frontmatter. Content without frontmatter is returned whole.
+func splitSkillFrontmatter(content []byte) (description string, body []byte) {
+	text := string(content)
+	if !strings.HasPrefix(text, "---\n") {
+		return "", content
+	}
+	head, rest, ok := strings.Cut(text[len("---\n"):], "\n---\n")
+	if !ok {
+		return "", content
+	}
+	var fm struct {
+		Description string `yaml:"description"`
+	}
+	if err := yaml.Unmarshal([]byte(head), &fm); err != nil {
+		return "", content
+	}
+	return strings.TrimSpace(fm.Description), []byte(strings.TrimLeft(rest, "\n"))
 }
 
 // extractSkillDescription returns a one-line description for the skill by
@@ -43,6 +72,89 @@ func extractSkillDescription(content []byte) string {
 	return "MDL skill"
 }
 
+// projectGate is one command in the ordered gate list the generated CLAUDE.md
+// publishes as a project's definition of done.
+//
+// It exists as data rather than as literal markdown lines because the same
+// sequence is stated in three places that must agree: this file (re-read into
+// every session, so it IS the default behaviour), the `bootstrap-app` skill
+// (which sets the project up and hands over), and the bootstrap-prompt docs
+// page that describes the skill. When they were three hand-kept copies,
+// `mxcli test` was named in the skill's ports note and on no gate list at all,
+// so testing was reachable only by a user asking for it by name.
+// TestBootstrapProcedureNamesEveryGate holds the three together.
+type projectGate struct {
+	// Cmd is the command as written, without the leading "./mxcli ".
+	// A %s is substituted with the project's .mpr path.
+	Cmd string
+	// Note is the trailing comment explaining what the gate buys and roughly
+	// what it costs.
+	Note string
+	// Ref is the substring that must also appear in the bootstrap skill and on
+	// the docs page for this gate to count as stated there.
+	Ref string
+	// Command is the cobra command path ("docker check" for a subcommand),
+	// checked to exist so a rename breaks a test rather than every project's
+	// onboarding.
+	Command string
+}
+
+// projectGates is the ordered, cheapest-first gate list. Adding one here adds
+// it to every generated CLAUDE.md, and requires naming it in the bootstrap
+// skill and docs page too.
+var projectGates = []projectGate{
+	{"check script.mdl -p %s", "syntax + references, no apply (~2s)", "mxcli check", "check"},
+	{"exec script.mdl -p %s", "apply", "mxcli exec", "exec"},
+	{"lint -p %s", "rules (~3s)", "mxcli lint", "lint"},
+	{"report -p %s", "scored quality report", "mxcli report", "report"},
+	{"docker check -p %s", "mxbuild, the slow one (~25s)", "mxcli docker check", "docker check"},
+	{"test tests/ -p %s --local", "microflow tests (~30s cold, ~2s warm)", "mxcli test", "test"},
+	// --detach because an agent's tool call must return: without it the run was
+	// started with nohup and then managed by sleep/grep/pkill loops, a quarter
+	// of all tool calls in measured sessions. `run wait` is what follows an exec.
+	{"run --local --watch --detach -p %s", "the app, backgrounded; then `run wait`/`status`/`stop`", "mxcli run --local", "run"},
+}
+
+// renderProjectGates writes the gate list as aligned shell lines, comments in
+// one column.
+//
+// The single longest command (the detached run) overhangs the column instead of
+// setting it: every byte of padding is paid on every gate line in every
+// session, and aligning to that one line pushed all seven comments right.
+func renderProjectGates(mprPath string) string {
+	lines := make([]string, len(projectGates))
+	longest, width := 0, 0
+	for i, g := range projectGates {
+		lines[i] = "./mxcli " + fmt.Sprintf(g.Cmd, mprPath)
+		switch n := len(lines[i]); {
+		case n > longest:
+			width, longest = longest, n
+		case n > width:
+			width = n
+		}
+	}
+	var sb strings.Builder
+	for i, g := range projectGates {
+		sb.WriteString(lines[i])
+		if pad := width - len(lines[i]); pad > 0 {
+			sb.WriteString(strings.Repeat(" ", pad))
+		}
+		sb.WriteString("   # " + g.Note + "\n")
+	}
+	return sb.String()
+}
+
+// projectDisplayName is the name generated docs give the project: the app's,
+// taken from the .mpr file name, falling back to the folder name when there is
+// no .mpr. The folder is the repository's name in a cloud session ("seed",
+// "init-bootstrap"), which says nothing about the app.
+func projectDisplayName(dir, mprFile string) string {
+	if name := strings.TrimSuffix(filepath.Base(mprFile), ".mpr"); mprFile != "" && name != "" {
+		return name
+	}
+	return filepath.Base(dir)
+}
+
 func generateClaudeMD(projectName, mprFile string) string {
 	mprPath := mprFile
 	if mprPath == "" {
@@ -55,584 +167,148 @@ func generateClaudeMD(projectName, mprFile string) string {
 	var sb strings.Builder
 	w := func(s string) { sb.WriteString(s) }
 
-	// ── Header ──────────────────────────────────────────────────────
+	// This file is re-read into EVERY context started in this project, so its
+	// size is a per-session tax, not a one-off. It used to carry the MDL
+	// command reference, the lint rule table and the skill table — ~4,800 of
+	// its ~6,900 tokens — all of which mxcli answers itself, and all of which
+	// had drifted (10 of 14 built-in rules listed; "27" Starlark rules against
+	// 31 shipped; no layouts, rules, queues or scheduled events at all). #906
+	// was the same failure in the skill table, which reached 12 of 68 before
+	// anyone noticed.
+	//
+	// So the rule for anything added here is the brain's own: if a command can
+	// answer it, name the command instead. What stays is what no command can
+	// say — where things are, which gates to run, and how to behave.
+
 	w("# Mendix Project: " + projectName + "\n\n")
-	w("This is a Mendix project configured for AI-assisted development using mxcli and MDL (Mendix Definition Language).\n\n")
+	w("Built with mxcli and MDL (Mendix Definition Language).\n\n")
 
-	// ── Communication Style ────────────────────────────────────────
+	// ── Project Brain ───────────────────────────────────────────────
+	// The brain's project.md is documented as loaded every session, and this
+	// is the only thing that makes that true: routing to it through the skill
+	// alone does not, because a skill is triggered by symptom.
+	w("## Project Brain — read this first\n\n")
+	w("If " + bt + "docs/brain/" + bt + " exists, read " + bt + "docs/brain/project.md" + bt + " before doing anything\n")
+	w("else. It holds the decisions this project has already made — things no command can\n")
+	w("tell you, and that are cheap to contradict by accident.\n\n")
+	w("Then, depending on what you are doing:\n\n")
+	w("- **Building in a module** — also read " + bt + "docs/brain/modules/<Module>.md" + bt + " for the\n")
+	w("  modules you are about to touch. Not the whole directory; only those.\n")
+	w("- **Working a slice** — " + bt + "./mxcli brain brief --slice <name> -p " + mprPath + bt + " emits\n")
+	w("  exactly that pack (project + the slice's modules + its plan) as one read.\n")
+	w("- **Planning, or picking work up** — run " + bt + "./mxcli brain plan -p " + mprPath + bt + ".\n")
+	w("  It reports what is built from the model itself, so it cannot be out of date.\n\n")
+	w("Record what you learn with " + bt + "./mxcli brain capture" + bt + ". Read\n")
+	w(bt + ".ai-context/skills/project-brain/SKILL.md" + bt + " for what belongs there and what does not —\n")
+	w("the short version is that anything mxcli can answer must never be written down.\n\n")
+
+	// ── Communication Style ─────────────────────────────────────────
 	w("## Communication Style\n\n")
-	w("When discussing changes with the user:\n\n")
-	w("- **Never show raw MDL scripts in chat.** Instead, describe changes in plain language as a numbered list.\n")
+	w("- **Never show raw MDL in chat.** Describe changes in plain language as a numbered list.\n")
 	w("- After the user approves, write the MDL to a script file, validate it, and execute it silently.\n")
-	w("- Only show MDL code if the user explicitly asks to see the script.\n")
-	w("- When reporting results, summarize what was created/modified in plain language.\n")
-	w("- **Always quote identifiers** in MDL scripts with double quotes (" + bt + "\"Name\"" + bt + "). This prevents conflicts with MDL reserved keywords and is always safe — quotes are stripped automatically. Quote entity names, attribute names, parameter names, variable names, and association names.\n\n")
-	w("**Example — instead of showing MDL code, write this:**\n\n")
-	w("> Here's what I'll do:\n")
-	w("> 1. Create a new **Customer** entity in MyModule with:\n")
-	w(">    - **Name** (text, up to 100 characters)\n")
-	w(">    - **Email** (text, up to 200 characters)\n")
-	w(">    - **Age** (whole number)\n")
-	w(">\n")
-	w("> Shall I go ahead?\n\n")
+	w("- Show MDL only if the user asks to see the script.\n")
+	w("- Report results as plain language, not as a diff.\n\n")
 
-	// ── mxcli Location ─────────────────────────────────────────────
-	w("## Important: mxcli Location\n\n")
-	w("The " + bt + "mxcli" + bt + " tool is located in the **root folder of this project**, not in the system PATH. Always use the local path:\n\n")
-	w(bt3 + "bash\n./mxcli -p " + mprPath + "    # Correct - uses local binary\n" + bt3 + "\n\n")
-	w("**Do NOT use** " + bt + "mxcli" + bt + " directly - it will fail with \"command not found\". Always prefix with " + bt + "./" + bt + " to run the local binary.\n\n")
-
-	// ── Mendix Validation Tool ─────────────────────────────────────
-	w("## Mendix Validation Tool (mx)\n\n")
-	w("The " + bt + "mx" + bt + " command validates Mendix projects (same checks as Studio Pro). To set it up:\n\n")
+	// ── Running mxcli ───────────────────────────────────────────────
+	w("## Running mxcli\n\n")
+	w("The binary is in the **root of this project**, not on " + bt + "PATH" + bt + " — always " + bt + "./mxcli" + bt + ".\n\n")
 	w(bt3 + "bash\n")
-	w("./mxcli setup mxbuild -p " + mprPath + "    # Auto-download for project's Mendix version\n")
+	w("./mxcli -p " + mprPath + " -c \"DESCRIBE STRUCTURE\"   # one command\n")
+	w("./mxcli exec script.mdl -p " + mprPath + "        # a script\n")
 	w(bt3 + "\n\n")
-	w("After setup, " + bt + "mx" + bt + " is at " + bt + "~/.mxcli/mxbuild/{version}/modeler/mx" + bt + ". Usage:\n\n")
+	w("Scripts live in " + bt + "mdlsource/" + bt + ", one file per concern.\n")
+	// The language header (decision 4 on ako/mxcli#714): a script written now
+	// is mdl 1, and a headerless one is the older mdl 0, whose statements can
+	// mean something else. Mixing the two in one file is the failure to
+	// prevent, so the upgrade comes before the edit.
+	w("**Each starts with " + bt + "mdl 1;" + bt + ".** A headerless one is " + bt + "mdl 0" + bt + ": upgrade it first,\n")
+	w(bt + "./mxcli fmt --upgrade --header -p " + mprPath + " -w <file>" + bt + ", then\n")
+	w(bt + "check --deprecations=error --v1=error" + bt + " it; never mix them in a file.\n")
+	w("Exec a change twice: the second run must write nothing (unchanged).\n\n")
+
+	// ── The gates ───────────────────────────────────────────────────
+	// Ordered cheapest-first on purpose: each one is only worth paying for
+	// once the one above it is clean.
+	//
+	// The list is projectGates rather than literal lines because the same set
+	// has to appear in the bootstrap procedure (the skill) and on the docs
+	// page that describes it. Three hand-kept copies is how `test` came to be
+	// in two of them and absent from the one that is re-read every session.
+	w("## The gates, in order\n\n")
+	w("Run them cheapest-first; each is only worth paying for once the one above is clean.\n")
+	w("**They are the definition of done, not a menu** — a change is finished when they have\n")
+	w("all been run and you have said what each one reported.\n\n")
+	w("**Once per change, not per edit** — a change being a coherent unit of work, not a\n")
+	w("statement and not a file write. Iterate with " + bt + "exec" + bt + ", then run the gates once over the\n")
+	w("result: the whole list after every edit proves nothing the one run at the end does not.\n\n")
 	w(bt3 + "bash\n")
-	w("~/.mxcli/mxbuild/*/modeler/mx check " + mprPath + "   # Validate project\n")
-	w("./mxcli docker check -p " + mprPath + "               # Alternative (auto-downloads mxbuild)\n")
+	w(renderProjectGates(mprPath))
 	w(bt3 + "\n\n")
+	w("**" + bt + "lint" + bt + " printing no errors is not a pass** — read the warning count, and read\n")
+	w(bt + "report" + bt + "'s score. A green " + bt + "check" + bt + " proves nothing about behaviour or about how\n")
+	w("a page renders: logic needs " + bt + "test" + bt + ", and anything visual needs the app actually running.\n\n")
+	w("Set " + bt + "mx" + bt + " up once with " + bt + "./mxcli setup mxbuild -p " + mprPath + bt + ". To call it directly,\n")
+	w("name the version — " + bt + "~/.mxcli/mxbuild/<version>/modeler/mx" + bt + " — because a " + bt + "*" + bt + " glob\n")
+	w("breaks the moment two are cached.\n\n")
 
-	// ── Quick Start ─────────────────────────────────────────────────
-	w("## Quick Start\n\n")
-	w("### Execute a Single Command\n\n")
-	w("Use the " + bt + "-c" + bt + " flag to run a single MDL command:\n\n")
-	w(bt3 + "bash\n")
-	w("./mxcli -p " + mprPath + " -c \"SHOW MODULES\"              # List all modules\n")
-	w("./mxcli -p " + mprPath + " -c \"SHOW STRUCTURE\"             # Project overview\n")
-	w("./mxcli -p " + mprPath + " -c \"SHOW ENTITIES IN MyModule\"  # Entities in a module\n")
-	w("./mxcli -p " + mprPath + " -c \"DESCRIBE ENTITY MyModule.Customer\"  # Entity details\n")
-	w(bt3 + "\n\n")
-	w("### Execute an MDL Script File\n\n")
-	w(bt3 + "bash\n./mxcli exec script.mdl -p " + mprPath + "\n" + bt3 + "\n\n")
-	w("### Start Interactive REPL\n\n")
-	w(bt3 + "bash\n./mxcli\n# Then: CONNECT LOCAL '" + mprPath + "';\n" + bt3 + "\n\n")
-
-	// ── IMPORTANT: Before Writing MDL ───────────────────────────────
-	w("## IMPORTANT: Before Writing MDL Scripts or Working with Data\n\n")
-	w("**Read the relevant skill files FIRST before writing any MDL, seeding data, or doing database/import work:**\n\n")
-	w("| Skill File | When to Read |\n")
-	w("|------------|-------------|\n")
-	w("| " + bt + ".ai-context/skills/write-microflows.md" + bt + " | **Before writing any microflow** - syntax, common mistakes, validation checklist |\n")
-	w("| " + bt + ".ai-context/skills/create-page.md" + bt + " | **Before creating any page** - widget syntax reference |\n")
-	w("| " + bt + ".ai-context/skills/alter-page.md" + bt + " | **Before modifying pages** - ALTER PAGE/SNIPPET SET, INSERT, DROP, REPLACE |\n")
-	w("| " + bt + ".ai-context/skills/overview-pages.md" + bt + " | CRUD page patterns (overview + edit) |\n")
-	w("| " + bt + ".ai-context/skills/master-detail-pages.md" + bt + " | Master-detail page patterns |\n")
-	w("| " + bt + ".ai-context/skills/generate-domain-model.md" + bt + " | Entity, association, enumeration syntax |\n")
-	w("| " + bt + ".ai-context/skills/organize-project.md" + bt + " | Folders, MOVE command, project structure |\n")
-	w("| " + bt + ".ai-context/skills/manage-security.md" + bt + " | Security roles, GRANT/REVOKE, access control |\n")
-	w("| " + bt + ".ai-context/skills/manage-navigation.md" + bt + " | Navigation profiles, menus, home/login pages |\n")
-	w("| " + bt + ".ai-context/skills/check-syntax.md" + bt + " | **Pre-flight** validation checklist |\n")
-	w("| " + bt + ".ai-context/skills/demo-data.md" + bt + " | **READ for any database/import work** - Mendix ID system, demo data |\n")
-	w("| " + bt + ".ai-context/skills/test-microflows.md" + bt + " | **READ for testing** - test annotations, file formats, Docker setup |\n")
+	// ── The reference is the tool ───────────────────────────────────
+	w("## Syntax, rules and skills — ask the tool, not this file\n\n")
+	w("These change every release, and a copy that disagrees with the tool is worse than none.\n\n")
+	w("| To find out | Run |\n")
+	w("|---|---|\n")
+	w("| How to write any MDL — **before any skill** | " + bt + "./mxcli syntax" + bt + " → " + bt + "./mxcli syntax <topic> [sub]" + bt + " |\n")
+	w("| Which lint rules exist | " + bt + "./mxcli lint -p " + mprPath + " --list-rules" + bt + " |\n")
+	w("| What a command takes | " + bt + "./mxcli help <command>" + bt + " |\n")
+	w("| What this project contains | " + bt + "./mxcli -p " + mprPath + " -c \"DESCRIBE STRUCTURE\"" + bt + " |\n")
+	w("| Why it was built this way | " + bt + "docs/brain/" + bt + " (above) |\n")
 	w("\n")
-	w("**Always validate before presenting to user:**\n\n")
-	w(bt3 + "bash\n")
-	w("./mxcli check script.mdl                              # Syntax check\n")
-	w("./mxcli check script.mdl -p " + mprPath + " --references  # With reference validation\n")
-	w(bt3 + "\n\n")
+	w("**Skills** are in " + bt + ".ai-context/skills/<name>/SKILL.md" + bt + " (and " + bt + ".claude/skills/" + bt + ", which is\n")
+	w("the path Claude Code scans). Each one's frontmatter " + bt + "description" + bt + " says when to reach for\n")
+	w("it — that IS the index, so list the directory rather than looking for a table.\n\n")
+	// Measured on the BENCH-001 baseline (2026-10-10): reading the skills was
+	// ~68% of the session's re-read cost against ~31% of its calls, and one
+	// `cat write-microflows/SKILL.md` (7.1k tokens, re-read 43 times) cost more
+	// than every mxcli invocation in the costliest ten put together. The same
+	// answers cost 0.1-0.6k through `syntax`. Both paths existed; the line here
+	// said only "read the matching skill", so it read whole files.
+	//
+	// The routing itself rides the table row above rather than a paragraph of
+	// its own: this file is re-read every session, so prose about saving tokens
+	// that costs 500 bytes is self-defeating. What is left is the one thing the
+	// table cannot say.
+	w("**Read a skill's section, not the file** — each opens with a line-numbered index.\n\n")
 
-	// ── MDL Commands by Domain ──────────────────────────────────────
-	w("## MDL Commands by Domain\n\n")
+	// ── The non-derivable conventions ───────────────────────────────
+	// Short, and each one is here precisely because no command reports it.
+	w("## Conventions no command will tell you\n\n")
+	w("- **Quote every identifier** in MDL — " + bt + "Module.\"Customer\"" + bt + ", " + bt + "\"Status\": String(50)" + bt + ".\n")
+	w("  Quotes are stripped, so it is safe and sidesteps every parser keyword.\n")
+	w("  It does **not** exempt names Mendix itself reserves (" + bt + "Type" + bt + ", " + bt + "ID" + bt + ", " + bt + "CreatedDate" + bt + ") —\n")
+	w("  those are rejected quoted or not.\n")
+	w("- **A business process with human steps is a " + bt + "WORKFLOW" + bt + "**, not a status attribute\n")
+	w("  plus microflows — you get the user-task inbox, assignment, timers and a definition\n")
+	w("  the business can read. " + bt + "mxcli syntax workflow" + bt + ", skill " + bt + "write-workflows" + bt + ".\n")
+	w("- **An aggregation is a " + bt + "VIEW ENTITY" + bt + "** (OQL, Mendix 10.18+) — not a microflow that\n")
+	w("  retrieves rows and counts them. The database does the work instead of pulling every\n")
+	w("  object into memory. " + bt + "mxcli syntax view-entity" + bt + ", skill " + bt + "write-oql-queries" + bt + ".\n")
+	w("- **A " + bt + "/** ... */" + bt + " comment before a statement sets that element's documentation.**\n")
+	w("- **" + bt + "@Position(x, y)" + bt + " is optional** — mxcli places microflow activities, and\n")
+	w("  " + bt + "./mxcli layout" + bt + " arranges the domain model.\n\n")
 
-	// Exploration & Structure
-	w("### Exploration & Structure\n\n")
-	w("| Command | Description |\n")
-	w("|---------|-------------|\n")
-	w("| " + bt + "SHOW MODULES" + bt + " | List all modules |\n")
-	w("| " + bt + "SHOW STRUCTURE [DEPTH 1|2|3] [IN Module] [ALL]" + bt + " | Compact project overview at different detail levels |\n")
-	w("| " + bt + "SHOW CALLERS OF Module.Microflow" + bt + " | Find what calls a microflow |\n")
-	w("| " + bt + "SHOW CALLEES OF Module.Microflow" + bt + " | Find what a microflow calls |\n")
-	w("| " + bt + "SHOW REFERENCES OF Module.Entity" + bt + " | Find all references to an element |\n")
-	w("| " + bt + "SHOW IMPACT OF Module.Entity" + bt + " | Impact analysis for changes |\n")
-	w("| " + bt + "SHOW CONTEXT OF Module.Microflow" + bt + " | Show callers + callees + references |\n")
-	w("| " + bt + "SEARCH 'keyword'" + bt + " | Full-text search across all strings and source |\n")
-	w("| " + bt + "HELP [topic]" + bt + " | Show all commands or help on a topic |\n")
-	w("\n")
-
-	// Domain Model
-	w("### Domain Model\n\n")
-	w("| Command | Description |\n")
-	w("|---------|-------------|\n")
-	w("| " + bt + "SHOW ENTITIES [IN Module]" + bt + " | List entities |\n")
-	w("| " + bt + "SHOW ASSOCIATIONS [IN Module]" + bt + " | List associations |\n")
-	w("| " + bt + "SHOW ENUMERATIONS [IN Module]" + bt + " | List enumerations |\n")
-	w("| " + bt + "SHOW CONSTANTS [IN Module]" + bt + " | List constants |\n")
-	w("| " + bt + "DESCRIBE ENTITY Module.Entity" + bt + " | Show entity definition in MDL |\n")
-	w("| " + bt + "DESCRIBE ASSOCIATION Module.Assoc" + bt + " | Show association definition |\n")
-	w("| " + bt + "DESCRIBE ENUMERATION Module.Enum" + bt + " | Show enumeration definition |\n")
-	w("| " + bt + "CREATE MODULE ModuleName" + bt + " | Create a new module |\n")
-	w("| " + bt + "CREATE PERSISTENT ENTITY ..." + bt + " | Create a persistent entity with attributes |\n")
-	w("| " + bt + "CREATE NON-PERSISTENT ENTITY ..." + bt + " | Create a non-persistent (transient) entity |\n")
-	w("| " + bt + "CREATE ASSOCIATION ..." + bt + " | Create an association between entities |\n")
-	w("| " + bt + "CREATE ENUMERATION ..." + bt + " | Create an enumeration |\n")
-	w("| " + bt + "ALTER ENTITY Module.Entity ADD ..." + bt + " | Add/rename/modify/drop attributes, indexes, docs |\n")
-	w("| " + bt + "DROP ENTITY Module.Entity" + bt + " | Delete an entity |\n")
-	w("| " + bt + "DROP ASSOCIATION Module.Assoc" + bt + " | Delete an association |\n")
-	w("| " + bt + "DROP ENUMERATION Module.Enum" + bt + " | Delete an enumeration |\n")
-	w("\n")
-
-	// Microflows & Nanoflows
-	w("### Microflows & Nanoflows\n\n")
-	w("| Command | Description |\n")
-	w("|---------|-------------|\n")
-	w("| " + bt + "SHOW MICROFLOWS [IN Module]" + bt + " | List microflows |\n")
-	w("| " + bt + "SHOW NANOFLOWS [IN Module]" + bt + " | List nanoflows |\n")
-	w("| " + bt + "DESCRIBE MICROFLOW Module.Flow" + bt + " | Show microflow definition in MDL |\n")
-	w("| " + bt + "DESCRIBE NANOFLOW Module.Flow" + bt + " | Show nanoflow definition in MDL |\n")
-	w("| " + bt + "CREATE MICROFLOW ... BEGIN ... END;" + bt + " | Create a microflow with activities |\n")
-	w("| " + bt + "CREATE NANOFLOW ... BEGIN ... END;" + bt + " | Create a nanoflow with activities |\n")
-	w("| " + bt + "DROP MICROFLOW Module.Flow" + bt + " | Delete a microflow |\n")
-	w("| " + bt + "DROP NANOFLOW Module.Flow" + bt + " | Delete a nanoflow |\n")
-	w("\n")
-
-	// Pages & Snippets
-	w("### Pages & Snippets\n\n")
-	w("| Command | Description |\n")
-	w("|---------|-------------|\n")
-	w("| " + bt + "SHOW PAGES [IN Module]" + bt + " | List pages |\n")
-	w("| " + bt + "SHOW SNIPPETS [IN Module]" + bt + " | List snippets |\n")
-	w("| " + bt + "DESCRIBE PAGE Module.Page" + bt + " | Show page definition in MDL |\n")
-	w("| " + bt + "DESCRIBE SNIPPET Module.Snippet" + bt + " | Show snippet definition |\n")
-	w("| " + bt + "CREATE PAGE ... { widgets }" + bt + " | Create a page with widget syntax |\n")
-	w("| " + bt + "CREATE SNIPPET ... { widgets }" + bt + " | Create a reusable snippet |\n")
-	w("| " + bt + "ALTER PAGE Module.Page { ops }" + bt + " | Modify page in-place (SET, INSERT, DROP, REPLACE) |\n")
-	w("| " + bt + "ALTER SNIPPET Module.Snippet { ops }" + bt + " | Modify snippet in-place |\n")
-	w("| " + bt + "DROP PAGE Module.Page" + bt + " | Delete a page |\n")
-	w("| " + bt + "DROP SNIPPET Module.Snippet" + bt + " | Delete a snippet |\n")
-	w("\n")
-
-	// Security
-	w("### Security\n\n")
-	w("| Command | Description |\n")
-	w("|---------|-------------|\n")
-	w("| " + bt + "SHOW PROJECT SECURITY" + bt + " | Security level, admin, demo users overview |\n")
-	w("| " + bt + "SHOW MODULE ROLES [IN Module]" + bt + " | Module-level roles |\n")
-	w("| " + bt + "SHOW USER ROLES" + bt + " | Project-level user roles |\n")
-	w("| " + bt + "SHOW DEMO USERS" + bt + " | Configured demo users |\n")
-	w("| " + bt + "SHOW ACCESS ON MICROFLOW|PAGE|ENTITY Mod.Name" + bt + " | Role access on element |\n")
-	w("| " + bt + "SHOW SECURITY MATRIX [IN Module]" + bt + " | Full access overview |\n")
-	w("| " + bt + "CREATE MODULE ROLE Mod.Role" + bt + " | Create a module role |\n")
-	w("| " + bt + "CREATE USER ROLE Name (Mod.Role, ...)" + bt + " | Create a user role aggregating module roles |\n")
-	w("| " + bt + "ALTER USER ROLE Name ADD|REMOVE MODULE ROLES (...)" + bt + " | Modify user role |\n")
-	w("| " + bt + "GRANT EXECUTE ON MICROFLOW Mod.MF TO Mod.Role" + bt + " | Grant microflow access |\n")
-	w("| " + bt + "GRANT VIEW ON PAGE Mod.Page TO Mod.Role" + bt + " | Grant page access |\n")
-	w("| " + bt + "GRANT Mod.Role ON Mod.Entity (CREATE, DELETE, READ *, WRITE *)" + bt + " | Grant entity access |\n")
-	w("| " + bt + "REVOKE EXECUTE|VIEW|role ON element FROM role" + bt + " | Revoke access |\n")
-	w("| " + bt + "ALTER PROJECT SECURITY LEVEL OFF|PROTOTYPE|PRODUCTION" + bt + " | Set security level |\n")
-	w("| " + bt + "ALTER PROJECT SECURITY DEMO USERS ON|OFF" + bt + " | Toggle demo users |\n")
-	w("| " + bt + "CREATE DEMO USER 'name' PASSWORD 'pass' (UserRole, ...)" + bt + " | Create demo user |\n")
-	w("| " + bt + "DROP MODULE ROLE|USER ROLE|DEMO USER ..." + bt + " | Delete roles/users |\n")
-	w("\n")
-
-	// Navigation
-	w("### Navigation\n\n")
-	w("| Command | Description |\n")
-	w("|---------|-------------|\n")
-	w("| " + bt + "SHOW NAVIGATION" + bt + " | Summary of all profiles |\n")
-	w("| " + bt + "SHOW NAVIGATION MENU [Profile]" + bt + " | Menu tree for profile or all |\n")
-	w("| " + bt + "SHOW NAVIGATION HOMES" + bt + " | Home page assignments across profiles |\n")
-	w("| " + bt + "DESCRIBE NAVIGATION [Profile]" + bt + " | Full MDL output (round-trippable) |\n")
-	w("| " + bt + "CREATE OR REPLACE NAVIGATION Profile ..." + bt + " | Full replacement of a navigation profile |\n")
-	w("\n")
-
-	// Project Settings
-	w("### Project Settings\n\n")
-	w("| Command | Description |\n")
-	w("|---------|-------------|\n")
-	w("| " + bt + "SHOW SETTINGS" + bt + " | Overview of all settings |\n")
-	w("| " + bt + "DESCRIBE SETTINGS" + bt + " | Full MDL output (round-trippable) |\n")
-	w("| " + bt + "ALTER SETTINGS MODEL Key = Value" + bt + " | AfterStartupMicroflow, HashAlgorithm, JavaVersion, etc. |\n")
-	w("| " + bt + "ALTER SETTINGS CONFIGURATION 'Name' Key = Value" + bt + " | DatabaseType, DatabaseUrl, HttpPortNumber, etc. |\n")
-	w("| " + bt + "ALTER SETTINGS CONSTANT 'Name' VALUE 'val' IN CONFIGURATION 'cfg'" + bt + " | Override constant per configuration |\n")
-	w("| " + bt + "ALTER SETTINGS LANGUAGE Key = Value" + bt + " | DefaultLanguageCode |\n")
-	w("| " + bt + "ALTER SETTINGS WORKFLOWS Key = Value" + bt + " | UserEntity, DefaultTaskParallelism |\n")
-	w("\n")
-
-	// Business Events & Java Actions
-	w("### Business Events & Java Actions\n\n")
-	w("| Command | Description |\n")
-	w("|---------|-------------|\n")
-	w("| " + bt + "SHOW DATABASE CONNECTIONS [IN Module]" + bt + " | List database connections |\n")
-	w("| " + bt + "DESCRIBE DATABASE CONNECTION Mod.Name" + bt + " | Show connection definition in MDL |\n")
-	w("| " + bt + "SHOW BUSINESS EVENTS [IN Module]" + bt + " | List business event services |\n")
-	w("| " + bt + "DESCRIBE BUSINESS EVENT SERVICE Mod.Name" + bt + " | Full MDL output |\n")
-	w("| " + bt + "CREATE BUSINESS EVENT SERVICE ..." + bt + " | Create a business event service |\n")
-	w("| " + bt + "DROP BUSINESS EVENT SERVICE Mod.Name" + bt + " | Delete a service |\n")
-	w("| " + bt + "SHOW JAVA ACTIONS [IN Module]" + bt + " | List Java actions |\n")
-	w("| " + bt + "DESCRIBE JAVA ACTION Mod.Name" + bt + " | Full MDL output with signature |\n")
-	w("| " + bt + "CREATE JAVA ACTION ... AS $$ ... $$" + bt + " | Create with inline Java code |\n")
-	w("| " + bt + "DROP JAVA ACTION Mod.Name" + bt + " | Delete a Java action |\n")
-	w("\n")
-
-	// OData
-	w("### OData\n\n")
-	w("| Command | Description |\n")
-	w("|---------|-------------|\n")
-	w("| " + bt + "SHOW ODATA CLIENTS [IN Module]" + bt + " | List consumed OData services |\n")
-	w("| " + bt + "SHOW ODATA SERVICES [IN Module]" + bt + " | List published OData services |\n")
-	w("| " + bt + "DESCRIBE ODATA CLIENT Mod.Name" + bt + " | Full consumed OData MDL output |\n")
-	w("| " + bt + "DESCRIBE ODATA SERVICE Mod.Name" + bt + " | Full published OData MDL output |\n")
-	w("| " + bt + "CREATE ODATA CLIENT ..." + bt + " | Create a consumed OData service |\n")
-	w("| " + bt + "CREATE ODATA SERVICE ..." + bt + " | Create a published OData service |\n")
-	w("| " + bt + "ALTER ODATA CLIENT|SERVICE ..." + bt + " | Modify an OData service |\n")
-	w("| " + bt + "DROP ODATA CLIENT|SERVICE Mod.Name" + bt + " | Delete an OData service |\n")
-	w("\n")
-
-	// External SQL
-	w("### External SQL\n\n")
-	w("| Command | Description |\n")
-	w("|---------|-------------|\n")
-	w("| " + bt + "SQL CONNECT <driver> '<dsn>' AS <alias>" + bt + " | Connect to external database (postgres) |\n")
-	w("| " + bt + "SQL DISCONNECT <alias>" + bt + " | Close connection |\n")
-	w("| " + bt + "SQL CONNECTIONS" + bt + " | List active connections (alias + driver only) |\n")
-	w("| " + bt + "SQL <alias> SHOW TABLES" + bt + " | List tables via information_schema |\n")
-	w("| " + bt + "SQL <alias> DESCRIBE <table>" + bt + " | Show columns, types, nullability |\n")
-	w("| " + bt + "SQL <alias> <any-sql>" + bt + " | Raw SQL passthrough to external DB |\n")
-	w("\n")
-
-	// Catalog Queries
-	w("### Catalog Queries\n\n")
-	w("| Command | Description |\n")
-	w("|---------|-------------|\n")
-	w("| " + bt + "REFRESH CATALOG" + bt + " | Build catalog (metadata only) |\n")
-	w("| " + bt + "REFRESH CATALOG FULL" + bt + " | Full catalog with activities, widgets, cross-refs |\n")
-	w("| " + bt + "SHOW CATALOG TABLES" + bt + " | List available catalog tables |\n")
-	w("| " + bt + "SELECT ... FROM CATALOG.ENTITIES WHERE ..." + bt + " | SQL queries against project metadata |\n")
-	w("\n")
-
-	w("Available catalog tables: " + bt + "CATALOG.MODULES" + bt + ", " + bt + "CATALOG.ENTITIES" + bt + ", " + bt + "CATALOG.MICROFLOWS" + bt + ", " + bt + "CATALOG.PAGES" + bt + ", " + bt + "CATALOG.WORKFLOWS" + bt + ", " + bt + "CATALOG.ENUMERATIONS" + bt + ", " + bt + "CATALOG.ASSOCIATIONS" + bt + ", " + bt + "CATALOG.SNIPPETS" + bt + ", " + bt + "CATALOG.REFS" + bt + " (requires FULL mode).\n\n")
-
-	// Project Organization
-	w("### Project Organization\n\n")
-	w("| Command | Description |\n")
-	w("|---------|-------------|\n")
-	w("| " + bt + "MOVE PAGE|MICROFLOW|SNIPPET|... Mod.Name TO FOLDER 'path'" + bt + " | Move element to folder |\n")
-	w("| " + bt + "MOVE PAGE Mod.Name TO Module" + bt + " | Move to module root |\n")
-	w("| " + bt + "MOVE ENTITY Old.Name TO NewModule" + bt + " | Move entity across modules |\n")
-	w("| " + bt + "SHOW WORKFLOWS [IN Module]" + bt + " | List workflows |\n")
-	w("| " + bt + "DESCRIBE WORKFLOW Module.Workflow" + bt + " | Show workflow definition |\n")
-	w("| " + bt + "SHOW WIDGETS [IN Module]" + bt + " | Widget discovery (experimental) |\n")
-	w("\n")
-
-	// ── Script Validation ───────────────────────────────────────────
-	w("## Script Validation (mxcli check)\n\n")
-	w("Before executing MDL scripts, validate them for syntax errors:\n\n")
-	w(bt3 + "bash\n./mxcli check script.mdl\n" + bt3 + "\n\n")
-	w("### Check with Reference Validation\n\n")
-	w("Validate that all referenced modules, entities, and associations exist:\n\n")
-	w(bt3 + "bash\n./mxcli check script.mdl -p " + mprPath + " --references\n" + bt3 + "\n\n")
-	w("The reference checker is smart - it automatically skips references to objects that are created within the same script.\n\n")
-
-	// ── Linting ─────────────────────────────────────────────────────
-	w("## Linting\n\n")
-	w("Check your project for common issues:\n\n")
-	w(bt3 + "bash\n")
-	w("# Lint the project\n./mxcli lint -p " + mprPath + "\n\n")
-	w("# With colored output\n./mxcli lint -p " + mprPath + " --color\n\n")
-	w("# List available rules\n./mxcli lint -p " + mprPath + " --list-rules\n\n")
-	w("# Output as SARIF\n./mxcli lint -p " + mprPath + " --format sarif > results.sarif\n")
-	w(bt3 + "\n\n")
-	w("### Built-in Rules\n\n")
-	w("| Rule | Category | Description |\n")
-	w("|------|----------|-------------|\n")
-	w("| MPR001 | quality | PascalCase naming conventions (entities, microflows, pages, enumerations) |\n")
-	w("| MPR002 | quality | Empty microflows (no activities) |\n")
-	w("| MPR003 | design | Domain model size (>15 persistent entities per module) |\n")
-	w("| MPR004 | correctness | Empty validation feedback message (CE0091) |\n")
-	w("| MPR005 | correctness | Unconfigured image widget source |\n")
-	w("| MPR006 | correctness | Empty containers (runtime crash) |\n")
-	w("| MPR007 | security | Navigation page without allowed role (CE0557) |\n")
-	w("| SEC001 | security | Persistent entity without access rules |\n")
-	w("| SEC002 | security | Weak password policy (minimum length < 8) |\n")
-	w("| SEC003 | security | Demo users active at non-development security level |\n")
-	w("\n")
-	w("### Bundled Starlark Rules\n\n")
-	w("27 additional rules in " + bt + ".claude/lint-rules/*.star" + bt + ":\n\n")
-	w("| Rule | Category | Description |\n")
-	w("|------|----------|-------------|\n")
-	w("| SEC004 | security | Guest access enabled - review anonymous entity access |\n")
-	w("| SEC005 | security | Strict mode disabled - XPath constraint enforcement off |\n")
-	w("| SEC006 | security | PII attributes exposed without access rules |\n")
-	w("| SEC007 | security | Anonymous unconstrained READ (DIVD-2022-00019) |\n")
-	w("| SEC008 | security | PII entities readable without row scoping |\n")
-	w("| SEC009 | security | Large entities missing member-level access restrictions |\n")
-	w("| ARCH001 | architecture | Cross-module data access in pages |\n")
-	w("| ARCH002 | architecture | Data changes should go through microflows |\n")
-	w("| ARCH003 | architecture | Persistent entities need a unique business key |\n")
-	w("| QUAL001 | quality | McCabe cyclomatic complexity threshold |\n")
-	w("| QUAL002 | quality | Missing documentation on entities/microflows |\n")
-	w("| QUAL003 | quality | Long microflows (too many activities) |\n")
-	w("| QUAL004 | quality | Orphaned/unreferenced elements |\n")
-	w("| DESIGN001 | design | Entity with too many attributes |\n")
-	w("| CONV001 | naming | Boolean attributes must start with Is/Has/Can/Should/Was/Will |\n")
-	w("| CONV002 | quality | String/numeric attributes should not have default values |\n")
-	w("| CONV003 | naming | Pages should follow Entity_NewEdit/View/Overview naming |\n")
-	w("| CONV004 | naming | Enumerations should be prefixed with ENUM_ |\n")
-	w("| CONV005 | naming | Snippets should be prefixed with SNIPPET_ |\n")
-	w("| CONV006 | security | Entity access rules should not grant Create/Delete rights |\n")
-	w("| CONV007 | security | All persistent entity access rules need XPath constraints |\n")
-	w("| CONV008 | security | Each module role should map to exactly one user role |\n")
-	w("| CONV009 | quality | Microflows should have at most 15 objects |\n")
-	w("| CONV015 | quality | Entities should not have validation rules |\n")
-	w("| CONV016 | performance | Entities should not have event handlers |\n")
-	w("| CONV017 | performance | Attributes should not be calculated (virtual) |\n")
-	w("\n")
-	w("Custom Starlark rules in " + bt + ".claude/lint-rules/*.star" + bt + " are loaded automatically. See " + bt + "write-lint-rules" + bt + " skill for authoring guide.\n\n")
-
-	// ── Report ──────────────────────────────────────────────────────
-	w("## Best Practices Report\n\n")
-	w("Generate a scored best practices report:\n\n")
-	w(bt3 + "bash\n")
-	w("# Markdown report (default)\n./mxcli report -p " + mprPath + "\n\n")
-	w("# JSON report\n./mxcli report -p " + mprPath + " --format json\n\n")
-	w("# HTML report\n./mxcli report -p " + mprPath + " --format html\n")
-	w(bt3 + "\n\n")
-	w("The report scores 6 categories (Naming, Security, Quality, Architecture, Performance, Design) on a 0-100 scale. See " + bt + "assess-quality" + bt + " skill for the full assessment guide.\n\n")
-
-	// ── Slash Commands ──────────────────────────────────────────────
-	w("## Slash Commands\n\n")
-	w("Use these commands to quickly perform common tasks:\n\n")
-	w("| Command | Description |\n")
-	w("|---------|-------------|\n")
-	w("| " + bt + "/create-entity" + bt + " | Create a new entity with attributes |\n")
-	w("| " + bt + "/create-crud" + bt + " | Generate entity + overview + edit pages |\n")
-	w("| " + bt + "/refresh-catalog" + bt + " | Rebuild catalog for queries |\n")
-	w("| " + bt + "/explore" + bt + " | Explore project structure |\n")
-	w("| " + bt + "/check-script" + bt + " | Validate MDL script syntax |\n")
-	w("| " + bt + "/validate-project" + bt + " | Run mx check to validate project |\n")
-	w("| " + bt + "/lint" + bt + " | Check project for common issues |\n")
-	w("| " + bt + "/test" + bt + " | Run Playwright tests against the running app |\n")
-	w("| " + bt + "/diff-local" + bt + " | Show git diff of local MPR v2 changes |\n")
-	w("| " + bt + "/diff-script" + bt + " | Compare MDL script against project state |\n")
-	w("\n")
-
-	// ── Skills Reference ────────────────────────────────────────────
-	w("## Skills Reference\n\n")
-	w("Skills are in " + bt + ".ai-context/skills/" + bt + ". Read the relevant skill before starting work.\n\n")
-
-	w("### Quick Reference\n\n")
-	w("| Skill | Purpose |\n")
-	w("|-------|--------|\n")
-	w("| cheatsheet-variables | Variable declaration syntax quick lookup |\n")
-	w("| cheatsheet-errors | Common MDL errors and fixes |\n")
-	w("\n")
-
-	w("### Syntax Reference\n\n")
-	w("| Skill | Purpose |\n")
-	w("|-------|--------|\n")
-	w("| mdl-entities | Entity, attribute, association syntax |\n")
-	w("| write-microflows | **Read first** - Microflow syntax, common mistakes |\n")
-	w("| write-oql-queries | OQL query syntax for VIEW entities |\n")
-	w("| create-page | Page and widget syntax |\n")
-	w("| fragments | Reusable widget group syntax |\n")
-	w("\n")
-
-	w("### Patterns\n\n")
-	w("| Skill | Purpose |\n")
-	w("|-------|--------|\n")
-	w("| patterns-crud | Create/Read/Update/Delete patterns |\n")
-	w("| patterns-data-processing | Loops, aggregates, batch processing |\n")
-	w("| validation-microflows | Validation feedback patterns |\n")
-	w("\n")
-
-	w("### Pages\n\n")
-	w("| Skill | Purpose |\n")
-	w("|-------|--------|\n")
-	w("| overview-pages | List/grid overview page patterns |\n")
-	w("| master-detail-pages | Master-detail layout patterns |\n")
-	w("| alter-page | ALTER PAGE/SNIPPET in-place modifications |\n")
-	w("| bulk-widget-updates | Bulk widget property updates across pages |\n")
-	w("\n")
-
-	w("### Integration\n\n")
-	w("| Skill | Purpose |\n")
-	w("|-------|--------|\n")
-	w("| database-connections | External database connections (PostgreSQL, Oracle) |\n")
-	w("| rest-client | REST API consumption |\n")
-	w("| java-actions | Custom Java actions |\n")
-	w("| odata-data-sharing | OData services and external entities |\n")
-	w("\n")
-
-	w("### Operations\n\n")
-	w("| Skill | Purpose |\n")
-	w("|-------|--------|\n")
-	w("| manage-security | Security roles, GRANT/REVOKE, access control |\n")
-	w("| manage-navigation | Navigation profiles, menus, home/login pages |\n")
-	w("| organize-project | Folders, MOVE command, project structure |\n")
-	w("| project-settings | Project configuration (model, runtime, language) |\n")
-	w("| business-events | Business event services |\n")
-	w("\n")
-
-	w("### Infrastructure\n\n")
-	w("| Skill | Purpose |\n")
-	w("|-------|--------|\n")
-	w("| docker-workflow | Docker build and deployment |\n")
-	w("| run-app | Running the Mendix app locally |\n")
-	w("| runtime-admin-api | M2EE admin API |\n")
-	w("| system-module | System module entities reference |\n")
-	w("| verify-with-oql | OQL verification queries |\n")
-	w("| demo-data | **Read first for data work** - Demo data insertion |\n")
-	w("\n")
-
-	w("### Testing & Quality\n\n")
-	w("| Skill | Purpose |\n")
-	w("|-------|--------|\n")
-	w("| test-app | Playwright UI tests + DB assertions |\n")
-	w("| test-microflows | Microflow unit testing (.test.mdl files) |\n")
-	w("| write-lint-rules | Custom Starlark lint rule authoring |\n")
-	w("| assess-quality | **Full project quality assessment** against best practices |\n")
-	w("\n")
-
-	w("### Domain Model\n\n")
-	w("| Skill | Purpose |\n")
-	w("|-------|--------|\n")
-	w("| generate-domain-model | Full domain model generation |\n")
-	w("\n")
-
-	w("### Migration\n\n")
-	w("| Skill | Purpose |\n")
-	w("|-------|--------|\n")
-	w("| assess-migration | Migration assessment and planning |\n")
-	w("| migrate-k2-nintex | K2/Nintex workflow migration |\n")
-	w("| migrate-outsystems | OutSystems migration |\n")
-	w("| migrate-oracle-forms | Oracle Forms migration |\n")
-	w("| graph-studio-app | Reverse-engineer/graph Studio Pro app |\n")
-	w("\n")
-
-	w("### Debugging & Preflight\n\n")
-	w("| Skill | Purpose |\n")
-	w("|-------|--------|\n")
-	w("| debug-bson | BSON serialization debugging |\n")
-	w("| check-syntax | Pre-flight validation checklist |\n")
-	w("\n")
-
-	// ── MDL Syntax Quick Reference ──────────────────────────────────
-	w("## MDL Syntax Quick Reference\n\n")
-
-	w("### Entity Generalization (EXTENDS)\n\n")
-	w("**CRITICAL: EXTENDS goes BEFORE the opening parenthesis, not after!**\n\n")
-	w(bt3 + "sql\nCREATE PERSISTENT ENTITY Module.ProductPhoto EXTENDS System.Image (\n  PhotoCaption: String(200)\n);\n" + bt3 + "\n\n")
-
-	w("### Microflows - Supported Statements\n\n")
-	w("| Statement | Syntax |\n")
-	w("|-----------|--------|\n")
-	w("| Variable declaration | " + bt + "DECLARE $Var Type = value;" + bt + " |\n")
-	w("| Entity declaration | " + bt + "DECLARE $Entity Module.Entity;" + bt + " |\n")
-	w("| List declaration | " + bt + "DECLARE $List List of Module.Entity = empty;" + bt + " |\n")
-	w("| Assignment | " + bt + "SET $Var = expression;" + bt + " |\n")
-	w("| Create object | " + bt + "$Var = CREATE Module.Entity (Attr = value);" + bt + " |\n")
-	w("| Change object | " + bt + "CHANGE $Entity (Attr = value);" + bt + " |\n")
-	w("| Commit | " + bt + "COMMIT $Entity [WITH EVENTS] [REFRESH];" + bt + " |\n")
-	w("| Delete | " + bt + "DELETE $Entity;" + bt + " |\n")
-	w("| Rollback | " + bt + "ROLLBACK $Entity [REFRESH];" + bt + " |\n")
-	w("| Retrieve | " + bt + "RETRIEVE $Var FROM Module.Entity [WHERE condition];" + bt + " |\n")
-	w("| Call microflow | " + bt + "$Result = CALL MICROFLOW Module.Name (Param = $value);" + bt + " |\n")
-	w("| Call nanoflow | " + bt + "$Result = CALL NANOFLOW Module.Name (Param = $value);" + bt + " |\n")
-	w("| Call Java action | " + bt + "$Result = CALL JAVA ACTION Module.Name (Param = value);" + bt + " |\n")
-	w("| Show page | " + bt + "SHOW PAGE Module.PageName ($Param = $value);" + bt + " |\n")
-	w("| Close page | " + bt + "CLOSE PAGE;" + bt + " |\n")
-	w("| Validation | " + bt + "VALIDATION FEEDBACK $Entity/Attribute MESSAGE 'message';" + bt + " |\n")
-	w("| Log | " + bt + "LOG INFO|WARNING|ERROR [NODE 'name'] 'message';" + bt + " |\n")
-	w("| Annotation | " + bt + "@annotation 'text'" + bt + " (before activity) |\n")
-	w("| Position | " + bt + "@position(x, y)" + bt + " (before activity) |\n")
-	w("| Error handling | " + bt + "... ON ERROR CONTINUE|ROLLBACK|{ handler };" + bt + " |\n")
-	w("| IF | " + bt + "IF condition THEN ... [ELSE ...] END IF;" + bt + " |\n")
-	w("| LOOP | " + bt + "LOOP $Item IN $List BEGIN ... END LOOP;" + bt + " |\n")
-	w("| WHILE | " + bt + "WHILE condition BEGIN ... END WHILE;" + bt + " |\n")
-	w("| Return | " + bt + "RETURN $value;" + bt + " |\n")
-	w("\n")
-
-	w("### Microflows - NOT Supported (Will Cause Parse Errors)\n\n")
-	w("| Unsupported | Use Instead |\n")
-	w("|-------------|-------------|\n")
-	w("| " + bt + "CASE ... WHEN ... END CASE" + bt + " | Nested " + bt + "IF ... ELSE ... END IF" + bt + " |\n")
-	w("| " + bt + "TRY ... CATCH" + bt + " | " + bt + "ON ERROR { ... }" + bt + " blocks |\n")
-	w("\n")
-	w("**Notes:**\n")
-	w("- " + bt + "RETRIEVE ... LIMIT n" + bt + " IS supported. " + bt + "LIMIT 1" + bt + " returns a single entity.\n")
-	w("- " + bt + "ROLLBACK $Entity [REFRESH];" + bt + " IS supported. Rolls back uncommitted changes.\n\n")
-
-	w("### Pages Syntax Summary\n\n")
-	w("| Element | Syntax | Example |\n")
-	w("|---------|--------|--------|\n")
-	w("| Page properties | " + bt + "(Key: value, ...)" + bt + " | " + bt + "(Title: 'Edit', Layout: Atlas_Core.Atlas_Default)" + bt + " |\n")
-	w("| Widget name | Required after type | " + bt + "TEXTBOX txtName (...)" + bt + " |\n")
-	w("| Attribute binding | " + bt + "Attribute: AttrName" + bt + " | " + bt + "TEXTBOX txt (Label: 'Name', Attribute: Name)" + bt + " |\n")
-	w("| Microflow action | " + bt + "Action: MICROFLOW Name(Param: val)" + bt + " | " + bt + "Action: MICROFLOW Mod.ACT_Process(Order: $Order)" + bt + " |\n")
-	w("| Database source | " + bt + "DataSource: DATABASE Entity" + bt + " | " + bt + "DATAGRID dg (DataSource: DATABASE Mod.Entity)" + bt + " |\n")
-	w("| Selection source | " + bt + "DataSource: SELECTION widget" + bt + " | " + bt + "DATAVIEW dv (DataSource: SELECTION galleryList)" + bt + " |\n")
-	w("\n")
-
-	w("**Supported Widgets:** LAYOUTGRID, ROW, COLUMN, CONTAINER, TEXTBOX, TEXTAREA, CHECKBOX, RADIOBUTTONS, DATEPICKER, COMBOBOX, DYNAMICTEXT, DATAGRID, GALLERY, LISTVIEW, IMAGE, STATICIMAGE, DYNAMICIMAGE, ACTIONBUTTON, LINKBUTTON, DATAVIEW, HEADER, FOOTER, CONTROLBAR, SNIPPETCALL, NAVIGATIONLIST, CUSTOMCONTAINER.\n\n")
-
-	// ALTER PAGE summary
-	w("### ALTER PAGE / ALTER SNIPPET\n\n")
-	w("Modify existing pages in-place without full " + bt + "CREATE OR REPLACE" + bt + ":\n\n")
-	w("| Operation | Syntax |\n")
-	w("|-----------|--------|\n")
-	w("| Set property | " + bt + "SET Caption = 'New' ON widgetName" + bt + " |\n")
-	w("| Set multiple | " + bt + "SET (Caption = 'Save', ButtonStyle = Success) ON btn" + bt + " |\n")
-	w("| Page-level set | " + bt + "SET Title = 'New Title'" + bt + " (no ON clause) |\n")
-	w("| Insert after | " + bt + "INSERT AFTER widgetName { widgets }" + bt + " |\n")
-	w("| Insert before | " + bt + "INSERT BEFORE widgetName { widgets }" + bt + " |\n")
-	w("| Drop widgets | " + bt + "DROP WIDGET name1, name2" + bt + " |\n")
-	w("| Replace widget | " + bt + "REPLACE widgetName WITH { widgets }" + bt + " |\n")
-	w("\n")
-
-	// Reserved words
-	w("### Quoted Identifiers\n\n")
-	w("**Always quote all identifiers** (entity names, attribute names, parameter names) with double quotes. This eliminates all reserved keyword conflicts and is always safe — quotes are stripped automatically.\n\n")
-	w(bt3 + "sql\nCREATE PERSISTENT ENTITY Module.\"Customer\" (\n  \"Name\": String(200),\n  \"Status\": String(50),\n  \"Create\": DateTime\n);\n" + bt3 + "\n\n")
-
-	// ── MDL Script Files ────────────────────────────────────────────
-	w("## MDL Script Files\n\n")
-	w("Store MDL scripts in the " + bt + "mdlsource/" + bt + " directory:\n\n")
-	w(bt3 + "\nmdlsource/\n")
-	w("\u251c\u2500\u2500 domain-model.mdl      # Entity definitions\n")
-	w("\u251c\u2500\u2500 microflows.mdl        # Business logic\n")
-	w("\u2514\u2500\u2500 setup.mdl             # Initial setup script\n")
-	w(bt3 + "\n\n")
-	w("Execute a script:\n\n")
-	w(bt3 + "sql\nEXECUTE SCRIPT 'mdlsource/domain-model.mdl';\n" + bt3 + "\n\n")
-
-	// ── Example: Entity ─────────────────────────────────────────────
-	w("## Example: Create an Entity\n\n")
-	w(bt3 + "sql\n")
-	w("/**\n * Customer entity\n *\n * Stores customer information.\n */\n")
-	w("@Position(100, 100)\n")
-	w("CREATE PERSISTENT ENTITY Sales.Customer (\n")
-	w("  /** Customer name */\n")
-	w("  Name: String(200) NOT NULL ERROR 'Name is required',\n")
-	w("  /** Email address */\n")
-	w("  Email: String(200) UNIQUE ERROR 'Email must be unique',\n")
-	w("  /** Phone number */\n")
-	w("  Phone: String(50),\n")
-	w("  /** Active status */\n")
-	w("  IsActive: Boolean DEFAULT true\n")
-	w(");\n")
-	w(bt3 + "\n\n")
-
-	// ── Example: Microflow ──────────────────────────────────────────
-	w("## Example: Create a Microflow\n\n")
-	w(bt3 + "sql\n")
-	w("/**\n * Validates a customer before saving\n *\n * @param $Customer The customer to validate\n * @returns Boolean indicating validity\n */\n")
-	w("CREATE MICROFLOW Sales.VAL_Customer (\n")
-	w("  $Customer: Sales.Customer\n)\n")
-	w("RETURNS Boolean AS $IsValid\n")
-	w("BEGIN\n")
-	w("  DECLARE $IsValid Boolean = true;\n\n")
-	w("  IF trim($Customer/Name) = '' THEN\n")
-	w("    SET $IsValid = false;\n")
-	w("    VALIDATION FEEDBACK $Customer/Name MESSAGE 'Name is required';\n")
-	w("  END IF;\n\n")
-	w("  RETURN $IsValid;\n")
-	w("END;\n/\n")
-	w(bt3 + "\n\n")
-
-	w("## MDL Reference\n\n")
-	w("For detailed MDL syntax, see the skill files in " + bt + ".ai-context/skills/" + bt + ".\n")
+	// ── Finishing a change ──────────────────────────────────────────
+	// The bootstrap created README.md, FINDINGS.md and the plan; without this
+	// they are written once and then quietly stop being true, and the
+	// bootstrap procedure and the steady state disagree about what a finished
+	// change looks like.
+	w("## Finishing a change\n\n")
+	w("Bootstrap set these up; they are only worth having if every change keeps them.\n\n")
+	w("1. **Run the gates above, in order**, and say what each reported — not \"it builds\".\n")
+	w("2. **Capture requirements as they arrive** — " + bt + "./mxcli brain capture \"<requirement>\"\n")
+	w("   --slice <slice> -a @Mod.Thing" + bt + ". Never tick anything off: " + bt + "brain plan" + bt + " derives what\n")
+	w("   is built from the model, so finishing the work is what moves the number.\n")
+	w("3. **Append to " + bt + "FINDINGS.md" + bt + "** — anything surprising or broken, and how you verified it.\n")
+	w("4. **Commit.** An idle session is reaped and its container goes with it; whatever is\n")
+	w("   uncommitted is gone, including the model.\n\n")
 
 	return sb.String()
 }

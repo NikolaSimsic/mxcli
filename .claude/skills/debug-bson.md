@@ -1,5 +1,10 @@
 # Debug BSON Serialization Issues
 
+> **CE0463 specifically**: start with [`diagnose-ce0463.md`](diagnose-ce0463.md).
+> It carries the elimination order, the two controls that separate a package
+> upgrade from an mxcli defect, and the measurement traps (a crashed load reports
+> "0 errors"; normalised diffs hide the answer).
+
 This skill provides a systematic workflow for debugging BSON serialization errors when programmatically creating Mendix pages and widgets.
 
 ## When to Use This Skill
@@ -37,15 +42,47 @@ Note the exact error code (CE0463, CE0642, etc.) and which widget triggers it.
 
 ### Step 2: Get a Known-Good Reference
 
-Create a working example in Studio Pro and update it:
+Create a working example in Studio Pro and update it. **Do this on a COPY** — both
+commands below mutate the project, and `update-widgets` converts an MPRv2 project to
+single-file v1 (deletes `mprcontents/`):
 
 ```bash
-# Convert project to latest format and update widget definitions
-reference/mxbuild/modeler/mx convert -p /path/to/app.mpr
-reference/mxbuild/modeler/mx update-widgets /path/to/app.mpr
+# Convert project to latest format and update widget definitions (mutates in place)
+reference/mxbuild/modeler/mx convert -p /path/to/copy.mpr
+reference/mxbuild/modeler/mx update-widgets /path/to/copy.mpr
 ```
 
 Then extract the widget's BSON to compare against your generated output.
+
+#### `mx convert`'s error COUNT is not evidence about the model
+
+Measured on one model, twice (ledger #149), and it nearly produced a false
+regression report:
+
+```
+deployment/ ABSENT   ->  contains 1 errors, 64 warnings
+deployment/ PRESENT  ->  contains 0 errors, 64 warnings
+mx check (same copy) ->  contains 0 errors        # and -j writes "errors": []
+```
+
+Three things make this a trap rather than a curiosity:
+
+1. **convert never names the error.** The full output is the count — no rule id,
+   no document, no `-v`.
+2. **`mx check` creates `deployment/` as a side effect**, so checking a project
+   before converting it silently changes the convert result.
+3. **Converting twice gives `0`**, because the first convert leaves the directory
+   behind — so the natural "did it really fail?" retry reports success and hides
+   the original number.
+
+The count therefore moves with test hygiene: any throwaway copy made without a
+built `deployment/` reports `1`. Identical on two mxcli revisions, so it is not
+an mxcli behaviour at all.
+
+**Rule: if `mx convert` reports errors and will not say which, reproduce them
+under `mx check` before believing them.** Where convert *does* name what it
+changed — the property-rename diff method in the CLAUDE.md overlay section — it
+is still the authoritative tool; it is the bare count that proves nothing.
 
 ### Step 3: Extract and Compare BSON
 
@@ -200,9 +237,8 @@ The principle: for each `$type`, ALL instances must have the **exact same set of
 ### Version-Specific Properties
 
 Some properties only exist in certain Mendix versions. Before adding a property to a BSON writer:
-1. Check `reference/mendixmodellib/reflection-data/` for the property definition
-2. Check `min_version` if present
-3. Test with `mx diff` self-diff on the target version
+1. Check a Studio Pro-authored document **of the target version** for the property
+2. Test with `mx diff` self-diff on the target version
 
 **Example**: `IsReusableComponent` exists in `Projects$ModuleImpl` in newer Mendix but NOT in 11.6.4. Writing it → crash.
 
@@ -323,7 +359,7 @@ for t, props in crash_props.items():
 
 **Investigation methodology used for v0.10 CE0463 fixes** — see [WIDGET_BSON_VERSION_COMPATIBILITY.md](../../docs/03-development/WIDGET_BSON_VERSION_COMPATIBILITY.md) for the full case study and version-resilience model.
 
-**Quick workaround** (if you can't fix the root cause): Run `mx update-widgets` after creating pages.
+**Quick workaround** (if you can't fix the root cause): normalize with `mxcli fix widgets -p app.mpr`, which runs the widget update on the project **and preserves MPRv2 storage**. `mxcli docker check` does not fix anything: it checks the project as stored and labels each CE0463 the normalization would clear as a *stale widget definition* (it runs the update on a **temporary copy** to find out), and one it would not as *persists after update-widgets* — read [`diagnose-ce0463.md`](./diagnose-ce0463.md) before calling either widget drift. `docker build` and `docker check --update-widgets` check only the normalized copy, so they pass while the stored project still fails MxBuild. Do **not** run bare `mx update-widgets` on a v2 project you care about — it converts to single-file v1 and deletes `mprcontents/` (corrupts git, breaks `mxcli run --local`). Raw `mx update-widgets` is fine only on a throwaway diagnostic copy or a v1 project.
 
 ### CE0642: Property X Is Required
 
@@ -343,12 +379,27 @@ for t, props in crash_props.items():
 
 **Root cause**: The BSON array type indicator rule. Every Mendix BSON array must begin with an `int32` **type indicator** of `2` or `3`. This indicator is skipped by `extractBsonArray` and by Studio Pro's reader. Writing `int32(len(items))` as the first element instead produces an invalid indicator when `len ≠ 2` and `len ≠ 3` — Studio Pro cannot recognise the array and reads 0 parameter mappings.
 
-**Type indicator values**:
+**Type indicator values**. The marker is a **per-field constant**, not a
+function of the list's contents — measured over 19,078 unit files in 54 local
+projects, `Forms$FormSettings.ParameterMappings` is `2` in 816 empty *and* 306
+non-empty occurrences. So "initialized empty array" below names the fields, not
+a rule about emptiness, and the way to get a field right is to read it off a
+Studio Pro document rather than to reason from the list's length.
+
 | First element | Meaning |
 |---------------|---------|
-| `int32(3)` | Initialized array — used for `Items`, `DesignProperties`, and most non-empty lists |
-| `int32(2)` | Initialized empty array — used for `ParameterMappings`, `PagesForSpecializations`, `Parameters` |
-| Any other value | **Invalid** — Studio Pro ignores the entire array |
+| `int32(3)` | Used for `Items` (`Texts$Text`, `Menus$MenuItem*`), `DesignProperties`, `OfflineEntityConfigs`, and most contained-element lists |
+| `int32(2)` | Used for `ParameterMappings`, `PagesForSpecializations`, `Parameters`, `HomeItems`, `Profiles` |
+| `int32(1)` | **Legitimate, not invalid.** Mendix writes it for by-name reference and string lists — `CustomWidgets$WidgetValueType.AllowedTypes` (212k occurrences), `CustomIcons$CustomIcon.Tags`, `AllowedModuleRoles`. Verified in a Marketplace `.mpk` mxcli has never touched |
+| Anything else | Not observed. Writing an unobserved value is a guess; get a reference document |
+
+This table previously said any value other than 2 or 3 was invalid and would
+make Studio Pro ignore the array. That is false, and it was load-bearing: it
+framed mxcli's marker-1 navigation lists as corrupt rather than as a per-field
+mismatch, which is a different bug with a different fix. A wrong marker for a
+given field is still worth fixing — no Studio Pro document uses `1` for
+`Menus$MenuItemCollection.Items` — but the reason is "it does not match the
+documents", never "it is invalid".
 
 **How Studio Pro stores page parameter mappings**: Studio Pro does **not** store explicit `Forms$PageParameterMapping` objects in BSON. It always writes `ParameterMappings: [2]` (type indicator only, no inline objects) and infers `$currentObject` at runtime from the enclosing widget context — DataGrid row, DataView datasource, etc. No matter what the MDL source specifies for `(Param: $currentObject)`, the correct serialization is always the empty `[2]` array.
 
@@ -388,7 +439,7 @@ for _, pm := range a.ParameterMappings {
 
 2. **Mode-dependent properties must be consistent**: When changing a mode-switching property (e.g., `showContentAs`), all dependent properties must be updated to match.
 
-3. **`mx update-widgets` is the safety net**: Running this post-processing step normalizes all widget Objects to match mpk definitions. Use it as a fallback.
+3. **Widget normalization is the safety net — via `mxcli fix widgets`**: it applies the update-widgets normalization to the project *and* preserves MPRv2 storage. `mxcli docker build` (and `docker check --update-widgets`) normalize only a temporary copy, which hides CE0463 without fixing the stored project; a default `docker check` reports the stored project's CE0463 and labels the ones `fix widgets` clears. Bare `mx update-widgets` does the same normalization but rewrites a v2 project to v1 and deletes `mprcontents/` — only use it on a v1 project or a throwaway diagnostic copy.
 
 4. **The mpk is the source of truth**: The XML schema defines property types/defaults, the editorConfig.js defines visibility rules. Together they specify the complete expected Object structure.
 

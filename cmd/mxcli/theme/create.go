@@ -1,0 +1,494 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package theme
+
+import (
+	"encoding/json"
+	"fmt"
+	"io/fs"
+	"os"
+	"path"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+)
+
+// Create scaffolds a project-local theme.
+//
+// The three built-in themes cover a house style, not a brand. A theme derived
+// from a design has to live somewhere mxcli's registry can see it, or the only
+// way to use it is to hand-edit the generated block — which the digest fence
+// then refuses to touch on the next apply. So a created theme is a first-class
+// entry in LocalThemesDir: `theme list` shows it, `theme show` describes it,
+// `theme apply <name>` installs it, `theme remove` takes it out again.
+//
+// Scaffolding from an existing theme rather than from nothing is what keeps
+// this small. The Atlas wiring and the widget layer are copied byte for byte —
+// they are the same in every theme and are where most of the hard-won detail
+// lives — so a new theme is a palette and the recipes on top of it.
+func Create(projectDir, name string, opts CreateOptions) (*CreateResult, error) {
+	if err := validName(name); err != nil {
+		return nil, err
+	}
+	if projectDir == "" {
+		return nil, fmt.Errorf("a project is required to create a theme (pass -p)")
+	}
+	if err := requireMendixProject(projectDir); err != nil {
+		return nil, err
+	}
+
+	base, tokens, err := opts.resolve(projectDir)
+	if err != nil {
+		return nil, err
+	}
+	if base == name {
+		return nil, fmt.Errorf("cannot scaffold %q from itself; pass --base to pick a different starting point", name)
+	}
+
+	src, err := sourceFor(projectDir, base)
+	if err != nil {
+		return nil, err
+	}
+	baseTheme, err := src.load(base)
+	if err != nil {
+		return nil, err
+	}
+
+	dest := filepath.Join(projectDir, filepath.FromSlash(LocalThemesDir), name)
+	if _, err := os.Stat(dest); err == nil && !opts.Force {
+		return nil, fmt.Errorf("%s already exists; pass --force to overwrite it", dest)
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	res := &CreateResult{Name: name, Base: base, Dir: dest}
+	if tokens != nil {
+		res.Tokens = tokens
+		if alt := baseTheme.AltVariant(); !tokens.declares(alt) {
+			res.UnseededVariant = alt
+		}
+	}
+
+	rewrite := newRewriter(baseTheme, name, opts.Title, tokens)
+
+	// Tokens are validated against the base before anything is written. A
+	// design that names --mxt-brand-color instead of --mxt-brand would
+	// otherwise produce a theme that compiles, applies and changes nothing —
+	// the failure this whole path exists to avoid.
+	if tokens != nil {
+		if err := validateTokens(src, baseTheme, tokens); err != nil {
+			return nil, err
+		}
+	}
+
+	root := src.filesRoot()
+
+	// Decide about fonts BEFORE walking, not while walking. The decision is
+	// made by reading the theme partial and the files it affects are elsewhere
+	// in the tree, so doing it inline would depend on WalkDir's lexical order
+	// putting `_mxcli-<name>.scss` before `mxcli-fonts/` — true today only
+	// because of the leading underscore, and silently wrong the moment a
+	// partial is renamed.
+	if err := rewrite.planFonts(src, root, tokens); err != nil {
+		return nil, err
+	}
+	res.UnvendoredFonts = rewrite.unvendoredFonts
+
+	walkErr := fs.WalkDir(src.fsys, root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		rel := strings.TrimPrefix(p, root+"/")
+		body, err := fs.ReadFile(src.fsys, p)
+		if err != nil {
+			return err
+		}
+
+		out := body
+		if isBlockFile(rel) {
+			text := rewrite.text(string(body))
+			if tokens != nil {
+				// The rewritten path, not the base's: the partial has just
+				// been renamed to _mxcli-<name>.scss and that is what the
+				// seeder matches on.
+				text, err = seedTokens(rewrite.path(rel), text, baseTheme, name, tokens)
+				if err != nil {
+					return err
+				}
+			}
+			if len(rewrite.droppedFonts) > 0 {
+				text = dropFontFaces(text, rewrite.droppedFonts)
+			}
+			out = []byte(text)
+		}
+
+		// A vendored font file nothing loads any more is dead weight shipped
+		// with a SIL OFL licence for fonts the theme does not use.
+		if rewrite.dropsFontFile(rel) {
+			return nil
+		}
+
+		target := filepath.Join(dest, "files", filepath.FromSlash(rewrite.path(rel)))
+		// Reported relative to the scaffold root, not to the project. Bare, the
+		// two most important entries read as theme/web/custom-variables.scss
+		// and theme/web/main.scss — exactly the files an app is likeliest to
+		// have written itself, listed as "created" by the one command whose
+		// job is to write into theme/. Nothing was touched.
+		res.Files = append(res.Files, FileResult{
+			Path: path.Join("files", rewrite.path(rel)), Action: ActionCreated})
+		if opts.DryRun {
+			return nil
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(target, out, 0o644)
+	})
+	if walkErr != nil {
+		return nil, walkErr
+	}
+
+	manifest, err := rewrite.manifest(baseTheme, opts)
+	if err != nil {
+		return nil, err
+	}
+	res.Files = append(res.Files, FileResult{Path: "theme.json", Action: ActionCreated})
+	sort.Slice(res.Files, func(i, j int) bool { return res.Files[i].Path < res.Files[j].Path })
+	if opts.DryRun {
+		return res, nil
+	}
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(filepath.Join(dest, "theme.json"), manifest, 0o644); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// CreateOptions tunes Create.
+type CreateOptions struct {
+	// From is either the name of a theme to scaffold from, or the path to a
+	// design artifact declaring --mxt-* tokens. One flag, because "create a
+	// theme from X" is the sentence a user actually has in mind; which of the
+	// two X is gets decided by whether it names a theme.
+	From string
+	// Base overrides the theme to scaffold from when From is an artifact.
+	Base string
+	// Title and Summary override what `theme list` and `theme show` display.
+	Title, Summary string
+	// Force overwrites an existing project-local theme of the same name.
+	Force bool
+	// DryRun reports what would be written without writing it.
+	DryRun bool
+}
+
+// resolve works out the base theme and, if one was given, the design tokens.
+func (o CreateOptions) resolve(projectDir string) (string, *Tokens, error) {
+	base := o.Base
+	from := strings.TrimSpace(o.From)
+
+	// A bare --base with no --from is a scaffold-only create.
+	if from == "" {
+		if base == "" {
+			base = DefaultName
+		}
+		return base, nil, nil
+	}
+
+	// --from names a theme: scaffold from it, no tokens.
+	if _, err := sourceFor(projectDir, from); err == nil {
+		if base != "" && base != from {
+			return "", nil, fmt.Errorf("--from %s names a theme, so --base %s is ambiguous; pass one or the other", from, base)
+		}
+		return from, nil, nil
+	}
+
+	// --from is a path: read tokens out of it.
+	raw, err := os.ReadFile(from)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Name both readings, and list the themes actually visible from
+			// here — `mxcli theme list` without -p would hide the project's own,
+			// which is exactly the set a user working in a project means.
+			return "", nil, fmt.Errorf("--from %q is neither a theme name nor a readable file\n\n%s\n\n"+
+				"To seed a palette from a design, --from takes a path to a file declaring --mxt-* tokens.",
+				from, availableThemes(projectDir))
+		}
+		return "", nil, err
+	}
+	tokens := ExtractTokens(filepath.Base(from), string(raw))
+	if tokens.Count() == 0 {
+		return "", nil, fmt.Errorf("%s declares no --mxt-* tokens\n\n"+
+			"A design artifact seeds a theme by declaring the palette it wants, e.g.\n"+
+			"  :root { --mxt-brand: #7f5af0; --mxt-ground: #fffffe; }\n"+
+			"Run `mxcli theme show %s` for the full token list.", from, DefaultName)
+	}
+	if base == "" {
+		base = DefaultName
+	}
+	return base, tokens, nil
+}
+
+// CreateResult is what Create wrote.
+type CreateResult struct {
+	Name   string
+	Base   string
+	Dir    string
+	Files  []FileResult
+	Tokens *Tokens
+	// UnvendoredFonts are the seeded font families the theme names but does
+	// not ship: no woff2, no @font-face. They render only where installed.
+	UnvendoredFonts []string
+	// UnseededVariant is the base theme's alternate variant when the design
+	// declared no block for it. Its mixin is left exactly as the base ships
+	// it: the design's base palette describes the OTHER variant, and copying
+	// a light ground into a dark mixin whose remaining surfaces stay dark gives
+	// an unreadable mix (ako/mxcli#970). Empty when there was nothing to skip.
+	UnseededVariant Variant
+}
+
+// rewriter carries the renames that turn a copy of one theme into another:
+// the partial's filename, the mixin and @import identifiers built from the
+// name, and the title as it reads in the file comments.
+type rewriter struct {
+	baseName, baseTitle string
+	newName, newTitle   string
+	// tokens is the seeded palette, when one was given. The manifest derives
+	// the colorway and summary from it rather than inheriting the base's,
+	// which describe a palette that is no longer there.
+	tokens *Tokens
+	// droppedFonts are the vendored families the seeded fonts no longer name.
+	// Collected while rewriting the partial and consumed when filtering files,
+	// so the files and the @font-face rules that load them are dropped
+	// together — either alone leaves a theme that 404s or ships dead weight.
+	droppedFonts []string
+	// keptAnyFont records whether any @font-face survived, which decides
+	// whether the mxcli-fonts/ directory and its licence are still shipped.
+	keptAnyFont bool
+	// unvendoredFonts are the seeded primary families no @font-face in the
+	// base theme loads (#944): the theme names them, ships no file for them,
+	// and so renders them only where the font happens to be installed.
+	unvendoredFonts []string
+}
+
+func newRewriter(base *Theme, newName, newTitle string, tokens *Tokens) *rewriter {
+	if newTitle == "" {
+		newTitle = defaultTitle(newName)
+	}
+	return &rewriter{
+		baseName: base.Name, baseTitle: base.Title,
+		newName: newName, newTitle: newTitle,
+		tokens: tokens, keptAnyFont: true,
+	}
+}
+
+// defaultTitle turns "acme-dark" into "Acme Dark".
+func defaultTitle(name string) string {
+	parts := strings.FieldsFunc(name, func(r rune) bool { return r == '-' || r == '_' })
+	for i, p := range parts {
+		parts[i] = strings.ToUpper(p[:1]) + p[1:]
+	}
+	return strings.Join(parts, " ")
+}
+
+// path renames the files whose names carry the base theme's name: the SCSS
+// partial and the vendored font licence.
+//
+// The licence matters for a reason the partial does not. Nothing breaks today
+// when two themes scaffolded from signal both ship OFL-signal.txt — the content
+// is identical, because they genuinely do ship the same fonts. It breaks on the
+// edit the scaffold exists to invite: a brand theme that changes its fonts to
+// match its colours then ships IBM Plex's licence for fonts that are not IBM
+// Plex, and the filename is what would have caught that.
+func (r *rewriter) path(rel string) string {
+	for _, name := range []string{
+		"_mxcli-" + r.baseName + ".scss",
+		"OFL-" + r.baseName + ".txt",
+	} {
+		renamed := strings.Replace(name, r.baseName, r.newName, 1)
+		rel = strings.ReplaceAll(rel, name, renamed)
+	}
+	return rel
+}
+
+// text renames the identifiers built from the theme name — the alt-palette
+// mixin and the @import of the partial — and retitles the prose.
+//
+// The identifier rename must happen for the theme to work at all: the partial
+// defines @mixin mxcli-<name>-<alt> and main.scss imports "mxcli-<name>". Two
+// themes sharing a mixin name would collide the moment both were on disk.
+func (r *rewriter) text(s string) string {
+	s = strings.ReplaceAll(s, "mxcli-"+r.baseName, "mxcli-"+r.newName)
+	if r.baseTitle != "" && r.baseTitle != r.newTitle {
+		s = regexp.MustCompile(`\b`+regexp.QuoteMeta(r.baseTitle)+`\b`).ReplaceAllString(s, r.newTitle)
+	}
+	return s
+}
+
+// manifest writes the new theme's theme.json, derived from the base's so the
+// file descriptions stay accurate.
+func (r *rewriter) manifest(base *Theme, opts CreateOptions) ([]byte, error) {
+	t := *base
+	t.Name = r.newName
+	t.Title = r.newTitle
+	t.Local = false
+	t.Version = "1"
+	// A seeded palette makes the base's summary and swatches statements about
+	// the wrong theme: `mxcli theme list` showed a brand theme as "Cool slate,
+	// one teal signal colour" with Signal's six swatches. Derive what can be
+	// derived; --summary still wins.
+	if r.tokens != nil {
+		t.Colorway = deriveColorway(base, r.tokens)
+		t.Summary = seededSummary(r.tokens)
+	}
+	if opts.Summary != "" {
+		t.Summary = opts.Summary
+	}
+	t.Description = fmt.Sprintf("Project-local theme, scaffolded from %s by `mxcli theme create`. "+
+		"Edit the palette in files/theme/web/custom-variables.scss and the dark palette in "+
+		"files/theme/web/_mxcli-%s.scss, then re-run `mxcli theme apply %s`.",
+		base.Title, r.newName, r.newName)
+
+	t.Files = append([]FileSpec(nil), base.Files...)
+	if !r.keptAnyFont {
+		// The manifest is what `theme show` reads, so an entry for a directory
+		// the scaffold no longer writes describes files that are not there.
+		kept := t.Files[:0]
+		for _, f := range t.Files {
+			if !isVendoredFontPath(f.Path) {
+				kept = append(kept, f)
+			}
+		}
+		t.Files = kept
+	}
+	for i := range t.Files {
+		t.Files[i].Path = r.path(t.Files[i].Path)
+		// The purpose prose names the licence file, so it has to follow the
+		// rename too — otherwise `theme show` describes the new theme's fonts
+		// under a filename that is no longer there.
+		t.Files[i].Purpose = strings.ReplaceAll(
+			r.text(t.Files[i].Purpose), "OFL-"+r.baseName+".txt", "OFL-"+r.newName+".txt")
+	}
+
+	out, err := json.MarshalIndent(t, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(out, '\n'), nil
+}
+
+// seedTokens writes the extracted palette into the two files that carry one:
+// custom-variables.scss holds the default variant, and the alt-palette mixin
+// in the theme's partial holds the other.
+func seedTokens(rel, text string, base *Theme, newName string, tokens *Tokens) (string, error) {
+	switch {
+	case path.Base(rel) == "custom-variables.scss":
+		set := tokens.forVariant(base.DefaultVariant)
+		out, unplaced := applyTokens(text, set)
+		return appendTokens(out, unplaced, set, tokens.Source)
+
+	case path.Base(rel) == "_mxcli-"+newName+".scss":
+		// Only the mixin body may be rewritten. The rest of the partial is
+		// rules that *read* tokens through var(), and a value substituted
+		// there would hardcode a colour into a rule — exactly the mistake the
+		// palette/wiring split exists to prevent.
+		//
+		// The body is bounded by the first `}` at column 0, which holds
+		// because an alt-palette mixin is a flat list of declarations. A
+		// nested block inside one would truncate the span; the structural
+		// contract asserted in create_test.go is what would catch that.
+		mixin := regexp.MustCompile(`(?s)(@mixin\s+mxcli-` + regexp.QuoteMeta(newName) + `-\w+\s*\{)(.*?)(\n\})`)
+		m := mixin.FindStringSubmatchIndex(text)
+		if m == nil {
+			return "", fmt.Errorf("%s: no alt-palette mixin to seed", rel)
+		}
+		alt := base.AltVariant()
+		// A design with no block for the alternate variant says nothing about
+		// it. Its base palette is the DEFAULT variant's, and writing that
+		// into this mixin repainted the dark ground and ink light while the
+		// surfaces the design did not name stayed dark (ako/mxcli#970). The
+		// mixin is left as the base theme ships it; Create reports that.
+		if !tokens.declares(alt) {
+			return text, nil
+		}
+		set := tokens.forVariant(alt)
+		body := text[m[4]:m[5]]
+		seeded, unplaced := applyTokens(body, set)
+		// Only a token the design *scoped* to this variant is worth adding to
+		// the mixin. A base-only token the mixin does not already restate —
+		// --mxt-radius, say — is variant-independent: it lives in the palette,
+		// and copying it here would mean retuning it twice.
+		unplaced = onlyScoped(unplaced, tokens.scoped(alt))
+		if len(unplaced) > 0 {
+			var b strings.Builder
+			b.WriteString("\n\n  /* from ")
+			b.WriteString(tokens.Source)
+			b.WriteString(" */\n")
+			for _, n := range unplaced {
+				fmt.Fprintf(&b, "  %s: %s;", n, set[n])
+				b.WriteString("\n")
+			}
+			seeded += strings.TrimRight(b.String(), "\n")
+		}
+		return text[:m[4]] + seeded + text[m[5]:], nil
+	}
+	return text, nil
+}
+
+// validateTokens refuses names the base theme does not declare.
+//
+// An unrecognised --mxt-* token is not a harmless extra: nothing reads it, so
+// the theme applies cleanly and renders unchanged, and the only symptom is
+// that the design did not take. Naming the typo at create time is the whole
+// point of validating at all.
+func validateTokens(src source, base *Theme, tokens *Tokens) error {
+	names, err := knownTokens(src)
+	if err != nil {
+		return err
+	}
+	known := map[string]bool{}
+	for _, n := range names {
+		known[n] = true
+	}
+
+	var unknown []string
+	for _, set := range []TokenSet{tokens.Base, tokens.Dark, tokens.Light} {
+		for _, n := range set.Names() {
+			if !known[n] {
+				unknown = append(unknown, n)
+			}
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+	sort.Strings(unknown)
+	unknown = dedupe(unknown)
+	return fmt.Errorf("%s declares %d token(s) theme %q does not recognise: %s\n\n"+
+		"Nothing reads an unknown token, so the theme would apply and render unchanged.\n"+
+		"Run `mxcli theme show %s` for the tokens it does read.",
+		tokens.Source, len(unknown), base.Name, strings.Join(unknown, ", "), base.Name)
+}
+
+// onlyScoped keeps the names the design declared inside a variant block.
+func onlyScoped(names []string, scoped TokenSet) []string {
+	var out []string
+	for _, n := range names {
+		if _, ok := scoped[n]; ok {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+func dedupe(sorted []string) []string {
+	out := sorted[:0]
+	for i, s := range sorted {
+		if i == 0 || s != sorted[i-1] {
+			out = append(out, s)
+		}
+	}
+	return out
+}

@@ -1,0 +1,194 @@
+// SPDX-License-Identifier: Apache-2.0
+
+// Check-time validation for a widget's action slot holding something that is
+// not an action.
+//
+// `Action:`, `OnClick:` and `OnChange:` each have a dedicated grammar branch
+// carrying actionExprV3. When the value does not match that rule — a real
+// keyword short its argument (`Action: OPEN_LINK`), or a token that was never a
+// keyword (`Action: TOTALLY_MADE_UP`) — ANTLR does not fail: it falls through to
+// the generic `keyword COLON propertyValueV3` alternative at the end of
+// widgetPropertyV3 and the slot ends up holding a plain string. WidgetV3's
+// GetAction/GetOnChange type-assert to *ast.ActionV3, get nil, and the widget is
+// written with Forms$NoAction.
+//
+// Nothing downstream notices. A no-action button is legal Mendix, so the build
+// is clean — measured on 11.12.0: `mxcli check` passed, `exec` reported "Created
+// page", `mx check` reported 0 errors, and `describe page` came back with no
+// action on the widget at all. The author gets a button that renders, says
+// "Unlink", and does nothing (mendixlabs/mxcli#1062).
+//
+// This is the third appearance of the class. SIGN_OUT and OPEN_LINK both used to
+// reach Forms$NoAction through the *writer's* default branch (CapTrackV2
+// FINDINGS §10, cited in sdk/mpr/writer_widgets_action.go); this is the same
+// silent degrade one layer up, in the parser.
+//
+// The rule is only possible because `NOTHING` was promoted to a real
+// actionExprV3 alternative in the same change. It is the documented spelling for
+// a deliberately inert widget and it reached Forms$NoAction by exactly this
+// fall-through, so before the promotion "scalar in an action slot" covered the
+// working case and the two broken ones alike.
+package executor
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/linter"
+)
+
+// actionSlotKeys are the property keys with a dedicated actionExprV3 branch.
+//
+// `Action:` and `OnClick:` are aliases that both land on Properties["Action"]
+// once parsed (issue #603), but an *unparsed* `OnClick:` keeps its own key —
+// the generic fall-through stores the property under the name as written — so
+// both spellings have to be looked for here.
+//
+// A pluggable widget's NAMED action slot (`createFileAction: …`) degrades the
+// same way and is deliberately not listed: for an arbitrary widget property a
+// string is an ordinary value, so the fault is only decidable against a loaded
+// widget definition, which `mxcli check` has no project to supply.
+var actionSlotKeys = []string{"Action", "OnClick", "OnChange"}
+
+// underSpecified maps an action keyword to what it is missing, so the message
+// can name the one token the author left out rather than printing the whole
+// grammar. Keyed lowercase; looked up case-insensitively.
+var underSpecified = map[string]string{
+	"open_link":     "a URL — `Action: open link 'https://example.com'`, or an attribute holding one — `Action: open link $currentObject/URL`",
+	"complete_task": "an outcome name — `Action: complete task 'Approved'`",
+	"complete task": "an outcome name — `Action: complete task 'Approved'`",
+	"show_page":     "a page — `Action: show page Module.Page`",
+	"create_object": "an entity — `Action: create object Module.Entity`",
+	"microflow":     "a microflow — `Action: call microflow Module.Flow`",
+	"nanoflow":      "a nanoflow — `Action: call nanoflow Module.Flow`",
+}
+
+// validateWidgetActionSlot reports (MDL-WIDGET28) an action slot whose value is
+// not an action expression.
+//
+// An error, not a warning, unlike the neighbouring "silently dropped" rules
+// (MDL-WIDGET20/21/23). Those fire on values that are *valid MDL* the writer
+// happens not to route; this one fires on text that failed to parse as the thing
+// the slot accepts, and after NOTHING was promoted there is no scalar spelling
+// of an action left for it to catch by mistake. ALTER PAGE already refuses the
+// same value ("Action value must be an action expression") — CREATE PAGE was the
+// inconsistent one.
+func validateWidgetActionSlot(w *ast.WidgetV3, locationPrefix string) []linter.Violation {
+	if w == nil {
+		return nil
+	}
+	var out []linter.Violation
+	// Iterated over a fixed slice rather than over w.Properties: map order is
+	// not stable, and a widget with two faulty slots must report them the same
+	// way every run (CLAUDE.md, determinism).
+	for _, slot := range actionSlotKeys {
+		for _, key := range actionSlotSpellings(w, slot) {
+			raw := w.Properties[key]
+			if _, ok := raw.(*ast.ActionV3); ok {
+				continue
+			}
+			out = append(out, linter.Violation{
+				RuleID:   "MDL-WIDGET28",
+				Severity: linter.SeverityError,
+				Message: fmt.Sprintf(
+					"%s: widget `%s` has `%s: %s`, which is not an action — the widget is written with "+
+						"no action at all and renders as a dead control (Mendix accepts it, so the build stays clean)",
+					locationPrefix, w.Name, key, renderActionSlotValue(raw)),
+				Suggestion: actionSlotSuggestion(raw),
+			})
+		}
+	}
+	return append(out, validateInputEventActions(w, locationPrefix)...)
+}
+
+// validateInputEventActions is the same rule for an input widget's event
+// actions with no grammar keyword, such as a text box's `OnEnterKeyPress:`
+// (input_event_actions.go, ako/mxcli#1743). They arrive through the generic
+// `key: value` branch, where a flow call written without `call` is a data
+// source the builder converts — so the shape is judged by the functions the
+// builder uses, not by "is it an *ast.ActionV3". Writing one under both of its
+// names is MDL-WIDGET18, a value the builder refuses. A widget without the
+// slot is not judged here: the per-kind property check refuses the key.
+func validateInputEventActions(w *ast.WidgetV3, locationPrefix string) []linter.Violation {
+	kind := strings.ToLower(w.Type)
+	var out []linter.Violation
+	for _, ev := range inputEventActions {
+		if !ev.kinds[kind] {
+			continue
+		}
+		canon, hasCanon := lookupPropCI(w, ev.key)
+		alias, hasAlias := lookupPropCI(w, ev.stored)
+		key, raw, err := inputEventPick(ev.key, canon, hasCanon, ev.stored, alias, hasAlias)
+		if err != nil {
+			out = append(out, violation18(locationPrefix, w, err.Error()))
+			continue
+		}
+		if raw == nil {
+			continue
+		}
+		if _, err := inputEventValue(key, raw); err != nil {
+			out = append(out, linter.Violation{
+				RuleID:     "MDL-WIDGET28",
+				Severity:   linter.SeverityError,
+				Message:    fmt.Sprintf("%s: widget `%s`: %s", locationPrefix, w.Name, err.Error()),
+				Suggestion: actionSlotSuggestion(raw),
+			})
+		}
+	}
+	return out
+}
+
+// actionSlotSpellings are the property keys on w that spell slot. A value that
+// does not parse keeps its key AS WRITTEN, so `onClick: TOTALLY_MADE_UP` — the
+// spelling the skills teach — is stored under "onClick", and an exact lookup of
+// "OnClick" missed it: the widget was written with no action and nothing said
+// so (found with ako/mxcli#1698, whose per-widget rule now leaves these to this
+// one). On a built-in widget every case of the slot's name is that slot. On a
+// pluggable widget only the exact spelling is: its keys are its package's own,
+// and one of them may be an `action` that is not an action slot.
+func actionSlotSpellings(w *ast.WidgetV3, slot string) []string {
+	if _, native := nativeWidgetKinds[strings.ToLower(w.Type)]; !native {
+		if _, ok := w.Properties[slot]; ok {
+			return []string{slot}
+		}
+		return nil
+	}
+	var keys []string
+	for k := range w.Properties {
+		if strings.EqualFold(k, slot) {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// renderActionSlotValue prints the offending value the way the author wrote it,
+// so the message can be matched against the source line.
+func renderActionSlotValue(raw any) string {
+	if s, ok := raw.(string); ok {
+		return s
+	}
+	return fmt.Sprintf("%v", raw)
+}
+
+// actionSlotSuggestion names the missing token when the value is a real action
+// keyword, and otherwise lists what the slot takes.
+//
+// The split matters: an author who wrote `OPEN_LINK` knows which action they
+// want and needs one argument, while an author who wrote `TOTALLY_MADE_UP`
+// needs the vocabulary. Telling the first one to "see `mxcli syntax
+// page.action`" buries the answer they were one token away from.
+func actionSlotSuggestion(raw any) string {
+	if s, ok := raw.(string); ok {
+		if missing, known := underSpecified[strings.ToLower(strings.Join(strings.Fields(s), " "))]; known {
+			return fmt.Sprintf("`%s` is a real action but takes %s.", s, missing)
+		}
+	}
+	return "Use an action expression — save changes, cancel changes, close page, delete, " +
+		"sign out, show page Module.Page, call microflow Module.Flow, call nanoflow Module.Flow, " +
+		"open link 'url', complete task 'Outcome', create object Module.Entity — " +
+		"or `NOTHING` if the widget is meant to do nothing. See `mxcli syntax page.action`."
+}

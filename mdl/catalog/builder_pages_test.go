@@ -3,9 +3,8 @@
 package catalog
 
 import (
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"testing"
-
-	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 func TestScanWidgetOwnRefs(t *testing.T) {
@@ -24,7 +23,7 @@ func TestScanWidgetOwnRefs(t *testing.T) {
 			},
 		},
 	}
-	ent, mf, nf := scanWidgetOwnRefs(dataView)
+	ent, mf, nf, _, _ := scanWidgetOwnRefs(dataView)
 	if ent != "Sales.Order" {
 		t.Errorf("entity = %q, want Sales.Order", ent)
 	}
@@ -41,7 +40,7 @@ func TestScanWidgetOwnRefs(t *testing.T) {
 		"Action": map[string]any{"Settings": map[string]any{"Microflow": "M.DoThing"}},
 		"Extra":  map[string]any{"Nanoflow": "M.DoNano"},
 	}
-	if _, mf, nf := scanWidgetOwnRefs(button); mf != "M.DoThing" || nf != "M.DoNano" {
+	if _, mf, nf, _, _ := scanWidgetOwnRefs(button); mf != "M.DoThing" || nf != "M.DoNano" {
 		t.Errorf("button refs = (%q,%q), want (M.DoThing, M.DoNano)", mf, nf)
 	}
 
@@ -52,13 +51,13 @@ func TestScanWidgetOwnRefs(t *testing.T) {
 		"B": map[string]any{"Microflow": "M.Alpha"},
 	}
 	for range 5 {
-		if _, mf, _ := scanWidgetOwnRefs(multi); mf != "M.Alpha" {
+		if _, mf, _, _, _ := scanWidgetOwnRefs(multi); mf != "M.Alpha" {
 			t.Fatalf("non-deterministic microflow pick: got %q, want M.Alpha", mf)
 		}
 	}
 
 	// No refs.
-	if e, m, n := scanWidgetOwnRefs(map[string]any{"$Type": "Forms$Label"}); e != "" || m != "" || n != "" {
+	if e, m, n, p, _ := scanWidgetOwnRefs(map[string]any{"$Type": "Forms$Label"}); e != "" || m != "" || n != "" || p != "" {
 		t.Errorf("expected no refs, got (%q,%q,%q)", e, m, n)
 	}
 }
@@ -96,7 +95,7 @@ func TestExtractLayoutRef(t *testing.T) {
 			name: "binary Layout field",
 			rawData: map[string]any{
 				"FormCall": map[string]any{
-					"Layout": primitive.Binary{
+					"Layout": bson.Binary{
 						Data: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10},
 					},
 				},
@@ -189,7 +188,9 @@ func TestExtractWidgetsRecursive(t *testing.T) {
 		}
 	})
 
-	t.Run("skips DivContainer but includes children", func(t *testing.T) {
+	t.Run("indexes a user DivContainer and its children", func(t *testing.T) {
+		// A named/plain DivContainer is a real `container` widget (styleable,
+		// clickable) — it must appear in the catalog alongside its children.
 		w := map[string]any{
 			"$ID":   "div1",
 			"Name":  "divContainer",
@@ -204,18 +205,23 @@ func TestExtractWidgetsRecursive(t *testing.T) {
 			},
 		}
 		got := extractWidgetsRecursive(w)
-		if len(got) != 1 {
-			t.Fatalf("expected 1 widget (child only), got %d", len(got))
+		if len(got) != 2 {
+			t.Fatalf("expected 2 widgets (container + child), got %d", len(got))
 		}
-		if got[0].ID != "child1" {
-			t.Errorf("expected child1, got %q", got[0].ID)
+		if got[0].ID != "div1" || got[0].WidgetType != "Forms$DivContainer" {
+			t.Errorf("expected the container first, got %+v", got[0])
+		}
+		if got[1].ID != "child1" {
+			t.Errorf("expected child1 second, got %q", got[1].ID)
 		}
 	})
 
-	t.Run("skips Pages$DivContainer but includes children", func(t *testing.T) {
+	t.Run("skips the transparent conditionalVisibilityWidget wrapper", func(t *testing.T) {
+		// The synthetic layout placeholder (DivContainer named
+		// conditionalVisibilityWidget*, no styling) is omitted; children stay.
 		w := map[string]any{
 			"$ID":   "div2",
-			"Name":  "pagesDivContainer",
+			"Name":  "conditionalVisibilityWidget1",
 			"$Type": "Pages$DivContainer",
 			"Widgets": []any{
 				int32(0),
@@ -232,6 +238,20 @@ func TestExtractWidgetsRecursive(t *testing.T) {
 		}
 		if got[0].ID != "child2" {
 			t.Errorf("expected child2, got %q", got[0].ID)
+		}
+	})
+
+	t.Run("indexes a styled conditionalVisibilityWidget (not transparent)", func(t *testing.T) {
+		// If a wrapper-named container carries styling it is a real user widget.
+		w := map[string]any{
+			"$ID":        "div3",
+			"Name":       "conditionalVisibilityWidget9",
+			"$Type":      "Forms$DivContainer",
+			"Appearance": map[string]any{"Class": "card"},
+		}
+		got := extractWidgetsRecursive(w)
+		if len(got) != 1 || got[0].ID != "div3" {
+			t.Fatalf("expected the styled container to be indexed, got %+v", got)
 		}
 	})
 
@@ -358,7 +378,7 @@ func TestGetBsonArrayElements(t *testing.T) {
 		{"int32 type indicator", []any{int32(0), "a", "b"}, 2},
 		{"int type indicator", []any{int(0), "a", "b"}, 2},
 		{"no type indicator", []any{"a", "b"}, 2},
-		{"primitive.A with indicator", primitive.A{int32(0), "a"}, 1},
+		{"bson.A with indicator", bson.A{int32(0), "a"}, 1},
 		{"empty array", []any{}, -1},
 	}
 
@@ -385,8 +405,8 @@ func TestToBsonArray(t *testing.T) {
 		}
 	})
 
-	t.Run("primitive.A converted", func(t *testing.T) {
-		input := primitive.A{"x", "y"}
+	t.Run("bson.A converted", func(t *testing.T) {
+		input := bson.A{"x", "y"}
 		got := toBsonArray(input)
 		if len(got) != 2 {
 			t.Errorf("expected 2, got %d", len(got))
@@ -422,7 +442,7 @@ func TestExtractBsonID(t *testing.T) {
 		{"nil", nil, ""},
 		{"string", "my-id", "my-id"},
 		{"binary map with base64 GUID", map[string]any{"Data": "AQIDBAUGBwgJCgsMDQ4PEA=="}, "04030201-0605-0807-090a-0b0c0d0e0f10"},
-		{"primitive.Binary", primitive.Binary{Data: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}}, "04030201-0605-0807-090a-0b0c0d0e0f10"},
+		{"bson.Binary", bson.Binary{Data: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}}, "04030201-0605-0807-090a-0b0c0d0e0f10"},
 	}
 
 	for _, tt := range tests {
@@ -470,7 +490,7 @@ func TestExtractBinaryID(t *testing.T) {
 	}{
 		{"string", "my-id", "my-id"},
 		{"bytes 16", []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}, "04030201-0605-0807-090a-0b0c0d0e0f10"},
-		{"primitive.Binary", primitive.Binary{Data: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}}, "04030201-0605-0807-090a-0b0c0d0e0f10"},
+		{"bson.Binary", bson.Binary{Data: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}}, "04030201-0605-0807-090a-0b0c0d0e0f10"},
 		{"nil", nil, ""},
 		{"unsupported", 42, ""},
 	}
@@ -534,5 +554,67 @@ func TestBytesToHex(t *testing.T) {
 				t.Errorf("bytesToHex(%v) = %q, want %q", tt.data, got, tt.want)
 			}
 		})
+	}
+}
+
+// upstream #773: a widget action that OPENS a page created no reference at all,
+// so a page reachable only from a button reported "(no callers found)" — a false
+// negative that reads as "safe to delete".
+//
+// The cause was one missing key. scanWidgetOwnRefs collected Entity, Microflow
+// and Nanoflow but not `Form`, which is where a page reference lives — "Form"
+// being Mendix's original word for a page, the same rename behind
+// ShowFormAction/CloseFormAction.
+func TestScanWidgetOwnRefs_PageReference(t *testing.T) {
+	// An action button that opens a page: `show_page Module.Target`.
+	showPage := map[string]any{
+		"$Type": "Forms$ActionButton",
+		"Action": map[string]any{
+			"$Type":        "Forms$ShowPageClientAction",
+			"PageSettings": map[string]any{"$Type": "Forms$PageSettings", "Form": "Sales.OrderDetail"},
+		},
+	}
+	if _, _, _, page, _ := scanWidgetOwnRefs(showPage); page != "Sales.OrderDetail" {
+		t.Errorf("page = %q, want Sales.OrderDetail", page)
+	}
+
+	// The compound the issue reported — "create object … then open page" — is ONE
+	// action carrying BOTH an entity and a page. Collecting only the entity (which
+	// is what happened) still leaves the page with no inbound reference.
+	createThenShow := map[string]any{
+		"$Type": "Forms$ActionButton",
+		"Action": map[string]any{
+			"$Type":        "Forms$CreateObjectClientAction",
+			"Entity":       "Sales.Order",
+			"PageSettings": map[string]any{"$Type": "Forms$PageSettings", "Form": "Sales.OrderDetail"},
+		},
+	}
+	ent, _, _, page, _ := scanWidgetOwnRefs(createThenShow)
+	if ent != "Sales.Order" {
+		t.Errorf("entity = %q, want Sales.Order", ent)
+	}
+	if page != "Sales.OrderDetail" {
+		t.Errorf("page = %q, want Sales.OrderDetail — the page half of "+
+			"'create object … then open page' is the reference the issue reported missing", page)
+	}
+
+	// A child widget's page must not be attributed to its parent, same as the
+	// existing microflow rule.
+	container := map[string]any{
+		"$Type": "Forms$DivContainer",
+		"Widgets": []any{
+			map[string]any{
+				"$Type":  "Forms$ActionButton",
+				"Action": map[string]any{"PageSettings": map[string]any{"Form": "Sales.ChildPage"}},
+			},
+		},
+	}
+	if _, _, _, page, _ := scanWidgetOwnRefs(container); page != "" {
+		t.Errorf("page = %q, want empty — a child button's page must not leak to the container", page)
+	}
+
+	// A widget with no action references no page.
+	if _, _, _, page, _ := scanWidgetOwnRefs(map[string]any{"$Type": "Forms$Label"}); page != "" {
+		t.Errorf("page = %q, want empty", page)
 	}
 }

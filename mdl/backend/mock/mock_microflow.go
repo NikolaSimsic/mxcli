@@ -58,11 +58,60 @@ func (m *MockBackend) ParseMicroflowFromRaw(raw map[string]any, unitID, containe
 	panic("mock ParseMicroflowFromRaw called but ParseMicroflowFromRawFunc is not set")
 }
 
+func (m *MockBackend) ParseNanoflowFromRaw(raw map[string]any, unitID, containerID model.ID) *microflows.Nanoflow {
+	if m.ParseNanoflowFromRawFunc != nil {
+		return m.ParseNanoflowFromRawFunc(raw, unitID, containerID)
+	}
+	panic("mock ParseNanoflowFromRaw called but ParseNanoflowFromRawFunc is not set")
+}
+
 func (m *MockBackend) ParseMicroflowBSON(contents []byte, unitID, containerID model.ID) (*microflows.Microflow, error) {
 	if m.ParseMicroflowBSONFunc != nil {
 		return m.ParseMicroflowBSONFunc(contents, unitID, containerID)
 	}
 	return nil, fmt.Errorf("MockBackend.ParseMicroflowBSON not configured")
+}
+
+func (m *MockBackend) ListRules() ([]*microflows.Rule, error) {
+	if m.ListRulesFunc != nil {
+		return m.ListRulesFunc()
+	}
+	return nil, fmt.Errorf("MockBackend.ListRules not configured")
+}
+
+func (m *MockBackend) GetRule(id model.ID) (*microflows.Rule, error) {
+	if m.GetRuleFunc != nil {
+		return m.GetRuleFunc(id)
+	}
+	return nil, fmt.Errorf("MockBackend.GetRule not configured")
+}
+
+func (m *MockBackend) CreateRule(rule *microflows.Rule) error {
+	if m.CreateRuleFunc != nil {
+		return m.CreateRuleFunc(rule)
+	}
+	return fmt.Errorf("MockBackend.CreateRule not configured")
+}
+
+func (m *MockBackend) UpdateRule(rule *microflows.Rule) error {
+	if m.UpdateRuleFunc != nil {
+		return m.UpdateRuleFunc(rule)
+	}
+	return fmt.Errorf("MockBackend.UpdateRule not configured")
+}
+
+func (m *MockBackend) DeleteRule(id model.ID) error {
+	if m.DeleteRuleFunc != nil {
+		return m.DeleteRuleFunc(id)
+	}
+	return fmt.Errorf("MockBackend.DeleteRule not configured")
+}
+
+func (m *MockBackend) MoveRule(rule *microflows.Rule) error {
+	if m.MoveRuleFunc != nil {
+		return m.MoveRuleFunc(rule)
+	}
+	return fmt.Errorf("MockBackend.MoveRule not configured")
 }
 
 func (m *MockBackend) ListNanoflows() ([]*microflows.Nanoflow, error) {
@@ -112,4 +161,21 @@ func (m *MockBackend) IsRule(qualifiedName string) (bool, error) {
 		return m.IsRuleFunc(qualifiedName)
 	}
 	return false, nil
+}
+
+// ReadBackMicroflow errors unless stubbed: without a codec the mock cannot say
+// how a microflow reads back, and the caller then compares statements.
+func (m *MockBackend) ReadBackMicroflow(mf *microflows.Microflow) (*microflows.Microflow, error) {
+	if m.ReadBackMicroflowFunc != nil {
+		return m.ReadBackMicroflowFunc(mf)
+	}
+	return nil, fmt.Errorf("MockBackend.ReadBackMicroflow not configured")
+}
+
+// ReadBackNanoflow errors unless stubbed, like ReadBackMicroflow.
+func (m *MockBackend) ReadBackNanoflow(nf *microflows.Nanoflow) (*microflows.Nanoflow, error) {
+	if m.ReadBackNanoflowFunc != nil {
+		return m.ReadBackNanoflowFunc(nf)
+	}
+	return nil, fmt.Errorf("MockBackend.ReadBackNanoflow not configured")
 }

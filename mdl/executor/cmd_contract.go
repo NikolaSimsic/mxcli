@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/dmlayout"
 	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
 	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
@@ -171,10 +172,16 @@ func describeContractEntity(ctx *ExecContext, name ast.QualifiedName, format str
 	}
 	fmt.Fprintln(ctx.Output)
 
-	// Properties
+	// Properties, with complex types expanded the way an import would expand
+	// them. Reporting `MaxQty  Shared.Uom.Quantity` — or, in the MDL form,
+	// `MaxQty: String(200)` from edmToMendixType's catch-all — describes an
+	// attribute that cannot exist and hides the ones that will
+	// (mendixlabs/mxcli#1118).
+	props, unsupported := doc.FlattenProperties(et.Properties)
+
 	nameWidth := len("Property")
 	typeWidth := len("Type")
-	for _, p := range et.Properties {
+	for _, p := range props {
 		if len(p.Name) > nameWidth {
 			nameWidth = len(p.Name)
 		}
@@ -186,12 +193,19 @@ func describeContractEntity(ctx *ExecContext, name ast.QualifiedName, format str
 
 	fmt.Fprintf(ctx.Output, "  %-*s  %-*s  %s\n", nameWidth, "Property", typeWidth, "Type", "Nullable")
 	fmt.Fprintf(ctx.Output, "  %s  %s  %s\n", strings.Repeat("-", nameWidth), strings.Repeat("-", typeWidth), "--------")
-	for _, p := range et.Properties {
+	for _, p := range props {
 		nullable := "Yes"
 		if p.Nullable != nil && !*p.Nullable {
 			nullable = "No"
 		}
 		fmt.Fprintf(ctx.Output, "  %-*s  %-*s  %s\n", nameWidth, p.Name, typeWidth, formatEdmType(p), nullable)
+	}
+	if len(unsupported) > 0 {
+		fmt.Fprintln(ctx.Output)
+		fmt.Fprintln(ctx.Output, "  Not importable as attributes:")
+		for _, u := range unsupported {
+			fmt.Fprintf(ctx.Output, "    %s\n", u)
+		}
 	}
 
 	// Navigation properties
@@ -280,14 +294,15 @@ func outputContractEntityMDL(ctx *ExecContext, et *types.EdmEntityType, svcQN st
 	}
 
 	fmt.Fprintf(ctx.Output, "create external entity %s.%s\n", module, et.Name)
-	fmt.Fprintf(ctx.Output, "from odata client %s (\n", svcQN)
+	fmt.Fprintf(ctx.Output, "from consumed odata service %s (\n", svcQN)
 	fmt.Fprintf(ctx.Output, "    EntitySet: '%s',\n", entitySetName)
 	fmt.Fprintf(ctx.Output, "    RemoteName: '%s',\n", et.Name)
 	fmt.Fprintf(ctx.Output, "    Countable: Yes\n")
 	fmt.Fprintln(ctx.Output, ")")
 	fmt.Fprintln(ctx.Output, "(")
 
-	for i, p := range et.Properties {
+	props, _ := doc.FlattenProperties(et.Properties)
+	for i, p := range props {
 		// Skip ID properties that are not real attributes
 		isKey := false
 		for _, k := range et.KeyProperties {
@@ -305,19 +320,18 @@ func outputContractEntityMDL(ctx *ExecContext, et *types.EdmEntityType, svcQN st
 		attrName := attrNameForOData(p.Name, et.Name)
 		mendixType := edmToMendixType(p)
 		comma := ","
-		if i == len(et.Properties)-1 {
+		if i == len(props)-1 {
 			comma = ""
 		}
 		// When the OData property name was renamed (reserved word), show the
 		// original OData name as a comment so the user knows the mapping.
-		if attrName != p.Name {
-			fmt.Fprintf(ctx.Output, "    -- OData property: %s\n", p.Name)
+		if attrName != p.Path() {
+			fmt.Fprintf(ctx.Output, "    -- OData property: %s\n", p.Path())
 		}
 		fmt.Fprintf(ctx.Output, "    %s: %s%s\n", attrName, mendixType, comma)
 	}
 
 	fmt.Fprintln(ctx.Output, ");")
-	fmt.Fprintln(ctx.Output, "/")
 
 	return nil
 }
@@ -444,13 +458,18 @@ func edmToMendixType(p *types.EdmProperty) string {
 
 // reservedEntityAttrNames are Mendix-reserved attribute names that must be
 // renamed when imported from an OData property of the same name.
-// These names conflict with Mendix system members or runtime internals.
 // The check is case-insensitive (see attrNameForOData).
+//
+// Every entry is one Mendix rejects with CE7247 "The name 'x' is a reserved
+// word." Verified on 11.12.1 by importing a contract with a property for each
+// name and prefixing disabled: seven errors, one per name below. `name` was on
+// this list and is NOT among them — an external entity with an attribute
+// literally named `name` builds clean, and prefixing it mangled the commonest
+// property in any contract (mxcli-formula1 #28). Do not add a name here without
+// a CE7247 to point at.
 var reservedEntityAttrNames = map[string]bool{
 	// Mendix internal identifier
 	"id": true,
-	// Mendix system-managed attribute for the object name (present on many entities)
-	"name": true,
 	// System ownership association (HasOwner / System.owner)
 	"owner": true,
 	// System audit associations (HasChangedBy / System.changedBy)
@@ -507,10 +526,11 @@ func createExternalEntities(ctx *ExecContext, s *ast.CreateExternalEntitiesStmt)
 		return mdlerrors.NewBackend("get domain model", err)
 	}
 
-	// Index existing entities by name for upsert
-	existing := make(map[string]*domainmodel.Entity)
-	for _, ent := range dm.Entities {
-		existing[ent.Name] = ent
+	// What new entities are placed against: the module as read, plus every
+	// entity this import creates, so they clear each other as well.
+	placed := &domainmodel.DomainModel{
+		Entities:    append([]*domainmodel.Entity(nil), dm.Entities...),
+		Annotations: dm.Annotations,
 	}
 
 	// Build a global type lookup so we can resolve BaseType references across schemas.
@@ -523,6 +543,16 @@ func createExternalEntities(ctx *ExecContext, s *ast.CreateExternalEntitiesStmt)
 
 	serviceRef := s.ServiceRef.String()
 	var created, updated, skipped, failed int
+	// Attribute names the import had to change because Mendix reserves them.
+	// Reported at the end so the local name never silently diverges from the
+	// contract; the mapping still points at the remote property either way.
+	var renamed []string
+	// Contract properties that could not become attributes, with the reason.
+	// Reported at the end: an import that drops a property and reports success
+	// is indistinguishable from one that had nothing to drop, which is how a
+	// whole set of ComplexType properties went missing unnoticed until a page
+	// referencing them failed to build (mendixlabs/mxcli#1118).
+	var dropped []string
 
 	for _, schema := range doc.Schemas {
 		for _, et := range schema.EntityTypes {
@@ -533,20 +563,37 @@ func createExternalEntities(ctx *ExecContext, s *ast.CreateExternalEntitiesStmt)
 			}
 			isTopLevel := entitySetName != ""
 
-			// Mendix entity name: entity set name when present (e.g. "People"),
-			// otherwise the type name (e.g. "PlanItem", "Flight", "Trip").
+			// Mendix entity name: the entity TYPE name, as Studio Pro names it
+			// ("Part" for entity set "Parts", "Person" for "People"). Naming it
+			// after the set broke every script written against Studio Pro's name
+			// (mendixlabs/mxcli#1432). An entity an older mxcli imported under
+			// the set name is still found, by its remote identity, and keeps the
+			// name pages and microflows already use.
+			existingEntity := importedEntityFor(dm, serviceRef, entitySetName, et.Name)
 			mendixName := et.Name
-			if isTopLevel {
-				mendixName = entitySetName
+			if existingEntity != nil {
+				mendixName = existingEntity.Name
 			}
 
 			// Apply entity name filter (matched against type name OR entity set name)
-			if len(filterSet) > 0 && !filterSet[strings.ToLower(et.Name)] && !filterSet[strings.ToLower(mendixName)] {
+			if len(filterSet) > 0 && !filterSet[strings.ToLower(et.Name)] && !filterSet[strings.ToLower(entitySetName)] {
 				continue
 			}
 
 			// Resolve the merged property and key set by walking the BaseType chain.
 			mergedProps, keyProps := mergedPropertiesWithKey(et, typeByQualified)
+
+			// Expand complex-typed properties into one attribute per leaf, the
+			// way Studio Pro imports them (MaxQty -> MaxQty_UoMNId,
+			// MaxQty_QuantityValue). Without this every such property fell
+			// through the `!strings.HasPrefix(p.Type, "Edm.")` drop below and
+			// vanished without a word, and the loss surfaced much later as
+			// CE1613 on a page written against the attributes Studio Pro would
+			// have made (mendixlabs/mxcli#1118).
+			flatProps, nestedComplex := doc.FlattenProperties(mergedProps)
+			for _, u := range nestedComplex {
+				dropped = append(dropped, fmt.Sprintf("%s.%s", mendixName, u))
+			}
 
 			keyPropSet := make(map[string]bool)
 			for _, k := range keyProps {
@@ -574,28 +621,70 @@ func createExternalEntities(ctx *ExecContext, s *ast.CreateExternalEntitiesStmt)
 				})
 			}
 
-			// Default Creatable / Updatable for attributes. For top-level
-			// entities the default follows the entity set's Insert/Update
-			// restrictions — missing annotations mean read-only (Mendix
-			// Studio Pro applies the same conservative default, and
-			// mxbuild treats silent metadata as non-writable). For
-			// non-top-level (contained/derived) entities both default to
-			// true, matching Studio Pro's output where contained types are
-			// mutated via their parent's write flow.
+			// Capability defaults follow Mendix's CONSERVATIVE model: an OData
+			// entity set with no InsertRestrictions/UpdateRestrictions annotation
+			// is treated as read-only (Creatable/Updatable = false). Verified
+			// against `mx check` on the TripPin RESTier service — its metadata has
+			// zero capability annotations, and Mendix reports the entities as
+			// Creatable=False, so the app must match or CE6630 fires. Only an
+			// explicit annotation flips a capability on. Non-top-level (contained/
+			// derived) types default true — they are mutated via their parent's
+			// write flow. (The earlier permissive default regressed this; the
+			// service that motivated #729 was a narrower ETag/Concurrency case.)
 			defaultCreatable := false
-			defaultUpdatable := false
 			if !isTopLevel {
 				defaultCreatable = true
-				defaultUpdatable = true
 			}
 			if entitySet != nil && entitySet.Insertable != nil {
 				defaultCreatable = *entitySet.Insertable
 			}
-			if entitySet != nil && entitySet.Updatable != nil {
-				defaultUpdatable = *entitySet.Updatable
-			}
+
+			// Updatable does NOT follow UpdateRestrictions, and that asymmetry
+			// with Creatable right above it is the whole of this rule: NO
+			// attribute of a top-level entity is updatable, and EVERY attribute
+			// of a non-top-level one is, because the latter is written through
+			// its parent's flow.
+			//
+			// Measured on mxbuild 11.12.1 across ten contract shapes, each a
+			// top-level set mxbuild reads as updatable and each answering
+			// False — inline <Record>, typed <Record Type=…>,
+			// UpdateMethod=PATCH, +NonUpdatableProperties +DeleteRestrictions,
+			// unannotated, external <Annotations Target=…>,
+			// Core.Permissions/ReadWrite, Core.OptimisticConcurrency (ETag),
+			// DeepUpdateSupport/Supported=true, and NonUpdatableProperties
+			// naming ONLY the key. That last one is what closes it: the service
+			// lists `Id` as the sole non-updatable property, i.e. asserts that
+			// the others ARE updatable, and mxbuild still says False. Following
+			// the annotation is one CE6630 per attribute.
+			//
+			// It is not "the entity is read-only" — Creatable follows
+			// Insertable on the very same attributes. It is not the model's
+			// "allow creating and changing objects locally" either: setting
+			// AllowCreateChangeLocally=Yes left the expectation at False. An
+			// external object can be changed in memory and passed to an
+			// external action, which is what that flag governs; this one
+			// mirrors what the endpoint itself accepts.
+			//
+			// entitySet.Updatable and NonUpdatableProperties are therefore read
+			// but never consulted here. They are left in place deliberately: if
+			// a contract is ever found that mxbuild does treat as updatable,
+			// this is where the per-property list becomes load-bearing again —
+			// and the key would then need its own guard, since mxbuild computes
+			// a top-level key as non-updatable independently (one CE6630 per
+			// key part, measured across the same ten shapes).
+			defaultUpdatable := !isTopLevel
 			nonInsertable := make(map[string]bool)
 			nonUpdatable := make(map[string]bool)
+			// Filter/Sort restrictions name the properties the service refuses to
+			// filter or sort on. Marking them filterable anyway is CE6630
+			// ("'latitude' is marked Filterable=False in the OData service, but
+			// True in the app") — one per property, on an import whose whole job
+			// is to match the contract.
+			// Both restrictions have two shapes — a per-property exclusion list and
+			// a whole-set boolean — so they are resolved by EdmEntitySet rather
+			// than read field by field here; consulting one shape and not the
+			// other is what produced 28 × CE6630 on a single service
+			// (mxcli-formula1 §48). AttrFilterable/AttrSortable are nil-safe.
 			if entitySet != nil {
 				for _, name := range entitySet.NonInsertableProperties {
 					nonInsertable[name] = true
@@ -605,42 +694,113 @@ func createExternalEntities(ctx *ExecContext, s *ast.CreateExternalEntitiesStmt)
 				}
 			}
 
-			// Build attributes from merged properties
+			// Build attributes from the flattened property set
 			var attrs []*domainmodel.Attribute
-			for _, p := range mergedProps {
+			for _, p := range flatProps {
 				// Drop collection-of-primitive — handled separately as primitive
-				// collection NPEs (not yet implemented).
+				// collection NPEs below.
 				if strings.HasPrefix(p.Type, "Collection(") {
 					continue
 				}
-				// Drop non-Edm types (complex types and entity refs) — they need
-				// to be modelled as NPEs/associations, not implemented yet.
+				// Anything still not an Edm type after the flatten is an entity
+				// reference, an enum, or a complex type this document does not
+				// declare. None of them can become an attribute — but say so:
+				// silence here is what made mendixlabs/mxcli#1118 cost a build to discover.
 				if !strings.HasPrefix(p.Type, "Edm.") {
+					dropped = append(dropped, fmt.Sprintf("%s.%s (%s) — not a supported attribute type", mendixName, p.Path(), p.Type))
 					continue
 				}
 				// Drop Edm.Duration — Mendix has no native duration type and
 				// Studio Pro skips these properties.
 				if p.Type == "Edm.Duration" {
+					dropped = append(dropped, fmt.Sprintf("%s.%s (Edm.Duration) — Mendix has no duration type; Studio Pro skips it too", mendixName, p.Path()))
 					continue
 				}
 
+				// Contract-side lookups key on the property PATH, which is what
+				// the service names in a PropertyPath annotation and what a
+				// $filter would address: "MaxQty/QuantityValue", not the local
+				// attribute name.
+				remoteName := p.Path()
+
+				isKey := keyPropSet[p.Name]
+
 				creatable := defaultCreatable
 				updatable := defaultUpdatable
-				if nonInsertable[p.Name] || p.Computed {
+				if nonInsertable[remoteName] || p.Computed {
 					creatable = false
 				}
-				if nonUpdatable[p.Name] || p.Computed || p.Immutable {
+				if nonUpdatable[remoteName] || p.Computed || p.Immutable {
 					updatable = false
+				}
+				// The key of a top-level entity is non-updatable for a reason
+				// of its own — a key cannot be changed after the object exists,
+				// which is the symptom that was reported ("'DefinitionId' is
+				// marked Updatable=False in the OData service, but True in the
+				// app") — but it needs no guard here, because defaultUpdatable
+				// already answers false for every top-level attribute. On a
+				// NON-top-level entity the key goes the other way and must stay
+				// updatable: clearing it there is CE6630 inverted, measured on
+				// the live TripPin contract over Trip, PlanItem, Event, Flight,
+				// PublicTransportation, Employee and Manager. `UserName` is the
+				// two-sided control inside that one document — False on Person
+				// (an entity set), True on Employee and Manager (derived).
+				// A property reached through a complex type carries NONE of the
+				// four capabilities, whatever the entity set says.
+				//
+				// Creatable/Updatable follow "External entities that contain
+				// attributes of complex types can only be read or deleted. They
+				// cannot be created, updated, or used in external actions"
+				// (Consumed OData Service Requirements), measured on 11.12.1
+				// against a contract annotated Insertable=true AND
+				// Updatable=true: Mendix still reports them Creatable=False /
+				// Updatable=False, so following the entity set is two CE6630 per
+				// attribute.
+				//
+				// Filterable/Sortable go the same way, but ONLY on an entity
+				// with no entity set. A flattened attribute is queryable exactly
+				// where its entity is: measured on TripPin (11.12.1), which
+				// carries no capability annotations at all, Mendix reports
+				//
+				//	Person   (entity set People)      HomeAddress_Address  True
+				//	Employee (derived, no entity set) HomeAddress_Address  False
+				//	Manager  (derived, no entity set) BossOffice_Address   False
+				//	Event    (derived, no entity set) OccursAt_BuildingInfo False
+				//
+				// so CE6630 fires in BOTH directions and a blanket answer cannot
+				// be right: stamping false everywhere is "marked Filterable=True
+				// in the OData service, but False in the app" on People, and
+				// leaving the default true is the same sentence inverted on the
+				// other three. Manager.BossOffice is Manager's OWN property, so
+				// the split is the entity set, not inheritance.
+				//
+				// Ordinary attributes of a derived type stay filterable — this
+				// is a property of the flattening, not of derived types.
+				filterable := entitySet.AttrFilterable(remoteName)
+				sortable := entitySet.AttrSortable(remoteName)
+				if p.RemotePath != "" {
+					creatable = false
+					updatable = false
+					if !isTopLevel {
+						filterable = false
+						sortable = false
+					}
 				}
 
 				attrName := attrNameForOData(p.Name, et.Name)
+				if attrName != p.Name {
+					// Never let a rename be discovered later, when a page written
+					// against the published $metadata fails with "The selected
+					// attribute … no longer exists" (mxcli-formula1 #28).
+					renamed = append(renamed, fmt.Sprintf("%s.%s: %s -> %s", mendixName, p.Name, p.Name, attrName))
+				}
 				attr := &domainmodel.Attribute{
 					Name:       attrName,
-					Type:       edmToDomainModelAttrType(p, keyPropSet[p.Name]),
-					RemoteName: p.Name,
+					Type:       edmToDomainModelAttrType(p, isKey),
+					RemoteName: remoteName,
 					RemoteType: p.Type,
-					Filterable: true,
-					Sortable:   true,
+					Filterable: filterable,
+					Sortable:   sortable,
 					Creatable:  creatable,
 					Updatable:  updatable,
 				}
@@ -648,7 +808,7 @@ func createExternalEntities(ctx *ExecContext, s *ast.CreateExternalEntitiesStmt)
 				attrs = append(attrs, attr)
 			}
 
-			if existingEntity, ok := existing[mendixName]; ok {
+			if existingEntity != nil {
 				if !s.CreateOrModify {
 					fmt.Fprintf(ctx.Output, "  SKIPPED: %s.%s (already exists; use create or modify to update)\n", targetModule, mendixName)
 					skipped++
@@ -664,18 +824,20 @@ func createExternalEntities(ctx *ExecContext, s *ast.CreateExternalEntitiesStmt)
 				continue
 			}
 
-			location := model.Point{X: 100 + (created+updated)*150, Y: 100}
-			newEntity := &domainmodel.Entity{
-				Name:     mendixName,
-				Location: location,
-			}
+			newEntity := &domainmodel.Entity{Name: mendixName}
 			newEntity.ID = model.ID(types.GenerateID())
 			applyExternalEntityFields(newEntity, et, isTopLevel, serviceRef, entitySet, keyParts, attrs)
+			// Placed against everything already in the module, including the
+			// entities this import has just created. The old formula counted only
+			// this run's entities, so an import into a populated module stacked
+			// its first entity on whatever sat at (100, 100) (#1479).
+			newEntity.Location = dmlayout.Place(placed, newEntity)
 			if err := ctx.Backend.CreateEntity(dm.ID, newEntity); err != nil {
 				fmt.Fprintf(ctx.Output, "  FAILED: %s.%s — %v\n", targetModule, mendixName, err)
 				failed++
 				continue
 			}
+			placed.Entities = append(placed.Entities, newEntity)
 			created++
 		}
 	}
@@ -683,11 +845,23 @@ func createExternalEntities(ctx *ExecContext, s *ast.CreateExternalEntitiesStmt)
 	// Second pass: create primitive-collection NPEs (e.g. TripTag for
 	// Trip.Tags = Collection(Edm.String)) and the association from the
 	// parent entity to each NPE.
-	dm, err = ctx.Backend.GetDomainModel(module.ID)
-	if err == nil {
-		npesCreated := createPrimitiveCollectionNPEs(ctx, dm, doc, typeByQualified, esMap, serviceRef)
-		if npesCreated > 0 {
-			fmt.Fprintf(ctx.Output, "Created %d primitive-collection NPEs\n", npesCreated)
+	//
+	// OData primitive collections are a Mendix 11.0 feature: the backing
+	// Rest$ODataMappedPrimitiveCollectionValue / Rest$ODataPrimitiveCollection*
+	// storage types do not exist in the 10.x type cache, so writing them makes
+	// `mx check` on Mendix 10.x abort the whole load with
+	// TypeCacheUnknownTypeException. Pre-11 Studio Pro simply omits these
+	// properties when importing an external entity, so mirror that: skip the NPEs
+	// on < 11.0 (the rest of the entity imports normally).
+	if pv := ctx.Backend.ProjectVersion(); pv != nil && !pv.IsAtLeast(11, 0) {
+		fmt.Fprintf(ctx.Output, "Skipped primitive-collection NPEs (OData primitive collections require Mendix 11.0+; project is %s)\n", pv.ProductVersion)
+	} else {
+		dm, err = ctx.Backend.GetDomainModel(module.ID)
+		if err == nil {
+			npesCreated := createPrimitiveCollectionNPEs(ctx, dm, doc, typeByQualified, esMap, serviceRef)
+			if npesCreated > 0 {
+				fmt.Fprintf(ctx.Output, "Created %d primitive-collection NPEs\n", npesCreated)
+			}
 		}
 	}
 
@@ -704,6 +878,23 @@ func createExternalEntities(ctx *ExecContext, s *ast.CreateExternalEntitiesStmt)
 
 	fmt.Fprintf(ctx.Output, "\nFrom %s into %s: %d created, %d updated, %d skipped, %d failed\n",
 		svcQN, targetModule, created, updated, skipped, failed)
+
+	if len(dropped) > 0 {
+		sort.Strings(dropped)
+		fmt.Fprintf(ctx.Output, "\n  %d contract propert(y/ies) could not be imported as attributes:\n", len(dropped))
+		for _, d := range dropped {
+			fmt.Fprintf(ctx.Output, "    %s\n", d)
+		}
+	}
+
+	if len(renamed) > 0 {
+		sort.Strings(renamed)
+		fmt.Fprintf(ctx.Output, "\n  %d attribute name(s) changed — Mendix reserves the contract's spelling (CE7247),\n", len(renamed))
+		fmt.Fprintf(ctx.Output, "  so a page or expression must use the local name, not the one in $metadata:\n")
+		for _, r := range renamed {
+			fmt.Fprintf(ctx.Output, "    %s\n", r)
+		}
+	}
 
 	return nil
 }
@@ -730,16 +921,15 @@ func createPrimitiveCollectionNPEs(
 	// Lookup parent Mendix entity by EDMX type qualified name.
 	parentByQN := make(map[string]*domainmodel.Entity)
 	for qn, et := range typeByQualified {
-		mendixName := et.Name
-		if es := esMap[qn]; es != "" {
-			mendixName = es
+		if ent := importedEntityFor(dm, serviceRef, esMap[qn], et.Name); ent != nil {
+			parentByQN[qn] = ent
 		}
-		for _, ent := range dm.Entities {
-			if ent.Name == mendixName {
-				parentByQN[qn] = ent
-				break
-			}
-		}
+	}
+
+	// Placement obstacles: the module as re-read, plus each NPE created here.
+	placed := &domainmodel.DomainModel{
+		Entities:    append([]*domainmodel.Entity(nil), dm.Entities...),
+		Annotations: dm.Annotations,
 	}
 
 	count := 0
@@ -801,17 +991,22 @@ func createPrimitiveCollectionNPEs(
 				npe := &domainmodel.Entity{
 					Name:              npeName,
 					Persistable:       false,
-					Location:          model.Point{X: parentEnt.Location.X + 200, Y: parentEnt.Location.Y + 100},
 					Attributes:        []*domainmodel.Attribute{attr},
 					Source:            "Rest$ODataPrimitiveCollectionEntitySource",
 					RemoteServiceName: serviceRef,
 				}
 				npe.ID = model.ID(types.GenerateID())
+				// Beside its parent, but clear of it: the fixed +200/+100 offset
+				// this replaces drew the helper on top of any parent wider than
+				// 200px or taller than 100px, which is most of them (#1479).
+				npe.Location = dmlayout.PlaceNear(placed, npe,
+					model.Point{X: parentEnt.Location.X + 200, Y: parentEnt.Location.Y + 100})
 
 				if err := ctx.Backend.CreateEntity(dm.ID, npe); err != nil {
 					fmt.Fprintf(ctx.Output, "  NPE FAILED: %s — %v\n", npeName, err)
 					continue
 				}
+				placed.Entities = append(placed.Entities, npe)
 				count++
 
 				// Create the association from the parent entity to the NPE.
@@ -847,6 +1042,26 @@ func isInheritedProperty(et *types.EdmEntityType, propName string, byQN map[stri
 		}
 	}
 	return true
+}
+
+// importedEntityFor returns the entity an import of this OData entity type
+// writes to: the one already mapped to the same entity set of the same service,
+// else the one carrying the type's name.
+//
+// The remote identity comes first because mxcli once named a top-level entity
+// after its entity SET (mendixlabs/mxcli#1432). Matching on the name alone would
+// make a re-import of such a module create a type-named twin mapping the same
+// set, and renaming the old one would break everything written against it.
+func importedEntityFor(dm *domainmodel.DomainModel, serviceRef, entitySetName, typeName string) *domainmodel.Entity {
+	if entitySetName != "" {
+		for _, ent := range dm.Entities {
+			if ent.Source == "Rest$ODataRemoteEntitySource" &&
+				ent.RemoteServiceName == serviceRef && ent.RemoteEntitySet == entitySetName {
+				return ent
+			}
+		}
+	}
+	return findEntityByName(dm, typeName)
 }
 
 // findEntityByName returns a domain model entity by name, or nil if not found.
@@ -934,35 +1149,38 @@ func createNavigationAssociations(
 		esByType[es.EntityType] = es
 	}
 	// Build a lookup from EDMX type qualified name → existing Mendix entity.
-	// An entity type matches by its EntitySet name when present, otherwise by
-	// its bare type name.
 	mendixByType := make(map[string]*domainmodel.Entity)
 	for qn, et := range typeByQualified {
-		entitySetName := esMap[qn]
-		mendixName := et.Name
-		if entitySetName != "" {
-			mendixName = entitySetName
-		}
-		for _, ent := range dm.Entities {
-			if ent.Name == mendixName {
-				mendixByType[qn] = ent
-				break
-			}
+		if ent := importedEntityFor(dm, serviceRef, esMap[qn], et.Name); ent != nil {
+			mendixByType[qn] = ent
 		}
 	}
 
 	// Track associations we've already created to avoid duplicates from
-	// inherited nav properties.
-	existingAssocs := make(map[assocKey]bool)
+	// inherited nav properties. existingAssocs is keyed by association name (for
+	// uniqueness/renaming); existingNav is keyed by the OData nav-property name
+	// so a re-import skips a nav property that already has an association instead
+	// of creating a numerically-suffixed duplicate (Friends, Friends2, …). The
+	// nav-property key relies on RemoteParentNavigationProperty, which the
+	// legacy read preserves; the modelsdk read does not, so the natural
+	// association name (== nav-property name) is the fallback skip signal.
+	existingAssocs, existingNav := indexExistingAssociations(dm)
+
+	// The association an earlier import made for a navigation property, keyed
+	// like existingNav, so a partnered end imported the old way can be named.
+	navAssoc := make(map[assocKey]*domainmodel.Association)
+	entityName := make(map[model.ID]string, len(dm.Entities))
+	for _, ent := range dm.Entities {
+		entityName[ent.ID] = ent.Name
+	}
 	for _, a := range dm.Associations {
-		// Find parent entity name for this association
-		for _, ent := range dm.Entities {
-			if ent.ID == a.ParentID {
-				existingAssocs[assocKey{ent.Name, a.Name}] = true
-				break
-			}
+		if p, ok := entityName[a.ParentID]; ok && a.RemoteParentNavigationProperty != "" {
+			navAssoc[assocKey{p, a.RemoteParentNavigationProperty}] = a
 		}
 	}
+	// Partnered navigations Mendix does not offer, and associations from an
+	// earlier import that map a partnered end the way that is CE6618.
+	var unavailable, stale []string
 
 	count := 0
 	for _, schema := range doc.Schemas {
@@ -999,6 +1217,66 @@ func createNavigationAssociations(
 				// Studio Pro doesn't create them either when the target is
 				// stored as Rest$ODataEntityTypeSource (Persistable=false).
 				if parentEnt.Persistable && !childEnt.Persistable {
+					continue
+				}
+
+				// A navigation property with a Partner is one END of a
+				// bidirectional relationship, and Mendix does not treat the ends
+				// separately (mendixlabs/mxcli#1231). Measured on 11.12.1, with
+				// importing each end as its own association as the baseline —
+				// CE6618 "Navigation 'Lines' from external entity 'Buffer' to
+				// 'Line' is not available in the OData service" on every end:
+				//
+				//	one-to-many    ONE association, from the single-valued end,
+				//	               naming both properties          0 errors
+				//	many-to-many   no form builds — one association, two, or
+				//	one-to-one     Owner Both: CE6618 on both ends
+				//
+				// So a one-to-many pair is created once, by its single-valued end
+				// (it holds the reference, so it is the FROM entity), and the
+				// other two are not created at all and are reported instead.
+				// The unpartnered collection navigations beside them in the same
+				// contract build clean, which is what makes Partner the line.
+				partner := partnerNavigation(np, parentQN, typeByQualified[targetTypeName])
+				if partner != nil {
+					partnerMany := strings.HasPrefix(partner.Type, "Collection(")
+					if isMany == partnerMany {
+						if prior := navAssoc[assocKey{parentEnt.Name, np.Name}]; prior != nil {
+							stale = append(stale, prior.Name)
+						}
+						// Once per pair: from the end that sorts first.
+						if parentQN+"/"+np.Name <= targetTypeName+"/"+partner.Name {
+							kind := "many-to-many"
+							if !isMany {
+								kind = "one-to-one"
+							}
+							unavailable = append(unavailable, fmt.Sprintf("%s.%s / %s.%s (%s)",
+								parentEnt.Name, np.Name, childEnt.Name, partner.Name, kind))
+						}
+						continue
+					}
+					if isMany {
+						// The single-valued end creates the association; one
+						// an earlier import made from this end is CE6618.
+						if prior := navAssoc[assocKey{parentEnt.Name, np.Name}]; prior != nil {
+							stale = append(stale, prior.Name)
+						}
+						continue
+					}
+					if prior := navAssoc[assocKey{parentEnt.Name, np.Name}]; prior != nil &&
+						prior.RemoteChildNavigationProperty == "" {
+						stale = append(stale, prior.Name)
+					}
+				}
+
+				// Re-import dedup: if this nav property already has an
+				// association on the parent, skip it — otherwise a second import
+				// creates a numerically-suffixed duplicate (Friends, Friends2,
+				// Friends3 …). Match by the OData nav-property name when the read
+				// preserves it (legacy), else by the natural association name
+				// (== nav-property name; the modelsdk read drops the nav prop).
+				if existingNav[assocKey{parentEnt.Name, np.Name}] ||
+					existingAssocs[assocKey{parentEnt.Name, np.Name}] {
 					continue
 				}
 
@@ -1050,6 +1328,28 @@ func createNavigationAssociations(
 					CreatableFromParent:            creatable,
 					UpdatableFromParent:            updatable,
 				}
+				if partner != nil {
+					// The child end's capabilities come from the TARGET's entity
+					// set, exactly as the parent end's come from the source's.
+					creatableFromChild := true
+					updatableFromChild := true
+					if es, ok := esByType[targetTypeName]; ok {
+						creatableFromChild = es.Insertable != nil && *es.Insertable
+						updatableFromChild = es.Updatable != nil && *es.Updatable
+					}
+					if r, ok := restrictionsByType[targetTypeName]; ok {
+						if r.nonInsertable[partner.Name] {
+							creatableFromChild = false
+						}
+						if r.nonUpdatable[partner.Name] {
+							updatableFromChild = false
+						}
+					}
+					assoc.RemoteChildNavigationProperty = partner.Name
+					assoc.Navigability2 = "BothDirections"
+					assoc.CreatableFromChild = creatableFromChild
+					assoc.UpdatableFromChild = updatableFromChild
+				}
 				assoc.ID = model.ID(types.GenerateID())
 
 				if err := ctx.Backend.CreateAssociation(dm.ID, assoc); err != nil {
@@ -1057,11 +1357,98 @@ func createNavigationAssociations(
 					continue
 				}
 				existingAssocs[assocKey{parentEnt.Name, assocName}] = true
+				existingNav[assocKey{parentEnt.Name, np.Name}] = true
+				if partner != nil {
+					existingNav[assocKey{childEnt.Name, partner.Name}] = true
+				}
 				count++
 			}
 		}
 	}
+
+	if len(unavailable) > 0 {
+		sort.Strings(unavailable)
+		fmt.Fprintf(ctx.Output, "\n  %d partnered navigation pair(s) not imported — Mendix does not offer a\n", len(unavailable))
+		fmt.Fprintf(ctx.Output, "  bidirectional many-to-many or one-to-one navigation, and an association\n")
+		fmt.Fprintf(ctx.Output, "  for either end fails the build with CE6618:\n")
+		for _, u := range unavailable {
+			fmt.Fprintf(ctx.Output, "    %s\n", u)
+		}
+	}
+	if len(stale) > 0 {
+		sort.Strings(stale)
+		fmt.Fprintf(ctx.Output, "\n  %d association(s) from an earlier import map one end of a partnered\n", len(stale))
+		fmt.Fprintf(ctx.Output, "  navigation separately, which fails the build with CE6618. Drop them and\n")
+		fmt.Fprintf(ctx.Output, "  re-run this import:\n")
+		prefix := ""
+		if mod := moduleNameOfDomainModel(ctx, dm); mod != "" {
+			prefix = mod + "."
+		}
+		for _, name := range stale {
+			fmt.Fprintf(ctx.Output, "    drop association %s%s;\n", prefix, name)
+		}
+	}
 	return count
+}
+
+// partnerNavigation returns the navigation property on the target type that np
+// names as its Partner, provided it points back at np's own type — or nil when
+// np is one-directional. A Partner that does not lead back is malformed
+// metadata, and treating it as one-directional is what Mendix can still map.
+func partnerNavigation(np *types.EdmNavigationProperty, ownerQN string, target *types.EdmEntityType) *types.EdmNavigationProperty {
+	if np.Partner == "" || target == nil {
+		return nil
+	}
+	for _, other := range target.NavigationProperties {
+		if other.Name != np.Partner || other.ContainsTarget {
+			continue
+		}
+		back := strings.TrimSuffix(strings.TrimPrefix(other.Type, "Collection("), ")")
+		if back == ownerQN {
+			return other
+		}
+	}
+	return nil
+}
+
+// indexExistingAssociations builds the two lookup tables the re-import dedup
+// needs, both keyed by (parent entity name, name):
+//
+//   - byName — the association's own name.
+//   - byNav  — the OData navigation property it was generated from.
+//
+// byNav is the one that matters, and it is not a convenience. Association names
+// are unique per MODULE, so the second entity with a `season` nav property gets
+// `season_2`. Such an association can never match itself by name, so without
+// byNav a re-import recreates it — computing a fresh suffix each time, two more
+// per run, unbounded and invisible to `mx check` (mxcli-formula1 §50).
+//
+// byNav is only populated for associations that carry
+// RemoteParentNavigationProperty, which is why the modelsdk reader must read the
+// OData source back; dropping it there silently reduced this to the name match.
+func indexExistingAssociations(dm *domainmodel.DomainModel) (byName, byNav map[assocKey]bool) {
+	byName = make(map[assocKey]bool)
+	byNav = make(map[assocKey]bool)
+	parentName := make(map[model.ID]string, len(dm.Entities))
+	for _, ent := range dm.Entities {
+		parentName[ent.ID] = ent.Name
+	}
+	for _, a := range dm.Associations {
+		p, ok := parentName[a.ParentID]
+		if !ok {
+			continue
+		}
+		byName[assocKey{p, a.Name}] = true
+		if a.RemoteParentNavigationProperty != "" {
+			byNav[assocKey{p, a.RemoteParentNavigationProperty}] = true
+		}
+		// A partnered pair is one association; its other end is reached from
+		// the child entity under the child navigation property.
+		if c, ok := parentName[a.ChildID]; ok && a.RemoteChildNavigationProperty != "" {
+			byNav[assocKey{c, a.RemoteChildNavigationProperty}] = true
+		}
+	}
+	return byName, byNav
 }
 
 // uniqueAssocName returns a Mendix-safe association name for an OData nav
@@ -1121,19 +1508,37 @@ func applyExternalEntityFields(
 		ent.Source = "Rest$ODataRemoteEntitySource"
 		ent.Persistable = true
 		ent.RemoteEntitySet = entitySet.Name
-		ent.Countable = true
-		// Capabilities default to false when the entity set's Capabilities
-		// annotations are absent. Silent metadata means the service doesn't
-		// advertise write support, so Mendix treats it as read-only — this
-		// matches Studio Pro's behaviour and mxbuild's validation rules.
+		// Countable follows the contract when it says so. OData's own default is
+		// countable, so an unannotated set stays true — but a service that
+		// declares CountRestrictions/Countable=false and an app that says true is
+		// CE6630 ("marked Countable=False in the OData service, but True in the
+		// app"), which is the whole point of generating from $metadata.
+		ent.Countable = entitySet.Countable == nil || *entitySet.Countable
+		// Capabilities default to false (Mendix's conservative read-only default)
+		// when the entity set has no Insert/Delete restriction annotation — an
+		// unannotated service is treated as read-only, and the app must match or
+		// mx check reports CE6630 (verified against the TripPin RESTier service,
+		// whose metadata has zero capability annotations). Only an explicit
+		// annotation turns a capability on.
 		// Rest$ODataRemoteEntitySource has no Updatable field; updatability
 		// is expressed per attribute via Rest$ODataMappedValue.
 		ent.Creatable = entitySet.Insertable != nil && *entitySet.Insertable
 		ent.Deletable = entitySet.Deletable != nil && *entitySet.Deletable
 		ent.Updatable = false
-		ent.SkipSupported = true
-		ent.TopSupported = true
-		ent.CreateChangeLocally = false
+		// Skip/Top follow the contract for the same reason Countable does. They
+		// were stamped true regardless, which made `TopSupported: No` on the
+		// PUBLISHING side unusable: the contract correctly said Bool="false", the
+		// consuming app said true, and the consumer failed to build with CE6630
+		// "'Seasons' is marked supports $top=False in the OData service, but True
+		// in the app". OData's own default is supported, so an unannotated set
+		// stays true (mxcli-formula1 §42).
+		ent.SkipSupported = entitySet.SkipSupported == nil || *entitySet.SkipSupported
+		ent.TopSupported = entitySet.TopSupported == nil || *entitySet.TopSupported
+		// CreateChangeLocally is deliberately NOT set. Unlike the capability flags
+		// above it cannot be derived from the service contract — it is a local
+		// modelling choice ("Allow creating and changing objects locally"), so
+		// stamping it here reset the user's setting on every re-import (#782). A
+		// newly-created entity arrives zero-valued, which is Mendix's default.
 		return
 	}
 
@@ -1150,6 +1555,8 @@ func applyExternalEntityFields(
 	ent.Updatable = false
 	ent.SkipSupported = false
 	ent.TopSupported = false
+	// An entity-type source has no CreateChangeLocally in storage (the writer does
+	// not emit one), so clear it when an entity is re-imported as a derived type.
 	ent.CreateChangeLocally = false
 }
 
@@ -1220,7 +1627,10 @@ func edmToDomainModelAttrType(p *types.EdmProperty, isKey bool) domainmodel.Attr
 	case "Edm.Boolean":
 		return &domainmodel.BooleanAttributeType{}
 	case "Edm.DateTime", "Edm.DateTimeOffset", "Edm.Date":
-		return &domainmodel.DateTimeAttributeType{}
+		// LocalizeDate true is what the writer emitted before it wrote the
+		// property at all (#743), and what Studio Pro stores for an imported
+		// Edm.DateTimeOffset.
+		return &domainmodel.DateTimeAttributeType{LocalizeDate: true}
 	case "Edm.Guid":
 		return &domainmodel.StringAttributeType{Length: 36}
 	case "Edm.Binary":
@@ -1425,7 +1835,15 @@ func parseAsyncAPIContract(ctx *ExecContext, name ast.QualifiedName) (*types.Asy
 		svcQN := modName + "." + svc.Name
 
 		if svc.Document == "" {
-			return nil, svcQN, mdlerrors.NewValidationf("no cached AsyncAPI contract for %s. This service has no Document field (it may be a publisher, not a consumer)", svcQN)
+			// A publisher caches no contract — Studio Pro renders one on export
+			// and stores nothing. Its channels and messages are in the stored
+			// Definition, though, and the channel id there is the topic other
+			// apps bind to, so project the definition rather than refusing the
+			// read (ako/mxcli#2381, #2384 §5.4).
+			if doc := contractFromDefinition(svc); doc != nil {
+				return doc, svcQN, nil
+			}
+			return nil, svcQN, mdlerrors.NewValidationf("no AsyncAPI contract for %s: it has neither a cached contract (a consumed service) nor a definition (a published one)", svcQN)
 		}
 
 		doc, err := types.ParseAsyncAPI(svc.Document)
@@ -1437,6 +1855,52 @@ func parseAsyncAPIContract(ctx *ExecContext, name ast.QualifiedName) (*types.Asy
 	}
 
 	return nil, "", mdlerrors.NewNotFound("business event service", name.Module+"."+name.Name)
+}
+
+// contractFromDefinition projects a published business event service's stored
+// definition into the shape the contract readers expect. It is a view of what is
+// stored, not a rendering of the AsyncAPI document Studio Pro exports: only the
+// values the model actually holds are filled in, and OperationID is left empty
+// because a publisher stores none (Studio Pro mints `receive<Message>Events` at
+// export time, which is the renderer's business — #2384 part E).
+//
+// OperationType follows AsyncAPI 2's direction, which is the *other* app's point
+// of view: a message this service publishes is one others `subscribe` to, which
+// is what Studio Pro writes and what CanSubscribe records.
+func contractFromDefinition(svc *model.BusinessEventService) *types.AsyncAPIDocument {
+	if svc == nil || svc.Definition == nil {
+		return nil
+	}
+	doc := &types.AsyncAPIDocument{
+		Title:      svc.Definition.ServiceName,
+		DocVersion: "1.0.0",
+	}
+	for _, ch := range svc.Definition.Channels {
+		for _, msg := range ch.Messages {
+			op := "publish"
+			if msg.CanSubscribe {
+				op = "subscribe"
+			}
+			doc.Channels = append(doc.Channels, &types.AsyncAPIChannel{
+				Name:          ch.ChannelName,
+				OperationType: op,
+				MessageRef:    msg.MessageName,
+			})
+			m := &types.AsyncAPIMessage{
+				Name:        msg.MessageName,
+				Description: msg.Description,
+				ContentType: "application/json",
+			}
+			for _, a := range msg.Attributes {
+				m.Properties = append(m.Properties, &types.AsyncAPIProperty{
+					Name: a.AttributeName,
+					Type: a.AttributeType,
+				})
+			}
+			doc.Messages = append(doc.Messages, m)
+		}
+	}
+	return doc
 }
 
 // asyncTypeString formats an AsyncAPI property type for display.

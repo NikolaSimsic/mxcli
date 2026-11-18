@@ -84,7 +84,15 @@ func (s *mdlServer) mdlCompletionItems(linePrefixUpper string) []protocol.Comple
 		return items
 	}
 
-	// After SHOW, suggest showable objects
+	// After LIST, suggest the listings. They were offered after SHOW, which is
+	// the deprecated spelling of `list` (MDL-DEPR002); completion offers mdl 1
+	// spellings only (ako/mxcli#714 decision 5).
+	if strings.HasPrefix(linePrefixUpper, "LIST ") || linePrefixUpper == "LIST" {
+		items = append(items, mdlListContextKeywords...)
+		return items
+	}
+
+	// After SHOW, what `show` still starts in mdl 1: the flow activities.
 	if strings.HasPrefix(linePrefixUpper, "SHOW ") || linePrefixUpper == "SHOW" {
 		items = append(items, mdlShowContextKeywords...)
 		return items
@@ -116,12 +124,26 @@ func (s *mdlServer) widgetRegistryCompletions() []protocol.CompletionItem {
 // appear until the server is restarted.
 func (s *mdlServer) ensureWidgetRegistry() {
 	s.widgetCompletionsOnce.Do(func() {
-		registry, err := executor.NewWidgetRegistry()
-		if err != nil {
-			return
+		// With a project, load exactly the registry `check` validates against:
+		// definitions generated from the installed .mpk first, since .mxcli/ is
+		// gitignored and a fresh clone has none. Loading .def.json alone offered
+		// only the nine embedded widgets, and the diagnostics built on this
+		// registry disagreed with check (ako/mxcli#663).
+		var registry *executor.WidgetRegistry
+		if s.mprPath != "" {
+			registry = executor.LoadWidgetRegistry(s.mprPath)
+		} else {
+			r, err := executor.NewWidgetRegistry()
+			if err != nil {
+				return
+			}
+			if err := r.LoadUserDefinitions(""); err != nil {
+				log.Printf("warning: loading user widget definitions for LSP: %v", err)
+			}
+			registry = r
 		}
-		if err := registry.LoadUserDefinitions(s.mprPath); err != nil {
-			log.Printf("warning: loading user widget definitions for LSP: %v", err)
+		if registry == nil {
+			return
 		}
 		s.widgetRegistry = registry
 		for _, def := range registry.All() {
@@ -154,8 +176,10 @@ var mdlCreateContextKeywords = []protocol.CompletionItem{
 	kw("JAVA ACTION", "Java action type"),
 }
 
-// mdlShowContextKeywords are items suggested after SHOW.
-var mdlShowContextKeywords = []protocol.CompletionItem{
+// mdlListContextKeywords are items suggested after LIST. `context of` is not
+// among them: `list context of` is a deprecated spelling of `describe context
+// of` (MDL-DEPR090).
+var mdlListContextKeywords = []protocol.CompletionItem{
 	kw("ENTITIES", "List entities"),
 	kw("MICROFLOWS", "List microflows"),
 	kw("NANOFLOWS", "List nanoflows"),
@@ -167,13 +191,20 @@ var mdlShowContextKeywords = []protocol.CompletionItem{
 	kw("ASSOCIATIONS", "List associations"),
 	kw("CONSTANTS", "List constants"),
 	kw("WIDGETS", "List widgets"),
-	kw("CALLERS", "Show callers of element"),
-	kw("CALLEES", "Show callees of element"),
-	kw("REFERENCES", "Show references to element"),
-	kw("IMPACT", "Show impact analysis"),
-	kw("CONTEXT", "Show context of element"),
-	kw("CATALOG", "Show catalog info"),
+	kw("CALLERS", "List callers of element"),
+	kw("CALLEES", "List callees of element"),
+	kw("REFERENCES", "List references to element"),
+	kw("IMPACT", "List impact analysis"),
+	kw("CATALOG", "List catalog tables"),
 	kw("DATABASE CONNECTIONS", "List database connections"),
+}
+
+// mdlShowContextKeywords are items suggested after SHOW: the microflow and
+// nanoflow activities `show` starts.
+var mdlShowContextKeywords = []protocol.CompletionItem{
+	kw("PAGE", "Show page activity"),
+	kw("MESSAGE", "Show message activity"),
+	kw("HOME PAGE", "Show home page activity"),
 }
 
 func kw(label string, detail string) protocol.CompletionItem {
@@ -197,15 +228,15 @@ func snippet(label, insertText, detail string) protocol.CompletionItem {
 var mdlCreateSnippets = []protocol.CompletionItem{
 	snippet("CREATE ENTITY", "CREATE ENTITY ${1:Module}.${2:EntityName}\n(\n\t${3:AttributeName} : ${4:String}\n);", "Create a new entity"),
 	snippet("CREATE PERSISTENT ENTITY", "CREATE PERSISTENT ENTITY ${1:Module}.${2:EntityName}\n(\n\t${3:AttributeName} : ${4:String}\n);", "Create a persistent entity"),
-	snippet("CREATE NON_PERSISTENT ENTITY", "CREATE NON_PERSISTENT ENTITY ${1:Module}.${2:EntityName}\n(\n\t${3:AttributeName} : ${4:String}\n);", "Create a non-persistent entity"),
-	snippet("CREATE MICROFLOW", "CREATE MICROFLOW ${1:Module}.${2:MicroflowName}\nBEGIN\n\t$0\nEND;", "Create a new microflow"),
+	snippet("CREATE NON-PERSISTENT ENTITY", "CREATE NON-PERSISTENT ENTITY ${1:Module}.${2:EntityName}\n(\n\t${3:AttributeName} : ${4:String}\n);", "Create a non-persistent entity"),
+	snippet("CREATE MICROFLOW", "CREATE MICROFLOW ${1:Module}.${2:MicroflowName} ()\nBEGIN\n\t$0\nEND;", "Create a new microflow"),
 	snippet("CREATE MICROFLOW (with params)", "CREATE MICROFLOW ${1:Module}.${2:MicroflowName}\n(\n\t$$${3:Param}: ${4:Module.Entity}\n)\nRETURNS ${5:Boolean} AS $$${6:Result}\nBEGIN\n\t$0\nEND;", "Create microflow with parameters"),
-	snippet("CREATE NANOFLOW", "CREATE NANOFLOW ${1:Module}.${2:NanoflowName}\nBEGIN\n\t$0\nEND;", "Create a new nanoflow"),
+	snippet("CREATE NANOFLOW", "CREATE NANOFLOW ${1:Module}.${2:NanoflowName} ()\nBEGIN\n\t$0\nEND;", "Create a new nanoflow"),
 	snippet("CREATE NANOFLOW (with params)", "CREATE NANOFLOW ${1:Module}.${2:NanoflowName}\n(\n\t$$${3:Param}: ${4:Module.Entity}\n)\nRETURNS ${5:Boolean} AS $$${6:Result}\nBEGIN\n\t$0\nEND;", "Create nanoflow with parameters"),
-	snippet("CREATE ENUMERATION", "CREATE ENUMERATION ${1:Module}.${2:EnumName}\n(\n\t'${3:Value1}' '${4:Caption1}',\n\t'${5:Value2}' '${6:Caption2}'\n);", "Create a new enumeration"),
-	snippet("CREATE CONSTANT", "CREATE CONSTANT ${1:Module}.${2:ConstantName}\nTYPE ${3|String,Integer,Long,Decimal,Boolean,DateTime|}\nDEFAULT ${4:'value'};", "Create a new constant"),
-	snippet("CREATE PAGE", "CREATE PAGE ${1:Module}.${2:PageName}\n(\n\tTitle: '${3:Page Title}',\n\tLayout: ${4:Atlas_Core.Atlas_Default}\n)\n{\n\t$0\n}", "Create a new page"),
-	snippet("CREATE SNIPPET", "CREATE SNIPPET ${1:Module}.${2:SnippetName}\n{\n\t$0\n}", "Create a new snippet"),
+	snippet("CREATE ENUMERATION", "CREATE ENUMERATION ${1:Module}.${2:EnumName}\n(\n\t${3:Value1} '${4:Caption1}',\n\t${5:Value2} '${6:Caption2}'\n);", "Create a new enumeration"),
+	snippet("CREATE CONSTANT", "CREATE CONSTANT ${1:Module}.${2:ConstantName}\n(\n\tType: ${3|String,Integer,Long,Decimal,Boolean,DateTime|},\n\tDefaultValue: ${4:'value'}\n);", "Create a new constant"),
+	snippet("CREATE PAGE", "CREATE PAGE ${1:Module}.${2:PageName}\n(\n\tTitle: '${3:Page Title}',\n\tLayout: ${4:Atlas_Core.Atlas_Default}\n)\n{\n\t$0\n};", "Create a new page"),
+	snippet("CREATE SNIPPET", "CREATE SNIPPET ${1:Module}.${2:SnippetName}\n{\n\t$0\n};", "Create a new snippet"),
 	snippet("CREATE ASSOCIATION", "CREATE ASSOCIATION ${1:Module}.${2:AssocName}\nFROM ${1:Module}.${3:ChildEntity}\nTO ${1:Module}.${4:ParentEntity}\nTYPE ${5|Reference,ReferenceSet|};", "Create a new association"),
 	snippet("CREATE MODULE", "CREATE MODULE ${1:ModuleName};", "Create a new module"),
 }
@@ -398,14 +429,14 @@ func objectTypeToCompletionKind(objectType string) (protocol.CompletionItemKind,
 		return protocol.CompletionItemKindFile, "import mapping"
 	case "EXPORT_MAPPING":
 		return protocol.CompletionItemKindFile, "export mapping"
-	case "REST_CLIENT":
-		return protocol.CompletionItemKindInterface, "rest client"
+	case "CONSUMED_REST_SERVICE", "REST_CLIENT":
+		return protocol.CompletionItemKindInterface, "consumed rest service"
 	case "PUBLISHED_REST_SERVICE":
 		return protocol.CompletionItemKindInterface, "published rest service"
-	case "ODATA_CLIENT":
-		return protocol.CompletionItemKindInterface, "odata client"
-	case "ODATA_SERVICE":
-		return protocol.CompletionItemKindInterface, "odata service"
+	case "CONSUMED_ODATA_SERVICE", "ODATA_CLIENT":
+		return protocol.CompletionItemKindInterface, "consumed odata service"
+	case "PUBLISHED_ODATA_SERVICE", "ODATA_SERVICE":
+		return protocol.CompletionItemKindInterface, "published odata service"
 	case "DATABASE_CONNECTION":
 		return protocol.CompletionItemKindInterface, "database connection"
 	case "BUSINESS_EVENT_SERVICE":
@@ -463,7 +494,7 @@ func (s *mdlServer) variableCompletionItems(docText string, linePrefix string, c
 		}
 	}
 
-	// Extract page parameter names from CREATE PAGE ... Params: { $Name: Type, ... }
+	// Extract page parameter names from CREATE PAGE ... Params: ( $Name: Type, ... )
 	paramNames := extractPageParamNames(docText)
 	for _, name := range paramNames {
 		if partial == "" || strings.HasPrefix(strings.ToUpper(name), partial) {
@@ -681,8 +712,19 @@ func (s *mdlServer) widgetPropertyCompletionItems(text, linePrefix string, curso
 		})
 	}
 
+	// A text-template property's `<Name>Params` companion is offered beside it:
+	// the template takes literal text, so without the companion the obvious
+	// completion is also the one that renders the same string on every row
+	// (ako/mxcli#575).
+	addTemplateParams := func(m executor.PropertyMapping, detail string) {
+		if m.Operation != "texttemplate" || m.PropertyKey == "" {
+			return
+		}
+		addProp(m.PropertyKey+"Params", detail+" — `{N}` bindings", protocol.CompletionItemKindProperty)
+	}
 	for _, m := range def.PropertyMappings {
 		addProp(m.PropertyKey, "Property ("+m.Operation+")", protocol.CompletionItemKindProperty)
+		addTemplateParams(m, "Parameters for `"+m.PropertyKey+"`")
 	}
 	for _, mode := range def.Modes {
 		for _, m := range mode.PropertyMappings {
@@ -691,6 +733,7 @@ func (s *mdlServer) widgetPropertyCompletionItems(text, linePrefix string, curso
 				detail += " [mode: " + mode.Name + "]"
 			}
 			addProp(m.PropertyKey, detail, protocol.CompletionItemKindProperty)
+			addTemplateParams(m, "Parameters for `"+m.PropertyKey+"`")
 		}
 	}
 	for _, m := range def.ChildSlots {

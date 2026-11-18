@@ -22,10 +22,11 @@ DROP IMAGE COLLECTION MyModule.StatusIcons;
 ### Check references before dropping
 
 ```sql
-SHOW REFERENCES TO MyModule.AppIcons;
+mdl 1;
+LIST REFERENCES TO MyModule.AppIcons;
 DROP IMAGE COLLECTION MyModule.AppIcons;
 ```
 
 ## See Also
 
-[CREATE IMAGE COLLECTION](create-image-collection.md), [SHOW / DESCRIBE IMAGE COLLECTION](show-describe-image-collection.md)
+[CREATE IMAGE COLLECTION](create-image-collection.md), [SHOW / DESCRIBE IMAGE COLLECTION](list-describe-image-collection.md)

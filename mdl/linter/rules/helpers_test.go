@@ -30,7 +30,11 @@ func setupEntitiesDB(t *testing.T, entities [][]any) catalog.CatalogDB {
 		t.Fatalf("failed to open in-memory db: %v", err)
 	}
 
-	_, err = db.Exec(`CREATE TABLE modules (Name TEXT PRIMARY KEY, Source TEXT)`)
+	// Id mirrors the real `modules` view. Platform filtering keys off the System
+	// module's sentinel Id — Source is empty for System exactly as it is for a
+	// user module — and these iterators swallow query errors, so a missing
+	// column shows up as "no rows" rather than "no such column".
+	_, err = db.Exec(`CREATE TABLE modules (Id TEXT, Name TEXT PRIMARY KEY, Source TEXT)`)
 	if err != nil {
 		t.Fatalf("failed to create modules table: %v", err)
 	}
@@ -39,20 +43,29 @@ func setupEntitiesDB(t *testing.T, entities [][]any) catalog.CatalogDB {
 		Id TEXT, Name TEXT, QualifiedName TEXT, ModuleName TEXT, Folder TEXT,
 		EntityType TEXT, Description TEXT, Generalization TEXT,
 		AttributeCount INTEGER, AccessRuleCount INTEGER, ValidationRuleCount INTEGER,
-		HasEventHandlers INTEGER, IsExternal INTEGER
+		HasEventHandlers INTEGER, IsExternal INTEGER,
+		HasCreatedDate INTEGER, HasChangedDate INTEGER,
+		HasOwner INTEGER, HasChangedBy INTEGER
 	)`)
 	if err != nil {
 		t.Fatalf("failed to create entities table: %v", err)
 	}
 
 	for _, row := range entities {
-		_, err := db.Exec(`INSERT INTO entities VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		// Named columns, not positional: the fixture supplies the 13 a rule
+		// test cares about, and a column added to the real schema (the four
+		// audit members were) must not break every caller.
+		_, err := db.Exec(`INSERT INTO entities
+			(Id, Name, QualifiedName, ModuleName, Folder, EntityType, Description,
+			 Generalization, AttributeCount, AccessRuleCount, ValidationRuleCount,
+			 HasEventHandlers, IsExternal)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			row...)
 		if err != nil {
 			t.Fatalf("failed to insert entity: %v", err)
 		}
 		moduleName := row[3].(string)
-		if _, err := db.Exec(`INSERT OR IGNORE INTO modules (Name, Source) VALUES (?, '')`, moduleName); err != nil {
+		if _, err := db.Exec(`INSERT OR IGNORE INTO modules (Id, Name, Source) VALUES (?, ?, '')`, moduleName+"-id", moduleName); err != nil {
 			t.Fatalf("failed to insert module: %v", err)
 		}
 	}

@@ -5,10 +5,13 @@ package executor
 
 import (
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
 	"github.com/mendixlabs/mxcli/mdl/types"
+	"github.com/mendixlabs/mxcli/mdl/visitor"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
@@ -28,9 +31,12 @@ func (fb *flowBuilder) addCreateVariableAction(s *ast.DeclareStmt) model.ID {
 	typeName := declType.Kind.String()
 	fb.declaredVars[s.Variable] = typeName
 
+	activityX := fb.posX
+
 	action := &microflows.CreateVariableAction{
-		BaseElement:       model.BaseElement{ID: model.ID(types.GenerateID())},
-		ErrorHandlingType: fb.ehType(nil),
+		BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
+		// fb.ehType, not explicitErrorHandling — see ehType's doc comment.
+		ErrorHandlingType: fb.ehType(s.ErrorHandling),
 		VariableName:      s.Variable,
 		DataType:          convertASTToMicroflowDataType(declType, nil),
 		InitialValue:      fb.exprToString(s.InitialValue),
@@ -44,12 +50,16 @@ func (fb *flowBuilder) addCreateVariableAction(s *ast.DeclareStmt) model.ID {
 				Size:        model.Size{Width: ActivityWidth, Height: ActivityHeight},
 			},
 			AutoGenerateCaption: true,
+			ErrorHandlingType:   fb.ehType(s.ErrorHandling),
 		},
 		Action: action,
 	}
 
 	fb.objects = append(fb.objects, activity)
 	fb.posX += fb.spacing
+
+	fb.finishCustomErrorHandler(activity.ID, activityX, s.ErrorHandling, s.Variable)
+
 	return activity.ID
 }
 
@@ -57,14 +67,15 @@ func (fb *flowBuilder) addCreateVariableAction(s *ast.DeclareStmt) model.ID {
 func (fb *flowBuilder) addChangeVariableAction(s *ast.MfSetStmt) model.ID {
 	// Validate that the variable has been declared
 	if !fb.isVariableDeclared(s.Target) {
-		fb.addErrorWithExample(
-			fmt.Sprintf("variable '%s' is not declared", s.Target),
-			errorExampleDeclareVariable(s.Target))
+		fb.addUndeclaredSetError(s.Target)
 	}
 
+	activityX := fb.posX
+
 	action := &microflows.ChangeVariableAction{
-		BaseElement:       model.BaseElement{ID: model.ID(types.GenerateID())},
-		ErrorHandlingType: fb.ehType(nil),
+		BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
+		// fb.ehType, not explicitErrorHandling — see ehType's doc comment.
+		ErrorHandlingType: fb.ehType(s.ErrorHandling),
 		VariableName:      s.Target,
 		Value:             fb.exprToString(s.Value),
 	}
@@ -77,37 +88,84 @@ func (fb *flowBuilder) addChangeVariableAction(s *ast.MfSetStmt) model.ID {
 				Size:        model.Size{Width: ActivityWidth, Height: ActivityHeight},
 			},
 			AutoGenerateCaption: true,
+			ErrorHandlingType:   fb.ehType(s.ErrorHandling),
 		},
 		Action: action,
 	}
 
 	fb.objects = append(fb.objects, activity)
 	fb.posX += fb.spacing
+
+	fb.finishCustomErrorHandler(activity.ID, activityX, s.ErrorHandling, s.Target)
+
 	return activity.ID
+}
+
+// commitTypeOf maps the AST's Commit modifier onto the stored Mendix enum. Both
+// create and change previously hardcoded CommitTypeNo, so any project authored or
+// round-tripped through MDL had its commit flags silently cleared (#779).
+func commitTypeOf(f ast.CommitFlag) microflows.CommitType {
+	switch f {
+	case ast.CommitYes:
+		return microflows.CommitTypeYes
+	case ast.CommitYesWithoutEvents:
+		return microflows.CommitTypeYesWithoutEvents
+	default:
+		return microflows.CommitTypeNo
+	}
 }
 
 // addCreateObjectAction creates a CREATE OBJECT statement.
 func (fb *flowBuilder) addCreateObjectAction(s *ast.CreateObjectStmt) model.ID {
-	action := &microflows.CreateObjectAction{
-		BaseElement:       model.BaseElement{ID: model.ID(types.GenerateID())},
-		ErrorHandlingType: fb.ehType(s.ErrorHandling),
-		OutputVariable:    s.Variable,
-		Commit:            microflows.CommitTypeNo,
-	}
 	// Set entity reference as qualified name (BY_NAME_REFERENCE)
 	entityQN := ""
 	if s.EntityType.Module != "" && s.EntityType.Name != "" {
 		entityQN = s.EntityType.Module + "." + s.EntityType.Name
+	}
+
+	// A Mendix Create activity ALWAYS names its output, and Studio Pro supplies
+	// the name itself when you drop one. mxcli wrote an empty VariableName for
+	// `CREATE Mod.Thing (…);` with no `$Var =`, and mxbuild rejects that as
+	// CE6005 "The 'Entity' property is required." — an error that names the wrong
+	// property, since Entity IS stored. Measured on 11.14.0: the assigned and
+	// unassigned documents differ in exactly one field, and setting that one
+	// field takes the project from 1 error to 0 (ako/CapTrackV3 FINDINGS §9).
+	//
+	// Supplied rather than refused, because nothing is being guessed: the author
+	// said create this entity and did not ask for a handle, which is precisely
+	// what an auto-named output is. Studio Pro's own convention is New<Entity>.
+	outputVar := s.Variable
+	if outputVar == "" {
+		outputVar = fb.freshCreateVariable(s.EntityType.Name)
+		if fb.generatedVars == nil {
+			fb.generatedVars = map[string]bool{}
+		}
+		fb.generatedVars[outputVar] = true
+	}
+
+	action := &microflows.CreateObjectAction{
+		BaseElement:       model.BaseElement{ID: model.ID(types.GenerateID())},
+		ErrorHandlingType: fb.ehType(s.ErrorHandling),
+		OutputVariable:    outputVar,
+		Commit:            commitTypeOf(s.Commit),
+		RefreshInClient:   s.RefreshInClient,
+	}
+	if entityQN != "" {
 		action.EntityQualifiedName = entityQN
 	}
 
-	// Register variable type for CHANGE statements
-	if fb.varTypes != nil && entityQN != "" {
+	// Register variable type for CHANGE statements. The AUTHOR's name is
+	// registered, never the generated one: an auto-named output is deliberately
+	// not referenceable, so a later `change $NewThing` stays the error it is.
+	if fb.varTypes != nil && entityQN != "" && s.Variable != "" {
 		fb.varTypes[s.Variable] = entityQN
 	}
 
 	// Build InitialMembers for each SET assignment
 	for _, change := range s.Changes {
+		if fb.refuseSystemMemberChange(change.Attribute, entityQN) {
+			continue
+		}
 		memberChange := &microflows.MemberChange{
 			BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
 			Type:        microflows.MemberChangeTypeSet,
@@ -139,14 +197,51 @@ func (fb *flowBuilder) addCreateObjectAction(s *ast.CreateObjectStmt) model.ID {
 	return activity.ID
 }
 
+// freshCreateVariable returns the output-variable name for a CREATE the script
+// did not assign, following Studio Pro's New<Entity> convention.
+//
+// It must not collide with a name already in the flow: two activities sharing an
+// output variable is CE0119, so a bare "New"+entity would turn one silent defect
+// into another the moment a microflow creates two of the same entity. The suffix
+// walks up until the name is free, and the search is bounded by the number of
+// variables that exist, so it always terminates.
+func (fb *flowBuilder) freshCreateVariable(entityName string) string {
+	base := "New" + entityName
+	if base == "New" {
+		base = "NewObject"
+	}
+	if !fb.variableNameTaken(base) {
+		return base
+	}
+	for i := 2; ; i++ {
+		candidate := base + strconv.Itoa(i)
+		if !fb.variableNameTaken(candidate) {
+			return candidate
+		}
+	}
+}
+
+// variableNameTaken reports whether a name is already used in this flow. varTypes
+// carries the ones the script named; generatedVars carries the ones this function
+// has handed out, which varTypes deliberately does not record.
+func (fb *flowBuilder) variableNameTaken(name string) bool {
+	if fb.varTypes != nil {
+		if _, ok := fb.varTypes[name]; ok {
+			return true
+		}
+	}
+	return fb.generatedVars[name]
+}
+
 // addCommitAction creates a COMMIT statement.
 func (fb *flowBuilder) addCommitAction(s *ast.MfCommitStmt) model.ID {
 	action := &microflows.CommitObjectsAction{
 		BaseElement:       model.BaseElement{ID: model.ID(types.GenerateID())},
 		ErrorHandlingType: fb.ehType(s.ErrorHandling),
 		CommitVariable:    s.Variable,
-		WithEvents:        s.WithEvents,
-		RefreshInClient:   s.RefreshInClient,
+		// Absent WITHOUT EVENTS means events ON — Mendix's default (#895).
+		WithEvents:      !s.WithoutEvents,
+		RefreshInClient: s.RefreshInClient,
 	}
 
 	activityX := fb.posX
@@ -173,8 +268,10 @@ func (fb *flowBuilder) addCommitAction(s *ast.MfCommitStmt) model.ID {
 // addDeleteAction creates a DELETE statement.
 func (fb *flowBuilder) addDeleteAction(s *ast.DeleteObjectStmt) model.ID {
 	action := &microflows.DeleteObjectAction{
-		BaseElement:    model.BaseElement{ID: model.ID(types.GenerateID())},
-		DeleteVariable: s.Variable,
+		BaseElement:       model.BaseElement{ID: model.ID(types.GenerateID())},
+		ErrorHandlingType: explicitErrorHandling(fb, s.ErrorHandling),
+		DeleteVariable:    s.Variable,
+		RefreshInClient:   s.RefreshInClient,
 	}
 
 	activityX := fb.posX
@@ -199,12 +296,17 @@ func (fb *flowBuilder) addDeleteAction(s *ast.DeleteObjectStmt) model.ID {
 	return activity.ID
 }
 
-// addRollbackAction creates a ROLLBACK statement.
-func (fb *flowBuilder) addRollbackAction(s *ast.RollbackStmt) model.ID {
-	action := &microflows.RollbackObjectAction{
-		BaseElement:      model.BaseElement{ID: model.ID(types.GenerateID())},
-		RollbackVariable: s.Variable,
-		RefreshInClient:  s.RefreshInClient,
+// addExternalObjectAction creates a SEND or DELETE EXTERNAL OBJECT activity
+// (mendixlabs/mxcli#1735).
+func (fb *flowBuilder) addExternalObjectAction(s *ast.ExternalObjectStmt) model.ID {
+	activityX := fb.posX
+	var action microflows.MicroflowAction
+	id := model.BaseElement{ID: model.ID(types.GenerateID())}
+	eh := explicitErrorHandling(fb, s.ErrorHandling)
+	if s.Delete {
+		action = &microflows.DeleteExternalObjectAction{BaseElement: id, Variable: s.Variable, RefreshInClient: s.RefreshInClient, ErrorHandlingType: eh}
+	} else {
+		action = &microflows.SendExternalObjectAction{BaseElement: id, Variable: s.Variable, RefreshInClient: s.RefreshInClient, ErrorHandlingType: eh}
 	}
 
 	activity := &microflows.ActionActivity{
@@ -221,6 +323,40 @@ func (fb *flowBuilder) addRollbackAction(s *ast.RollbackStmt) model.ID {
 
 	fb.objects = append(fb.objects, activity)
 	fb.posX += fb.spacing
+
+	fb.finishCustomErrorHandler(activity.ID, activityX, s.ErrorHandling, "")
+
+	return activity.ID
+}
+
+// addRollbackAction creates a ROLLBACK statement.
+func (fb *flowBuilder) addRollbackAction(s *ast.RollbackStmt) model.ID {
+	activityX := fb.posX
+	action := &microflows.RollbackObjectAction{
+		BaseElement:      model.BaseElement{ID: model.ID(types.GenerateID())},
+		RollbackVariable: s.Variable,
+		RefreshInClient:  s.RefreshInClient,
+		// Explicit only: the writer has never stored a type on a rollback, so
+		// no clause must keep writing none (mendixlabs/mxcli#1252).
+		ErrorHandlingType: explicitErrorHandling(fb, s.ErrorHandling),
+	}
+
+	activity := &microflows.ActionActivity{
+		BaseActivity: microflows.BaseActivity{
+			BaseMicroflowObject: microflows.BaseMicroflowObject{
+				BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
+				Position:    model.Point{X: fb.posX, Y: fb.posY},
+				Size:        model.Size{Width: ActivityWidth, Height: ActivityHeight},
+			},
+			AutoGenerateCaption: true,
+		},
+		Action: action,
+	}
+
+	fb.objects = append(fb.objects, activity)
+	fb.posX += fb.spacing
+
+	fb.finishCustomErrorHandler(activity.ID, activityX, s.ErrorHandling, "")
 
 	return activity.ID
 }
@@ -234,11 +370,14 @@ func (fb *flowBuilder) addChangeObjectAction(s *ast.ChangeObjectStmt) model.ID {
 	// exec of such actions stays valid without requiring authored MDL to say
 	// `refresh` explicitly; when the author wrote `refresh`, we keep the
 	// same flag for non-empty changes too.
+	activityX := fb.posX
+
 	action := &microflows.ChangeObjectAction{
-		BaseElement:       model.BaseElement{ID: model.ID(types.GenerateID())},
-		ErrorHandlingType: fb.ehType(nil),
+		BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
+		// fb.ehType, not explicitErrorHandling — see ehType's doc comment.
+		ErrorHandlingType: fb.ehType(s.ErrorHandling),
 		ChangeVariable:    s.Variable,
-		Commit:            microflows.CommitTypeNo,
+		Commit:            commitTypeOf(s.Commit),
 		RefreshInClient:   s.RefreshInClient || len(s.Changes) == 0,
 	}
 
@@ -247,15 +386,31 @@ func (fb *flowBuilder) addChangeObjectAction(s *ast.ChangeObjectStmt) model.ID {
 	if fb.varTypes != nil {
 		entityQN = fb.varTypes[s.Variable]
 	}
+	// A Change object activity takes one object. Over a list the member was
+	// qualified through the list type — Attribute "List of M.E.Attr", CE1613
+	// at build time (mendixlabs/mxcli#1422) — so refuse it rather than write it.
+	if fb.isListVariable(s.Variable) && len(s.Changes) > 0 {
+		fb.addError("$%s is a list (%s), not an object: `change $%s` would store the member as %q, which mxbuild rejects "+
+			"with CE1613 — retrieve the object with `retrieve $%s from … first;` (under `mdl 1;` `limit 1` is a list of one), "+
+			"or change the list's items inside a loop",
+			s.Variable, entityQN, s.Variable, entityQN+"."+s.Changes[0].Attribute, s.Variable)
+	}
 
-	// Build MemberChange items for each SET assignment
+	// Build a MemberChange for each `=`, `+=` or `-=` member
 	for _, change := range s.Changes {
+		if fb.refuseSystemMemberChange(change.Attribute, entityQN) {
+			continue
+		}
 		memberChange := &microflows.MemberChange{
 			BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
-			Type:        microflows.MemberChangeTypeSet,
+			Type:        memberChangeTypeOf(change.Op),
 			Value:       fb.memberExpressionToString(change.Value, entityQN, change.Attribute),
 		}
+		errorsBefore := len(fb.errors)
 		fb.resolveMemberChange(memberChange, change.Attribute, entityQN)
+		if memberChange.Type != microflows.MemberChangeTypeSet && len(fb.errors) == errorsBefore {
+			fb.checkAddRemoveMember(memberChange, s.Variable, change.Attribute)
+		}
 		action.Changes = append(action.Changes, memberChange)
 	}
 
@@ -267,46 +422,115 @@ func (fb *flowBuilder) addChangeObjectAction(s *ast.ChangeObjectStmt) model.ID {
 				Size:        model.Size{Width: ActivityWidth, Height: ActivityHeight},
 			},
 			AutoGenerateCaption: true,
+			ErrorHandlingType:   fb.ehType(s.ErrorHandling),
 		},
 		Action: action,
 	}
 
 	fb.objects = append(fb.objects, activity)
 	fb.posX += fb.spacing
+
+	fb.finishCustomErrorHandler(activity.ID, activityX, s.ErrorHandling, s.Variable)
+
 	return activity.ID
 }
 
-func (fb *flowBuilder) addEnumSplit(s *ast.EnumSplitStmt) model.ID {
-	if count := enumSplitBranchCount(s); count > maxEnumSplitBranches {
-		fb.addError("enum split has %d branches; at most %d branches are supported", count, maxEnumSplitBranches)
-		return ""
+// addAssociationMemberChange builds `add|remove <value> to|from $Obj/Assoc`: a
+// Change object activity with one Add or Remove member, which is what Studio
+// Pro's Add/Remove buttons store for a reference set (mendixlabs/mxcli#1288).
+// It is `change $Obj (Assoc += <value>)` (or `-=`) under another spelling, so
+// it goes through addChangeObjectAction and resolves and validates the member
+// exactly as that does.
+func (fb *flowBuilder) addAssociationMemberChange(op microflows.MemberChangeType, variable, association string, value ast.Expression, commit ast.CommitFlag, refresh bool, eh *ast.ErrorHandlingClause) model.ID {
+	itemOp := ast.MemberAdd
+	if op == microflows.MemberChangeTypeRemove {
+		itemOp = ast.MemberRemove
 	}
+	return fb.addChangeObjectAction(&ast.ChangeObjectStmt{
+		Variable:        variable,
+		Changes:         []ast.ChangeItem{{Attribute: association, Op: itemOp, Value: value}},
+		Commit:          commit,
+		RefreshInClient: refresh,
+		ErrorHandling:   eh,
+	})
+}
 
+// memberChangeTypeOf maps a CHANGE member's operator to the stored MemberChange
+// Type: `=` Set, `+=` Add, `-=` Remove (mendixlabs/mxcli#1473).
+func memberChangeTypeOf(op ast.MemberChangeOp) microflows.MemberChangeType {
+	switch op {
+	case ast.MemberAdd:
+		return microflows.MemberChangeTypeAdd
+	case ast.MemberRemove:
+		return microflows.MemberChangeTypeRemove
+	}
+	return microflows.MemberChangeTypeSet
+}
+
+// checkAddRemoveMember refuses an Add or Remove member that is not on a
+// reference set. Measured on 11.12.2: an Add member on an attribute or on a
+// plain Reference fails `mx check` with CE0033 "The 'Type' property of this
+// member cannot be 'Add'." — whether it was written `+=` or `add … to`.
+func (fb *flowBuilder) checkAddRemoveMember(mc *microflows.MemberChange, variable, member string) {
+	verb := "add (`+=` / `add … to`)"
+	if mc.Type == microflows.MemberChangeTypeRemove {
+		verb = "remove (`-=` / `remove … from`)"
+	}
+	if mc.AssociationQualifiedName == "" {
+		fb.addError("%s on $%s/%s: %s is not an association — Add and Remove apply to reference-set members only "+
+			"(mxbuild: CE0033); set an attribute with `change $%s (%s = …)`", verb, variable, member, member, variable, member)
+		return
+	}
+	if dot := strings.Index(mc.AssociationQualifiedName, "."); dot > 0 {
+		info := fb.lookupAssociation(mc.AssociationQualifiedName[:dot], mc.AssociationQualifiedName[dot+1:])
+		if info != nil && info.Type != domainmodel.AssociationTypeReferenceSet {
+			fb.addError("%s on $%s/%s: %s is a Reference, not a ReferenceSet — Add and Remove apply to reference sets only "+
+				"(mxbuild: CE0033); set a reference with `change $%s (%s = …)`",
+				verb, variable, member, mc.AssociationQualifiedName, variable, mc.AssociationQualifiedName)
+		}
+	}
+}
+
+// There is no branch limit. The 16 that used to be enforced here was the size of
+// splitCaseOrderAnchors, which once stored every case's order; a split of four or
+// more cases now stores it as origin side + canvas depth (enumSplitOriginAnchors,
+// orderedEnumSplitFlows), so the table is only consulted for three cases or fewer.
+// Studio Pro writes splits far wider than 16 (mendixlabs/mxcli#1416).
+func (fb *flowBuilder) addEnumSplit(s *ast.EnumSplitStmt) model.ID {
 	if fb.measurer == nil {
 		fb.measurer = &layoutMeasurer{varTypes: fb.varTypes}
 	}
 
 	splitX := fb.posX
 	centerY := fb.posY
+	caption := "$" + s.Variable
+	var condition microflows.SplitCondition = &microflows.ExpressionSplitCondition{
+		BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
+		Expression:  "$" + s.Variable,
+	}
+	if s.Condition != nil {
+		// `case Mod.Rule(…)`: the decision is a rule returning an enumeration.
+		// Same condition an `if` on a rule builds (mendixlabs/mxcli#1414).
+		caption = fb.exprToString(s.Condition)
+		condition = fb.buildSplitCondition(s.Condition, caption)
+		fb.checkRuleCaseCoverage(s)
+	}
 	split := &microflows.ExclusiveSplit{
 		BaseMicroflowObject: microflows.BaseMicroflowObject{
 			BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
 			Position:    model.Point{X: splitX, Y: centerY},
 			Size:        model.Size{Width: SplitWidth, Height: SplitHeight},
 		},
-		Caption: "$" + s.Variable,
-		SplitCondition: &microflows.ExpressionSplitCondition{
-			BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
-			Expression:  "$" + s.Variable,
-		},
+		Caption:           caption,
+		SplitCondition:    condition,
 		ErrorHandlingType: fb.ehType(nil),
 	}
+	splitIndex := len(fb.objects)
 	fb.objects = append(fb.objects, split)
 	splitID := split.ID
-	if fb.pendingAnnotations != nil {
-		fb.applyAnnotations(splitID, fb.pendingAnnotations)
-		fb.pendingAnnotations = nil
-	}
+	// applyPendingAnnotations, not applyAnnotations: only it records the
+	// statement's @curve for applyFlowCurves (mendixlabs/mxcli#1414).
+	fb.applyPendingAnnotations(splitID)
 
 	type branch struct {
 		values []string
@@ -322,22 +546,39 @@ func (fb *flowBuilder) addEnumSplit(s *ast.EnumSplitStmt) model.ID {
 
 	branchWidth := 0
 	for _, br := range branches {
-		w := fb.measurer.measureStatements(br.body).Width
+		w := fb.measurer.measureBranch(br.body).Width
 		if w > branchWidth {
 			branchWidth = w
 		}
 	}
+	// CaseSplitColumns: the first outcome on the line, the others as columns
+	// under the split (flowlayout.go).
+	caseCols := fb.layoutStyle().CaseSplit == CaseSplitColumns && len(branches) > 1
+	var plan caseColumns
+	firstShift := 0
+	if caseCols {
+		bodies := make([][]ast.MicroflowStatement, len(branches))
+		for i, br := range branches {
+			bodies[i] = br.body
+		}
+		plan = fb.measurer.planCaseColumns(splitX, bodies)
+		if len(branches[0].values) > 1 {
+			firstShift = firstCaseGroupShift
+		}
+		branchWidth = caseColumnsBranchWidth(fb.measurer.measureBranch(branches[0].body).Width+firstShift, plan, SplitWidth)
+	}
 	if branchWidth == 0 {
 		branchWidth = HorizontalSpacing / 2
 	}
-	mergeX := splitX + SplitWidth + HorizontalSpacing/2 + branchWidth + HorizontalSpacing/2
+	mergeX := splitX + SplitWidth + HorizontalSpacing/2 + branchWidth
+	mergeX, mergeY := mergePosition(s.Annotations, mergeX, centerY)
 	var merge *microflows.ExclusiveMerge
 	ensureMerge := func() *microflows.ExclusiveMerge {
 		if merge == nil {
 			merge = &microflows.ExclusiveMerge{
 				BaseMicroflowObject: microflows.BaseMicroflowObject{
 					BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
-					Position:    model.Point{X: mergeX, Y: centerY},
+					Position:    model.Point{X: mergeX, Y: mergeY},
 					Size:        model.Size{Width: MergeSize, Height: MergeSize},
 				},
 			}
@@ -371,6 +612,22 @@ func (fb *flowBuilder) addEnumSplit(s *ast.EnumSplitStmt) model.ID {
 		}
 	}
 
+	origins := enumSplitOriginAnchors(branchYs, centerY)
+	if caseCols {
+		branchYs[0], origins = centerY, nil
+	}
+	columnTop := 0
+	var caseAnchors []ast.CaseAnchor
+	if s.Annotations != nil {
+		caseAnchors = s.Annotations.CaseAnchors
+	}
+	slot := func(i int) splitCaseSlot {
+		if origins == nil {
+			return splitCaseSlot{order: i, origin: -1, anchors: caseAnchors}
+		}
+		return splitCaseSlot{order: i, origin: origins[i], anchors: caseAnchors}
+	}
+
 	savedEndsWithReturn := fb.endsWithReturn
 	allBranchesReturn := len(branches) > 0
 	for i, br := range branches {
@@ -378,22 +635,79 @@ func (fb *flowBuilder) addEnumSplit(s *ast.EnumSplitStmt) model.ID {
 		fb.posX = splitX + SplitWidth + HorizontalSpacing/2
 		fb.posY = branchY
 		fb.endsWithReturn = false
+		// Where a multi-value outcome's own merge goes, and how this outcome's
+		// first flows are drawn (sides for a column, the line for the first).
+		groupX, groupY := splitX+SplitWidth+HorizontalSpacing/4, branchY
+		var column *elseColumnCursor
+		if caseCols && i > 0 {
+			if columnTop == 0 {
+				// Every column starts under everything the first outcome drew.
+				_, bottom, _ := objectsExtent(fb.objects[splitIndex:])
+				columnTop = max(centerY+branchHeights[0]/2, bottom) + BranchGap
+			}
+			top := columnTop
+			if len(br.values) > 1 {
+				groupX, groupY = plan.x[i], top+MergeSize/2
+				top += MergeSize + BranchGap
+			}
+			column = fb.startElseColumn(plan.x[i], top)
+		} else if caseCols {
+			fb.posX += firstShift
+		}
+		caseFlowSides := func(from int) {
+			if !caseCols {
+				return
+			}
+			if column != nil {
+				setColumnFlowSides(fb.flows[from:], slot(i))
+				return
+			}
+			for _, f := range fb.flows[from:] {
+				f.OriginConnectionIndex, f.DestinationConnectionIndex = AnchorRight, AnchorLeft
+				if ec, ok := f.CaseValue.(microflows.EnumerationCase); ok {
+					slot(i).applyCaseAnchor(f, ec.Value)
+				}
+			}
+		}
 
 		lastID := model.ID("")
 		pendingCase := ""
 		var prevAnchor *ast.FlowAnchors
+		branchEnds := lastStmtIsReturn(br.body)
+		outerHandlers := fb.enterBranch()
 		for j, stmt := range br.body {
 			thisAnchor := stmtOwnAnchor(stmt)
+			column.begin(stmt)
 			actID := fb.addStatement(stmt)
+			column.end()
+			if fb.pendingJoin != nil {
+				// `join L` as the FIRST statement of a case body means the split
+				// itself goes to the merge, so the case flows are emitted with the
+				// merge as destination rather than an activity.
+				if lastID == "" {
+					label := fb.pendingJoin.Label
+					fb.pendingJoin = nil
+					fb.labels().handled++
+					m := fb.mergeForLabel(label)
+					from := len(fb.flows)
+					fb.addGroupedEnumSplitFlows(splitID, m.ID, br.values, slot(i), groupX, groupY)
+					caseFlowSides(from)
+				} else {
+					fb.takePendingJoin(lastID, pendingCase, prevAnchor)
+				}
+				pendingCase = ""
+				continue
+			}
 			if actID == "" {
 				continue
 			}
-			if fb.pendingAnnotations != nil {
-				fb.applyAnnotations(actID, fb.pendingAnnotations)
-				fb.pendingAnnotations = nil
-			}
+			// applyPendingAnnotations, not applyAnnotations: only it records the
+			// statement's @curve for applyFlowCurves (mendixlabs/mxcli#1414).
+			fb.applyPendingAnnotations(actID)
 			if lastID == "" {
-				fb.addGroupedEnumSplitFlows(splitID, actID, br.values, i, splitX+SplitWidth+HorizontalSpacing/4, branchY)
+				from := len(fb.flows)
+				fb.addGroupedEnumSplitFlows(splitID, actID, br.values, slot(i), groupX, groupY)
+				caseFlowSides(from)
 				// The first statement in a case can carry @anchor(from:…,
 				// to:…) that should apply to the split→firstActivity flow.
 				// addGroupedEnumSplitFlows appends one flow per case value;
@@ -401,6 +715,11 @@ func (fb *flowBuilder) addEnumSplit(s *ast.EnumSplitStmt) model.ID {
 				// through describe → exec without silently dropping.
 				if thisAnchor != nil && len(fb.flows) > 0 {
 					applyUserAnchors(fb.flows[len(fb.flows)-1], nil, thisAnchor)
+					// The outcome's own `to:` on the CASE is the more specific
+					// of the two, so it wins over the first statement's.
+					if len(br.values) == 1 {
+						slot(i).applyCaseAnchor(fb.flows[len(fb.flows)-1], br.values[0])
+					}
 				}
 			} else {
 				var flow *microflows.SequenceFlow
@@ -410,11 +729,12 @@ func (fb *flowBuilder) addEnumSplit(s *ast.EnumSplitStmt) model.ID {
 				} else {
 					flow = newHorizontalFlow(lastID, actID)
 				}
+				if column != nil {
+					flow.OriginConnectionIndex, flow.DestinationConnectionIndex = AnchorBottom, AnchorTop
+				}
 				applyUserAnchors(flow, prevAnchor, thisAnchor)
 				fb.flows = append(fb.flows, flow)
-				if fb.emptyErrorHandlerFrom == lastID {
-					fb.addPendingErrorHandlerFlowForStatement(lastID, actID, stmt, statementsReferenceVar(br.body[j+1:], fb.errorHandlerSkipVar))
-				}
+				fb.settleBranchFlow(lastID, actID, stmt, br.body[j+1:], branchEnds)
 			}
 			prevAnchor = thisAnchor
 			if fb.nextConnectionPoint != "" {
@@ -422,24 +742,50 @@ func (fb *flowBuilder) addEnumSplit(s *ast.EnumSplitStmt) model.ID {
 				fb.nextConnectionPoint = ""
 				pendingCase = fb.nextFlowCase
 				fb.nextFlowCase = ""
+				// A branch statement's own anchor (prevAnchor) already carries its
+				// outgoing side; a nested if's exit anchor must not outlive it.
+				fb.nextFlowAnchor = nil
 			} else {
 				lastID = actID
 			}
 		}
 
-		if lastStmtIsReturn(br.body) {
+		if branchEnds {
+			// What a returning branch could not settle goes on to the
+			// enclosing path, which settles it after the CASE.
+			fb.leaveBranch(outerHandlers)
 			continue
 		}
 		allBranchesReturn = false
 		if lastID == "" {
-			fb.addGroupedEnumSplitFlows(splitID, ensureMerge().ID, br.values, i, splitX+SplitWidth+HorizontalSpacing/4, branchY)
-		} else {
-			if pendingCase != "" {
-				fb.flows = append(fb.flows, newHorizontalFlowWithCase(lastID, ensureMerge().ID, pendingCase))
-			} else {
-				fb.flows = append(fb.flows, newHorizontalFlow(lastID, ensureMerge().ID))
+			from := len(fb.flows)
+			fb.addGroupedEnumSplitFlows(splitID, ensureMerge().ID, br.values, slot(i), groupX, groupY)
+			caseFlowSides(from)
+			if column != nil {
+				// An empty column goes straight from the split's bottom to the merge's.
+				for _, f := range fb.flows[from:] {
+					if f.DestinationID == ensureMerge().ID {
+						f.DestinationConnectionIndex = AnchorBottom
+					}
+				}
 			}
+		} else {
+			var tail *microflows.SequenceFlow
+			if pendingCase != "" {
+				tail = newHorizontalFlowWithCase(lastID, ensureMerge().ID, pendingCase)
+			} else {
+				tail = newHorizontalFlow(lastID, ensureMerge().ID)
+			}
+			if origins != nil {
+				tail.DestinationConnectionIndex = mergeSideFor(fb.objectPosition(lastID), fb.objectPosition(ensureMerge().ID))
+			}
+			if column != nil {
+				tail.OriginConnectionIndex, tail.DestinationConnectionIndex = AnchorRight, AnchorBottom
+			}
+			fb.flows = append(fb.flows, tail)
+			fb.settleBranchFlow(lastID, ensureMerge().ID, nil, nil, false)
 		}
+		fb.leaveBranch(outerHandlers)
 	}
 
 	fb.posX = mergeX + HorizontalSpacing/2
@@ -449,6 +795,9 @@ func (fb *flowBuilder) addEnumSplit(s *ast.EnumSplitStmt) model.ID {
 		fb.endsWithReturn = true
 	} else {
 		fb.nextConnectionPoint = ensureMerge().ID
+		// `@anchor(from: X)` on a CASE is the flow leaving it — out of its
+		// merge — as on an IF (#767). It was accepted and dropped (#1587).
+		fb.nextFlowAnchor = mergeExitFlowAnchor(s)
 	}
 	return splitID
 }
@@ -487,19 +836,53 @@ func (fb *flowBuilder) addStructuredInheritanceSplit(s *ast.InheritanceSplitStmt
 		ErrorHandlingType: microflows.ErrorHandlingTypeRollback,
 		VariableName:      s.Variable,
 	}
+	splitIndex := len(fb.objects)
 	fb.objects = append(fb.objects, split)
 	splitID := split.ID
-	if fb.pendingAnnotations != nil {
-		fb.applyAnnotations(splitID, fb.pendingAnnotations)
-		fb.pendingAnnotations = nil
-	}
+	// applyPendingAnnotations, not applyAnnotations: only it records the
+	// statement's @curve for applyFlowCurves (mendixlabs/mxcli#1414).
+	fb.applyPendingAnnotations(splitID)
 
-	branchWidth := fb.measurer.measureStatements(appendInheritanceBodies(s)).Width
+	// The branches are laid out one BELOW another, all starting at branchStartX,
+	// so the room they need is the WIDEST branch — not the total. This used to
+	// measure every body concatenated into one list, which made the merge slide
+	// right by a whole activity-plus-spacing per extra branch and left it far
+	// past the branches it joins (mendixlabs/mxcli#953: three one-activity
+	// branches starting at x=720 put the merge at x=1480 instead of x=920).
+	// `layout.go`'s measureInheritanceSplitStatement always took the max, so the
+	// builder disagreed with its own measurer.
+	branchWidth := 0
+	for _, body := range inheritanceBranchBodies(s) {
+		if w := fb.measurer.measureStatements(body).Width; w > branchWidth {
+			branchWidth = w
+		}
+	}
+	// CaseSplitColumns (flowlayout.go): the first case on the line, every other
+	// case with a body as a column under the split. The (empty) branch always
+	// exists; without a body it stays a flow straight to the merge.
+	columnBodies := make([][]ast.MicroflowStatement, 0, len(s.Cases)+1)
+	for _, c := range s.Cases {
+		columnBodies = append(columnBodies, c.Body)
+	}
+	if len(s.ElseBody) > 0 {
+		columnBodies = append(columnBodies, s.ElseBody)
+	}
+	caseCols := fb.layoutStyle().CaseSplit == CaseSplitColumns && len(columnBodies) > 1
+	var plan caseColumns
+	firstHeight := 0
+	if caseCols {
+		plan = fb.measurer.planCaseColumns(splitX, columnBodies)
+		first := fb.measurer.measureStatements(columnBodies[0])
+		firstHeight = max(first.Height, ActivityHeight)
+		branchWidth = caseColumnsBranchWidth(first.Width, plan, ActivityWidth)
+	}
+	columnTop := 0
 	if branchWidth == 0 {
 		branchWidth = HorizontalSpacing / 2
 	}
 	branchStartX := splitX + ActivityWidth + HorizontalSpacing/2
 	mergeX := branchStartX + branchWidth + HorizontalSpacing/2
+	mergeX, mergeY := mergePosition(s.Annotations, mergeX, centerY)
 
 	type branchTail struct {
 		id        model.ID
@@ -507,6 +890,10 @@ func (fb *flowBuilder) addStructuredInheritanceSplit(s *ast.InheritanceSplitStmt
 		fromSplit bool
 		order     int
 		anchor    *ast.FlowAnchors
+		handlers  pendingHandlers
+		// column says the branch is a CaseSplitColumns column, which rejoins the
+		// merge from below.
+		column bool
 	}
 	var branchTails []branchTail
 
@@ -527,23 +914,40 @@ func (fb *flowBuilder) addStructuredInheritanceSplit(s *ast.InheritanceSplitStmt
 		fb.posX = branchStartX
 		fb.posY = branchY
 		fb.endsWithReturn = false
+		var column *elseColumnCursor
+		if caseCols && branchNumber > 0 && branchNumber < len(plan.x) {
+			if columnTop == 0 {
+				_, bottom, _ := objectsExtent(fb.objects[splitIndex:])
+				columnTop = max(centerY+firstHeight/2, bottom) + BranchGap
+			}
+			column = fb.startElseColumn(plan.x[branchNumber], columnTop)
+		} else if caseCols {
+			fb.posY = centerY
+		}
 
 		var lastID model.ID
 		var prevAnchor *ast.FlowAnchors
 		pendingCase := ""
-		for _, stmt := range body {
+		branchEnds := lastStmtIsReturn(body)
+		outerHandlers := fb.enterBranch()
+		for j, stmt := range body {
 			thisAnchor := stmtOwnAnchor(stmt)
+			column.begin(stmt)
 			actID := fb.addStatement(stmt)
+			column.end()
+			if fb.takeBranchJoin(lastID, splitID, caseValue, pendingCase, prevAnchor, nil) {
+				pendingCase = ""
+				continue
+			}
 			if actID == "" {
 				continue
 			}
 			if cast, ok := stmt.(*ast.CastObjectStmt); ok && cast.OutputVariable != "" && caseValue != "" && fb.varTypes != nil {
 				fb.varTypes[cast.OutputVariable] = caseValue
 			}
-			if fb.pendingAnnotations != nil {
-				fb.applyAnnotations(actID, fb.pendingAnnotations)
-				fb.pendingAnnotations = nil
-			}
+			// applyPendingAnnotations, not applyAnnotations: only it records the
+			// statement's @curve for applyFlowCurves (mendixlabs/mxcli#1414).
+			fb.applyPendingAnnotations(actID)
 			if lastID == "" {
 				var flow *microflows.SequenceFlow
 				if branchNumber == 0 {
@@ -551,19 +955,23 @@ func (fb *flowBuilder) addStructuredInheritanceSplit(s *ast.InheritanceSplitStmt
 				} else {
 					flow = newDownwardFlowWithInheritanceCase(splitID, actID, caseValue)
 				}
+				if column != nil {
+					flow.DestinationConnectionIndex = AnchorTop
+				}
 				applyUserAnchors(flow, nil, thisAnchor)
 				fb.flows = append(fb.flows, flow)
 			} else {
+				flow := newHorizontalFlow(lastID, actID)
 				if pendingCase != "" {
-					flow := newHorizontalFlowWithCase(lastID, actID, pendingCase)
-					applyUserAnchors(flow, prevAnchor, thisAnchor)
-					fb.flows = append(fb.flows, flow)
+					flow = newHorizontalFlowWithCase(lastID, actID, pendingCase)
 					pendingCase = ""
-				} else {
-					flow := newHorizontalFlow(lastID, actID)
-					applyUserAnchors(flow, prevAnchor, thisAnchor)
-					fb.flows = append(fb.flows, flow)
 				}
+				if column != nil {
+					flow.OriginConnectionIndex, flow.DestinationConnectionIndex = AnchorBottom, AnchorTop
+				}
+				applyUserAnchors(flow, prevAnchor, thisAnchor)
+				fb.flows = append(fb.flows, flow)
+				fb.settleBranchFlow(lastID, actID, stmt, body[j+1:], branchEnds)
 			}
 			prevAnchor = thisAnchor
 			if fb.nextConnectionPoint != "" {
@@ -571,25 +979,57 @@ func (fb *flowBuilder) addStructuredInheritanceSplit(s *ast.InheritanceSplitStmt
 				fb.nextConnectionPoint = ""
 				pendingCase = fb.nextFlowCase
 				fb.nextFlowCase = ""
+				// A branch statement's own anchor (prevAnchor) already carries its
+				// outgoing side; a nested if's exit anchor must not outlive it.
+				fb.nextFlowAnchor = nil
 			} else {
 				lastID = actID
 			}
 		}
 
-		if !lastStmtIsReturn(body) {
+		if !branchEnds {
 			allBranchesReturn = false
 			if lastID != "" {
-				branchTails = append(branchTails, branchTail{id: lastID, caseValue: pendingCase, anchor: prevAnchor})
+				// The tail's flow into the merge is drawn once every branch is
+				// built, and the handlers of its last activity are settled on
+				// it then, so they wait with it.
+				branchTails = append(branchTails, branchTail{id: lastID, caseValue: pendingCase, anchor: prevAnchor, handlers: fb.takePendingErrorHandlers(), column: column != nil})
 			}
 		}
+		fb.leaveBranch(outerHandlers)
 	}
 
 	for _, c := range s.Cases {
 		addBranch(qualifiedNameString(c.Entity), c.Body)
 	}
+	// The empty-entity branch is NOT optional, and is not a "default" case: on an
+	// object-type decision it is the `(empty)` flow, for a null object. Dropping
+	// it when no `else` is written fails the build with
+	//
+	//	CE0089 "The '(empty)' value should be configured for an outgoing flow."
+	//
+	// (verified on mxbuild 11.6.6). So it is emitted unconditionally, and MDL's
+	// `else` on an inheritance split IS that `(empty)` case — which is also why
+	// an `else` cannot substitute for the base entity's own case (CE0090): the
+	// two cover different things.
+	//
+	// DESCRIBE suppresses this flow when its body is empty, so a describe→exec
+	// roundtrip does not accumulate `else` blocks; exec re-creates it here.
 	addBranch("", s.ElseBody)
 
-	fb.posX = mergeX
+	// Where the next element goes. This was `mergeX`, i.e. the merge's own centre,
+	// so whatever followed `end split` was drawn ON TOP of the merge, joined by a
+	// zero-length sequence flow (#953). The model is valid either way, so nothing
+	// below this line — not `mx check`, not the build — can notice.
+	//
+	// The spacing constants are centre-to-centre and tuned for a 40px edge gap, so
+	// clearing a 40-wide merge before a 120-wide activity needs MergeSize + half a
+	// pitch. That is what addIfStatement uses. addEnumSplit uses only
+	// HorizontalSpacing/2, which leaves an activity's left edge exactly touching
+	// the merge (measured: merge 890, activity 970, both edges at 910) — legible,
+	// but not the house gap, and not worth re-laying out every existing enum split
+	// to change.
+	fb.posX = mergeX + MergeSize + HorizontalSpacing/2
 	fb.posY = centerY
 	fb.endsWithReturn = savedEndsWithReturn
 	if allBranchesReturn {
@@ -598,7 +1038,7 @@ func (fb *flowBuilder) addStructuredInheritanceSplit(s *ast.InheritanceSplitStmt
 		merge := &microflows.ExclusiveMerge{
 			BaseMicroflowObject: microflows.BaseMicroflowObject{
 				BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
-				Position:    model.Point{X: mergeX, Y: centerY},
+				Position:    model.Point{X: mergeX, Y: mergeY},
 				Size:        model.Size{Width: MergeSize, Height: MergeSize},
 			},
 		}
@@ -614,15 +1054,19 @@ func (fb *flowBuilder) addStructuredInheritanceSplit(s *ast.InheritanceSplitStmt
 				applyInheritanceSplitCaseOrder(flow, tail.order)
 				fb.flows = append(fb.flows, flow)
 			} else {
+				flow := newHorizontalFlow(tail.id, merge.ID)
 				if tail.caseValue != "" {
-					flow := newHorizontalFlowWithCase(tail.id, merge.ID, tail.caseValue)
-					applyUserAnchors(flow, tail.anchor, nil)
-					fb.flows = append(fb.flows, flow)
-				} else {
-					flow := newHorizontalFlow(tail.id, merge.ID)
-					applyUserAnchors(flow, tail.anchor, nil)
-					fb.flows = append(fb.flows, flow)
+					flow = newHorizontalFlowWithCase(tail.id, merge.ID, tail.caseValue)
 				}
+				if tail.column {
+					flow.OriginConnectionIndex, flow.DestinationConnectionIndex = AnchorRight, AnchorBottom
+				}
+				applyUserAnchors(flow, tail.anchor, nil)
+				fb.flows = append(fb.flows, flow)
+				outerHandlers := fb.enterBranch()
+				fb.adoptPendingErrorHandlers(tail.handlers)
+				fb.settleBranchFlow(tail.id, merge.ID, nil, nil, false)
+				fb.leaveBranch(outerHandlers)
 			}
 		}
 		fb.nextConnectionPoint = merge.ID
@@ -630,9 +1074,9 @@ func (fb *flowBuilder) addStructuredInheritanceSplit(s *ast.InheritanceSplitStmt
 	return splitID
 }
 
-func (fb *flowBuilder) addGroupedEnumSplitFlows(originID, destinationID model.ID, values []string, order int, mergeX, mergeY int) {
+func (fb *flowBuilder) addGroupedEnumSplitFlows(originID, destinationID model.ID, values []string, slot splitCaseSlot, mergeX, mergeY int) {
 	if len(values) <= 1 {
-		fb.addEnumSplitFlows(originID, destinationID, values, order)
+		fb.addEnumSplitFlows(originID, destinationID, values, slot)
 		return
 	}
 	branchMerge := &microflows.ExclusiveMerge{
@@ -643,21 +1087,149 @@ func (fb *flowBuilder) addGroupedEnumSplitFlows(originID, destinationID model.ID
 		},
 	}
 	fb.objects = append(fb.objects, branchMerge)
-	fb.addEnumSplitFlows(originID, branchMerge.ID, values, order)
+	fb.addEnumSplitFlows(originID, branchMerge.ID, values, slot)
 	fb.flows = append(fb.flows, newHorizontalFlow(branchMerge.ID, destinationID))
 }
 
-func (fb *flowBuilder) addEnumSplitFlows(originID, destinationID model.ID, values []string, order int) {
+func (fb *flowBuilder) addEnumSplitFlows(originID, destinationID model.ID, values []string, slot splitCaseSlot) {
+	split, target := fb.objectPosition(originID), fb.objectPosition(destinationID)
 	if len(values) == 0 {
 		flow := newHorizontalFlow(originID, destinationID)
-		applySplitCaseOrder(flow, order)
+		slot.apply(flow, split, target)
 		fb.flows = append(fb.flows, flow)
 		return
 	}
 	for _, value := range values {
 		flow := newHorizontalFlowWithEnumCase(originID, destinationID, value)
-		applySplitCaseOrder(flow, order)
+		slot.apply(flow, split, target)
+		slot.applyCaseAnchor(flow, value)
 		fb.flows = append(fb.flows, flow)
+	}
+}
+
+// splitCaseSlot says how one case's flow leaves the split. origin is the side of
+// the split it leaves from, or -1 for a split of up to three cases, which keeps the
+// pair table below (top, right, bottom — the same sides, as it happens).
+type splitCaseSlot struct {
+	order  int
+	origin int
+	// anchors are the CASE's `@anchor(A: (from: …, to: …))` entries.
+	anchors []ast.CaseAnchor
+}
+
+// applyCaseAnchor sets the sides the CASE's @anchor names for this value's
+// flow, over the defaults apply chose (mendixlabs/mxcli#1587).
+func (slot splitCaseSlot) applyCaseAnchor(flow *microflows.SequenceFlow, value string) {
+	if fa := caseAnchorFor(slot.anchors, value); fa != nil {
+		applyUserAnchors(flow, fa, fa)
+	}
+}
+
+// caseAnchorFor returns the anchors written for value, matched as WHEN values
+// are: case-insensitively, quotes ignored.
+func caseAnchorFor(anchors []ast.CaseAnchor, value string) *ast.FlowAnchors {
+	for _, ca := range anchors {
+		if sameCaseValue(ca.Value, value) {
+			return ca.Anchors
+		}
+	}
+	return nil
+}
+
+func sameCaseValue(a, b string) bool {
+	return strings.EqualFold(strings.Trim(a, "\"`"), strings.Trim(b, "\"`"))
+}
+
+// apply sets the flow's sides. split and target are where the two ends actually are,
+// which is not where the stack was planned once a branch carries @position: a line is
+// only sent out of the top corner towards something above the split, and out of the
+// bottom towards something below, whatever third the case was counted into.
+//
+// Up to three cases keep the pair table's side whatever the geometry, because that
+// side is how DESCRIBE reads the WHEN order back (splitCaseOrder), and the order has
+// to survive a branch moved anywhere with @position. Holding them to the geometry
+// rule reordered a CASE whose branches were placed out of order. A side that
+// differs is written explicitly, `@anchor(A: (from: right))` (mendixlabs/mxcli#1587).
+func (slot splitCaseSlot) apply(flow *microflows.SequenceFlow, split, target model.Point) {
+	if flow == nil {
+		return
+	}
+	if slot.origin < 0 {
+		applySplitCaseOrder(flow, slot.order)
+		return
+	}
+	origin := slot.origin
+	if origin == AnchorTop && target.Y >= split.Y || origin == AnchorBottom && target.Y <= split.Y {
+		origin = AnchorRight
+	}
+	flow.OriginConnectionIndex = origin
+	flow.DestinationConnectionIndex = AnchorLeft
+}
+
+// objectPosition returns where an already-built object stands.
+func (fb *flowBuilder) objectPosition(id model.ID) model.Point {
+	for i := len(fb.objects) - 1; i >= 0; i-- {
+		if o := fb.objects[i]; o != nil && o.GetID() == id {
+			return o.GetPosition()
+		}
+	}
+	return model.Point{}
+}
+
+// enumSplitOriginAnchors picks the side of the split each case leaves from, for a
+// split of four or more cases: the upper third from the top corner, the middle
+// third from the right, the lower third from the bottom. It returns nil for three
+// cases or fewer, which the pair table already draws that way.
+//
+// The pair table was written to store the case ORDER (see splitCaseOrder), and past
+// the third case it does so with sides no drawing would choose: the fourth case
+// leaves the split's LEFT corner, the fifth to eighth arrive on top of their
+// activity, the ninth onwards on its far side. Seven cases drawn that way cross each
+// other and the activities they pass. Grouped, no two lines cross: the branches are
+// stacked top to bottom in case order, so a line from the top corner only ever goes
+// up and one from the bottom only down.
+//
+// A third is by count, the remainder going to the middle (7 cases: 2/3/2) or, when
+// it is two, one each to top and bottom (8 cases: 3/2/3). A branch is only given the
+// top corner if it really is above the split, and the bottom only if below, so a
+// stack made lopsided by one tall branch never gets a line that leaves upwards to
+// reach something underneath.
+func enumSplitOriginAnchors(branchYs []int, centerY int) []int {
+	n := len(branchYs)
+	if n <= 3 {
+		return nil
+	}
+	top, bottom := n/3, n/3
+	if n%3 == 2 {
+		top++
+		bottom++
+	}
+	origins := make([]int, n)
+	for i, y := range branchYs {
+		switch {
+		case i < top && y < centerY:
+			origins[i] = AnchorTop
+		case i >= n-bottom && y > centerY:
+			origins[i] = AnchorBottom
+		default:
+			origins[i] = AnchorRight
+		}
+	}
+	return origins
+}
+
+// mergeSideFor is the side of the closing merge a branch arrives on: an upper branch
+// comes down onto its top corner and a lower one up onto its bottom, instead of all of
+// them converging on the left corner. It goes by where the branch's last element
+// actually stands, so a branch moved with @position still arrives from its own side.
+func mergeSideFor(last, merge model.Point) int {
+	switch {
+	case last.Y < merge.Y:
+		return AnchorTop
+	case last.Y > merge.Y:
+		return AnchorBottom
+	default:
+		return AnchorLeft
 	}
 }
 
@@ -685,8 +1257,6 @@ var splitCaseOrderAnchors = []splitCaseOrderAnchor{
 	{AnchorLeft, AnchorBottom},
 }
 
-var maxEnumSplitBranches = len(splitCaseOrderAnchors)
-
 func applySplitCaseOrder(flow *microflows.SequenceFlow, order int) {
 	if flow == nil || order < 0 || order >= len(splitCaseOrderAnchors) {
 		return
@@ -706,17 +1276,6 @@ func enumSplitCaseValues(c ast.EnumSplitCase) []string {
 	return nil
 }
 
-func enumSplitBranchCount(s *ast.EnumSplitStmt) int {
-	if s == nil {
-		return 0
-	}
-	count := len(s.Cases)
-	if len(s.ElseBody) > 0 {
-		count++
-	}
-	return count
-}
-
 func appendEnumBodies(s *ast.EnumSplitStmt) []ast.MicroflowStatement {
 	var stmts []ast.MicroflowStatement
 	for _, c := range s.Cases {
@@ -726,13 +1285,18 @@ func appendEnumBodies(s *ast.EnumSplitStmt) []ast.MicroflowStatement {
 	return stmts
 }
 
-func appendInheritanceBodies(s *ast.InheritanceSplitStmt) []ast.MicroflowStatement {
-	var stmts []ast.MicroflowStatement
+// inheritanceBranchBodies returns each branch of a type split as its own body,
+// including the `(empty)` branch.
+//
+// It deliberately does NOT flatten them into one list. The predecessor did, and
+// every caller then measured the branches as if they ran end to end when they
+// are in fact stacked vertically (#953).
+func inheritanceBranchBodies(s *ast.InheritanceSplitStmt) [][]ast.MicroflowStatement {
+	bodies := make([][]ast.MicroflowStatement, 0, len(s.Cases)+1)
 	for _, c := range s.Cases {
-		stmts = append(stmts, c.Body...)
+		bodies = append(bodies, c.Body)
 	}
-	stmts = append(stmts, s.ElseBody...)
-	return stmts
+	return append(bodies, s.ElseBody)
 }
 
 type inheritanceSplitCaseOrderAnchor struct {
@@ -776,10 +1340,12 @@ func qualifiedNameString(qn ast.QualifiedName) string {
 }
 
 func (fb *flowBuilder) addCastAction(s *ast.CastObjectStmt) model.ID {
+	activityX := fb.posX
 	action := &microflows.CastAction{
-		BaseElement:    model.BaseElement{ID: model.ID(types.GenerateID())},
-		ObjectVariable: s.ObjectVariable,
-		OutputVariable: s.OutputVariable,
+		BaseElement:       model.BaseElement{ID: model.ID(types.GenerateID())},
+		ObjectVariable:    s.ObjectVariable,
+		OutputVariable:    s.OutputVariable,
+		ErrorHandlingType: fb.ehType(s.ErrorHandling),
 	}
 
 	activity := &microflows.ActionActivity{
@@ -796,6 +1362,7 @@ func (fb *flowBuilder) addCastAction(s *ast.CastObjectStmt) model.ID {
 
 	fb.objects = append(fb.objects, activity)
 	fb.posX += fb.spacing
+	fb.finishCustomErrorHandler(activity.ID, activityX, s.ErrorHandling, s.OutputVariable)
 	return activity.ID
 }
 
@@ -807,54 +1374,84 @@ func (fb *flowBuilder) addRetrieveAction(s *ast.RetrieveStmt) model.ID {
 		// Association retrieve: RETRIEVE $List FROM $Parent/Module.AssocName
 		// Always use AssociationRetrieveSource to preserve the original syntax.
 		// The runtime resolves traversal direction from association metadata.
-		assocQN := s.Source.Module + "." + s.Source.Name
+		//
+		// A bare name (`$O/Ord_Cust`) resolves against the start variable's
+		// entity, or is refused: joined as it stands it was stored as ".Ord_Cust",
+		// with an empty module — CE1613, and a describe that does not parse
+		// (ako/mxcli#1690).
+		assocModule, assocName := s.Source.Module, s.Source.Name
+		if assocModule == "" {
+			if qn, ok := fb.qualifyBareRetrieveAssociation(s); ok {
+				assocModule, assocName, _ = strings.Cut(qn, ".")
+			}
+		}
+		assocQN := assocModule + "." + assocName
 
 		// Look up association to determine type and direction.
 		// For Reference associations, AssociationRetrieveSource always returns a single
 		// object (the entity on the other end). When the user navigates from the child
 		// (non-owner) side, the intent is to get a list of parent entities — we must use
 		// a DatabaseRetrieveSource with XPath constraint instead.
-		assocInfo := fb.lookupAssociation(s.Source.Module, s.Source.Name)
+		assocInfo := fb.lookupAssociation(assocModule, assocName)
 		startVarType := ""
 		if fb.varTypes != nil {
 			startVarType = fb.varTypes[s.StartVariable]
 		}
 
-		outputUsedAsList := fb.listInputVariables != nil && fb.listInputVariables[s.Variable]
 		outputUsedAsObject := fb.objectInputVariables != nil && fb.objectInputVariables[s.Variable]
+		outputUsedAsList := fb.listInputVariables != nil && fb.listInputVariables[s.Variable]
 		// startsFromChildSide is true when the retrieve's start variable is the
 		// child side of the association (or a subclass of it). Inheritance has
 		// to be honoured so traversals like `$httpRequest/System.HttpHeaders`
 		// — where HttpRequest extends HttpMessage and HttpHeaders has child
-		// HttpMessage — are still classified as reverse traversal.
+		// HttpMessage — are still classified as reverse traversal (which returns
+		// a list, so the output variable is typed accordingly below).
+		//
+		// Which end it starts from is the rule a spliced fragment and check
+		// --references take (associationRetrieveEndFrom). A self-reference is
+		// followed from its FROM end, never the child side: it used to be read
+		// as a reverse traversal, typed as a list unless an object use followed,
+		// and a list use of it was written and failed the build with CE0013 /
+		// CE0097 / CE0100 (ako/mxcli#1793, measured on 11.13.0). A specialization
+		// of both ends of an association between two entities stays read from
+		// the child side, as before: which end Mendix takes there is not
+		// measured, and the fragment and the check leave it untyped.
+		startEnd := fb.associationRetrieveEndFrom(startVarType, assocInfo)
 		startsFromChildSide := assocInfo != nil &&
 			assocInfo.childEntityQN != "" &&
-			fb.entityIsSubtypeOf(startVarType, assocInfo.childEntityQN)
-		// Owner-both Reference associations need later usage context: the same
-		// compact retrieve can be consumed as either a list or a single object.
-		// Owner="" means metadata was unavailable, so keep the association source.
+			(startEnd == assocEndTo || startEnd == assocEndAmbiguous)
+
+		// The `$var/Module.Assoc` syntax is a retrieve-by-association (in-memory).
+		// Keep it as an AssociationRetrieveSource — that is what preserves the
+		// distinction between memory and database retrieves (issue #726), and for
+		// a reverse Reference traversal (child → parent) Mendix returns a list and
+		// mxbuild accepts it.
+		//
+		// The ONE exception is an owner="both" Reference consumed as a list: a
+		// reverse AssociationRetrieveSource over such an association resolves to a
+		// SINGLE object in Mendix (mxbuild reports CE0100 when it feeds a loop or
+		// aggregate), so there is no in-memory way to obtain the list — fall back
+		// to a DatabaseRetrieveSource. Object usage stays an association retrieve.
+		// A self-reference is never a reverse traversal (startsFromChildSide), so
+		// it never takes this branch.
 		expandReverseReference := assocInfo != nil &&
 			assocInfo.Type == domainmodel.AssociationTypeReference &&
-			assocInfo.Owner != "" &&
+			assocInfo.Owner == domainmodel.AssociationOwnerBoth &&
 			assocInfo.parentPersistable &&
 			assocInfo.childEntityQN != "" &&
 			startsFromChildSide &&
-			(assocInfo.Owner != domainmodel.AssociationOwnerBoth || (outputUsedAsList && !outputUsedAsObject))
+			outputUsedAsList && !outputUsedAsObject
 
 		if expandReverseReference {
-			// Reverse traversal on Reference: child → parent (one-to-many)
-			// Use DatabaseRetrieveSource with XPath to get a list of parent entities
-			dbSource := &microflows.DatabaseRetrieveSource{
+			source = &microflows.DatabaseRetrieveSource{
 				BaseElement:         model.BaseElement{ID: model.ID(types.GenerateID())},
 				EntityQualifiedName: assocInfo.parentEntityQN,
 				XPathConstraint:     "[" + assocQN + " = $" + s.StartVariable + "]",
 			}
-			source = dbSource
 			if fb.varTypes != nil {
 				fb.varTypes[s.Variable] = "List of " + assocInfo.parentEntityQN
 			}
 		} else {
-			// Forward traversal or ReferenceSet: use AssociationRetrieveSource
 			source = &microflows.AssociationRetrieveSource{
 				BaseElement:              model.BaseElement{ID: model.ID(types.GenerateID())},
 				StartVariable:            s.StartVariable,
@@ -862,14 +1459,18 @@ func (fb *flowBuilder) addRetrieveAction(s *ast.RetrieveStmt) model.ID {
 			}
 			if fb.varTypes != nil {
 				if assocInfo != nil && assocInfo.Type == domainmodel.AssociationTypeReference {
-					// Forward Reference traversal returns a single object. Legacy or
-					// non-persistable reverse traversal can still use association
-					// source syntax, but keeps list typing for downstream actions.
+					// Reference: forward traversal (parent side) → single object;
+					// reverse traversal (child side) → list of the other entity.
 					otherEntity := assocInfo.childEntityQN
 					if startsFromChildSide {
 						otherEntity = assocInfo.parentEntityQN
 					}
-					if startsFromChildSide && !outputUsedAsObject {
+					// associationRetrieveYieldsList is shared with check
+					// --references (MDL-RETRIEVE03, mendixlabs/mxcli#1516), which
+					// refuses the object use this branch types leniently.
+					yieldsList := associationRetrieveYieldsList(false,
+						assocInfo.Owner == domainmodel.AssociationOwnerBoth, startsFromChildSide)
+					if yieldsList && !outputUsedAsObject {
 						fb.varTypes[s.Variable] = "List of " + otherEntity
 					} else {
 						fb.varTypes[s.Variable] = otherEntity
@@ -900,16 +1501,21 @@ func (fb *flowBuilder) addRetrieveAction(s *ast.RetrieveStmt) model.ID {
 			EntityQualifiedName: entityQN,
 		}
 
-		// Set range if LIMIT is specified
-		if s.Limit != "" {
-			rangeType := microflows.RangeTypeCustom
-			// LIMIT 1 with no offset uses RangeTypeFirst for single object retrieval
-			if s.Limit == "1" && s.Offset == "" {
-				rangeType = microflows.RangeTypeFirst
-			}
+		// The range. The visitor has already resolved what `limit 1` means in
+		// the script's language version (ako/mxcli#734): First is the object
+		// range, a limit or offset the Custom range, which is always a list.
+		if s.First {
 			dbSource.Range = &microflows.Range{
 				BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
-				RangeType:   rangeType,
+				RangeType:   microflows.RangeTypeFirst,
+			}
+		} else if s.Limit != "" || s.Offset != "" {
+			// An offset alone is a Custom range too; testing the limit only
+			// wrote `offset 5000` as the "all" range, and the retrieve
+			// returned the first objects instead (mendixlabs/mxcli#1737).
+			dbSource.Range = &microflows.Range{
+				BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
+				RangeType:   microflows.RangeTypeCustom,
 				Limit:       s.Limit,
 				Offset:      s.Offset,
 			}
@@ -918,7 +1524,7 @@ func (fb *flowBuilder) addRetrieveAction(s *ast.RetrieveStmt) model.ID {
 		// Convert WHERE expression if present
 		// XPath constraints are stored with square brackets in BSON: [expression]
 		if s.Where != nil {
-			dbSource.XPathConstraint = retrieveXPathConstraint(s.Where)
+			dbSource.XPathConstraint = retrieveXPathConstraint(s.Where, s.Source.String())
 		}
 
 		// Convert SORT BY columns if present
@@ -927,16 +1533,78 @@ func (fb *flowBuilder) addRetrieveAction(s *ast.RetrieveStmt) model.ID {
 				// Resolve attribute path - if just a simple name, prefix with entity
 				attrPath := col.Attribute
 				var entityRefSteps []microflows.EntityRefStep
-				if !strings.Contains(attrPath, ".") {
-					attrPath = entityQN + "." + attrPath
+				if len(col.Associations) > 0 {
+					// The script SPELLS the hops. Take them as written rather than
+					// inferring: inference cannot tell two associations reaching the
+					// same entity apart, and picking the wrong one is a model that
+					// builds cleanly and sorts by the wrong thing
+					// (mendixlabs/mxcli#1152).
+					resolved, finalQN, err := fb.resolveSortAssociationPath(entityQN, col.Associations, col.Attribute)
+					if err != nil {
+						fb.addError("sort by %s: %s", sortColumnText(col), err.Error())
+						continue // Skip this sort column but continue processing others
+					}
+					entityRefSteps, attrPath = resolved, finalQN
+				} else if !strings.Contains(attrPath, ".") {
+					// Qualify with the entity that DECLARES the attribute, which is
+					// not always the one being retrieved. Mendix resolves a sort
+					// reference against the declaring entity, so qualifying an
+					// INHERITED name with the list's own entity produced CE1613 "The
+					// selected attribute … no longer exists" — after `mxcli check`
+					// and `exec` both passed (CapTrackV2 §13). Reading the same
+					// attribute already worked, because the page builder walks the
+					// chain; this path did not, though flowBuilder has carried
+					// resolveAttributeInEntityHierarchy all along.
+					//
+					// Falling back to the plain qualification keeps the behaviour
+					// for a unit test with no backend, and for an attribute the
+					// model does not know about — which is the checker's business to
+					// report, not this function's to guess at.
+					if declared, ok := fb.resolveAttributeInEntityHierarchy(entityQN, attrPath); ok {
+						attrPath = declared
+					} else {
+						attrPath = entityQN + "." + attrPath
+					}
 				} else {
 					// Validate that qualified attribute path belongs to the retrieved entity
 					// Expected format: Module.Entity.Attribute
 					parts := strings.Split(attrPath, ".")
+					// A TWO-part path is never one of those, and the guard below used
+					// to skip it entirely: `System.createdDate` reads as
+					// Module.Attribute, named no entity, and was written straight
+					// through as the sort's AttributeQualifiedName. Mendix then
+					// resolves it to nothing and stores a null AttributeId, which
+					// makes the project UNLOADABLE — not a CE code but an unhandled
+					// System.ArgumentNullException out of AttributeRef.set_AttributeId,
+					// so Studio Pro cannot open it either (ako/CapTrackV3 FINDINGS §46).
+					//
+					// Refused rather than repaired. `Module.Attribute` has no reading
+					// that names an entity, and the two candidate repairs — treat it
+					// as a bare member of the retrieved entity, or as a member of the
+					// module's like-named entity — mean different things and only the
+					// author knows which.
+					//
+					// A system member is spelled BARE (`sort by createdDate`), which
+					// works whenever the entity stores it: measured on 11.14.0, that
+					// builds at 0 errors, and the same sort on an entity that does not
+					// store it is CE1613 — Mendix reporting the truth, not a defect.
+					if len(parts) == 2 {
+						fb.addError("sort by '%s' is not a valid attribute reference — a qualified sort "+
+							"attribute is Module.Entity.Attribute, and '%s' names no entity. Mendix stores "+
+							"an empty attribute reference for it, which makes the project impossible to "+
+							"open. Write a system member bare (`sort by %s`), or qualify it fully",
+							col.Attribute, attrPath, parts[1])
+						continue // Skip this sort column but continue processing others
+					}
 					if len(parts) >= 3 {
 						// Extract entity from attribute path (first two parts)
 						attrEntityQN := parts[0] + "." + parts[1]
-						if attrEntityQN != entityQN {
+						// An ANCESTOR is not a foreign entity: naming the declaring
+						// entity outright is the reference Mendix wants, and it was
+						// refused as not belonging (CapTrackV2 §13). It takes no
+						// EntityRefSteps either — inheritance is not a traversal,
+						// the attribute is on the object already.
+						if attrEntityQN != entityQN && !fb.entityIsSubtypeOf(entityQN, attrEntityQN) {
 							entityRefSteps = fb.inferSortEntityRefSteps(entityQN, attrPath)
 							if len(entityRefSteps) == 0 {
 								fb.addError("sort by attribute '%s' does not belong to entity '%s'", col.Attribute, entityQN)
@@ -962,23 +1630,32 @@ func (fb *flowBuilder) addRetrieveAction(s *ast.RetrieveStmt) model.ID {
 
 		source = dbSource
 
-		// Register variable type for CHANGE statements
-		// RETRIEVE with LIMIT 1 returns a single entity, otherwise returns a List
+		// Register variable type for CHANGE statements: the object range binds
+		// one object, every other range a list.
 		if fb.varTypes != nil {
-			if s.Limit == "1" {
-				// LIMIT 1 returns a single entity
+			if s.First {
 				fb.varTypes[s.Variable] = entityQN
 			} else {
-				// No LIMIT or LIMIT > 1 returns a list
 				fb.varTypes[s.Variable] = "List of " + entityQN
 			}
 		}
 	}
 
 	action := &microflows.RetrieveAction{
-		BaseElement:    model.BaseElement{ID: model.ID(types.GenerateID())},
-		OutputVariable: s.Variable,
-		Source:         source,
+		BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
+		// ErrorHandlingType lives on the ACTION in the metamodel, not on the
+		// activity — the activity-level assignment below is read by nothing and
+		// serialized by neither engine, which is why `ON ERROR CONTINUE` on a
+		// retrieve parsed, executed without complaint, and arrived in the model as
+		// the writer's hardcoded "Rollback" (ako/CapTrackV3 FINDINGS §11).
+		//
+		// Only an EXPLICIT clause is carried. Left empty the writer keeps the
+		// literal it has always written, so a retrieve nobody annotated is
+		// byte-identical to before — which matters because a NANOFLOW's default is
+		// Abort, and Abort is CE6035 on most activity types.
+		ErrorHandlingType: explicitErrorHandling(fb, s.ErrorHandling),
+		OutputVariable:    s.Variable,
+		Source:            source,
 	}
 
 	activityX := fb.posX
@@ -1003,52 +1680,248 @@ func (fb *flowBuilder) addRetrieveAction(s *ast.RetrieveStmt) model.ID {
 	return activity.ID
 }
 
-func retrieveXPathConstraint(expr ast.Expression) string {
-	xpath := normalizeXPathEnumRefs(expressionToXPath(expr))
+// retrieveXPathConstraint is the constraint a database retrieve of entity stores
+// for its where clause. A qualified attribute of entity is stored bare and an
+// enumeration value as a string literal (storedXPathConstraint, #874).
+func retrieveXPathConstraint(expr ast.Expression, entity string) string {
+	xpath := storedXPathConstraint(expressionToXPathNames(expr), entity)
 	if strings.HasPrefix(strings.TrimSpace(xpath), "[") && strings.HasSuffix(strings.TrimSpace(xpath), "]") {
-		return strings.TrimSpace(xpath)
+		return visitor.FormatXPathConstraint(strings.TrimSpace(xpath))
 	}
-	return "[" + xpath + "]"
+	// A constraint too long to read on one line is broken at its boolean joints;
+	// one that already fits comes back unchanged (upstream #979).
+	return visitor.FormatXPathConstraint("[" + xpath + "]")
 }
 
+// inferSortEntityRefSteps finds the one association hop that reaches the entity
+// DECLARING the sort attribute, for a `sort by Module.Entity.Attribute` whose
+// entity is neither the retrieved one nor an ancestor of it.
+//
+// Mendix stores such a sort as an AttributeRef whose AttributeQualifiedName
+// names the far entity plus an EntityRef carrying one EntityRefStep per hop.
+// DESCRIBE emits only the attribute's qualified name — MDL has no spelling for
+// the hop — so replaying a described retrieve has to re-derive the step, and
+// the whole round trip rests on that derivation.
+//
+// The association is not necessarily declared on the retrieved entity, nor in
+// its module. `Administration.Account` reaches `System.Language` through
+// `System.User_Language`, which is declared on the ANCESTOR `System.User` and
+// stored in the SYSTEM module's domain model. Searching only the retrieved
+// entity's own module for associations whose parent is the retrieved entity
+// itself found nothing, so a retrieve `mxcli describe` had just emitted was
+// refused by `exec` with "does not belong to entity" while `mxcli check` passed
+// — mendixlabs/mxcli#1152. Same shape as the inherited-attribute defect
+// (CapTrackV2 §13): the resolver that walks the generalization chain existed,
+// and this path did not call it.
+//
+// So the walk is over the generalization chain, and each ancestor is looked up
+// in ITS OWN module — which is also where the association's qualified name
+// comes from. Qualifying with the retrieved entity's module is what the
+// same-module case made look right, and it is wrong exactly in the case that
+// was broken.
+//
+// The destination end is matched with entityIsSubtypeOf rather than by equality,
+// because an association may point at a SPECIALIZATION of the entity that
+// declares the attribute; Mendix stores the declaring entity in the path either
+// way.
+//
+// Limitation, stated because the round trip depends on it: where several
+// associations reach the same entity, MDL cannot say which one was stored, and
+// the nearest entity's first association wins. The order is deterministic (both
+// the chain walk and dm.Associations are ordered), so a replay is stable — but
+// a model with two hops to one entity can still round-trip to the other one.
+// Spelling the hop would need grammar, and is a language change, not a fix.
 func (fb *flowBuilder) inferSortEntityRefSteps(sourceEntityQN, attrPath string) []microflows.EntityRefStep {
 	attrEntityQN := entityQualifiedNameFromAttribute(attrPath)
 	if attrEntityQN == "" || attrEntityQN == sourceEntityQN {
 		return nil
 	}
-	parts := strings.SplitN(sourceEntityQN, ".", 2)
-	if len(parts) != 2 || parts[0] == "" {
+	if fb == nil || fb.backend == nil {
 		return nil
 	}
-	if fb.backend == nil {
-		return nil
-	}
-	mod, err := fb.backend.GetModuleByName(parts[0])
-	if err != nil || mod == nil {
-		return nil
-	}
-	dm, err := fb.backend.GetDomainModel(mod.ID)
-	if err != nil || dm == nil {
-		return nil
-	}
-	entityNames := make(map[model.ID]string, len(dm.Entities))
-	for _, e := range dm.Entities {
-		entityNames[e.ID] = parts[0] + "." + e.Name
-	}
-	for _, assoc := range dm.Associations {
-		parentQN := entityNames[assoc.ParentID]
-		childQN := entityNames[assoc.ChildID]
-		if parentQN == sourceEntityQN && childQN == attrEntityQN {
-			return []microflows.EntityRefStep{{Association: parts[0] + "." + assoc.Name, DestinationEntity: childQN}}
+	seen := make(map[string]bool)
+	for currentQN := sourceEntityQN; currentQN != ""; {
+		if seen[currentQN] {
+			return nil
 		}
-	}
-	for _, assoc := range dm.CrossAssociations {
-		parentQN := entityNames[assoc.ParentID]
-		if parentQN == sourceEntityQN && assoc.ChildRef == attrEntityQN {
-			return []microflows.EntityRefStep{{Association: parts[0] + "." + assoc.Name, DestinationEntity: assoc.ChildRef}}
+		seen[currentQN] = true
+
+		parts := strings.SplitN(currentQN, ".", 2)
+		if len(parts) != 2 || parts[0] == "" {
+			return nil
 		}
+		moduleName := parts[0]
+		mod, err := fb.backend.GetModuleByName(moduleName)
+		if err != nil || mod == nil {
+			return nil
+		}
+		dm, err := fb.backend.GetDomainModel(mod.ID)
+		if err != nil || dm == nil {
+			return nil
+		}
+		entityNames := make(map[model.ID]string, len(dm.Entities))
+		for _, e := range dm.Entities {
+			entityNames[e.ID] = moduleName + "." + e.Name
+		}
+		for _, assoc := range dm.Associations {
+			if entityNames[assoc.ParentID] != currentQN {
+				continue
+			}
+			childQN := entityNames[assoc.ChildID]
+			if childQN != "" && fb.entityIsSubtypeOf(childQN, attrEntityQN) {
+				return []microflows.EntityRefStep{{Association: moduleName + "." + assoc.Name, DestinationEntity: childQN}}
+			}
+		}
+		for _, assoc := range dm.CrossAssociations {
+			if entityNames[assoc.ParentID] != currentQN {
+				continue
+			}
+			if assoc.ChildRef != "" && fb.entityIsSubtypeOf(assoc.ChildRef, attrEntityQN) {
+				return []microflows.EntityRefStep{{Association: moduleName + "." + assoc.Name, DestinationEntity: assoc.ChildRef}}
+			}
+		}
+
+		entity := dm.FindEntityByName(parts[1])
+		if entity == nil {
+			return nil
+		}
+		currentQN = entity.GeneralizationRef
 	}
 	return nil
+}
+
+// sortColumnText renders a sort column the way it was authored, for messages.
+func sortColumnText(col ast.SortColumnDef) string {
+	if len(col.Associations) == 0 {
+		return col.Attribute
+	}
+	return strings.Join(append(append([]string{}, col.Associations...), col.Attribute), "/")
+}
+
+// resolveSortAssociationPath turns an authored `Assoc/…/Attribute` sort column
+// into the EntityRefSteps Mendix stores alongside the attribute, plus the
+// attribute's fully-qualified name.
+//
+// This is the spelling that exists because inference cannot be made correct:
+// where two associations reach the same entity — `Order_ShipTo` and
+// `Order_BillTo`, both `Order → Address`, an ordinary shape — the stored hop is
+// not recoverable from the attribute name alone, and DESCRIBE emitted nothing
+// else. Measured on 11.12.3: a microflow sorting by the billing address came
+// back from `describe → exec` sorting by the shipping one, at 0 errors on both
+// sides (mendixlabs/mxcli#1152).
+//
+// Everything here is refused rather than guessed. A hop that does not resolve,
+// one that starts nowhere near the entity in hand, or a final attribute on an
+// entity the last hop does not reach are each an error — a step written with an
+// empty DestinationEntity is the one outcome worse than a refusal, since it
+// makes the project unopenable (System.ArgumentNullException at
+// EntityRefStep.set_DestinationEntityId) rather than merely wrong.
+func (fb *flowBuilder) resolveSortAssociationPath(sourceEntityQN string, hops []string, attrName string) ([]microflows.EntityRefStep, string, error) {
+	if sourceEntityQN == "" {
+		return nil, "", fmt.Errorf("the retrieved entity is unknown, so the association path cannot be resolved")
+	}
+	if fb == nil || fb.backend == nil {
+		return nil, "", fmt.Errorf("no project is open, so the association path cannot be resolved")
+	}
+
+	steps := make([]microflows.EntityRefStep, 0, len(hops))
+	current := sourceEntityQN
+	for _, hop := range hops {
+		assocQN, info := fb.lookupSortHop(current, hop)
+		if info == nil {
+			return nil, "", fmt.Errorf("association '%s' was not found", hop)
+		}
+		var dest string
+		switch {
+		case fb.entityIsSubtypeOf(current, info.parentEntityQN):
+			dest = info.childEntityQN
+		case fb.entityIsSubtypeOf(current, info.childEntityQN):
+			dest = info.parentEntityQN
+		default:
+			return nil, "", fmt.Errorf("association '%s' connects %s and %s, neither of which is %s",
+				assocQN, info.parentEntityQN, info.childEntityQN, current)
+		}
+		if dest == "" {
+			return nil, "", fmt.Errorf("association '%s' has an unresolved end, so the entity it reaches is unknown", assocQN)
+		}
+		steps = append(steps, microflows.EntityRefStep{Association: assocQN, DestinationEntity: dest})
+		current = dest
+	}
+
+	// The final attribute is qualified with the entity that DECLARES it, which
+	// for an inherited attribute is an ancestor of the last hop's destination —
+	// the same rule (and the same CE1613 when broken) as a sort with no hops.
+	if strings.Count(attrName, ".") >= 2 {
+		owner := attrName[:strings.LastIndex(attrName, ".")]
+		if !fb.entityIsSubtypeOf(current, owner) {
+			return nil, "", fmt.Errorf("attribute '%s' does not belong to %s, which is where the association path ends",
+				attrName, current)
+		}
+		return steps, attrName, nil
+	}
+	if declared, ok := fb.resolveAttributeInEntityHierarchy(current, attrName); ok {
+		return steps, declared, nil
+	}
+	return nil, "", fmt.Errorf("entity %s has no attribute '%s'", current, attrName)
+}
+
+// lookupSortHop resolves one segment of a sort column's association path. A
+// qualified segment names its module outright; a bare one is looked for in the
+// modules of the entity in hand and of its ancestors, because an association is
+// stored in the module of the entity that DECLARES it — which for an inherited
+// one is not the module of the entity being sorted (mendixlabs/mxcli#1152).
+func (fb *flowBuilder) lookupSortHop(currentEntityQN, hop string) (string, *assocLookupResult) {
+	if i := strings.LastIndex(hop, "."); i > 0 {
+		if info := fb.lookupAssociation(hop[:i], hop[i+1:]); info != nil {
+			return hop, info
+		}
+		return hop, nil
+	}
+	for _, moduleName := range fb.entityChainModules(currentEntityQN) {
+		if info := fb.lookupAssociation(moduleName, hop); info != nil {
+			return moduleName + "." + hop, info
+		}
+	}
+	return hop, nil
+}
+
+// entityChainModules lists the modules of an entity and of its ancestors,
+// nearest first and without repeats.
+func (fb *flowBuilder) entityChainModules(entityQN string) []string {
+	var out []string
+	seenModule := make(map[string]bool)
+	seenEntity := make(map[string]bool)
+	for currentQN := entityQN; currentQN != ""; {
+		if seenEntity[currentQN] {
+			break
+		}
+		seenEntity[currentQN] = true
+		parts := strings.SplitN(currentQN, ".", 2)
+		if len(parts) != 2 || parts[0] == "" {
+			break
+		}
+		if !seenModule[parts[0]] {
+			seenModule[parts[0]] = true
+			out = append(out, parts[0])
+		}
+		if fb.backend == nil {
+			break
+		}
+		mod, err := fb.backend.GetModuleByName(parts[0])
+		if err != nil || mod == nil {
+			break
+		}
+		dm, err := fb.backend.GetDomainModel(mod.ID)
+		if err != nil || dm == nil {
+			break
+		}
+		entity := dm.FindEntityByName(parts[1])
+		if entity == nil {
+			break
+		}
+		currentQN = entity.GeneralizationRef
+	}
+	return out
 }
 
 func entityQualifiedNameFromAttribute(attrPath string) string {
@@ -1061,6 +1934,48 @@ func entityQualifiedNameFromAttribute(attrPath string) string {
 
 // addListOperationAction creates list operations like HEAD, TAIL, FIND, etc.
 func (fb *flowBuilder) addListOperationAction(s *ast.ListOperationStmt) model.ID {
+	// `contains` and `find` are overloaded: contains(list, object) / find(list,
+	// condition) are list operations, but contains(haystack, needle) and
+	// find(haystack, needle) over strings are String functions. When the input is
+	// a declared String variable, Mendix requires a Change Variable action
+	// carrying the string expression — a List operation activity on strings fails
+	// the build (CE0023/CE0097/CE0111). Ledger findings #53 (contains) and #63 (find).
+	//
+	// The operation test is shared with MDL063, which must not report the
+	// CE0111 this rewrite exists to avoid — see stringOverloadedListOp.
+	if fb.declaredVars != nil && fb.declaredVars[s.InputVariable] == "String" &&
+		stringOverloadedListOp(s.Operation) {
+		switch s.Operation {
+		case ast.ListOpContains:
+			return fb.addChangeVariableAction(&ast.MfSetStmt{
+				Target: s.OutputVariable,
+				Value: &ast.FunctionCallExpr{
+					Name: "contains",
+					Arguments: []ast.Expression{
+						&ast.VariableExpr{Name: s.InputVariable},
+						&ast.VariableExpr{Name: s.SecondVariable},
+					},
+				},
+				ErrorHandling: s.ErrorHandling,
+			})
+		case ast.ListOpFind:
+			// The string find's second argument is carried as Condition (the
+			// visitor stores arg1 there); rebuild `find($in, <arg1>)`.
+			second := s.Condition
+			if second == nil {
+				second = &ast.VariableExpr{Name: s.SecondVariable}
+			}
+			return fb.addChangeVariableAction(&ast.MfSetStmt{
+				Target: s.OutputVariable,
+				Value: &ast.FunctionCallExpr{
+					Name:      "find",
+					Arguments: []ast.Expression{&ast.VariableExpr{Name: s.InputVariable}, second},
+				},
+				ErrorHandling: s.ErrorHandling,
+			})
+		}
+	}
+
 	var operation microflows.ListOperation
 
 	switch s.Operation {
@@ -1081,7 +1996,7 @@ func (fb *flowBuilder) addListOperationAction(s *ast.ListOperationStmt) model.ID
 			operation = &microflows.FindOperation{
 				BaseElement:  model.BaseElement{ID: model.ID(types.GenerateID())},
 				ListVariable: s.InputVariable,
-				Expression:   fb.exprToString(s.Condition),
+				Expression:   fb.exprToString(fb.qualifyIteratorAttributes(s.Condition, s.InputVariable, "find")),
 			}
 		}
 	case ast.ListOpFilter:
@@ -1091,7 +2006,7 @@ func (fb *flowBuilder) addListOperationAction(s *ast.ListOperationStmt) model.ID
 			operation = &microflows.FilterOperation{
 				BaseElement:  model.BaseElement{ID: model.ID(types.GenerateID())},
 				ListVariable: s.InputVariable,
-				Expression:   fb.exprToString(s.Condition),
+				Expression:   fb.exprToString(fb.qualifyIteratorAttributes(s.Condition, s.InputVariable, "filter")),
 			}
 		}
 	case ast.ListOpSort:
@@ -1111,10 +2026,20 @@ func (fb *flowBuilder) addListOperationAction(s *ast.ListOperationStmt) model.ID
 			if !spec.Ascending {
 				direction = microflows.SortDirectionDescending
 			}
-			// Build fully qualified attribute name: Entity.Attribute
+			// Qualify with the entity that DECLARES the attribute, as the
+			// retrieve sort does: an inherited name qualified with the list's
+			// own entity is CE1613 (mendixlabs/mxcli#1430).
 			attrQN := spec.Attribute
 			if entityType != "" && !strings.Contains(spec.Attribute, ".") {
-				attrQN = entityType + "." + spec.Attribute
+				if declared, ok := fb.resolveAttributeInEntityHierarchy(entityType, spec.Attribute); ok {
+					attrQN = declared
+				} else {
+					fb.refuseMissingListMember("sort", s.InputVariable, entityType, spec.Attribute)
+					attrQN = entityType + "." + spec.Attribute
+				}
+			}
+			if fb.qualifiedMembersOnly {
+				fb.refuseUnqualifiedAttribute(attrQN, spec.Attribute, entityType)
 			}
 			sortItems = append(sortItems, &microflows.SortItem{
 				BaseElement:            model.BaseElement{ID: model.ID(types.GenerateID())},
@@ -1173,27 +2098,18 @@ func (fb *flowBuilder) addListOperationAction(s *ast.ListOperationStmt) model.ID
 		return ""
 	}
 
+	activityX := fb.posX
 	action := &microflows.ListOperationAction{
-		BaseElement:    model.BaseElement{ID: model.ID(types.GenerateID())},
-		Operation:      operation,
-		OutputVariable: s.OutputVariable,
+		BaseElement:       model.BaseElement{ID: model.ID(types.GenerateID())},
+		Operation:         operation,
+		OutputVariable:    s.OutputVariable,
+		ErrorHandlingType: fb.ehType(s.ErrorHandling),
 	}
 
-	// Track output variable type for operations that preserve/produce list types
+	// The output holds what the operation keeps of its input list.
 	if fb.varTypes != nil && s.OutputVariable != "" && s.InputVariable != "" {
-		inputType := fb.varTypes[s.InputVariable]
-		switch s.Operation {
-		case ast.ListOpFilter, ast.ListOpSort, ast.ListOpTail, ast.ListOpUnion, ast.ListOpIntersect, ast.ListOpSubtract, ast.ListOpRange:
-			// These operations preserve the list type
-			if inputType != "" {
-				fb.varTypes[s.OutputVariable] = inputType
-			}
-		case ast.ListOpHead, ast.ListOpFind:
-			// These return a single element (remove "List of " prefix)
-			if after, ok := strings.CutPrefix(inputType, "List of "); ok {
-				fb.varTypes[s.OutputVariable] = after
-			}
-			// CONTAINS and EQUALS return Boolean, no need to track
+		if t := listOperationResult(operation).typeFrom(fb.varTypes[s.InputVariable]); t != "" {
+			fb.varTypes[s.OutputVariable] = t
 		}
 	}
 
@@ -1211,14 +2127,109 @@ func (fb *flowBuilder) addListOperationAction(s *ast.ListOperationStmt) model.ID
 
 	fb.objects = append(fb.objects, activity)
 	fb.posX += fb.spacing
+	fb.finishCustomErrorHandler(activity.ID, activityX, s.ErrorHandling, s.OutputVariable)
 	return activity.ID
 }
 
+// listResult is what a list operation's output holds, as against the list it
+// reads.
+type listResult int
+
+const (
+	listResultNone    listResult = iota // a Boolean: contains, equals
+	listResultList                      // the list itself: filter, sort, tail, union, intersect, subtract, range
+	listResultElement                   // one object of it: head, find
+)
+
+// listOperationResult says what op's output holds. It reads the operation,
+// not the statement, so a stored list operation's output can be typed the way
+// the full build (addListOperationAction) types it (ako/mxcli#1777).
+func listOperationResult(op microflows.ListOperation) listResult {
+	switch op.(type) {
+	case *microflows.FilterOperation, *microflows.FilterByAttributeOperation, *microflows.SortOperation,
+		*microflows.TailOperation, *microflows.UnionOperation, *microflows.IntersectOperation,
+		*microflows.SubtractOperation, *microflows.ListRangeOperation:
+		return listResultList
+	case *microflows.HeadOperation, *microflows.FindOperation, *microflows.FindByAttributeOperation:
+		return listResultElement
+	}
+	return listResultNone
+}
+
+// listOperationStmtResult is listOperationResult for the statement, before
+// any activity is built: the same answer, so a check that types variables from
+// the text (flowObjectTypes, behind MDL-SET01) and the build that types them
+// from the activity agree on what a list operation's output holds
+// (ako/mxcli#2176). The string-overloaded find/contains on a String input is
+// not a list operation at all; callers type an output only when the input is
+// a list.
+func listOperationStmtResult(op ast.ListOperationType) listResult {
+	switch op {
+	case ast.ListOpFilter, ast.ListOpSort, ast.ListOpTail, ast.ListOpUnion, ast.ListOpIntersect,
+		ast.ListOpSubtract, ast.ListOpRange:
+		return listResultList
+	case ast.ListOpHead, ast.ListOpFind:
+		return listResultElement
+	}
+	return listResultNone
+}
+
+// typeFrom is the type an output holding r has when the list it reads has
+// inputType ("List of Module.Entity"); "" when that is not known or the
+// output holds no entity.
+func (r listResult) typeFrom(inputType string) string {
+	switch r {
+	case listResultList:
+		return inputType
+	case listResultElement:
+		if elem, ok := strings.CutPrefix(inputType, "List of "); ok {
+			return elem
+		}
+	}
+	return ""
+}
+
+// listOperationInput is the list op reads: the first of the two a union,
+// intersect, subtract or equals reads, whose type the output takes.
+func listOperationInput(op microflows.ListOperation) string {
+	switch o := op.(type) {
+	case *microflows.HeadOperation:
+		return o.ListVariable
+	case *microflows.TailOperation:
+		return o.ListVariable
+	case *microflows.FindOperation:
+		return o.ListVariable
+	case *microflows.FilterOperation:
+		return o.ListVariable
+	case *microflows.FindByAttributeOperation:
+		return o.ListVariable
+	case *microflows.FilterByAttributeOperation:
+		return o.ListVariable
+	case *microflows.SortOperation:
+		return o.ListVariable
+	case *microflows.ListRangeOperation:
+		return o.ListVariable
+	case *microflows.ContainsOperation:
+		return o.ListVariable
+	case *microflows.UnionOperation:
+		return o.ListVariable1
+	case *microflows.IntersectOperation:
+		return o.ListVariable1
+	case *microflows.SubtractOperation:
+		return o.ListVariable1
+	case *microflows.EqualsOperation:
+		return o.ListVariable1
+	}
+	return ""
+}
+
 func (fb *flowBuilder) listAttributeOperation(s *ast.ListOperationStmt, filter bool) microflows.ListOperation {
-	binary, ok := s.Condition.(*ast.BinaryExpr)
-	if !ok || binary.Operator != "=" {
+	// `find $L where …` / `filter $L where …` is always the by-expression
+	// operation, even when the expression happens to read `Member = value`.
+	if s.ByExpression || !ast.IsMemberEquality(s.Condition) {
 		return nil
 	}
+	binary := s.Condition.(*ast.BinaryExpr)
 	fieldName, ok := listOperationFieldName(binary.Left)
 	if !ok || fieldName == "" {
 		return nil
@@ -1228,6 +2239,13 @@ func (fb *flowBuilder) listAttributeOperation(s *ast.ListOperationStmt, filter b
 		return nil
 	}
 
+	verb := "find"
+	if filter {
+		verb = "filter"
+	}
+	if fb.refuseMissingListMember(verb, s.InputVariable, fb.listElementEntity(s.InputVariable), fieldName) {
+		return nil
+	}
 	attributeName, associationName := fb.resolveListOperationMember(s.InputVariable, fieldName)
 	if associationName == "" && !strings.Contains(attributeName, ".") {
 		return nil
@@ -1291,29 +2309,63 @@ func (fb *flowBuilder) addAggregateListAction(s *ast.AggregateListStmt) model.ID
 		function = microflows.AggregateFunctionMax
 	case ast.AggregateReduce:
 		function = microflows.AggregateFunctionReduce
+	case ast.AggregateAll:
+		function = microflows.AggregateFunctionAll
+	case ast.AggregateAny:
+		function = microflows.AggregateFunctionAny
 	default:
 		return ""
 	}
 
+	activityX := fb.posX
 	action := &microflows.AggregateListAction{
-		BaseElement:    model.BaseElement{ID: model.ID(types.GenerateID())},
-		InputVariable:  s.InputVariable,
-		OutputVariable: s.OutputVariable,
-		Function:       function,
+		BaseElement:       model.BaseElement{ID: model.ID(types.GenerateID())},
+		InputVariable:     s.InputVariable,
+		OutputVariable:    s.OutputVariable,
+		Function:          function,
+		ErrorHandlingType: fb.ehType(s.ErrorHandling),
+	}
+
+	// The fold Mendix stores beside the expression. REDUCE names both in MDL;
+	// ALL and ANY always fold a Boolean and never take a seed, which is what
+	// Studio Pro writes for them (empty initial value, Boolean return type).
+	switch s.Operation {
+	case ast.AggregateReduce:
+		if s.InitialValue != nil {
+			action.ReduceInitialValue = expressionToString(s.InitialValue)
+		}
+		if s.ReturnType != nil {
+			action.ReduceReturnType = convertASTToMicroflowDataType(*s.ReturnType, nil)
+		}
+	case ast.AggregateAll, ast.AggregateAny:
+		action.ReduceReturnType = &microflows.BooleanType{}
 	}
 
 	if s.IsExpression && s.Expression != nil {
 		action.UseExpression = true
 		action.Expression = expressionToString(s.Expression)
 	} else if s.Attribute != "" {
-		// For SUM/AVG/MIN/MAX, build qualified attribute name from variable type
-		if fb.varTypes != nil {
-			listType := fb.varTypes[s.InputVariable]
-			if after, ok := strings.CutPrefix(listType, "List of "); ok {
-				entityType := after
+		// For SUM/AVG/MIN/MAX, qualify the attribute with the entity that
+		// DECLARES it, as a sort does: an inherited one qualified with the
+		// list's own entity is CE1613 "The selected attribute 'M.Sub.Total' no
+		// longer exists" (measured on 11.13.0, ako/mxcli#1646).
+		if entityType := fb.listElementEntity(s.InputVariable); entityType != "" {
+			if declared, ok := fb.resolveAttributeInEntityHierarchy(entityType, s.Attribute); ok && !strings.Contains(s.Attribute, ".") {
+				action.AttributeQualifiedName = declared
+			} else {
+				fb.refuseMissingListMember(strings.ToLower(s.Operation.String()), s.InputVariable, entityType, s.Attribute)
 				action.AttributeQualifiedName = entityType + "." + s.Attribute
 			}
 		}
+		if fb.qualifiedMembersOnly && action.AttributeQualifiedName == "" {
+			fb.refuseUnqualifiedAttribute(s.Attribute, s.Attribute, fb.listElementEntity(s.InputVariable))
+		}
+	}
+
+	// Declare the result so a later SET on it is accepted, as the validate path
+	// already does (mendixlabs/mxcli#1413).
+	if fb.declaredVars != nil && s.OutputVariable != "" {
+		fb.declaredVars[s.OutputVariable] = aggregateResultType(action.Function, action.ReduceReturnType)
 	}
 
 	activity := &microflows.ActionActivity{
@@ -1330,7 +2382,30 @@ func (fb *flowBuilder) addAggregateListAction(s *ast.AggregateListStmt) model.ID
 
 	fb.objects = append(fb.objects, activity)
 	fb.posX += fb.spacing
+	fb.finishCustomErrorHandler(activity.ID, activityX, s.ErrorHandling, s.OutputVariable)
 	return activity.ID
+}
+
+// aggregateResultType is the primitive an aggregate's output holds: Integer
+// for a count, Decimal for an average, Boolean for all and any, a reduce's
+// return type. A sum, minimum or maximum follows the attribute's type, which
+// is not resolved here, so it is Unknown. It reads the action, not the
+// statement, so a stored aggregate's output can be typed the way the full
+// build (addAggregateListAction) types it (ako/mxcli#1777).
+func aggregateResultType(fn microflows.AggregateFunction, reduceReturnType microflows.DataType) string {
+	switch fn {
+	case microflows.AggregateFunctionCount:
+		return "Integer"
+	case microflows.AggregateFunctionAverage:
+		return "Decimal"
+	case microflows.AggregateFunctionAll, microflows.AggregateFunctionAny:
+		return "Boolean"
+	case microflows.AggregateFunctionReduce:
+		if reduceReturnType != nil {
+			return reduceReturnType.GetTypeName()
+		}
+	}
+	return "Unknown"
 }
 
 // addCreateListAction creates a CREATE LIST OF statement.
@@ -1340,10 +2415,12 @@ func (fb *flowBuilder) addCreateListAction(s *ast.CreateListStmt) model.ID {
 		entityQN = s.EntityType.Module + "." + s.EntityType.Name
 	}
 
+	activityX := fb.posX
 	action := &microflows.CreateListAction{
 		BaseElement:         model.BaseElement{ID: model.ID(types.GenerateID())},
 		OutputVariable:      s.Variable,
 		EntityQualifiedName: entityQN,
+		ErrorHandlingType:   fb.ehType(s.ErrorHandling),
 	}
 
 	// Register variable type as list
@@ -1365,46 +2442,113 @@ func (fb *flowBuilder) addCreateListAction(s *ast.CreateListStmt) model.ID {
 
 	fb.objects = append(fb.objects, activity)
 	fb.posX += fb.spacing
+	fb.finishCustomErrorHandler(activity.ID, activityX, s.ErrorHandling, s.Variable)
 	return activity.ID
 }
 
-// addAddToListAction creates an ADD TO list statement.
+// addAddToListAction creates an ADD TO list statement, or the Add member
+// change of a Change object activity when the target is $Obj/Module.Assoc.
 func (fb *flowBuilder) addAddToListAction(s *ast.AddToListStmt) model.ID {
+	if s.Association != "" {
+		value := s.Value
+		if value == nil {
+			value = &ast.VariableExpr{Name: s.Item}
+		}
+		return fb.addAssociationMemberChange(microflows.MemberChangeTypeAdd, s.List, s.Association, value, s.Commit, s.RefreshInClient, s.ErrorHandling)
+	}
 	value := fb.exprToString(s.Value)
 	if value == "" && s.Item != "" {
 		value = "$" + s.Item
 	}
-	action := &microflows.ChangeListAction{
-		BaseElement:    model.BaseElement{ID: model.ID(types.GenerateID())},
-		Type:           microflows.ChangeListTypeAdd,
-		ChangeVariable: s.List,
-		Value:          value,
-	}
-
-	activity := &microflows.ActionActivity{
-		BaseActivity: microflows.BaseActivity{
-			BaseMicroflowObject: microflows.BaseMicroflowObject{
-				BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
-				Position:    model.Point{X: fb.posX, Y: fb.posY},
-				Size:        model.Size{Width: ActivityWidth, Height: ActivityHeight},
-			},
-			AutoGenerateCaption: true,
-		},
-		Action: action,
-	}
-
-	fb.objects = append(fb.objects, activity)
-	fb.posX += fb.spacing
-	return activity.ID
+	activityX := fb.posX
+	id := fb.addChangeListAction(microflows.ChangeListTypeAdd, s.List, value, s.ErrorHandling)
+	fb.finishCustomErrorHandler(id, activityX, s.ErrorHandling, "")
+	return id
 }
 
-// addRemoveFromListAction creates a REMOVE FROM list statement.
+// addRemoveFromListAction creates a REMOVE FROM list statement, or the Remove
+// member change of a Change object activity when the target is $Obj/Module.Assoc.
 func (fb *flowBuilder) addRemoveFromListAction(s *ast.RemoveFromListStmt) model.ID {
+	if s.Association != "" {
+		return fb.addAssociationMemberChange(microflows.MemberChangeTypeRemove, s.List, s.Association, &ast.VariableExpr{Name: s.Item}, s.Commit, s.RefreshInClient, s.ErrorHandling)
+	}
+	activityX := fb.posX
+	id := fb.addChangeListAction(microflows.ChangeListTypeRemove, s.List, "$"+s.Item, s.ErrorHandling)
+	fb.finishCustomErrorHandler(id, activityX, s.ErrorHandling, "")
+	return id
+}
+
+// addClearListAction creates a CLEAR $List statement: a Change list action of
+// type Clear, which stores no value (ako/mxcli#944).
+func (fb *flowBuilder) addClearListAction(s *ast.ClearListStmt) model.ID {
+	return fb.addChangeListAction(microflows.ChangeListTypeClear, s.List, "", nil)
+}
+
+// addReplaceListAction creates `set $List = <expr>` on a list variable: the
+// Replace operation of a Change list activity, stored as Type "Set". A Change
+// variable action cannot target a list — mxbuild answers CE7247 "Variable 'A'
+// does not have a primitive type" — and describe prints a stored Set as
+// `set $List = <expr>;`, so this is the only reading that round-trips.
+func (fb *flowBuilder) addReplaceListAction(s *ast.MfSetStmt) model.ID {
+	activityX := fb.posX
+	id := fb.addChangeListAction(microflows.ChangeListTypeSet, s.Target, fb.exprToString(s.Value), s.ErrorHandling)
+	fb.finishCustomErrorHandler(id, activityX, s.ErrorHandling, s.Target)
+	return id
+}
+
+// isListVariable reports whether name is a variable this flow knows to hold a
+// list (a parameter, a create list, a retrieve or a list operation's output).
+func (fb *flowBuilder) isListVariable(name string) bool {
+	return strings.HasPrefix(fb.varTypes[strings.TrimPrefix(name, "$")], "List of ")
+}
+
+// objectVariableType returns the entity of a variable this flow knows to hold
+// a single OBJECT (a parameter, a retrieve's object range or forward Reference,
+// a create object, a cast, a head/find), and false for a primitive, a list, a
+// member path or a variable of unknown type.
+func (fb *flowBuilder) objectVariableType(name string) (string, bool) {
+	name = strings.TrimPrefix(name, "$")
+	if strings.Contains(name, "/") {
+		return "", false
+	}
+	if _, primitive := fb.declaredVars[name]; primitive {
+		return "", false
+	}
+	t := fb.varTypes[name]
+	if t == "" || strings.HasPrefix(t, "List of ") || !strings.Contains(t, ".") {
+		return "", false
+	}
+	return t, true
+}
+
+// refuseSetOnObject reports `set $Obj = …` on an object variable. Mendix has no
+// action that reassigns one: Change variable takes only a primitive, and
+// mxbuild answers CE7247 "Variable 'X' does not have a primitive type"
+// (mendixlabs/mxcli#1323). A list has Change list Replace (ako/mxcli#949); an
+// object has nothing, so the statement is refused rather than written.
+func (fb *flowBuilder) refuseSetOnObject(target string) bool {
+	entity, ok := fb.objectVariableType(target)
+	if !ok {
+		return false
+	}
+	name := strings.TrimPrefix(target, "$")
+	fb.addError("cannot set object variable '$%s' (%s): Mendix has no action that reassigns an object variable — "+
+		"Change variable takes only a primitive, and mxbuild rejects it with CE7247 \"Variable '%s' does not have a primitive type\". "+
+		"Return the new object from a sub-microflow instead (recursion for a chain walk), retrieve it into a new variable, "+
+		"or change the object's members with `change $%s (…)`", name, entity, name, name)
+	return true
+}
+
+// addChangeListAction appends a Change list activity of the given operation.
+// eh is the statement's `on error` clause, nil for the statements that take
+// none; the caller finishes a custom handler.
+func (fb *flowBuilder) addChangeListAction(op microflows.ChangeListType, list, value string, eh *ast.ErrorHandlingClause) model.ID {
 	action := &microflows.ChangeListAction{
-		BaseElement:    model.BaseElement{ID: model.ID(types.GenerateID())},
-		Type:           microflows.ChangeListTypeRemove,
-		ChangeVariable: s.List,
-		Value:          "$" + s.Item,
+		BaseElement:       model.BaseElement{ID: model.ID(types.GenerateID())},
+		Type:              op,
+		ChangeVariable:    list,
+		Value:             value,
+		ErrorHandlingType: fb.ehType(eh),
 	}
 
 	activity := &microflows.ActionActivity{
@@ -1417,6 +2561,9 @@ func (fb *flowBuilder) addRemoveFromListAction(s *ast.RemoveFromListStmt) model.
 			AutoGenerateCaption: true,
 		},
 		Action: action,
+	}
+	if eh != nil {
+		activity.ErrorHandlingType = fb.ehType(eh)
 	}
 
 	fb.objects = append(fb.objects, activity)
@@ -1445,13 +2592,74 @@ func (fb *flowBuilder) isEntity(moduleName, entityName string) bool {
 	return false
 }
 
+// moduleExists reports whether a module of this name is in the project. The
+// common path is GetModuleByName; when that errors — the error could mean
+// "not found" or "cannot read", and this decision treats those differently —
+// the module roster decides. A roster that cannot be read counts as "exists":
+// the member keeps the old silent fallback rather than this refusal, because
+// silence over a guess is this file's rule for an unreadable model.
+func (fb *flowBuilder) moduleExists(name string) bool {
+	if mod, err := fb.backend.GetModuleByName(name); err == nil {
+		return mod != nil
+	}
+	mods, err := fb.backend.ListModules()
+	if err != nil {
+		return true
+	}
+	for _, m := range mods {
+		if m != nil && m.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveMemberChange determines whether a member name is an association or attribute
 // and sets the appropriate field on the MemberChange. It queries the domain model
 // to check if the name matches an association on the entity; if no metadata is
 // available, it falls back to a name-shape heuristic.
 //
 // memberName can be either bare ("Order_Customer") or qualified ("MfTest.Order_Customer").
+// isValidMemberIdentifier reports whether name is a plain member identifier or a
+// dot-qualified name (e.g. "Resource", "SkillProfile_Resource", or
+// "BuildScheduling.SkillProfile_Resource"). Each dot-separated segment must be a
+// valid Mendix identifier: a letter or underscore followed by letters, digits, or
+// underscores. Quotes, spaces, and empty segments are rejected.
+func isValidMemberIdentifier(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, seg := range strings.Split(name, ".") {
+		if seg == "" {
+			return false
+		}
+		for i, r := range seg {
+			ok := r == '_' ||
+				(r >= 'a' && r <= 'z') ||
+				(r >= 'A' && r <= 'Z') ||
+				(i > 0 && r >= '0' && r <= '9')
+			if !ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func (fb *flowBuilder) resolveMemberChange(mc *microflows.MemberChange, memberName string, entityQN string) {
+	if fb.qualifiedMembersOnly {
+		defer func() { fb.refuseUnqualifiedAttribute(mc.AttributeQualifiedName, memberName, entityQN) }()
+	}
+	// Guard against a malformed member identifier reaching the writer, where it
+	// would serialize as an invalid Attribute/Association value that passes
+	// `mxcli check` but fails to load in MxBuild/Studio Pro (StorageLoadException:
+	// "... is not a valid AttributeIdentifier"). The visitor normalizes quoted
+	// members, so this only fires on genuinely invalid input. Empty names are
+	// left to the existing graceful handling below.
+	if memberName != "" && !isValidMemberIdentifier(memberName) {
+		fb.addError("invalid member name %q — a Change/Set member must be a plain identifier or Module.Name; remove quotes and other illegal characters", memberName)
+		return
+	}
 	if entityQN == "" {
 		// Entity type of $variable is unknown (e.g., the variable comes from a
 		// java action whose return type isn't registered, or from the iterator
@@ -1496,6 +2704,38 @@ func (fb *flowBuilder) resolveMemberChange(mc *microflows.MemberChange, memberNa
 		qualifiedName = moduleName + "." + memberName
 	}
 
+	// System.owner and System.changedBy are associations to System.User that no
+	// domain model lists — an entity carries them as flags on the root of its
+	// generalization chain — so the lookup below cannot find them. A list
+	// operation finds and filters by them (measured clean on 11.12.5,
+	// ako/mxcli#1629). A create or change object cannot set them (CE1050);
+	// those statements refuse them before reaching here (refuseSystemMemberChange).
+	if strings.Count(memberName, ".") == 1 {
+		if canonical, ok := builtinSystemMemberAssociation(memberName); ok {
+			if memberName != canonical {
+				fb.addError("%s", systemMemberSpellingRefusal(memberName, canonical, entityQN))
+				return
+			}
+			mc.AssociationQualifiedName = canonical
+			return
+		}
+	}
+
+	// A one-dot member whose qualifier is NOT a module (`Assoc.Attr`) is a
+	// member reached through an association. Mendix's ChangeActionItem cannot
+	// represent that at all — the slot holds either an attribute of the changed
+	// entity or an association reference — and writing the name verbatim (the
+	// fallback below) ships a project mxbuild rejects with CE1613 a whole build
+	// later. Refuse with the working idiom instead, but only when the module
+	// list answers confidently: an unreadable model keeps the old silent
+	// fallback rather than guessing.
+	// (docs/12-bug-reports/2026-10-16-change-member-through-association.md)
+	if fb.backend != nil && strings.Count(memberName, ".") == 1 && !fb.moduleExists(lookupModule) {
+		fb.addError("member %q on entity %s: %q is not a module, so this is a member reached through an association — a change item cannot set it. Retrieve the associated object and change that instead: `retrieve $obj from $var/%s;` then `change $obj (%s = ...)`",
+			memberName, entityQN, lookupModule, lookupModule, bareName)
+		return
+	}
+
 	// Query the authored (or target) module's domain model first. When the
 	// association actually lives in a different module — the common case for
 	// cross-module associations like `OtherModule.Assoc_Name` on a
@@ -1517,14 +2757,28 @@ func (fb *flowBuilder) resolveMemberChange(mc *microflows.MemberChange, memberNa
 						return
 					}
 				}
-				// Not an association in the authored module — if the author
-				// qualified it (e.g. `Module.Attr`) the qualification is an
-				// error we must preserve rather than silently dropping; the
-				// writer will surface it during mx check.
+				// Not an association in the authored module. A single-qualifier
+				// name (`Module.Name`) can ONLY be an association — attributes are
+				// bare or `Module.Entity.Attribute` (two qualifiers). So a one-dot
+				// member that isn't a known association is a reference to an
+				// association that does not exist. Writing it as an Attribute
+				// produces an *unloadable* .mpr (StorageLoadException "... is not a
+				// valid AttributeIdentifier") rather than a clean CE error — reject
+				// it here instead (FINDINGS #51). Associations created earlier in the
+				// same script are visible via GetDomainModel, so this does not
+				// false-positive on same-script associations.
+				if strings.Count(memberName, ".") == 1 {
+					fb.addError("member %q on entity %s is not a known association (and a one-qualifier name cannot be an attribute) — create the association first (`create or modify association %s from ... to ...`) or fix the name", memberName, entityQN, memberName)
+					return
+				}
 				if strings.Contains(memberName, ".") {
+					// Two-or-more-dot qualified attribute (Module.Entity.Attribute):
+					// preserve the authored qualification; mx check surfaces a wrong one.
 					mc.AttributeQualifiedName = memberName
 				} else if attrQN, ok := fb.resolveAttributeInEntityHierarchy(entityQN, memberName); ok {
 					mc.AttributeQualifiedName = attrQN
+				} else if assocQN, ok := fb.resolveInheritedAssociation(entityQN, memberName); ok {
+					mc.AssociationQualifiedName = assocQN
 				} else {
 					mc.AttributeQualifiedName = entityQN + "." + memberName
 				}
@@ -1534,6 +2788,23 @@ func (fb *flowBuilder) resolveMemberChange(mc *microflows.MemberChange, memberNa
 	}
 
 	resolveMemberChangeFallback(mc, memberName, entityQN)
+}
+
+// refuseUnqualifiedAttribute records an error when attrQN — the attribute a
+// member resolved to — is not Module.Entity.Attribute, under
+// qualifiedMembersOnly. entityQN is the entity the member was resolved
+// against, "" when the variable's entity is not known.
+func (fb *flowBuilder) refuseUnqualifiedAttribute(attrQN, memberName, entityQN string) {
+	if attrQN == "" || strings.Count(attrQN, ".") >= 2 {
+		return
+	}
+	if entityQN == "" {
+		fb.addError("cannot qualify member %q: the entity its variable holds is not known here, and a bare "+
+			"attribute name would make the project unloadable (\"not a valid AttributeIdentifier\"); "+
+			"name it in full as Module.Entity.%s", memberName, memberName)
+		return
+	}
+	fb.addError("cannot qualify member %q on %s; name it in full as Module.Entity.Attribute", memberName, entityQN)
 }
 
 func (fb *flowBuilder) resolveAttributeInEntityHierarchy(entityQN, attrName string) (string, bool) {
@@ -1566,6 +2837,59 @@ func (fb *flowBuilder) resolveAttributeInEntityHierarchy(entityQN, attrName stri
 		for _, attr := range entity.Attributes {
 			if attr != nil && attr.Name == attrName {
 				return currentQN + "." + attrName, true
+			}
+		}
+		currentQN = entity.GeneralizationRef
+	}
+	return "", false
+}
+
+// resolveInheritedAssociation finds a bare association name among the
+// associations entityQN inherits from a generalization in ANOTHER module, and
+// returns its qualified name. An association lives in its FROM entity's
+// module, so one inherited from Other.Person is in Other — the lookup by name
+// in the specialization's own module cannot see it, and the bare name was
+// written as an attribute of the specialization, which mxbuild reports as
+// CE1613 (ako/mxcli#1637). describe prints a find's association short, so its
+// output executes through here. The entity's own module was searched by name
+// already; a match must involve the ancestor, at either end.
+func (fb *flowBuilder) resolveInheritedAssociation(entityQN, name string) (string, bool) {
+	if fb == nil || fb.backend == nil || entityQN == "" || name == "" {
+		return "", false
+	}
+	ownModule, _, _ := strings.Cut(entityQN, ".")
+	seen := make(map[string]bool)
+	for currentQN := entityQN; currentQN != ""; {
+		if seen[currentQN] {
+			return "", false
+		}
+		seen[currentQN] = true
+		module, entityName, ok := strings.Cut(currentQN, ".")
+		if !ok {
+			return "", false
+		}
+		mod, err := fb.backend.GetModuleByName(module)
+		if err != nil || mod == nil {
+			return "", false
+		}
+		dm, err := fb.backend.GetDomainModel(mod.ID)
+		if err != nil || dm == nil {
+			return "", false
+		}
+		entity := dm.FindEntityByName(entityName)
+		if entity == nil {
+			return "", false
+		}
+		if module != ownModule {
+			for _, a := range dm.Associations {
+				if a != nil && a.Name == name && (a.ParentID == entity.ID || a.ChildID == entity.ID) {
+					return module + "." + name, true
+				}
+			}
+			for _, a := range dm.CrossAssociations {
+				if a != nil && a.Name == name && a.ParentID == entity.ID {
+					return module + "." + name, true
+				}
 			}
 		}
 		currentQN = entity.GeneralizationRef
@@ -1614,6 +2938,56 @@ func (fb *flowBuilder) entityIsSubtypeOf(candidateQN, ancestorQN string) bool {
 		currentQN = entity.GeneralizationRef
 	}
 	return false
+}
+
+// refuseMissingListMember records the refusal for a list operation's or an
+// aggregate's member that the list's entity provably does not have, and
+// reports whether it did. Without it the builder wrote `<entity>.<name>`
+// anyway, which mxbuild rejects with CE1613 (ako/mxcli#1646). The verdict and
+// the message are check --references' own (flowMemberVerdict,
+// listMemberRefusal), so exec without the preflight says what check says. A
+// member that cannot be judged — the entity unknown, a module unreadable, a
+// qualified name — is written as before.
+func (fb *flowBuilder) refuseMissingListMember(verb, list, entityQN, member string) bool {
+	if fb == nil || fb.backend == nil || entityQN == "" || member == "" || strings.Contains(member, ".") {
+		return false
+	}
+	if res, _ := flowMemberVerdict(fb.backend, entityQN, member, !isAggregateVerb(verb)); res != memberMissing {
+		return false
+	}
+	fb.addError("%s", listMemberRefusal(listMemberWhere(verb, list, member), entityQN, member, nearMembersFor(fb.backend, entityQN)))
+	return true
+}
+
+// qualifyBareRetrieveAssociation resolves the association a retrieve names by
+// its bare name — `retrieve $C from $O/Ord_Cust` — against the entity the start
+// variable holds, and records the refusal when it cannot. The answer is
+// resolveBareAssociation's, which check --references asks too.
+func (fb *flowBuilder) qualifyBareRetrieveAssociation(s *ast.RetrieveStmt) (string, bool) {
+	entity := ""
+	if fb.varTypes != nil {
+		entity = strings.TrimPrefix(fb.varTypes[s.StartVariable], "List of ")
+	}
+	qn, matches, verdict := fb.resolveBareAssociationFrom(entity, s.Source.Name)
+	if verdict == bareAssocResolved {
+		return qn, true
+	}
+	fb.addError("%s", bareRetrieveAssociationRefusal(s.Variable, s.StartVariable, s.Source.Name, entity, matches, verdict))
+	return "", false
+}
+
+// resolveBareAssociationFrom is resolveBareAssociation over the project as the
+// builder sees it: the statements before this one already written.
+func (fb *flowBuilder) resolveBareAssociationFrom(entityQN, name string) (string, []string, bareAssocVerdict) {
+	if fb == nil || fb.backend == nil || entityQN == "" || name == "" {
+		return "", nil, bareAssocUnknown
+	}
+	if fb.assocCatalog == nil {
+		cat := associationCatalogFor(fb.backend)
+		fb.assocCatalog = &cat
+	}
+	chain, complete := generalizationChainFor(fb.backend, entityQN)
+	return resolveBareAssociation(name, chain, complete, *fb.assocCatalog)
 }
 
 // resolveMemberChangeFallback preserves the authored member name shape when the
@@ -1687,5 +3061,302 @@ func (fb *flowBuilder) lookupAssociation(moduleName, assocName string) *assocLoo
 			}
 		}
 	}
+	// A domain model keeps associations in TWO lists: an association whose target
+	// lives in another module (or in System) is a DomainModels$CrossAssociation,
+	// where only the local end is BY_ID and the remote end is the BY_NAME
+	// ChildRef. Searching only the first list left every cross-module hop
+	// unresolvable, so an expression navigating one was written without its
+	// target-entity step and mxbuild failed CE0117 (#829) — the same two-list
+	// trap as #854 and issuetracker #19.
+	//
+	// The remote entity is not in this domain model, so its persistability is
+	// unknown here; callers that need it must resolve the entity themselves
+	// rather than read `false` as "non-persistable".
+	for _, ca := range dm.CrossAssociations {
+		if ca.Name == assocName {
+			return &assocLookupResult{
+				Type:              ca.Type,
+				Owner:             ca.Owner,
+				parentEntityQN:    entityNames[ca.ParentID],
+				childEntityQN:     ca.ChildRef,
+				parentPersistable: entityPersistable[ca.ParentID],
+				childPersistable:  true,
+			}
+		}
+	}
 	return nil
+}
+
+// associationRetrieveEndFrom is the end of info a retrieve over it starts from
+// when its start variable holds startType, by associationRetrieveEnd — the
+// rule the full build, a spliced fragment and check --references share. A
+// self-reference is followed from its FROM end (ako/mxcli#1793).
+func (fb *flowBuilder) associationRetrieveEndFrom(startType string, info *assocLookupResult) assocRetrieveEnd {
+	if info == nil {
+		return assocEndNone
+	}
+	return associationRetrieveEnd(
+		fb.entityIsSubtypeOf(startType, info.parentEntityQN),
+		fb.entityIsSubtypeOf(startType, info.childEntityQN),
+		info.parentEntityQN != "" && info.parentEntityQN == info.childEntityQN)
+}
+
+// associationRetrieveType is what `retrieve $X from $Start/assocQN` binds when
+// $Start holds startType ("Module.Entity"): the list or the object at the
+// other end, by associationRetrieveEndFrom and associationRetrieveYieldsList —
+// the answer addRetrieveAction and check --references take. Mind the
+// inversion: an association's parent is its FROM end and its child the TO end,
+// so a retrieve from the TO end yields the FROM entity. A self-reference is
+// followed from its FROM end: the object a reference holds, the list a
+// reference set holds (measured on 11.13.0, ako/mxcli#1777). "" when it cannot
+// be established: the association or the start unknown, the start a list, the
+// start no end of it, or a specialization of both ends of an association
+// between two entities, where which end it starts from is not known.
+func (fb *flowBuilder) associationRetrieveType(startType, assocQN string) string {
+	if startType == "" || strings.HasPrefix(startType, "List of ") {
+		return ""
+	}
+	module, name, ok := strings.Cut(assocQN, ".")
+	if !ok || module == "" || name == "" {
+		return ""
+	}
+	info := fb.lookupAssociation(module, name)
+	if info == nil || info.parentEntityQN == "" || info.childEntityQN == "" {
+		return ""
+	}
+	refSet := info.Type == domainmodel.AssociationTypeReferenceSet
+	var fromTo bool
+	switch fb.associationRetrieveEndFrom(startType, info) {
+	case assocEndFrom:
+		fromTo = false
+	case assocEndTo:
+		fromTo = true
+	default:
+		return ""
+	}
+	other := info.childEntityQN
+	if fromTo {
+		other = info.parentEntityQN
+	}
+	if associationRetrieveYieldsList(refSet, info.Owner == domainmodel.AssociationOwnerBoth, fromTo) {
+		return "List of " + other
+	}
+	return other
+}
+
+// qualifyIteratorAttributes rewrites a bare attribute name in a FILTER/FIND
+// predicate into `$currentObject/<Attr>`.
+//
+// Mendix's "filter by expression" / "find by expression" evaluates the predicate
+// once per item with the item bound to `$currentObject`; a bare attribute name is
+// not a valid expression there and the build fails with CE0117. mxcli used to
+// store the authored text verbatim, so `filter($L, Amount > 0)` wrote
+// `"Amount > 0"` and produced a model that `mxcli check` accepted and mxbuild
+// rejected — measured identically on 11.11.0 and 11.13.0, so this is mxcli's
+// behaviour and not a Mendix version change (issue #1002).
+//
+// This is the other half of bug #343. That fix rerouted `filter($L, attr = value)`
+// to `Microflows$Filter` (filter BY ATTRIBUTE), which takes a member name rather
+// than an expression and so accepts the bare form. Everything else — a different
+// operator, a compound predicate — still fell through to the expression shape.
+// The split was on the operator and invisible to the author: `Status = 'x'` built
+// and `Status != 'x'` did not.
+//
+// Only a name that provably resolves to a member of the list's element entity is
+// qualified. A name that does NOT resolve, when the entity IS known, is a real
+// mistake and is reported here rather than left to surface as CE0117 at build
+// time. When the element entity cannot be determined nothing is proven either
+// way, so the expression is passed through unchanged.
+func (fb *flowBuilder) qualifyIteratorAttributes(cond ast.Expression, listVariable, opLabel string) ast.Expression {
+	if cond == nil {
+		return nil
+	}
+	entityQN := fb.listElementEntity(listVariable)
+	if entityQN == "" {
+		return cond
+	}
+
+	// name → the path segment to write after `$currentObject/`. An attribute is
+	// referenced by its bare name; an association carries its module qualifier.
+	renamed := map[string]string{}
+	var rewrite func(ast.Expression) ast.Expression
+	rewrite = func(e ast.Expression) ast.Expression {
+		switch n := e.(type) {
+		case nil:
+			return nil
+		case *ast.IdentifierExpr:
+			segment, ok := fb.iteratorMemberPath(entityQN, n.Name)
+			if !ok {
+				if !isMendixExpressionKeyword(n.Name) {
+					fb.addError("%s($%s, …): %q is not an attribute or association of %s — a %s predicate is evaluated once per item, so a bare name must be a member of the list's entity (mxbuild reports CE0117 otherwise)",
+						opLabel, listVariable, n.Name, entityQN, opLabel)
+				}
+				return n
+			}
+			renamed[n.Name] = segment
+			return &ast.AttributePathExpr{
+				Variable: "currentObject",
+				Path:     []string{segment},
+				Segments: []ast.PathSegment{{Name: segment, Separator: "/"}},
+			}
+		case *ast.BinaryExpr:
+			return &ast.BinaryExpr{Left: rewrite(n.Left), Operator: n.Operator, Right: rewrite(n.Right)}
+		case *ast.UnaryExpr:
+			return &ast.UnaryExpr{Operator: n.Operator, Operand: rewrite(n.Operand)}
+		case *ast.ParenExpr:
+			return &ast.ParenExpr{Inner: rewrite(n.Inner)}
+		case *ast.FunctionCallExpr:
+			args := make([]ast.Expression, len(n.Arguments))
+			for i, a := range n.Arguments {
+				args[i] = rewrite(a)
+			}
+			return &ast.FunctionCallExpr{Name: n.Name, Arguments: args}
+		case *ast.IfThenElseExpr:
+			return &ast.IfThenElseExpr{
+				Condition: rewrite(n.Condition),
+				ThenExpr:  rewrite(n.ThenExpr),
+				ElseExpr:  rewrite(n.ElseExpr),
+			}
+		case *ast.SourceExpr:
+			inner := rewrite(n.Expression)
+			if n.Source == "" {
+				return inner
+			}
+			// A non-empty Source is the exact text to write back (decimal and
+			// whitespace fidelity, #17-19), so patch the names inside it rather
+			// than re-rendering the tree — the same treatment association paths
+			// get in resolveAssociationPaths.
+			return &ast.SourceExpr{Expression: inner, Source: qualifyNamesInSource(n.Source, renamed)}
+		default:
+			// LiteralExpr, VariableExpr, AttributePathExpr, QualifiedNameExpr,
+			// ConstantRefExpr, TokenExpr, XPathPathExpr: nothing to qualify. An
+			// AttributePathExpr is already anchored to some variable, and naming
+			// the wrong one is MDL-LISTOP01's business, not this function's.
+			return e
+		}
+	}
+
+	return rewrite(cond)
+}
+
+// listElementEntity returns the qualified entity name of a list variable's
+// elements, or "" when the variable's type was never tracked.
+func (fb *flowBuilder) listElementEntity(listVariable string) string {
+	if fb == nil || fb.varTypes == nil || listVariable == "" {
+		return ""
+	}
+	entityQN, _ := strings.CutPrefix(fb.varTypes[listVariable], "List of ")
+	if entityQN == fb.varTypes[listVariable] {
+		return "" // not a list type
+	}
+	return entityQN
+}
+
+// iteratorMemberPath resolves a bare name against entityQN and returns the path
+// segment that references it from `$currentObject`. An attribute keeps its bare
+// name; an association is returned module-qualified, which is how Mendix spells
+// one in a path (`$currentObject/Sales.Order_Customer`).
+func (fb *flowBuilder) iteratorMemberPath(entityQN, name string) (string, bool) {
+	if name == "" || strings.Contains(name, ".") {
+		return "", false
+	}
+	if _, ok := fb.resolveAttributeInEntityHierarchy(entityQN, name); ok {
+		return name, true
+	}
+	if fb.backend == nil {
+		return "", false
+	}
+	module, _, found := strings.Cut(entityQN, ".")
+	if !found {
+		return "", false
+	}
+	mod, err := fb.backend.GetModuleByName(module)
+	if err != nil || mod == nil {
+		return "", false
+	}
+	dm, err := fb.backend.GetDomainModel(mod.ID)
+	if err != nil || dm == nil {
+		return "", false
+	}
+	for _, a := range dm.Associations {
+		if a.Name == name {
+			return module + "." + name, true
+		}
+	}
+	for _, a := range dm.CrossAssociations {
+		if a.Name == name {
+			return module + "." + name, true
+		}
+	}
+	return "", false
+}
+
+// isMendixExpressionKeyword reports whether name is a bare word Mendix defines
+// itself, so an unresolved one is not reported as a missing attribute.
+func isMendixExpressionKeyword(name string) bool {
+	switch strings.ToLower(name) {
+	case "true", "false", "empty", "nil", "null":
+		return true
+	}
+	return false
+}
+
+// bareNameInSourceRe matches a whole-word occurrence of a name that is not
+// already part of a path (`$currentObject/Amount`) or a qualified name
+// (`Module.Amount`). Go's regexp has no lookbehind, so the preceding character
+// is captured and put back.
+var bareNameInSourceRe = regexp.MustCompile(`(^|[^\w./$])([A-Za-z_]\w*)(\b)`)
+
+// qualifyNamesInSource rewrites each name in names to `$currentObject/<segment>`
+// within expression source text, leaving single-quoted string literals alone.
+func qualifyNamesInSource(source string, names map[string]string) string {
+	if len(names) == 0 {
+		return source
+	}
+	var out strings.Builder
+	for i := 0; i < len(source); {
+		if source[i] == '\'' {
+			// Copy the whole literal verbatim, including doubled-quote escapes.
+			j := i + 1
+			for j < len(source) {
+				if source[j] == '\'' {
+					if j+1 < len(source) && source[j+1] == '\'' {
+						j += 2
+						continue
+					}
+					j++
+					break
+				}
+				j++
+			}
+			out.WriteString(source[i:j])
+			i = j
+			continue
+		}
+		next := strings.IndexByte(source[i:], '\'')
+		end := len(source)
+		if next >= 0 {
+			end = i + next
+		}
+		segment := source[i:end]
+		out.WriteString(bareNameInSourceRe.ReplaceAllStringFunc(segment, func(m string) string {
+			sub := bareNameInSourceRe.FindStringSubmatch(m)
+			if len(sub) == 4 {
+				if segment, ok := names[sub[2]]; ok {
+					return sub[1] + "$currentObject/" + segment
+				}
+			}
+			return m
+		}))
+		i = end
+	}
+	return out.String()
+}
+
+// RetrieveXPathConstraint is the XPath constraint a `retrieve … where` stores,
+// for a caller outside the executor that runs the retrieve itself: the test
+// runner's interpreter route sends it to the running app instead of writing a
+// Retrieve activity, and must send the same constraint the activity would hold.
+func RetrieveXPathConstraint(where ast.Expression, entity string) string {
+	return retrieveXPathConstraint(where, entity)
 }

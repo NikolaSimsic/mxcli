@@ -6,11 +6,18 @@ package ast
 //
 //	CREATE DATA TRANSFORMER Module.Name SOURCE JSON '...' { JSLT '...'; };
 type CreateDataTransformerStmt struct {
+	CreateGuard           // `create … if not exists` (ako/mxcli#731)
+	Folder         string // Folder path within module (empty = leave placement alone)
 	Name           QualifiedName
 	SourceType     string // "JSON" or "XML"
 	SourceJSON     string // the source content
 	Steps          []DataTransformerStepDef
 	CreateOrModify bool // true for CREATE OR MODIFY / CREATE OR REPLACE
+	// Documentation is the `/** … */` doc comment before the statement
+	// (mendixlabs/mxcli#1510). DocumentationSet says one was written: absent
+	// keeps the stored documentation on a rewrite, empty clears it (#1018).
+	Documentation    string
+	DocumentationSet bool
 }
 
 func (s *CreateDataTransformerStmt) isStatement() {}
@@ -23,6 +30,7 @@ type DataTransformerStepDef struct {
 
 // DropDataTransformerStmt represents: DROP DATA TRANSFORMER Module.Name
 type DropDataTransformerStmt struct {
+	DropGuard
 	Name QualifiedName
 }
 

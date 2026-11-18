@@ -4,6 +4,7 @@ package docker
 
 import (
 	"archive/zip"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -13,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mendixlabs/mxcli/sdk/mpr"
-	"github.com/mendixlabs/mxcli/sdk/mpr/version"
+	"github.com/mendixlabs/mxcli/internal/zipentry"
+	mxversion "github.com/mendixlabs/mxcli/mdl/types"
 )
 
 // BuildOptions configures the docker build command.
@@ -34,11 +35,136 @@ type BuildOptions struct {
 	// SkipCheck skips the 'mx check' pre-build validation.
 	SkipCheck bool
 
-	// SkipUpdateWidgets skips the 'mx update-widgets' step before checking.
+	// SkipUpdateWidgets skips the update-widgets re-check that labels the
+	// stored project's CE0463 errors (--no-update-widgets).
 	SkipUpdateWidgets bool
+
+	// UpdateWidgetsFirst runs 'mx update-widgets' on the temporary copy before
+	// the check and builds that widget-normalised copy (--update-widgets): the
+	// behaviour before ako/mxcli#1794. By default the project is checked and
+	// built as stored.
+	UpdateWidgetsFirst bool
 
 	// Stdout for output messages.
 	Stdout io.Writer
+}
+
+// buildSteps is what buildOnCopy needs once the tools are resolved. An empty
+// MxPath skips update-widgets and the check (--skip-check, or no mx found).
+type buildSteps struct {
+	ProjectPath        string // absolute
+	MxPath             string
+	MxBuildPath        string
+	JavaHome           string
+	OutputDir          string // absolute
+	SkipUpdateWidgets  bool
+	UpdateWidgetsFirst bool
+	DryRun             bool
+}
+
+// mxbuildCmd runs MxBuild. A package variable so tests can substitute a stub
+// that writes into the project it is given the way MxBuild does.
+var mxbuildCmd = func(mxbuildPath, javaHome, outputDir, mprPath string, w, stderr io.Writer) error {
+	cmd := exec.Command(mxbuildPath,
+		"--target=portable-app-package",
+		fmt.Sprintf("--java-home=%s", javaHome),
+		fmt.Sprintf("--java-exe-path=%s", JavaExePath(javaHome)),
+		fmt.Sprintf("-o=%s", outputDir),
+		mprPath,
+	)
+	cmd.Stdout = w
+	cmd.Stderr = stderr
+	prepareOneShotMxCommand(cmd) // one build, so no Gradle daemon (ako/mxcli#1340)
+	return runWithWatchdog(cmd, mxbuildWatchdogLimits(), javaHome)
+}
+
+// buildOnCopy runs the steps of a build that read the model — mx update-widgets,
+// mx check and MxBuild — on one temporary copy of the project, and writes only
+// the PAD package to s.OutputDir (ako/mxcli#961).
+//
+// The copy is what lets the build use the widget-normalised model without
+// changing the project: update-widgets used to run on the project itself, under
+// a snapshot that restored only an MPRv2 project's storage, so an MPRv1 .mpr was
+// rewritten permanently by every build, and mx check and MxBuild wrote
+// theme-cache/, deployment/, javasource/ proxies and the Eclipse files into it.
+// A dry run without a check has nothing to run and copies nothing.
+func buildOnCopy(s buildSteps, w, stderr io.Writer) error {
+	if s.DryRun && s.MxPath == "" {
+		return nil
+	}
+	workMpr, cleanup, err := copyProjectToTemp(s.ProjectPath)
+	if err != nil {
+		return fmt.Errorf("copy the project to a temporary directory for building: %w\n"+
+			"  mx and MxBuild write into the project they are given, so docker build never runs them on the original;\n"+
+			"  set TMPDIR to a disk with room for the project", err)
+	}
+	defer cleanup()
+	out := newPathRewriter(w, filepath.Dir(workMpr), filepath.Dir(s.ProjectPath))
+	errOut := newPathRewriter(stderr, filepath.Dir(workMpr), filepath.Dir(s.ProjectPath))
+	defer out.Flush()
+	defer errOut.Flush()
+	fmt.Fprintln(w, "Building from a temporary copy of the project (mx and MxBuild write into the project")
+	fmt.Fprintln(w, "  they are given; the project on disk is not changed, only the output directory is written).")
+
+	if s.MxPath != "" {
+		// The project is checked — and built — as stored, as `docker check`
+		// checks it (#646): a build that normalised widget definitions on its
+		// copy succeeded on a project whose stored widgets `docker check`,
+		// `run --local` and Studio Pro all report as stale, so "it built" did
+		// not mean "what is committed builds" (ako/mxcli#1794).
+		// --update-widgets is the old behaviour.
+		normalised := false
+		if s.UpdateWidgetsFirst {
+			fmt.Fprintln(w, "Normalising widget definitions on the temporary copy (--update-widgets; the project")
+			fmt.Fprintln(w, "  keeps its own, `mxcli fix widgets` applies the normalisation to it)...")
+			if err := updateWidgetsCmd(s.MxPath, workMpr, out, errOut); err != nil {
+				out.Flush()
+				fmt.Fprintf(w, "Warning: update-widgets failed (continuing): %v\n", err)
+			} else {
+				normalised = true
+			}
+		}
+		fmt.Fprintln(w, "Checking project for errors...")
+		var checkOut, checkErrOut bytes.Buffer
+		err := mxCheckCmd(s.MxPath, workMpr, nil, io.MultiWriter(out, &checkOut), io.MultiWriter(errOut, &checkErrOut))
+		out.Flush()
+		errOut.Flush()
+		if err != nil {
+			hint := "fix them, or use --skip-check to bypass"
+			if !normalised {
+				if stored := ce0463Lines(checkOut.String() + "\n" + checkErrOut.String()); len(stored) > 0 {
+					if !s.SkipUpdateWidgets {
+						recheckCE0463(w, out, s.MxPath, workMpr, s.ProjectPath, stored, checkOut.String())
+					}
+					hint = "`mxcli fix widgets` resyncs the stale widget definitions in the project; " +
+						"--update-widgets builds a widget-normalised copy instead, leaving the project as it is; " +
+						"--skip-check bypasses the check"
+				}
+			}
+			return fmt.Errorf("project has errors (%s): %w", hint, err)
+		}
+		fmt.Fprintln(w, "  Project check passed.")
+		if normalised {
+			fmt.Fprintln(w, "Note: this builds a widget-normalised copy (--update-widgets); the project as stored")
+			fmt.Fprintln(w, "  may still have stale widget definitions — `mxcli fix widgets` applies the normalisation to it.")
+		}
+	}
+	if s.DryRun {
+		return nil
+	}
+
+	if err := os.MkdirAll(s.OutputDir, 0755); err != nil {
+		return fmt.Errorf("creating output directory: %w", err)
+	}
+	fmt.Fprintf(w, "Running MxBuild (target=portable-app-package)...\n")
+	fmt.Fprintf(w, "  Output: %s\n", s.OutputDir)
+	err = mxbuildCmd(s.MxBuildPath, s.JavaHome, s.OutputDir, workMpr, out, errOut)
+	out.Flush()
+	errOut.Flush()
+	if err != nil {
+		return fmt.Errorf("mxbuild failed: %w", err)
+	}
+	return nil
 }
 
 // Build runs MxBuild to create a Portable App Distribution package and applies patches.
@@ -50,12 +176,12 @@ func Build(opts BuildOptions) error {
 
 	// Step 1: Detect version
 	fmt.Fprintln(w, "Detecting project version...")
-	reader, err := mpr.Open(opts.ProjectPath)
+	reader, err := openReadOnly(opts.ProjectPath)
 	if err != nil {
 		return fmt.Errorf("opening project: %w", err)
 	}
 	pv := reader.ProjectVersion()
-	reader.Close()
+	reader.Disconnect()
 
 	fmt.Fprintf(w, "  Mendix version: %s\n", pv.ProductVersion)
 
@@ -84,41 +210,52 @@ func Build(opts BuildOptions) error {
 		}
 	}
 
-	// Step 3: Resolve JDK 21
-	fmt.Fprintln(w, "Resolving JDK 21...")
-	javaHome, err := resolveJDK21()
+	// Step 3: Resolve the JDK the PROJECT asks for
+	javaMajor, fromProject := ProjectJavaMajor(opts.ProjectPath)
+	fmt.Fprintf(w, "Resolving %s...\n", describeJavaRequirement(javaMajor, fromProject))
+	javaHome, err := resolveJDK(javaMajor)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(w, "  JAVA_HOME: %s\n", javaHome)
 	fmt.Fprintf(w, "  Java: %s\n", javaVersionString(javaHome))
 
-	// Step 4: Pre-build check
+	// Steps 4 and 5: update-widgets, mx check and MxBuild, on one temporary copy
+	// of the project (ako/mxcli#961). Each of them writes into the project it is
+	// given — update-widgets rewrites the model (an MPRv1 .mpr permanently, an
+	// MPRv2 one into MPRv1), mx check writes theme-cache/ and deployment/sass/,
+	// MxBuild regenerates javasource/ proxies, the .launch/.classpath/.project
+	// files and deployment/ — and the build needs none of that in the project:
+	// its product is the PAD package in the output directory.
+	projectPath, err := filepath.Abs(opts.ProjectPath)
+	if err != nil {
+		return err
+	}
+	outputDir := opts.OutputDir
+	if outputDir == "" {
+		outputDir = filepath.Join(filepath.Dir(projectPath), ".docker", "build")
+	}
+	if abs, err := filepath.Abs(outputDir); err == nil {
+		outputDir = abs
+	}
+	mxPath := ""
 	if !opts.SkipCheck {
-		fmt.Fprintln(w, "Checking project for errors...")
-		mxPath, err := ResolveMxForVersion(opts.MxBuildPath, pv.ProductVersion)
-		if err != nil {
-			fmt.Fprintf(w, "  Skipping check: %v\n", err)
-		} else {
-			// Run update-widgets before check to prevent false CE0463 errors
-			if !opts.SkipUpdateWidgets {
-				fmt.Fprintln(w, "  Updating widget definitions...")
-				uwCmd := exec.Command(mxPath, "update-widgets", opts.ProjectPath)
-				uwCmd.Stdout = w
-				uwCmd.Stderr = os.Stderr
-				if err := uwCmd.Run(); err != nil {
-					fmt.Fprintf(w, "  Warning: update-widgets failed (continuing): %v\n", err)
-				}
-			}
-
-			cmd := exec.Command(mxPath, "check", opts.ProjectPath)
-			cmd.Stdout = w
-			cmd.Stderr = os.Stderr
-			if err := cmd.Run(); err != nil {
-				return fmt.Errorf("project has errors (fix them or use --skip-check to bypass): %w", err)
-			}
-			fmt.Fprintln(w, "  Project check passed.")
+		if mxPath, err = ResolveMxForVersion(opts.MxBuildPath, pv.ProductVersion); err != nil {
+			fmt.Fprintf(w, "Skipping check: %v\n", err)
+			mxPath = ""
 		}
+	}
+	if err := buildOnCopy(buildSteps{
+		ProjectPath:        projectPath,
+		MxPath:             mxPath,
+		MxBuildPath:        mxbuildPath,
+		JavaHome:           javaHome,
+		OutputDir:          outputDir,
+		SkipUpdateWidgets:  opts.SkipUpdateWidgets,
+		UpdateWidgetsFirst: opts.UpdateWidgetsFirst,
+		DryRun:             opts.DryRun,
+	}, w, os.Stderr); err != nil {
+		return err
 	}
 
 	// Dry-run: stop here and show what would happen
@@ -146,34 +283,6 @@ func Build(opts BuildOptions) error {
 		fmt.Fprintln(w, "")
 		fmt.Fprintln(w, "Dry run complete. No changes made.")
 		return nil
-	}
-
-	// Step 5: Run MxBuild
-	outputDir := opts.OutputDir
-	if outputDir == "" {
-		outputDir = filepath.Join(filepath.Dir(opts.ProjectPath), ".docker", "build")
-	}
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("creating output directory: %w", err)
-	}
-
-	fmt.Fprintf(w, "Running MxBuild (target=portable-app-package)...\n")
-	fmt.Fprintf(w, "  Output: %s\n", outputDir)
-
-	javaExePath := filepath.Join(javaHome, "bin", "java")
-
-	cmd := exec.Command(mxbuildPath,
-		"--target=portable-app-package",
-		fmt.Sprintf("--java-home=%s", javaHome),
-		fmt.Sprintf("--java-exe-path=%s", javaExePath),
-		fmt.Sprintf("-o=%s", outputDir),
-		opts.ProjectPath,
-	)
-	cmd.Stdout = w
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("mxbuild failed: %w", err)
 	}
 
 	// Step 5b: Extract PAD ZIP if MxBuild produced one
@@ -239,6 +348,10 @@ type RunOptions struct {
 	// SkipCheck skips the 'mx check' pre-build validation.
 	SkipCheck bool
 
+	// UpdateWidgetsFirst builds a widget-normalised copy (--update-widgets);
+	// see BuildOptions.UpdateWidgetsFirst.
+	UpdateWidgetsFirst bool
+
 	// Fresh removes volumes before starting.
 	Fresh bool
 
@@ -273,12 +386,12 @@ func Run(opts RunOptions) error {
 
 	// Step 1: Detect version
 	fmt.Fprintln(w, "Detecting project version...")
-	reader, err := mpr.Open(opts.ProjectPath)
+	reader, err := openReadOnly(opts.ProjectPath)
 	if err != nil {
 		return fmt.Errorf("opening project: %w", err)
 	}
 	pv := reader.ProjectVersion()
-	reader.Close()
+	reader.Disconnect()
 	fmt.Fprintf(w, "  Mendix version: %s\n", pv.ProductVersion)
 
 	// Step 2 & 3: Ensure MxBuild and runtime are available.
@@ -341,10 +454,11 @@ func Run(opts RunOptions) error {
 	// Step 5: Build
 	fmt.Fprintln(w, "")
 	buildOpts := BuildOptions{
-		ProjectPath: opts.ProjectPath,
-		MxBuildPath: opts.MxBuildPath,
-		SkipCheck:   opts.SkipCheck,
-		Stdout:      w,
+		ProjectPath:        opts.ProjectPath,
+		MxBuildPath:        opts.MxBuildPath,
+		SkipCheck:          opts.SkipCheck,
+		UpdateWidgetsFirst: opts.UpdateWidgetsFirst,
+		Stdout:             w,
 	}
 	if err := Build(buildOpts); err != nil {
 		return fmt.Errorf("docker build: %w", err)
@@ -637,7 +751,7 @@ func extractZip(zipPath, targetDir string) error {
 		}
 
 		// Extract file
-		rc, err := f.Open()
+		rc, err := zipentry.Open(f)
 		if err != nil {
 			return fmt.Errorf("opening %s in zip: %w", name, err)
 		}
@@ -703,8 +817,8 @@ func ensurePADFiles(productVersion string, w io.Writer) error {
 		return fmt.Errorf("creating runtime directory in mxbuild: %w", err)
 	}
 
-	// Symlink runtime/pad into mxbuild
-	if err := os.Symlink(runtimePAD, mxbuildPAD); err != nil {
+	// Link runtime/pad into mxbuild (junction when Windows refuses a symlink)
+	if err := linkDir(runtimePAD, mxbuildPAD); err != nil {
 		return fmt.Errorf("symlinking PAD files: %w", err)
 	}
 	fmt.Fprintf(w, "  Linked PAD runtime files: %s -> %s\n", mxbuildPAD, runtimePAD)
@@ -717,13 +831,13 @@ func ensurePADFiles(productVersion string, w io.Writer) error {
 func ensureDemoUsers(projectPath string, w io.Writer) error {
 	fmt.Fprintln(w, "Checking demo users...")
 
-	reader, err := mpr.Open(projectPath)
+	reader, err := openReadOnly(projectPath)
 	if err != nil {
 		return fmt.Errorf("opening project: %w", err)
 	}
 
 	ps, err := reader.GetProjectSecurity()
-	reader.Close()
+	reader.Disconnect()
 	if err != nil {
 		return fmt.Errorf("reading project security: %w", err)
 	}
@@ -736,14 +850,14 @@ func ensureDemoUsers(projectPath string, w io.Writer) error {
 
 	fmt.Fprintln(w, "  No demo users found, creating default admin...")
 
-	writer, err := mpr.NewWriter(projectPath)
+	writer, err := openForWriting(projectPath)
 	if err != nil {
 		return fmt.Errorf("opening project for writing: %w", err)
 	}
-	defer writer.Close()
+	defer writer.Disconnect()
 
 	// Re-read security through writer's reader
-	ps, err = writer.Reader().GetProjectSecurity()
+	ps, err = writer.GetProjectSecurity()
 	if err != nil {
 		return fmt.Errorf("reading project security: %w", err)
 	}
@@ -777,7 +891,7 @@ func ensureDemoUsers(projectPath string, w io.Writer) error {
 }
 
 // DescribePatches returns the list of patches that would be applied for a given version.
-func DescribePatches(pv *version.ProjectVersion) []string {
+func DescribePatches(pv *mxversion.ProjectVersion) []string {
 	var patches []string
 	is116x := pv.MajorVersion == 11 && pv.MinorVersion == 6
 	patches = append(patches, "Set bin/start execute permission")
@@ -788,5 +902,6 @@ func DescribePatches(pv *version.ProjectVersion) []string {
 	patches = append(patches, "Replace deprecated openjdk base image")
 	patches = append(patches, "Add HEALTHCHECK instruction")
 	patches = append(patches, "Bind admin API to all interfaces")
+	patches = append(patches, "Set runtime/admin ports (avoid port 0 startup crash)")
 	return patches
 }

@@ -10,19 +10,21 @@ import (
 
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/modelsdk/codec"
+	"github.com/mendixlabs/mxcli/modelsdk/element"
 	genCa "github.com/mendixlabs/mxcli/modelsdk/gen/codeactions"
 	genJa "github.com/mendixlabs/mxcli/modelsdk/gen/javaactions"
-	"github.com/mendixlabs/mxcli/modelsdk/element"
 	mmpr "github.com/mendixlabs/mxcli/modelsdk/mpr"
 	"github.com/mendixlabs/mxcli/sdk/javaactions"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // NOTE: the parameter/return TYPE elements (StringType, BasicParameterType,
 // ConcreteEntityType, …) are emitted with the CodeActions$ storage prefix and so
 // come from gen/codeactions (genCa). The gen/javaactions copies of those types
 // emit a JavaActions$ prefix, which Studio Pro does not recognise. Only the
-// JavaAction document, its JavaActionParameter, and its (JavaActions$)
-// MicroflowActionInfo come from gen/javaactions.
+// JavaAction document and its JavaActionParameter come from gen/javaactions; the
+// MicroflowActionInfo is post-patched as raw BSON (CodeActions$ shape — see
+// patchMicroflowActionInfo / issue #656) rather than built from a gen element.
 
 func init() {
 	// A JavaAction always emits its Parameters and TypeParameters arrays (empty
@@ -55,6 +57,9 @@ func (b *Backend) CreateJavaAction(ja *javaactions.JavaAction) error {
 	if err != nil {
 		return fmt.Errorf("CreateJavaAction: encode: %w", err)
 	}
+	if contents, err = patchMicroflowActionInfo(contents, ja); err != nil {
+		return fmt.Errorf("CreateJavaAction: patch action info: %w", err)
+	}
 	if err := b.writer.InsertUnit(string(ja.ID), string(ja.ContainerID), "Documents", "JavaActions$JavaAction", contents); err != nil {
 		return fmt.Errorf("CreateJavaAction: insert: %w", err)
 	}
@@ -75,6 +80,9 @@ func (b *Backend) UpdateJavaAction(ja *javaactions.JavaAction) error {
 	if err != nil {
 		return fmt.Errorf("UpdateJavaAction: encode: %w", err)
 	}
+	if contents, err = patchMicroflowActionInfo(contents, ja); err != nil {
+		return fmt.Errorf("UpdateJavaAction: patch action info: %w", err)
+	}
 	if err := b.writer.UpdateRawUnit(string(ja.ID), contents); err != nil {
 		return fmt.Errorf("UpdateJavaAction: update: %w", err)
 	}
@@ -83,8 +91,9 @@ func (b *Backend) UpdateJavaAction(ja *javaactions.JavaAction) error {
 
 // WriteJavaSourceFile writes the .java stub for a java action under
 // javasource/<module>/actions/<Action>.java, using the shared generator so the
-// output is byte-identical to the legacy engine.
-func (b *Backend) WriteJavaSourceFile(moduleName, actionName string, javaCode string, params []*javaactions.JavaActionParameter, returnType javaactions.CodeActionReturnType, extraImports []string, extraCode string) error {
+// output is byte-identical to what mxbuild generates — the action's
+// documentation as the class javadoc included (ako/mxcli#1700).
+func (b *Backend) WriteJavaSourceFile(moduleName, actionName string, javaCode string, params []*javaactions.JavaActionParameter, returnType javaactions.CodeActionReturnType, extraImports []string, extraCode *string, documentation string) error {
 	if b.path == "" {
 		return fmt.Errorf("WriteJavaSourceFile: no project path")
 	}
@@ -92,9 +101,22 @@ func (b *Backend) WriteJavaSourceFile(moduleName, actionName string, javaCode st
 	if err := os.MkdirAll(javaDir, 0o755); err != nil {
 		return fmt.Errorf("WriteJavaSourceFile: create dir: %w", err)
 	}
-	source := javaactions.GenerateSource(moduleName, actionName, javaCode, params, returnType, extraImports, extraCode)
-	if err := os.WriteFile(filepath.Join(javaDir, actionName+".java"), []byte(source), 0o644); err != nil {
+	path := filepath.Join(javaDir, actionName+".java")
+	// Regenerate the way Studio Pro does: the existing file's import list and
+	// EXTRA CODE section are retained — the section unless the statement states
+	// it (extraCode non-nil, ako/mxcli#1702). Keeping only the user code turned
+	// an action that calls a helper in its extra code into Java that does not
+	// compile (ako/mxcli#705).
+	existing, _ := os.ReadFile(path)
+	extraImports, extra := javaactions.RetainSections(string(existing), extraImports, extraCode)
+	source := javaactions.GenerateSource(moduleName, actionName, javaCode, params, returnType, extraImports, extra, documentation)
+	changed, err := javaactions.WriteSourceIfChanged(path, source)
+	b.noteFileWrite(changed)
+	if err != nil {
 		return fmt.Errorf("WriteJavaSourceFile: write: %w", err)
+	}
+	if changed {
+		b.noteSourceFile(path, "", false, javaActionBody)
 	}
 	return nil
 }
@@ -108,7 +130,11 @@ func (b *Backend) DeleteJavaAction(id model.ID) error {
 	return b.writer.DeleteUnit(string(id))
 }
 
-// RenameJavaSourceFile renames javasource/<module>/actions/<old>.java to <new>.java.
+// RenameJavaSourceFile renames javasource/<module>/actions/<old>.java to
+// <new>.java and renames the class inside it, as mxbuild's regeneration does:
+// moving the file alone left `public class Old` in New.java, which is not valid
+// Java — a full build hides it by regenerating the stub in its own copy, but
+// `run --local --watch` hot reload and every IDE compile the file on disk.
 // A missing source file is not an error (the action may have no generated stub yet).
 func (b *Backend) RenameJavaSourceFile(moduleName, oldName, newName string) error {
 	if b.path == "" {
@@ -117,10 +143,87 @@ func (b *Backend) RenameJavaSourceFile(moduleName, oldName, newName string) erro
 	dir := filepath.Join(filepath.Dir(b.path), "javasource", strings.ToLower(moduleName), "actions")
 	oldPath := filepath.Join(dir, oldName+".java")
 	newPath := filepath.Join(dir, newName+".java")
-	if err := os.Rename(oldPath, newPath); err != nil && !os.IsNotExist(err) {
+	content, err := os.ReadFile(oldPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf("RenameJavaSourceFile: %w", err)
 	}
+	// Move first, then rewrite in place, so the file keeps its mode and a
+	// failed rewrite still leaves the source where the model now expects it.
+	if err := os.Rename(oldPath, newPath); err != nil {
+		return fmt.Errorf("RenameJavaSourceFile: %w", err)
+	}
+	// The move is a write whether or not the text needed rewriting.
+	b.noteFileWrite(true)
+	b.noteSourceFile(newPath, oldPath, false, javaActionBody)
+	if _, err := javaactions.WriteSourceIfChanged(newPath, javaactions.RenameSource(string(content), oldName, newName)); err != nil {
+		return fmt.Errorf("RenameJavaSourceFile: rewrite class name: %w", err)
+	}
 	return nil
+}
+
+// MoveJavaSourceFile moves javasource/<from>/actions/<action>.java into <to>'s
+// actions directory and rewrites its package line, as mxbuild regenerates it
+// there. Left behind, the source was not where mxbuild looks: measured on
+// 11.13.0, the build succeeded with a stub that throws "Java action was not
+// implemented" in the class the app calls, and compiled the author's code as an
+// orphaned class nothing calls. An occupied destination is refused before
+// anything moves; a missing source is not an error (the action may have no stub
+// yet). It returns the new project-relative path, or "" when nothing moved.
+func (b *Backend) MoveJavaSourceFile(fromModule, toModule, actionName string) (string, error) {
+	if b.path == "" {
+		return "", fmt.Errorf("MoveJavaSourceFile: no project path")
+	}
+	dir := func(module string) string {
+		return filepath.Join(filepath.Dir(b.path), "javasource", strings.ToLower(module), "actions")
+	}
+	moved, content, err := b.moveSourceFile(dir(fromModule), dir(toModule), actionName+".java", javaActionBody)
+	if moved == "" || err != nil {
+		return moved, err
+	}
+	dst := filepath.Join(filepath.Dir(b.path), filepath.FromSlash(moved))
+	if _, err := javaactions.WriteSourceIfChanged(dst, javaactions.MoveSource(content, fromModule, toModule)); err != nil {
+		return moved, fmt.Errorf("MoveJavaSourceFile: rewrite package: %w", err)
+	}
+	return moved, nil
+}
+
+// moveSourceFile moves fromDir/name to toDir/name, records the move for exec's
+// report as what, and returns the new project-relative path and the moved
+// file's content. It refuses an existing destination before touching anything,
+// and moves nothing — returning "" — when there is no source or the two
+// directories are the same.
+func (b *Backend) moveSourceFile(fromDir, toDir, name, what string) (string, string, error) {
+	if filepath.Clean(fromDir) == filepath.Clean(toDir) {
+		return "", "", nil
+	}
+	src, dst := filepath.Join(fromDir, name), filepath.Join(toDir, name)
+	content, err := os.ReadFile(src)
+	if os.IsNotExist(err) {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", err
+	}
+	rel, err := filepath.Rel(filepath.Dir(b.path), dst)
+	if err != nil {
+		return "", "", err
+	}
+	rel = filepath.ToSlash(rel)
+	if _, err := os.Stat(dst); err == nil {
+		return "", "", fmt.Errorf("%s already exists; move or delete it first", rel)
+	}
+	if err := os.MkdirAll(toDir, 0o755); err != nil {
+		return "", "", err
+	}
+	if err := os.Rename(src, dst); err != nil {
+		return "", "", err
+	}
+	b.noteFileWrite(true)
+	b.noteSourceFile(dst, src, false, what)
+	return rel, string(content), nil
 }
 
 // DeleteJavaSourceFile removes javasource/<module>/actions/<action>.java. A missing
@@ -130,7 +233,10 @@ func (b *Backend) DeleteJavaSourceFile(moduleName, actionName string) error {
 		return fmt.Errorf("DeleteJavaSourceFile: no project path")
 	}
 	filePath := filepath.Join(filepath.Dir(b.path), "javasource", strings.ToLower(moduleName), "actions", actionName+".java")
-	if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
+	switch err := os.Remove(filePath); {
+	case err == nil:
+		b.noteSourceFile(filePath, "", true, javaActionBody)
+	case !os.IsNotExist(err):
 		return fmt.Errorf("DeleteJavaSourceFile: %w", err)
 	}
 	return nil
@@ -186,16 +292,52 @@ func javaActionToGen(ja *javaactions.JavaAction) *genJa.JavaAction {
 		out.AddTypeParameters(gtp)
 	}
 
-	if ja.MicroflowActionInfo != nil {
-		mai := genJa.NewMicroflowActionInfo()
-		assignID(mai)
-		mai.SetCaption(ja.MicroflowActionInfo.Caption)
-		mai.SetCategory(ja.MicroflowActionInfo.Category)
-		out.SetMicroflowActionInfo(mai)
-	}
+	// MicroflowActionInfo is intentionally left null here and injected after
+	// encoding (see patchMicroflowActionInfo). The gen MicroflowActionInfo models
+	// its icon/image bitmaps as Primitive[string], which serialises to BSON
+	// strings — but Studio Pro stores them as mandatory binaries and crashes on a
+	// null or wrong-typed value (#656). Post-patching lets us emit the correct
+	// CodeActions$ shape with empty binaries without diverging the generated code.
 
 	out.SetJavaReturnType(codeActionReturnTypeToGen(ja.ReturnType))
 	return out
+}
+
+// microflowActionInfoBSON builds a MicroflowActionInfo sub-document in the
+// current metamodel shape: $Type CodeActions$MicroflowActionInfo with all four
+// icon/image bitmaps always present as (possibly empty) binaries, never null,
+// and no obsolete Icon key. Mirrors the legacy writer's shape (issue #656).
+func microflowActionInfoBSON(mai *javaactions.MicroflowActionInfo) bson.D {
+	id := string(mai.ID)
+	if id == "" {
+		id = mmpr.GenerateID()
+	}
+	bin := func(b []byte) bson.Binary {
+		if b == nil {
+			b = []byte{}
+		}
+		return bson.Binary{Subtype: 0x00, Data: b}
+	}
+	return bson.D{
+		{Key: "$ID", Value: mmpr.IDToBsonBinary(id)},
+		{Key: "$Type", Value: "CodeActions$MicroflowActionInfo"},
+		{Key: "Caption", Value: mai.Caption},
+		{Key: "Category", Value: mai.Category},
+		{Key: "IconData", Value: bin(mai.IconData)},
+		{Key: "IconDataDark", Value: bin(mai.IconDataDark)},
+		{Key: "ImageData", Value: bin(mai.ImageData)},
+		{Key: "ImageDataDark", Value: bin(mai.ImageDataDark)},
+	}
+}
+
+// patchMicroflowActionInfo replaces the encoded unit's null MicroflowActionInfo
+// slot with the correct sub-document when the action is exposed as a toolbox
+// item; a no-op otherwise. See issue #656.
+func patchMicroflowActionInfo(contents []byte, ja *javaactions.JavaAction) ([]byte, error) {
+	if ja.MicroflowActionInfo == nil {
+		return contents, nil
+	}
+	return codec.PatchBSONField(contents, "MicroflowActionInfo", microflowActionInfoBSON(ja.MicroflowActionInfo))
 }
 
 // codeActionParamTypeToGen converts a parameter type. Most types are wrapped in a
@@ -216,6 +358,18 @@ func codeActionParamTypeToGen(t javaactions.CodeActionParameterType) element.Ele
 		assignID(s)
 		s.SetGrammar(v.Grammar)
 		return s
+	case *javaactions.CustomBlobDocumentType:
+		// Direct, like StringTemplate: the inverse of codeActionParamTypeFromGen.
+		// Without it a rewrite of the action turned the document parameter into
+		// a String, and every call of it failed CE0115 (ako/mxcli#1451).
+		c := genCa.NewCustomBlobDocumentParameterType()
+		if v.ID != "" {
+			c.SetID(element.ID(v.ID))
+		}
+		assignID(c)
+		c.SetCustomDocumentTypeName(v.DocumentType)
+		c.SetCustomDocumentReadableTypeName(v.ReadableName)
+		return c
 	case *javaactions.EntityTypeParameterType:
 		e := genCa.NewEntityTypeParameterType()
 		if v.ID != "" {
@@ -224,6 +378,17 @@ func codeActionParamTypeToGen(t javaactions.CodeActionParameterType) element.Ele
 		assignID(e)
 		e.SetTypeParameterID(element.ID(v.TypeParameterID))
 		return e
+	case *javaactions.MicroflowType:
+		// Direct, not wrapped in a BasicParameterType — the shape Studio Pro
+		// stores (measured on MCP Server 5.1.0's AddTool.ExecutingMicroflow).
+		// Without this an update of a java action that has a microflow-typed
+		// parameter would rewrite it as a String. See codeActionBasicFromGen.
+		m := genJa.NewMicroflowJavaActionParameterType()
+		if v.ID != "" {
+			m.SetID(element.ID(v.ID))
+		}
+		assignID(m)
+		return m
 	default:
 		b := genCa.NewBasicParameterType()
 		assignID(b)
@@ -235,19 +400,18 @@ func codeActionParamTypeToGen(t javaactions.CodeActionParameterType) element.Ele
 // codeActionInnerTypeToGen converts the inner type carried by a BasicParameterType.
 func codeActionInnerTypeToGen(t javaactions.CodeActionParameterType) element.Element {
 	switch v := t.(type) {
+	case *javaactions.EnumerationType:
+		e := genCa.NewEnumerationType()
+		assignID(e)
+		e.SetEnumerationQualifiedName(v.Enumeration)
+		return e
 	case *javaactions.EntityType:
 		e := genCa.NewConcreteEntityType()
 		assignID(e)
 		e.SetEntityQualifiedName(v.Entity)
 		return e
 	case *javaactions.ListType:
-		l := genCa.NewListType()
-		assignID(l)
-		ce := genCa.NewConcreteEntityType()
-		assignID(ce)
-		ce.SetEntityQualifiedName(v.Entity)
-		l.SetParameter(ce)
-		return l
+		return codeActionListTypeToGen(v)
 	case *javaactions.TypeParameter:
 		p := genCa.NewParameterizedEntityType()
 		assignID(p)
@@ -263,19 +427,18 @@ func codeActionReturnTypeToGen(t javaactions.CodeActionReturnType) element.Eleme
 	switch v := t.(type) {
 	case nil:
 		return newPrimitiveCAType("VoidType")
+	case *javaactions.EnumerationType:
+		e := genCa.NewEnumerationType()
+		assignID(e)
+		e.SetEnumerationQualifiedName(v.Enumeration)
+		return e
 	case *javaactions.EntityType:
 		e := genCa.NewConcreteEntityType()
 		assignID(e)
 		e.SetEntityQualifiedName(v.Entity)
 		return e
 	case *javaactions.ListType:
-		l := genCa.NewListType()
-		assignID(l)
-		ce := genCa.NewConcreteEntityType()
-		assignID(ce)
-		ce.SetEntityQualifiedName(v.Entity)
-		l.SetParameter(ce)
-		return l
+		return codeActionListTypeToGen(v)
 	case *javaactions.TypeParameter:
 		p := genCa.NewParameterizedEntityType()
 		assignID(p)
@@ -284,6 +447,26 @@ func codeActionReturnTypeToGen(t javaactions.CodeActionReturnType) element.Eleme
 	default:
 		return newPrimitiveCAType(primitiveCAReturnTypeName(t))
 	}
+}
+
+// codeActionListTypeToGen converts a list type. The element is a
+// ParameterizedEntityType for a list of a type parameter — Studio Pro's "List of
+// <type parameter>" — and a ConcreteEntityType otherwise (#1183).
+func codeActionListTypeToGen(v *javaactions.ListType) element.Element {
+	l := genCa.NewListType()
+	assignID(l)
+	if v.TypeParameterID != "" {
+		p := genCa.NewParameterizedEntityType()
+		assignID(p)
+		p.SetTypeParameterID(element.ID(v.TypeParameterID))
+		l.SetParameter(p)
+		return l
+	}
+	ce := genCa.NewConcreteEntityType()
+	assignID(ce)
+	ce.SetEntityQualifiedName(v.Entity)
+	l.SetParameter(ce)
+	return l
 }
 
 // newPrimitiveCAType builds a bare CodeActions primitive type element by kind (the

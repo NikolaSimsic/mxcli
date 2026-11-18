@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 )
@@ -50,7 +51,9 @@ func TestBuildEntityValue_PlainEntity(t *testing.T) {
 	}
 	for i, w := range want {
 		got := v.Attributes[i]
-		if got.SType != "DomainModels$Attribute" || got.Name != w.name || got.Type != w.typ {
+		// Nested in the entity constructor an attribute is a PlainObject — no
+		// $Type, or PED stores it as String(200) (#923).
+		if got.SType != "" || got.Name != w.name || got.Type != w.typ {
 			t.Errorf("attr[%d] = %+v, want name=%s type=%s", i, got, w.name, w.typ)
 		}
 	}
@@ -110,7 +113,7 @@ func TestBuildEntityValue_RejectsUnsupportedFeatures(t *testing.T) {
 	}
 }
 
-func TestBuildAttributeValue_RejectsCalculatedAndNonDefaultValues(t *testing.T) {
+func TestBuildAttributeValue_RejectsCalculated(t *testing.T) {
 	b := &Backend{}
 	calc := attr("Full", &domainmodel.StringAttributeType{})
 	calc.Value = &domainmodel.AttributeValue{Type: "CalculatedValue"}
@@ -118,10 +121,83 @@ func TestBuildAttributeValue_RejectsCalculatedAndNonDefaultValues(t *testing.T) 
 		t.Error("expected calculated attribute to be rejected")
 	}
 
+	// A default value is no longer rejected here — the constructor doesn't carry
+	// it (it's set via a follow-up path-op), so buildAttributeValue accepts it.
 	deflt := attr("Qty", &domainmodel.IntegerAttributeType{})
 	deflt.Value = &domainmodel.AttributeValue{DefaultValue: "5"}
-	if _, err := b.buildAttributeValue(deflt); err == nil {
-		t.Error("expected non-Boolean default to be rejected")
+	if _, err := b.buildAttributeValue(deflt); err != nil {
+		t.Errorf("default value should be accepted by buildAttributeValue now, got: %v", err)
+	}
+}
+
+// Issue: attribute default values via PED path-op (Studio Pro 11.12+).
+func TestPedAttributeDefault(t *testing.T) {
+	mk := func(typ domainmodel.AttributeType, def string) *domainmodel.Attribute {
+		a := attr("A", typ)
+		if def != "" {
+			a.Value = &domainmodel.AttributeValue{DefaultValue: def}
+		}
+		return a
+	}
+	cases := []struct {
+		name    string
+		attr    *domainmodel.Attribute
+		wantVal string
+		wantSet bool
+	}{
+		{"no value", mk(&domainmodel.StringAttributeType{}, ""), "", false},
+		{"string default", mk(&domainmodel.StringAttributeType{}, "hi"), "hi", true},
+		{"integer default", mk(&domainmodel.IntegerAttributeType{}, "0"), "0", true},
+		{"boolean true", mk(&domainmodel.BooleanAttributeType{}, "true"), "true", true},
+		{"boolean false dropped", mk(&domainmodel.BooleanAttributeType{}, "false"), "", false},
+		// Enums are stored BARE by PED (verified live on 11.12) — the executor
+		// already provides the bare value name, sent as-is.
+		{"enum bare value", mk(&domainmodel.EnumerationAttributeType{EnumerationRef: "MES.WorkOrderStatus"}, "Draft"), "Draft", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			v, ok := pedAttributeDefault(c.attr)
+			if ok != c.wantSet || v != c.wantVal {
+				t.Errorf("pedAttributeDefault = (%q,%v), want (%q,%v)", v, ok, c.wantVal, c.wantSet)
+			}
+		})
+	}
+
+	// Calculated value carries no settable default.
+	calc := attr("C", &domainmodel.StringAttributeType{})
+	calc.Value = &domainmodel.AttributeValue{Type: "CalculatedValue"}
+	if _, ok := pedAttributeDefault(calc); ok {
+		t.Error("calculated value should not be a settable default")
+	}
+}
+
+func TestAttributeDefaultsSupported(t *testing.T) {
+	if attributeDefaultsSupported(nil) {
+		t.Error("nil version must not be supported")
+	}
+	if attributeDefaultsSupported(&types.ProjectVersion{MajorVersion: 11, MinorVersion: 11}) {
+		t.Error("11.11 must not be supported")
+	}
+	if !attributeDefaultsSupported(&types.ProjectVersion{MajorVersion: 11, MinorVersion: 12}) {
+		t.Error("11.12 must be supported")
+	}
+	if !attributeDefaultsSupported(&types.ProjectVersion{MajorVersion: 12, MinorVersion: 0}) {
+		t.Error("12.0 must be supported")
+	}
+}
+
+// On an unknown/old version the gate rejects a default up-front; without a
+// default it passes regardless of version.
+func TestGateAttributeDefaults(t *testing.T) {
+	b := &Backend{} // nil reader → version unknown → treated as < 11.12
+	withDefault := attr("Qty", &domainmodel.IntegerAttributeType{})
+	withDefault.Value = &domainmodel.AttributeValue{DefaultValue: "5"}
+	if err := b.gateAttributeDefaults([]*domainmodel.Attribute{withDefault}); err == nil {
+		t.Error("expected gate to reject a default on an unknown/old version")
+	}
+	plain := attr("Name", &domainmodel.StringAttributeType{})
+	if err := b.gateAttributeDefaults([]*domainmodel.Attribute{plain}); err != nil {
+		t.Errorf("plain attribute should pass the gate, got: %v", err)
 	}
 }
 
@@ -140,6 +216,21 @@ func TestAssociationMultiplicity(t *testing.T) {
 		if err != nil || got != c.want {
 			t.Errorf("type=%s owner=%s => %q,%v; want %q", c.typ, c.owner, got, err, c.want)
 		}
+	}
+}
+
+// PED cannot carry LocalizeDate, so `not localized` is refused rather than
+// silently created localized (#1373).
+func TestGuardUnsupportedEntityFeatures_RefusesNotLocalizedDateTime(t *testing.T) {
+	e := newPersistentEntity("Person", attr("Born", &domainmodel.DateTimeAttributeType{LocalizeDate: false}))
+	err := guardUnsupportedEntityFeatures(e)
+	if err == nil || !strings.Contains(err.Error(), "not localized") {
+		t.Errorf("not localized DateTime: err = %v, want a refusal naming it", err)
+	}
+	// Control: the default is accepted.
+	e = newPersistentEntity("Person", attr("Born", &domainmodel.DateTimeAttributeType{LocalizeDate: true}))
+	if err := guardUnsupportedEntityFeatures(e); err != nil {
+		t.Errorf("localized DateTime refused: %v", err)
 	}
 }
 
@@ -271,7 +362,11 @@ func pedReadResponder(values map[string]string) func(string, map[string]any) (st
 		if name == "ped_check_errors" {
 			return "No errors found.", false
 		}
-		if name != "ped_read_document" {
+		switch name {
+		case "ped_check_errors":
+			return "No errors found.", false
+		case "ped_read_document":
+		default:
 			return "SUCCESS", false
 		}
 		paths, _ := args["paths"].([]any)
@@ -369,5 +464,119 @@ func TestApplyInPlace_NoChangeIsNoOp(t *testing.T) {
 	}
 	if _, sent := f.callByName("ped_update_document"); sent {
 		t.Error("an identical-state ALTER must not write")
+	}
+}
+
+// TestCreateEntity_AttributeTypesAndLengthsOnTheWire pins the payload shape #923
+// is about. The entity constructor's attributes are PlainObjects: with a `$Type`
+// on them both the 11.14 and 11.15 servers ignore `type` and store String(200).
+// And since no constructor carries a String length, a non-default length must be
+// set afterwards on the attribute's type/length leaf.
+func TestCreateEntity_AttributeTypesAndLengthsOnTheWire(t *testing.T) {
+	f := newFakePED(t, func(name string, args map[string]any) (string, bool) {
+		switch name {
+		case "ped_check_errors":
+			return "No errors found.", false
+		case "ped_read_document":
+		default:
+			return "SUCCESS", false
+		}
+		paths, _ := args["paths"].([]any)
+		if len(paths) == 1 && paths[0] == "/entities/0/attributes" {
+			return `{"results":[{"path":"/entities/0/attributes","result":[` +
+				`{"$QualifiedName":"M.Order.Code"},{"$QualifiedName":"M.Order.Title"},` +
+				`{"$QualifiedName":"M.Order.Notes"},{"$QualifiedName":"M.Order.Paid"}]}]}`, false
+		}
+		return `{"results":[{"path":"/entities","result":[{"name":"Order"}]}]}`, false
+	})
+	b := &Backend{client: f.connectClient(t)}
+
+	e := newPersistentEntity("Order",
+		attr("Code", &domainmodel.StringAttributeType{Length: 50}),
+		attr("Title", &domainmodel.StringAttributeType{Length: 200}),
+		attr("Notes", &domainmodel.StringAttributeType{Length: 0}),
+		attr("Paid", &domainmodel.BooleanAttributeType{}),
+	)
+	if err := b.CreateEntity(model.ID(sessionDMPrefix+"M"), e); err != nil {
+		t.Fatalf("CreateEntity: %v", err)
+	}
+
+	var updates []string
+	for _, c := range f.calls {
+		if c.Name == "ped_update_document" {
+			raw, _ := json.Marshal(c.Args["operations"])
+			updates = append(updates, string(raw))
+		}
+	}
+	if len(updates) != 2 {
+		t.Fatalf("got %d ped_update_document calls, want 2 (entity add, length sets): %v", len(updates), updates)
+	}
+
+	var ops []struct {
+		Operation struct {
+			Value struct {
+				Attributes []map[string]any `json:"attributes"`
+			} `json:"value"`
+		} `json:"operation"`
+	}
+	if err := json.Unmarshal([]byte(updates[0]), &ops); err != nil || len(ops) != 1 {
+		t.Fatalf("entity add: %v %s", err, updates[0])
+	}
+	attrs := ops[0].Operation.Value.Attributes
+	wantTypes := []string{"String", "String", "String", "Boolean"}
+	for i, a := range attrs {
+		if _, has := a["$Type"]; has {
+			t.Errorf("nested attribute %v carries $Type — PED then stores it as String(200)", a["name"])
+		}
+		if a["type"] != wantTypes[i] {
+			t.Errorf("attribute %v type = %v, want %s", a["name"], a["type"], wantTypes[i])
+		}
+	}
+
+	// Lengths: only the non-default ones (0 is "unlimited"), at the live index.
+	for _, want := range []string{
+		`{"operation":{"type":"set","value":50},"path":"/entities/0/attributes/0/type/length"}`,
+		`{"operation":{"type":"set","value":0},"path":"/entities/0/attributes/2/type/length"}`,
+	} {
+		if !strings.Contains(updates[1], want) {
+			t.Errorf("length ops missing %s: %s", want, updates[1])
+		}
+	}
+	if strings.Contains(updates[1], "/attributes/1/") || strings.Contains(updates[1], "/attributes/3/") {
+		t.Errorf("length set on a default-length or non-String attribute: %s", updates[1])
+	}
+}
+
+// PED is not sent an export level (mendixlabs/mxcli#1498), so an authored one
+// that would change what is stored is refused rather than reported as written.
+func TestGuardExportLevels_RefusesWhatPEDWouldDrop(t *testing.T) {
+	api := newPersistentEntity("Request", attr("Payload", &domainmodel.StringAttributeType{Length: 10}))
+	api.ExportLevel = "API"
+	if err := guardExportLevels(api, nil); err == nil || !strings.Contains(err.Error(), "export level api") {
+		t.Errorf("new API entity: err = %v, want a refusal naming the clause", err)
+	}
+	attrAPI := newPersistentEntity("Request", attr("Payload", &domainmodel.StringAttributeType{Length: 10}))
+	attrAPI.Attributes[0].ExportLevel = "API"
+	if err := guardExportLevels(attrAPI, nil); err == nil || !strings.Contains(err.Error(), "attribute Payload") {
+		t.Errorf("new API attribute: err = %v, want a refusal naming the attribute", err)
+	}
+	// Controls: no clause, the default, and a rewrite that keeps the stored
+	// level are all what PED leaves in place.
+	plain := newPersistentEntity("Request", attr("Payload", &domainmodel.StringAttributeType{Length: 10}))
+	if err := guardExportLevels(plain, nil); err != nil {
+		t.Errorf("no clause refused: %v", err)
+	}
+	plain.ExportLevel = "Hidden"
+	if err := guardExportLevels(plain, nil); err != nil {
+		t.Errorf("hidden on a new entity refused: %v", err)
+	}
+	if err := guardExportLevels(api, api); err != nil {
+		t.Errorf("rewrite keeping the stored API level refused: %v", err)
+	}
+	if err := guardExportLevels(plain, api); err == nil {
+		t.Error("rewrite changing API to Hidden accepted, which PED would drop")
+	}
+	if err := guardAssociationFeatures(&domainmodel.Association{Name: "A", ExportLevel: "API"}); err == nil {
+		t.Error("association with export level api accepted")
 	}
 }

@@ -833,9 +833,9 @@ func TestAlterWorkflow_InsertAfter(t *testing.T) {
 		t.Errorf("Expected ActivityRef 'Review', got %q", op.ActivityRef)
 	}
 
-	callMf, ok := op.NewActivity.(*ast.WorkflowCallMicroflowNode)
+	callMf, ok := op.NewActivities[0].(*ast.WorkflowCallMicroflowNode)
 	if !ok {
-		t.Fatalf("Expected WorkflowCallMicroflowNode, got %T", op.NewActivity)
+		t.Fatalf("Expected WorkflowCallMicroflowNode, got %T", op.NewActivities[0])
 	}
 	if callMf.Microflow.Name != "SendNotification" {
 		t.Errorf("Expected Microflow 'SendNotification', got %q", callMf.Microflow.Name)
@@ -883,9 +883,9 @@ func TestAlterWorkflow_ReplaceActivity(t *testing.T) {
 		t.Errorf("Expected ActivityRef 'OldStep', got %q", op.ActivityRef)
 	}
 
-	_, ok = op.NewActivity.(*ast.WorkflowCallMicroflowNode)
+	_, ok = op.NewActivities[0].(*ast.WorkflowCallMicroflowNode)
 	if !ok {
-		t.Fatalf("Expected WorkflowCallMicroflowNode, got %T", op.NewActivity)
+		t.Fatalf("Expected WorkflowCallMicroflowNode, got %T", op.NewActivities[0])
 	}
 }
 
@@ -1227,5 +1227,227 @@ func TestAlterWorkflow_SetActivityDueDate(t *testing.T) {
 	}
 	if op.Value != "PT72H" {
 		t.Errorf("Expected Value 'PT72H', got %q", op.Value)
+	}
+}
+
+// TestBareWorkflowParameterName guards FINDINGS #41: a workflow `with (Name = ...)`
+// param mapping must normalize to the bare, unquoted last segment, because a
+// qualified name writes a null ParameterId (unloadable model) and a quoted name is
+// looked up verbatim (CE1613). Studio Pro uses the bare name.
+func TestBareWorkflowParameterName(t *testing.T) {
+	cases := map[string]string{
+		"Timesheet":                           "Timesheet", // bare — already correct
+		`"Timesheet"`:                         "Timesheet", // quoted — strip quotes
+		"TimeReg.ACT_ApproveWeek.Timesheet":   "Timesheet", // fully qualified — last segment
+		`TimeReg.ACT_ApproveWeek."Timesheet"`: "Timesheet", // qualified + quoted last segment
+	}
+	for in, want := range cases {
+		if got := bareWorkflowParameterName(in); got != want {
+			t.Errorf("bareWorkflowParameterName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// An unquoted value in a workflow `with (...)` mapping is a syntax error — the
+// grammar requires a STRING_LITERAL. It used to be a SIGSEGV instead: Build()
+// walks the parse tree even when the parse failed, so the mapping rule was
+// visited with a nil STRING_LITERAL child and every command that parses a
+// script (check, check --references, exec) died with no diagnostic.
+// See ako/mxcli#1023.
+func TestWorkflowVisitor_UnquotedParameterMappingDoesNotPanic(t *testing.T) {
+	for _, tc := range []struct{ name, input string }{
+		{"call microflow", `CREATE WORKFLOW M.T PARAMETER $Ctx: M.E
+BEGIN
+  CALL MICROFLOW M.ACT WITH (Ctx = $WorkflowContext);
+END WORKFLOW;`},
+		{"call workflow", `CREATE WORKFLOW M.T PARAMETER $Ctx: M.E
+BEGIN
+  CALL WORKFLOW M.Sub WITH (Ctx = $WorkflowContext);
+END WORKFLOW;`},
+		{"qualified parameter", `CREATE WORKFLOW M.T PARAMETER $Ctx: M.E
+BEGIN
+  CALL MICROFLOW M.ACT WITH (M.ACT.Ctx = $WorkflowContext);
+END WORKFLOW;`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, errs := Build(tc.input) // must not panic
+			if len(errs) == 0 {
+				t.Fatal("expected a syntax error for an unquoted mapping value, got none — " +
+					"the guard must not turn the crash into a silently accepted script")
+			}
+		})
+	}
+}
+
+// The control: the quoted form still parses and still yields the mapping, so
+// the nil guard skips only what the parser could not build.
+func TestWorkflowVisitor_QuotedParameterMappingStillBuilds(t *testing.T) {
+	input := `CREATE WORKFLOW M.T PARAMETER $Ctx: M.E
+BEGIN
+  CALL MICROFLOW M.ACT WITH (Ctx = '$WorkflowContext');
+END WORKFLOW;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("quoted mapping must parse cleanly, got %v", errs)
+	}
+	stmt := prog.Statements[0].(*ast.CreateWorkflowStmt)
+	call, ok := stmt.Activities[0].(*ast.WorkflowCallMicroflowNode)
+	if !ok {
+		t.Fatalf("expected a call-microflow activity, got %T", stmt.Activities[0])
+	}
+	if len(call.ParameterMappings) != 1 {
+		t.Fatalf("expected 1 parameter mapping, got %d", len(call.ParameterMappings))
+	}
+	if got := call.ParameterMappings[0]; got.Parameter != "Ctx" || got.Expression != "$WorkflowContext" {
+		t.Errorf("mapping = %+v, want {Ctx $WorkflowContext}", got)
+	}
+}
+
+// Describe writes `boundary event` before EVERY boundary event, and the syntax
+// topic documents that form, but the grammar took the keyword once and then all
+// clauses — so the describe output of any activity with two boundary events did
+// not parse (`mismatched input 'boundary' expecting ';'`). Both forms parse now.
+func TestWorkflowVisitor_BoundaryEventKeywordPerClause(t *testing.T) {
+	cases := map[string]string{
+		"user task": `create workflow M.W parameter $C: M.E
+begin
+  user task T 'c' page M.P outcomes 'a' { } 'b' { }
+    boundary event interrupting timer 'addDays([%CurrentDateTime%], 3)' { jump to T; }
+    boundary event non interrupting timer 'addDays([%CurrentDateTime%], 1)';
+end workflow;`,
+		"call microflow": `create workflow M.W parameter $C: M.E
+begin
+  call microflow M.ACT
+    boundary event interrupting timer 'addHours([%CurrentDateTime%], 1)'
+    boundary event non interrupting timer 'addHours([%CurrentDateTime%], 2)';
+end workflow;`,
+		"wait for notification": `create workflow M.W parameter $C: M.E
+begin
+  wait for notification w1
+    boundary event interrupting timer 'addDays([%CurrentDateTime%], 5)'
+    boundary event non interrupting timer 'addDays([%CurrentDateTime%], 2)';
+end workflow;`,
+		"one keyword, several clauses (the older form)": `create workflow M.W parameter $C: M.E
+begin
+  user task T 'c' page M.P outcomes 'a' { } 'b' { }
+    boundary event interrupting timer '${PT24H}' non interrupting timer '${PT1H}';
+end workflow;`,
+	}
+	for name, src := range cases {
+		t.Run(name, func(t *testing.T) {
+			prog, errs := Build(src)
+			if len(errs) > 0 {
+				t.Fatalf("parse errors: %v", errs)
+			}
+			var n int
+			switch a := prog.Statements[0].(*ast.CreateWorkflowStmt).Activities[0].(type) {
+			case *ast.WorkflowUserTaskNode:
+				n = len(a.BoundaryEvents)
+			case *ast.WorkflowCallMicroflowNode:
+				n = len(a.BoundaryEvents)
+			case *ast.WorkflowWaitForNotificationNode:
+				n = len(a.BoundaryEvents)
+			}
+			if n != 2 {
+				t.Errorf("boundary events = %d, want 2", n)
+			}
+		})
+	}
+}
+
+// `end workflow` ends a workflow from inside a branch. It is accepted in every
+// brace body and builds in statement order, so an End after a call stays after
+// it. See docs/11-proposals/PROPOSAL_workflow_end_activity.md.
+func TestWorkflowVisitor_EndWorkflowInBranches(t *testing.T) {
+	input := `create workflow M.W parameter $C: M.E
+begin
+  user task T 'Review' page M.P
+    outcomes
+      'Approve' { }
+      'Reject' { call microflow M.Notify; end workflow comment 'Rejected'; }
+    boundary event interrupting timer 'addDays([%CurrentDateTime%], 3)' { end workflow; };
+  decision '$WorkflowContext/Flag'
+    outcomes
+      true -> { end workflow; }
+      false -> { };
+end workflow;`
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	stmt := prog.Statements[0].(*ast.CreateWorkflowStmt)
+	if len(stmt.Activities) != 2 {
+		t.Fatalf("expected 2 main-flow activities, got %d", len(stmt.Activities))
+	}
+
+	task := stmt.Activities[0].(*ast.WorkflowUserTaskNode)
+	reject := task.Outcomes[1].Activities
+	if len(reject) != 2 {
+		t.Fatalf("Reject outcome: expected [call microflow, end workflow], got %d activities", len(reject))
+	}
+	if _, ok := reject[0].(*ast.WorkflowCallMicroflowNode); !ok {
+		t.Errorf("Reject[0] = %T, want the call microflow (statement order lost)", reject[0])
+	}
+	if end, ok := reject[1].(*ast.WorkflowEndNode); !ok || end.Caption != "Rejected" {
+		t.Errorf("Reject[1] = %#v, want an End captioned 'Rejected'", reject[1])
+	}
+	if len(task.BoundaryEvents) != 1 || len(task.BoundaryEvents[0].Activities) != 1 {
+		t.Fatalf("boundary event path: expected one activity")
+	}
+	if end, ok := task.BoundaryEvents[0].Activities[0].(*ast.WorkflowEndNode); !ok || end.Caption != "" {
+		t.Errorf("boundary path = %#v, want an uncaptioned End", task.BoundaryEvents[0].Activities[0])
+	}
+
+	decision := stmt.Activities[1].(*ast.WorkflowDecisionNode)
+	if _, ok := decision.Outcomes[0].Activities[0].(*ast.WorkflowEndNode); !ok {
+		t.Errorf("decision true branch = %T, want an End", decision.Outcomes[0].Activities[0])
+	}
+}
+
+// In the top-level body `end workflow` is the closer — it IS the main flow's End —
+// so one written in the middle stays a parse error. Mendix refuses an End there
+// anyway (CE6671). The closer keeps its optional `;` and `/`.
+func TestWorkflowVisitor_EndWorkflowOnlyClosesTheMainFlow(t *testing.T) {
+	mid := `create workflow M.W parameter $C: M.E
+begin
+  user task T 'c' page M.P outcomes 'a' { } 'b' { };
+  end workflow;
+  user task U 'u' page M.P outcomes 'a' { } 'b' { };
+end workflow;`
+	if _, errs := Build(mid); len(errs) == 0 {
+		t.Error("a top-level `end workflow;` followed by more activities must not parse")
+	}
+	for _, closer := range []string{"end workflow;", "end workflow\n/", "end workflow"} {
+		src := "create workflow M.W parameter $C: M.E\nbegin\n  user task T 'c' page M.P outcomes 'a' { } 'b' { };\n" + closer
+		if _, errs := Build(src); len(errs) > 0 {
+			t.Errorf("closer %q must still parse: %v", closer, errs)
+		}
+	}
+}
+
+// `return;` is how a microflow ends. In a workflow it is parsed — in a branch and
+// in the main flow — so MDL-WF11 can point at `end workflow;` instead of a bare
+// parse error, and so exec can refuse it rather than drop it.
+func TestWorkflowVisitor_ReturnIsParsedForItsHint(t *testing.T) {
+	input := `create workflow M.W parameter $C: M.E
+begin
+  user task T 'c' page M.P outcomes 'a' { return; } 'b' { };
+  return;
+end workflow;`
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	stmt := prog.Statements[0].(*ast.CreateWorkflowStmt)
+	if len(stmt.Activities) != 2 {
+		t.Fatalf("expected [user task, return], got %d activities", len(stmt.Activities))
+	}
+	if _, ok := stmt.Activities[1].(*ast.WorkflowReturnNode); !ok {
+		t.Errorf("main flow [1] = %T, want a WorkflowReturnNode", stmt.Activities[1])
+	}
+	task := stmt.Activities[0].(*ast.WorkflowUserTaskNode)
+	if _, ok := task.Outcomes[0].Activities[0].(*ast.WorkflowReturnNode); !ok {
+		t.Errorf("outcome 'a' = %T, want a WorkflowReturnNode", task.Outcomes[0].Activities[0])
 	}
 }

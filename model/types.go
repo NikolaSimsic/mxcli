@@ -5,9 +5,10 @@ package model
 
 import (
 	"encoding/json"
+	"strings"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // ID represents a unique identifier for model elements.
@@ -91,6 +92,14 @@ type Module struct {
 	AppStoreVersion     string `json:"appStoreVersion,omitempty"`
 	AppStoreGuid        string `json:"appStoreGuid,omitempty"`
 	IsReusableComponent bool   `json:"isReusableComponent,omitempty"`
+	// IsThemeModule is Studio Pro's "UI resources package" flag
+	// (Projects$ModuleImpl.IsThemeModule): the module's themesource styling is
+	// compiled as part of the theme, in the project's theme module order.
+	IsThemeModule bool `json:"isThemeModule,omitempty"`
+	// PackageFile is set for a module the project holds as a package file
+	// instead of as units: its path relative to the project directory,
+	// modules/<Name>.mxmodule. Such a module is read-only (ako/mxcli#1780).
+	PackageFile string `json:"packageFile,omitempty"`
 
 	// Contained units
 	DomainModelID ID   `json:"domainModelId,omitempty"`
@@ -196,10 +205,18 @@ func (c *Constant) GetContainerID() ID {
 // Enumeration represents an enumeration type.
 type Enumeration struct {
 	BaseElement
-	ContainerID   ID                 `json:"containerId"`
-	Name          string             `json:"name"`
-	Documentation string             `json:"documentation,omitempty"`
-	Values        []EnumerationValue `json:"values,omitempty"`
+	ContainerID   ID     `json:"containerId"`
+	Name          string `json:"name"`
+	Documentation string `json:"documentation,omitempty"`
+	// Excluded mirrors Studio Pro's "Exclude from project". It is model state
+	// that MDL cannot express for an enumeration, so every write path must
+	// carry the stored value rather than default it to false (#914).
+	Excluded bool               `json:"excluded,omitempty"`
+	Values   []EnumerationValue `json:"values,omitempty"`
+	// ExportLevel is "Hidden" or "API" (Studio Pro's "Usable"), which matters in
+	// a Protected (add-on) module (CE5400). The writer writes a set level and,
+	// for "", keeps the stored one (mendixlabs/mxcli#1498).
+	ExportLevel string `json:"exportLevel,omitempty"`
 }
 
 // GetName returns the enumeration's name.
@@ -225,13 +242,23 @@ func (v *EnumerationValue) GetName() string {
 	return v.Name
 }
 
-// RegularExpression represents a regular expression constraint.
+// RegularExpression represents a named regex document
+// (RegularExpressions$RegularExpression).
+//
+// It is a document rather than a string on a validation rule because Mendix
+// stores the rule's reference by qualified name
+// (DomainModels$RegExRuleInfo.RegExIdentifier), so one pattern is shared by
+// every attribute that validates against it.
 type RegularExpression struct {
 	BaseElement
 	ContainerID   ID     `json:"containerId"`
 	Name          string `json:"name"`
 	Documentation string `json:"documentation,omitempty"`
-	Expression    string `json:"expression"`
+	// Expression is the pattern. Mendix stores it under the BSON key
+	// "Expression" — NOT "RegEx", which is what modelsdk/gen binds.
+	Expression  string `json:"expression"`
+	ExportLevel string `json:"exportLevel,omitempty"`
+	Excluded    bool   `json:"excluded,omitempty"`
 }
 
 // GetName returns the regular expression's name.
@@ -242,6 +269,63 @@ func (r *RegularExpression) GetName() string {
 // GetContainerID returns the ID of the containing element.
 func (r *RegularExpression) GetContainerID() ID {
 	return r.ContainerID
+}
+
+// ScheduleKind identifies which ScheduledEvents$*Schedule variant a schedule is.
+// The variants differ in which fields they carry, so the kind has to be decided
+// before any field is read or written — see Schedule.
+type ScheduleKind string
+
+const (
+	ScheduleMinute       ScheduleKind = "Minute"
+	ScheduleHour         ScheduleKind = "Hour"
+	ScheduleDay          ScheduleKind = "Day"
+	ScheduleWeek         ScheduleKind = "Week"
+	ScheduleMonthDate    ScheduleKind = "MonthDate"
+	ScheduleMonthWeekday ScheduleKind = "MonthWeekday"
+	ScheduleYearDate     ScheduleKind = "YearDate"
+	ScheduleYearWeekday  ScheduleKind = "YearWeekday"
+)
+
+// Schedule is the repeat rule of a scheduled event — the polymorphic
+// ScheduledEvents$Schedule child, flattened into one struct with Kind saying
+// which variant it is.
+//
+// It is flat rather than eight types because the fields overlap heavily and the
+// consumers (a formatter, a serializer, a describe) all switch on the kind
+// anyway. Only the fields listed for a kind are written; the rest are ignored:
+//
+//	Minute        Multiplier
+//	Hour          Multiplier, MinuteOffset
+//	Day           HourOfDay, MinuteOfHour
+//	Week          Weekdays, HourOfDay, MinuteOfHour
+//	MonthDate     Multiplier, MonthOffset, DayOfMonth, HourOfDay, MinuteOfHour
+//	MonthWeekday  Multiplier, MonthOffset, DaySelector, Weekday, HourOfDay, MinuteOfHour
+//	YearDate      Month, DayOfMonth, HourOfDay, MinuteOfHour
+//	YearWeekday   Month, DaySelector, Weekday, HourOfDay, MinuteOfHour
+type Schedule struct {
+	Kind ScheduleKind `json:"kind"`
+
+	// Multiplier is the repeat count ("every N minutes/hours/months").
+	// Day, Week and the two Year variants have no multiplier in the metamodel.
+	Multiplier int `json:"multiplier,omitempty"`
+	// MinuteOffset is the minute within the hour, for the Hour variant only.
+	MinuteOffset int `json:"minuteOffset,omitempty"`
+	// MonthOffset selects which month of a multi-month cycle fires.
+	MonthOffset int `json:"monthOffset,omitempty"`
+
+	HourOfDay    int `json:"hourOfDay,omitempty"`
+	MinuteOfHour int `json:"minuteOfHour,omitempty"`
+
+	// DayOfMonth is 1-31; Month is 1-12.
+	DayOfMonth int `json:"dayOfMonth,omitempty"`
+	Month      int `json:"month,omitempty"`
+
+	// Weekdays holds the seven per-day flags of the Week variant, Sunday first.
+	Weekdays [7]bool `json:"weekdays,omitempty"`
+	// DaySelector is First|Second|Third|Fourth|Last, Weekday is Sunday..Saturday.
+	DaySelector string `json:"daySelector,omitempty"`
+	Weekday     string `json:"weekday,omitempty"`
 }
 
 // ScheduledEvent represents a scheduled event.
@@ -256,6 +340,15 @@ type ScheduledEvent struct {
 	Interval      int        `json:"interval,omitempty"`
 	IntervalType  string     `json:"intervalType,omitempty"`
 	Enabled       bool       `json:"enabled"`
+	// Schedule is the repeat rule. Every Studio Pro-authored event carries one;
+	// nil means the document did not have the child.
+	Schedule *Schedule `json:"schedule,omitempty"`
+	// OnOverlap is SkipNext or DelayNext — what happens when a run is still
+	// going when the next one is due. This is a scheduled event's own
+	// concurrency control; it does not go through a task queue.
+	OnOverlap   string `json:"onOverlap,omitempty"`
+	ExportLevel string `json:"exportLevel,omitempty"`
+	Excluded    bool   `json:"excluded,omitempty"`
 }
 
 // GetName returns the scheduled event's name.
@@ -320,14 +413,19 @@ type ConsumedODataService struct {
 	HttpConfiguration *HttpConfiguration `json:"httpConfiguration,omitempty"`
 
 	// Microflow reference (BY_NAME). Studio Pro's "Configuration source"
-	// dropdown has three options: Constants only, Configuration microflow,
-	// Headers microflow. Both microflow options write to the same BSON
-	// field `ConfigurationMicroflow`; Studio Pro picks the dropdown label
-	// based on the microflow's return type
-	// (System.ConsumedODataConfiguration vs list of System.HttpHeader).
-	// The MDL `HeadersMicroflow` keyword is an alias that writes to this
-	// same field.
-	ConfigurationMicroflow string `json:"configurationMicroflow,omitempty"` // BSON: ConfigurationMicroflow
+	// dropdown selects a configuration microflow. The BSON storage field was
+	// renamed across Mendix versions (see ODataConfigMicroflowBSONKey): Studio
+	// Pro >= 11.10 stores it under `ConfigurationEntityMicroflow` and ignores
+	// the pre-11.10 `ConfigurationMicroflow` key, silently showing "Constants
+	// only" (issue #728). The MDL `HeadersMicroflow` keyword is an alias that
+	// writes to this same field.
+	ConfigurationMicroflow string `json:"configurationMicroflow,omitempty"` // BSON: version-gated, see ODataConfigMicroflowBSONKey
+	// HeadersMicroflow is the "Headers microflow" dropdown option (returns a
+	// list of System.HttpHeader). It is a DIFFERENT storage slot from the
+	// configuration microflow on Mendix >= 11.10 (see ODataHeadersMicroflowBSONKey):
+	// mapping it to the configuration slot makes Studio Pro demand a
+	// System.ConsumedODataConfiguration return type (CE6808).
+	HeadersMicroflow       string `json:"headersMicroflow,omitempty"`       // BSON: version-gated, see ODataHeadersMicroflowBSONKey
 	ErrorHandlingMicroflow string `json:"errorHandlingMicroflow,omitempty"` // BSON: ErrorHandlingMicroflow
 
 	// Proxy constant references (BY_NAME to Constants$Constant)
@@ -345,6 +443,43 @@ type ConsumedODataService struct {
 	EndpointId      string `json:"endpointId,omitempty"`
 	CatalogUrl      string `json:"catalogUrl,omitempty"`
 	EnvironmentType string `json:"environmentType,omitempty"`
+}
+
+// ODataConfigMicroflowBSONKey returns the BSON storage field for a consumed
+// OData service's configuration microflow, which Mendix renamed across versions.
+// From the Rest$ConsumedODataService reflection metadata:
+//
+//	configurationMicroflow:       introduced 10.12.0, DELETED 11.10.0
+//	configurationEntityMicroflow: introduced 11.10.0
+//
+// Writing the pre-11.10 key on a >= 11.10 project makes Studio Pro ignore the
+// unknown field and fall back to "Constants only" (issue #728). Callers pass the
+// project's major/minor version.
+func ODataConfigMicroflowBSONKey(major, minor int) string {
+	if major > 11 || (major == 11 && minor >= 10) {
+		return "ConfigurationEntityMicroflow"
+	}
+	return "ConfigurationMicroflow"
+}
+
+// ODataConfigMicroflowBSONKeys lists every BSON field name the configuration
+// microflow has been stored under, across Mendix versions, so readers can accept
+// a service authored by any version (or by Studio Pro on a different version).
+func ODataConfigMicroflowBSONKeys() []string {
+	return []string{"ConfigurationEntityMicroflow", "ConfigurationMicroflow", "HeadersMicroflow"}
+}
+
+// ODataHeadersMicroflowBSONKey returns the BSON storage field for a consumed
+// OData service's "Headers microflow" (returns list of System.HttpHeader). On
+// Mendix >= 11.10 this is a distinct slot, HeaderListMicroflow; before 11.10 the
+// configuration and headers microflows shared the single ConfigurationMicroflow
+// field (Studio Pro distinguished them by the microflow's return type). Writing
+// a headers microflow into the configuration slot triggers CE6808 (issue #728).
+func ODataHeadersMicroflowBSONKey(major, minor int) string {
+	if major > 11 || (major == 11 && minor >= 10) {
+		return "HeaderListMicroflow"
+	}
+	return "ConfigurationMicroflow"
 }
 
 // HttpConfiguration represents the HTTP transport configuration (Microflows$HttpConfiguration).
@@ -380,24 +515,62 @@ func (s *ConsumedODataService) GetContainerID() ID {
 // PublishedODataService represents a published OData service.
 type PublishedODataService struct {
 	BaseElement
-	ContainerID         ID                     `json:"containerId"`
-	Name                string                 `json:"name"`
-	Documentation       string                 `json:"documentation,omitempty"`
-	Path                string                 `json:"path,omitempty"`
-	Namespace           string                 `json:"namespace,omitempty"`
-	ServiceName         string                 `json:"serviceName,omitempty"`
-	Version             string                 `json:"version,omitempty"`
-	ODataVersion        string                 `json:"odataVersion,omitempty"`
-	Summary             string                 `json:"summary,omitempty"`
-	Description         string                 `json:"description,omitempty"`
-	PublishAssociations bool                   `json:"publishAssociations,omitempty"`
+	ContainerID         ID     `json:"containerId"`
+	Name                string `json:"name"`
+	Documentation       string `json:"documentation,omitempty"`
+	Path                string `json:"path,omitempty"`
+	Namespace           string `json:"namespace,omitempty"`
+	ServiceName         string `json:"serviceName,omitempty"`
+	Version             string `json:"version,omitempty"`
+	ODataVersion        string `json:"odataVersion,omitempty"`
+	Summary             string `json:"summary,omitempty"`
+	Description         string `json:"description,omitempty"`
+	PublishAssociations bool   `json:"publishAssociations,omitempty"`
+	// SupportsGraphQL publishes the same resources over GraphQL as well as
+	// OData. One boolean, one extra endpoint; the OData surface is unchanged.
+	SupportsGraphQL     bool                   `json:"supportsGraphQL,omitempty"`
 	UseGeneralization   bool                   `json:"useGeneralization,omitempty"`
 	AuthenticationTypes []string               `json:"authenticationTypes,omitempty"`
 	AuthMicroflow       string                 `json:"authMicroflow,omitempty"`
 	EntityTypes         []*PublishedEntityType `json:"entityTypes,omitempty"`
 	EntitySets          []*PublishedEntitySet  `json:"entitySets,omitempty"`
-	AllowedModuleRoles  []string               `json:"allowedModuleRoles,omitempty"`
-	Excluded            bool                   `json:"excluded,omitempty"`
+	// Microflows are published as OData actions (ActionImport in $metadata).
+	Microflows         []*PublishedMicroflow `json:"microflows,omitempty"`
+	AllowedModuleRoles []string              `json:"allowedModuleRoles,omitempty"`
+	Excluded           bool                  `json:"excluded,omitempty"`
+	// ExportLevel has no MDL spelling; it is carried from what is stored so a
+	// rewrite does not delete it (#743). Empty on a service mxcli creates.
+	ExportLevel string `json:"exportLevel,omitempty"`
+}
+
+// PublishedMicroflow is a microflow exposed as an OData action.
+type PublishedMicroflow struct {
+	BaseElement
+	Microflow   string `json:"microflow,omitempty"`   // BY_NAME ref, Module.Microflow
+	ExposedName string `json:"exposedName,omitempty"` // the ActionImport name
+	Summary     string `json:"summary,omitempty"`
+	Description string `json:"description,omitempty"`
+	// The microflow's own return type, read off the microflow rather than
+	// authored so the two cannot drift. Kind and Ref are kept apart on purpose:
+	// "Module.X" alone cannot say whether X is an entity or an enumeration —
+	// the ambiguity CLAUDE.md documents for the MDL visitor.
+	ReturnTypeKind string                         `json:"returnTypeKind,omitempty"` // Boolean|String|…|Object|List|Enumeration
+	ReturnTypeRef  string                         `json:"returnTypeRef,omitempty"`  // qualified name for Object/List/Enumeration
+	Parameters     []*PublishedMicroflowParameter `json:"parameters,omitempty"`
+}
+
+// PublishedMicroflowParameter is one argument of a published microflow.
+type PublishedMicroflowParameter struct {
+	BaseElement
+	// MicroflowParameter is a BY_NAME ref of the form Module.Microflow.Param,
+	// the same shape the published-REST writer uses.
+	MicroflowParameter string `json:"microflowParameter,omitempty"`
+	ExposedName        string `json:"exposedName,omitempty"`
+	DataTypeKind       string `json:"dataTypeKind,omitempty"`
+	DataTypeRef        string `json:"dataTypeRef,omitempty"`
+	CanBeEmpty         bool   `json:"canBeEmpty,omitempty"`
+	Summary            string `json:"summary,omitempty"`
+	Description        string `json:"description,omitempty"`
 }
 
 // GetName returns the service's name.
@@ -431,6 +604,12 @@ type PublishedEntitySet struct {
 	DeleteMode     string `json:"deleteMode,omitempty"`
 	UsePaging      bool   `json:"usePaging,omitempty"`
 	PageSize       int    `json:"pageSize,omitempty"`
+
+	// OData query options. nil means "not specified" and is written as Mendix's
+	// own default of true; only an explicit false turns one off.
+	Countable     *bool `json:"countable,omitempty"`
+	SkipSupported *bool `json:"skipSupported,omitempty"`
+	TopSupported  *bool `json:"topSupported,omitempty"`
 }
 
 // PublishedMember represents a member (attribute/association/id) published in an OData entity type.
@@ -443,12 +622,34 @@ type PublishedMember struct {
 	Sortable    bool   `json:"sortable,omitempty"`
 	IsPartOfKey bool   `json:"isPartOfKey,omitempty"`
 
+	// CanBeEmpty is the stored value, carried by a rewrite since MDL has no
+	// spelling for it (#743). nil means not stored: the writer derives it as
+	// !IsPartOfKey, as it always did.
+	CanBeEmpty *bool `json:"canBeEmpty,omitempty"`
+
+	// EdmType is the OData EDM type the attribute is published as (e.g.
+	// "Edm.String"). Studio Pro stores this on every ODataPublish$PublishedAttribute;
+	// without it `mx check` reports CE5016 ("published as ."). Attribute members only.
+	EdmType string `json:"edmType,omitempty"`
+
+	// EnumerationAsString publishes an enumeration attribute as Edm.String
+	// rather than as its own EDM enum type. The two are one setting, not two:
+	// with this false, Mendix expects the enumeration itself to be published in
+	// the service and rejects Edm.String (CE5016 + CE4583 "Enumeration is not
+	// published in this service"). Attribute members only.
+	EnumerationAsString bool `json:"enumerationAsString,omitempty"`
+
 	// Association-specific fields (Kind == "association"). Studio Pro's
 	// ODataPublish$PublishedAssociationEnd records both the association
 	// target entity (qualified name) and the bare association name
 	// alongside ExposedName (the navigation property name).
 	AssociationTargetEntity string `json:"associationTargetEntity,omitempty"`
 	ExposedAssociationName  string `json:"exposedAssociationName,omitempty"`
+
+	// IsMany is the exposed navigation's multiplicity (to-many vs to-one).
+	// Studio Pro stores it on every PublishedAssociationEnd; without it
+	// `mx check` reports CE5022 ("changed multiplicity"). Association members only.
+	IsMany bool `json:"isMany,omitempty"`
 }
 
 // ============================================================================
@@ -474,8 +675,13 @@ type DatabaseConnection struct {
 // DatabaseQuery represents a DatabaseConnector$DatabaseQuery.
 type DatabaseQuery struct {
 	BaseElement
-	Name          string                    `json:"name"`
-	QueryType     int                       `json:"queryType"`     // 1 = custom SQL
+	Name      string `json:"name"`
+	QueryType int    `json:"queryType"` // 1 = custom SQL (Mendix <= 11.12 storage)
+	// QueryTypeName is the Mendix 11.13+ `Type` enum member ("Select" /
+	// "NonSelect" / "Unknown"), which replaced the integer QueryType. Empty on a
+	// project that stores the legacy key, or on a query mxcli has just authored;
+	// see mdl/dbconnector.
+	QueryTypeName string                    `json:"queryTypeName,omitempty"`
 	SQL           string                    `json:"sql,omitempty"` // extracted from TableMappings
 	TableMappings []*DatabaseTableMapping   `json:"tableMappings,omitempty"`
 	Parameters    []*DatabaseQueryParameter `json:"parameters,omitempty"`
@@ -595,6 +801,24 @@ type PublishedRestService struct {
 	Excluded     bool                     `json:"excluded,omitempty"`
 	AllowedRoles []string                 `json:"allowedRoles,omitempty"`
 	Resources    []*PublishedRestResource `json:"resources,omitempty"`
+	// Documentation is the service's own Documentation property — the
+	// developer-facing text Studio Pro shows on the document, not
+	// PublicDocumentation, the OpenAPI description consumers read
+	// (mendixlabs/mxcli#1510).
+	Documentation string `json:"documentation,omitempty"`
+
+	// AuthenticationTypes are the methods a caller may authenticate with, in
+	// the order stored: "Basic", "Session", "Microflow". Empty is "Requires
+	// authentication = No". AuthenticationMicroflow is the custom
+	// authentication microflow's qualified name, "" unless "Microflow" is
+	// among the methods (Studio Pro clears it when Custom is unticked).
+	AuthenticationTypes     []string `json:"authenticationTypes,omitempty"`
+	AuthenticationMicroflow string   `json:"authenticationMicroflow,omitempty"`
+	// Parameters are the service-level Rest$RestOperationParameter elements
+	// (Mendix 7.17+), in stored order: each binds a parameter of the
+	// authentication microflow to a query or header value of the request
+	// (mendixlabs/mxcli#1417). Each carries its stored $ID in ID.
+	Parameters []*PublishedRestOperationParameter `json:"parameters,omitempty"`
 }
 
 // GetName returns the service's name.
@@ -623,6 +847,65 @@ type PublishedRestOperation struct {
 	Microflow  string   `json:"microflow,omitempty"`
 	Deprecated bool     `json:"deprecated,omitempty"`
 	Parameters []string `json:"parameters,omitempty"` // path parameter names extracted from {param} in Path
+
+	// Documentation is the operation's documentation; MDL has no spelling for
+	// it, so a rewrite carries the stored value.
+	Documentation string `json:"documentation,omitempty"`
+	// ImportMapping / ExportMapping are the qualified names of the mappings bound
+	// to the request body and the response ("" when none).
+	ImportMapping string `json:"importMapping,omitempty"`
+	ExportMapping string `json:"exportMapping,omitempty"`
+	// Commit is "Yes", "YesWithoutEvents" or "No" ("" is written as "Yes").
+	Commit string `json:"commit,omitempty"`
+	// ObjectHandlingBackup is the import mapping's fallback object handling:
+	// "Create", "Ignore" or "Error" ("" is written as "Create"). MDL has no
+	// spelling for it, so a rewrite carries the stored value.
+	ObjectHandlingBackup string `json:"objectHandlingBackup,omitempty"`
+	// OperationParameters are the Rest$RestOperationParameter elements, in
+	// stored order. The executor derives them from the operation's microflow,
+	// as Studio Pro does. Empty means only the path is known: the writer then
+	// writes each {name} placeholder as a String path parameter.
+	OperationParameters []*PublishedRestOperationParameter `json:"operationParameters,omitempty"`
+}
+
+// PathParameterNames returns the names of the {name} placeholders in the
+// operation's path, in order.
+func (op *PublishedRestOperation) PathParameterNames() []string {
+	var names []string
+	path := op.Path
+	for {
+		start := strings.Index(path, "{")
+		if start < 0 {
+			break
+		}
+		end := strings.Index(path[start:], "}")
+		if end < 0 {
+			break
+		}
+		names = append(names, path[start+1:start+end])
+		path = path[start+end+1:]
+	}
+	return names
+}
+
+// PublishedRestOperationParameter is one Rest$RestOperationParameter of a
+// published REST operation.
+type PublishedRestOperationParameter struct {
+	// ID is the element's stored $ID, set for a service-level parameter so a
+	// rewrite keeps it ("" mints a fresh one).
+	ID   ID     `json:"id,omitempty"`
+	Name string `json:"name"`
+	// ParameterType is "Path", "Query", "Body", "Header" or "Form".
+	ParameterType string `json:"parameterType"`
+	// MicroflowParameter is the bound microflow parameter, qualified as
+	// Module.Microflow.Parameter ("" when unbound).
+	MicroflowParameter string `json:"microflowParameter,omitempty"`
+	Description        string `json:"description,omitempty"`
+	// DataType is the parameter's type: "String", "Integer", "Long",
+	// "Decimal", "Boolean", "DateTime", "Binary", "Enumeration", "Object" or
+	// "List". QualifiedName is the enumeration or the entity.
+	DataType      string `json:"dataType"`
+	QualifiedName string `json:"qualifiedName,omitempty"`
 }
 
 // ============================================================================
@@ -719,6 +1002,9 @@ type DataTransformer struct {
 	SourceJSON  string                 `json:"sourceJson,omitempty"` // source content
 	Steps       []*DataTransformerStep `json:"steps,omitempty"`
 	Excluded    bool                   `json:"excluded,omitempty"`
+	// Documentation is the transformer's Documentation property
+	// (mendixlabs/mxcli#1510).
+	Documentation string `json:"documentation,omitempty"`
 }
 
 // GetName returns the transformer's name.
@@ -761,6 +1047,10 @@ type WebUISettings struct {
 	EnableMicroflowReachabilityAnalysis bool   `json:"enableMicroflowReachabilityAnalysis"`
 	UseOptimizedClient                  string `json:"useOptimizedClient,omitempty"`
 	UrlPrefix                           string `json:"urlPrefix,omitempty"`
+	// ThemeModuleOrder is App Settings > Theme > module order: the modules
+	// whose themesource the theme compiles, in that order (a module listed
+	// later wins). Empty means Mendix's default order (ako/mxcli#1286).
+	ThemeModuleOrder []string `json:"themeModuleOrder,omitempty"`
 }
 
 // IntegrationSettings represents Settings$IntegrationProjectSettingsPart.
@@ -798,7 +1088,14 @@ type ServerConfiguration struct {
 type ConstantValue struct {
 	BaseElement
 	ConstantId string `json:"constantId"` // Qualified name: "BusinessEvents.ServerUrl"
-	Value      string `json:"value"`      // The overridden value
+	Value      string `json:"value"`      // The overridden value (empty when IsPrivate)
+	// IsPrivate marks an override whose value is private: the stored
+	// SharedOrPrivateValue is a Settings$PrivateValue, a marker type with no
+	// properties, because the value lives on the developer's workstation and is
+	// deliberately kept out of the shared model. Value is therefore always empty
+	// here — "" means "not in the model", not "overridden with the empty string".
+	// mxcli preserves the choice and never authors it.
+	IsPrivate bool `json:"isPrivate,omitempty"`
 }
 
 // ModelSettings represents Settings$ModelSettings.
@@ -813,10 +1110,14 @@ type ModelSettings struct {
 	JavaVersion                        string `json:"javaVersion,omitempty"`
 	RoundingMode                       string `json:"roundingMode,omitempty"`
 	ScheduledEventTimeZoneCode         string `json:"scheduledEventTimeZoneCode,omitempty"`
+	DefaultTimeZoneCode                string `json:"defaultTimeZoneCode,omitempty"`
 	FirstDayOfWeek                     string `json:"firstDayOfWeek,omitempty"`
 	DecimalScale                       int    `json:"decimalScale,omitempty"`
 	EnableDataStorageOptimisticLocking bool   `json:"enableDataStorageOptimisticLocking"`
 	UseDatabaseForeignKeyConstraints   bool   `json:"useDatabaseForeignKeyConstraints"`
+	UseOQLVersion2                     bool   `json:"useOQLVersion2"`
+	UseSystemContextForBackgroundTasks bool   `json:"useSystemContextForBackgroundTasks"`
+	SslCertificateAlgorithm            string `json:"sslCertificateAlgorithm,omitempty"`
 }
 
 // ConventionSettings represents Settings$ConventionSettings.
@@ -855,6 +1156,26 @@ type WorkflowsSettings struct {
 	UserEntity                string `json:"userEntity,omitempty"`
 	DefaultTaskParallelism    int    `json:"defaultTaskParallelism,omitempty"`
 	WorkflowEngineParallelism int    `json:"workflowEngineParallelism,omitempty"`
+	// Groups are the workflow groups from App > Settings > Workflows > Groups.
+	// The runtime materialises one System.WorkflowGroup per entry, which is what
+	// a user task's group targeting selects from.
+	Groups []WorkflowGroup `json:"groups,omitempty"`
+	// GroupsIncomplete records that the stored Groups list held an element the
+	// read could not convert. The write path rebuilds the list from Groups, so
+	// rewriting it would drop that element; UpdateProjectSettings refuses
+	// instead (ADR-0005 guard-don't-drop).
+	GroupsIncomplete bool `json:"-"`
+}
+
+// WorkflowGroup represents a Settings$WorkflowGroup: one entry of the workflows
+// settings part's Groups list. Name and Description are the only two properties
+// the type declares (modelsdk/gen, generated/metamodel and mendixmodelsdk 4.115.0
+// all agree), and there is no separate identifier — Name is the group's identity,
+// which is how ALTER SETTINGS WORKFLOWS ... GROUP addresses one.
+type WorkflowGroup struct {
+	BaseElement
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
 }
 
 // JarDeploymentSettings represents Settings$JarDeploymentSettings.
@@ -874,6 +1195,31 @@ type DistributionSettings struct {
 // ============================================================================
 
 // ImportMapping represents an ImportMappings$ImportMapping document.
+// WebServiceMappingSource is a mapping's SOAP binding: the imported web service
+// document plus which service, operation and root element of it the mapping
+// covers.
+//
+// It is read-only. mxcli cannot author a SOAP mapping, and the point of reading
+// it is precisely that it cannot: a rewrite that dropped these turned a working
+// integration into CE6896 "A mapping must have exactly one schema source" and
+// CE0270 "No root element could be found in the schema" (ako/mxcli#365).
+//
+// ParameterName and IsHeader exist on EXPORT mappings only — which SOAP message
+// part the mapping produces, and whether it is a header — and are carried for
+// the same reason.
+type WebServiceMappingSource struct {
+	ImportedWebService string `json:"importedWebService,omitempty"` // stored as wsdlFile
+	ServiceName        string `json:"serviceName,omitempty"`
+	OperationName      string `json:"operationName,omitempty"`
+	RootElementName    string `json:"rootElementName,omitempty"` // stored as xsdRootElementName
+	ParameterName      string `json:"parameterName,omitempty"`   // export only
+	IsHeader           bool   `json:"isHeader,omitempty"`        // export only
+}
+
+// IsSet reports whether the mapping is sourced from a web service. The imported
+// service is the discriminator: the other fields only qualify which part of it.
+func (w WebServiceMappingSource) IsSet() bool { return w.ImportedWebService != "" }
+
 type ImportMapping struct {
 	BaseElement
 	ContainerID   ID     `json:"containerId"`
@@ -882,9 +1228,39 @@ type ImportMapping struct {
 	Excluded      bool   `json:"excluded,omitempty"`
 	ExportLevel   string `json:"exportLevel,omitempty"`
 	// Schema source (at most one is set)
-	JsonStructure     string `json:"jsonStructure,omitempty"`     // qualified name
-	XmlSchema         string `json:"xmlSchema,omitempty"`         // qualified name
-	MessageDefinition string `json:"messageDefinition,omitempty"` // qualified name
+	JsonStructure string `json:"jsonStructure,omitempty"` // qualified name
+	XmlSchema     string `json:"xmlSchema,omitempty"`     // qualified name
+	// MessageDefinition is the pre-11.15 source: a definition inside a
+	// collection, Module.Collection.Definition. It is CARRIED like
+	// MessageDefinition2: nil means the stored document does not have the key.
+	// Mendix 11.15 removed it — a converted or newly made 11.15 mapping has no
+	// MessageDefinition key at all, and writing one is the overlay-rule
+	// mistake (ako/mxcli#987).
+	MessageDefinition *string `json:"messageDefinition,omitempty"`
+	// MessageDefinition2 is a version-introduced sibling (11.10+) that mxcli
+	// CARRIES rather than derives: nil means the stored document does not have
+	// the key, which is not the same as present-and-empty (ako/mxcli#279).
+	// From 11.15 it is the message-definition source, Module.MessageName — a
+	// MessageDefinitions$MessageDefinition2 document (ako/mxcli#987).
+	MessageDefinition2 *string `json:"messageDefinition2,omitempty"`
+	// WebServiceSource is the imported web service (SOAP) a mapping can be
+	// sourced from — a FOURTH source kind beside JSON structure, XML schema and
+	// message definition. mxcli does not author one, but it must not destroy
+	// one: the properties are read so a rewrite can be refused rather than
+	// silently dropping the binding (ako/mxcli#365).
+	WebServiceSource WebServiceMappingSource `json:"webServiceSource,omitempty"`
+	// RootElementName is the schema element an XML-schema (or SOAP) mapping is
+	// rooted at, stored as XsdRootElementName. MDL cannot state it and mxcli does
+	// not read an XSD, so it is carried, never derived: a rewrite that wrote ""
+	// left the mapping with CE0270 "No root element could be found in the
+	// schema" (mendixlabs/mxcli#1623). Empty for a JSON or message-definition
+	// mapping.
+	RootElementName string `json:"rootElementName,omitempty"`
+	// ParameterEntity is the entity of the mapping's INPUT object, stored as
+	// ParameterType — a DataTypes$ObjectType naming it. Empty means the mapping
+	// takes none, which Mendix stores as the DataTypes$UnknownType marker rather
+	// than by omitting the property (#265).
+	ParameterEntity string `json:"parameterEntity,omitempty"`
 	// Mapping tree (top-level elements, usually one root)
 	Elements []*ImportMappingElement `json:"elements,omitempty"`
 }
@@ -903,14 +1279,33 @@ type ImportMappingElement struct {
 	// Object mapping fields
 	Entity         string `json:"entity,omitempty"`         // qualified entity name
 	ObjectHandling string `json:"objectHandling,omitempty"` // "Create", "Find", "FindOrCreate", "Custom"
-	Association    string `json:"association,omitempty"`    // qualified association name
+	// ObjectHandlingBackup is what happens when the object is not found:
+	// "Create", "Error" or "Ignore" — the only three Mendix accepts (#261).
+	// Empty means the writer picks the default for the handling.
+	ObjectHandlingBackup string `json:"objectHandlingBackup,omitempty"`
+	// BackupAllowOverride sets ObjectHandlingBackupAllowOverride.
+	BackupAllowOverride bool   `json:"backupAllowOverride,omitempty"`
+	Association         string `json:"association,omitempty"` // qualified association name
+	// CustomHandler is set when ObjectHandling is "Custom": a microflow
+	// resolves the object instead of Create/Find (#264).
+	CustomHandler *MappingMicroflowCall `json:"customHandler,omitempty"`
 	// Value mapping fields
 	Attribute string `json:"attribute,omitempty"` // qualified attribute name (Module.Entity.Attr)
 	DataType  string `json:"dataType,omitempty"`  // "String", "Integer", "Boolean", etc.
 	IsKey     bool   `json:"isKey,omitempty"`
+	// Converter is a microflow the value passes through on its way to the
+	// attribute (#266). The element carries only this — there is no separate
+	// parameter path, because the microflow's input IS the member the element
+	// already binds.
+	Converter string `json:"converter,omitempty"` // qualified microflow name
 	// Schema fields (cloned from JSON structure element)
-	ExposedName    string `json:"exposedName,omitempty"`
-	JsonPath       string `json:"jsonPath,omitempty"`
+	ExposedName string `json:"exposedName,omitempty"`
+	JsonPath    string `json:"jsonPath,omitempty"`
+	// XmlPath is set for a mapping over an XML schema or a MESSAGE DEFINITION,
+	// which store BOTH path families — "Emails|Email|From" beside the JSON
+	// projection "(Array)|(Object)|From" (#263). Empty for a JSON-structure
+	// mapping.
+	XmlPath        string `json:"xmlPath,omitempty"`
 	MinOccurs      int    `json:"minOccurs,omitempty"`
 	MaxOccurs      int    `json:"maxOccurs,omitempty"` // 0 = default from JSON structure
 	Nillable       bool   `json:"nillable,omitempty"`
@@ -921,6 +1316,167 @@ type ImportMappingElement struct {
 	// Children
 	Children []*ImportMappingElement `json:"children,omitempty"`
 }
+
+// ============================================================================
+// Mapping custom object handling
+// ============================================================================
+
+// MappingMicroflowCall is the microflow that resolves a mapping element's object
+// when its handling is Custom (#264) — Studio Pro's "call a microflow" option.
+//
+// Stored as Mappings$MappingMicroflowCallImpl on the object element's
+// CustomHandlerCall property.
+type MappingMicroflowCall struct {
+	Microflow  string                       `json:"microflow"`
+	Parameters []*MappingMicroflowParameter `json:"parameters,omitempty"`
+}
+
+// MappingMicroflowParameter binds one of the called microflow's parameters.
+//
+// Four sources occur across the demo apps, and the stored shape distinguishes
+// them by a path marker plus LevelOfParent rather than by a kind field:
+//
+//	Source     stored path        LevelOfParent
+//	parent     "(parent)"         -1     the enclosing mapped object
+//	parameter  "(parameter)"      -1     the mapping's own input object
+//	ancestor   ""                 1..N   N levels up (export mappings)
+//	path       a JSON value path  -1     a value from the payload
+type MappingMicroflowParameter struct {
+	// Parameter is the qualified parameter reference,
+	// "Module.Microflow.ParamName".
+	Parameter string `json:"parameter"`
+	// Source is one of "parent", "parameter", "ancestor", "path".
+	Source string `json:"source"`
+	// LevelOfParent is meaningful for "ancestor" only; -1 otherwise.
+	LevelOfParent int `json:"levelOfParent"`
+	// ValuePath is the JSON path for "path" only.
+	ValuePath string `json:"valuePath,omitempty"`
+	// XmlValuePath mirrors ValuePath for XML/message-definition mappings. The
+	// marker sources write the SAME marker into both path properties; a value
+	// path writes the JSON one and leaves the XML one empty.
+	XmlValuePath string `json:"xmlValuePath,omitempty"`
+}
+
+// ============================================================================
+// Message Definitions
+// ============================================================================
+
+// messageDefinitionSource is the mapping's message-definition source,
+// whichever key holds it: the pre-11.15 three-part collection reference or the
+// 11.15 two-part document reference. Empty when the mapping has neither.
+func messageDefinitionSource(md, md2 *string) string {
+	if md != nil && *md != "" {
+		return *md
+	}
+	if md2 != nil {
+		return *md2
+	}
+	return ""
+}
+
+// MessageDefinitionSource returns the mapping's message-definition source,
+// from whichever key holds it (see messageDefinitionSource).
+func (im *ImportMapping) MessageDefinitionSource() string {
+	return messageDefinitionSource(im.MessageDefinition, im.MessageDefinition2)
+}
+
+// MessageDefinitionSource returns the mapping's message-definition source,
+// from whichever key holds it (see messageDefinitionSource).
+func (em *ExportMapping) MessageDefinitionSource() string {
+	return messageDefinitionSource(em.MessageDefinition, em.MessageDefinition2)
+}
+
+// MessageDefinitionCollection represents a
+// MessageDefinitions$MessageDefinitionCollection document — the unit. The
+// individual definitions live inside it, which is why a mapping's
+// MessageDefinition reference is THREE parts: Module.Collection.Definition.
+type MessageDefinitionCollection struct {
+	BaseElement
+	ContainerID ID     `json:"containerId"`
+	Name        string `json:"name"`
+	// Documentation, Excluded and ExportLevel are carried so a CREATE OR MODIFY
+	// preserves what the statement does not restate. ExportLevel is "Hidden" on
+	// every collection measured, but it is read rather than assumed.
+	Documentation string               `json:"documentation,omitempty"`
+	Excluded      bool                 `json:"excluded,omitempty"`
+	ExportLevel   string               `json:"exportLevel,omitempty"`
+	Definitions   []*MessageDefinition `json:"definitions,omitempty"`
+}
+
+// MessageDefinitionDocument represents a MessageDefinitions$MessageDefinition2
+// document — one message definition as its own unit, which is how Mendix 11.15
+// stores them (ako/mxcli#987). `mx convert` turns a collection into a folder of
+// the collection's name holding one of these per entry; the ExposedEntity tree
+// is unchanged. A mapping references one as Module.Name (MessageDefinition2).
+type MessageDefinitionDocument struct {
+	BaseElement
+	ContainerID   ID     `json:"containerId"`
+	Name          string `json:"name"`
+	Documentation string `json:"documentation,omitempty"`
+	Excluded      bool   `json:"excluded,omitempty"`
+	ExportLevel   string `json:"exportLevel,omitempty"`
+	// Root is the exposed entity the definition is built on.
+	Root *MessageDefinitionElement `json:"root,omitempty"`
+}
+
+// Definition views the document as a MessageDefinition, sharing its Root, so
+// the code that builds a mapping or edits members works on either storage.
+func (d *MessageDefinitionDocument) Definition() *MessageDefinition {
+	return &MessageDefinition{Name: d.Name, Root: d.Root}
+}
+
+// MessageDefinition is one EntityMessageDefinition inside a collection.
+type MessageDefinition struct {
+	Name string `json:"name"`
+	// Root is the exposed entity the definition is built on. Nil for a
+	// definition kind this reader does not model.
+	Root *MessageDefinitionElement `json:"root,omitempty"`
+}
+
+// MessageDefinitionElement is a node of a definition's exposed tree.
+//
+// Unlike a JSON structure, a message definition is derived from the DOMAIN
+// MODEL: every node names an entity or an attribute. It carries two names —
+// ExposedName is the node's name, ExposedItemName the singular one an unbounded
+// node's items get — and a mapping over it needs both, because it stores an
+// XmlPath built from them alongside the JSON projection.
+type MessageDefinitionElement struct {
+	// "Entity" or "Attribute".
+	Kind string `json:"kind"`
+	// Entity/Association are set on an Entity node; Attribute on an Attribute
+	// node. Association is set only when the node is reached through one, and
+	// Entity is then its TARGET — both are needed to rebuild or describe the
+	// node, because the stored MaxOccurs depends on the direction of traversal
+	// and cannot be recovered from the association alone.
+	Entity      string `json:"entity,omitempty"`
+	Association string `json:"association,omitempty"`
+	Attribute   string `json:"attribute,omitempty"`
+
+	ExposedName     string `json:"exposedName,omitempty"`
+	ExposedItemName string `json:"exposedItemName,omitempty"`
+	// OriginalName is the member's own name — the entity's, the attribute's, or
+	// for an association node the TARGET entity's. Stored beside ExposedName
+	// because the two differ routinely (52 of 56 roots, 406 of 933
+	// associations) and Mendix keeps both.
+	OriginalName string `json:"originalName,omitempty"`
+	// Example is author-set free text. Rare — 1 of 4,707 elements across the
+	// demo corpus and ako/TestApp — but hardcoding it empty would silently drop
+	// the one that exists, so it is carried like any other authored value.
+	Example string `json:"example,omitempty"`
+	// Path is the definition's own path ("Email|From"). It is NOT the mapping's
+	// XmlPath, which is built from the exposed names — the definition root's
+	// path is the ITEM name while the mapping's is "Emails|Email".
+	Path          string `json:"path,omitempty"`
+	MinOccurs     int    `json:"minOccurs,omitempty"`
+	MaxOccurs     int    `json:"maxOccurs,omitempty"`
+	PrimitiveType string `json:"primitiveType,omitempty"`
+
+	Children []*MessageDefinitionElement `json:"children,omitempty"`
+}
+
+// Unbounded reports whether the node repeats (0..*), which is what makes the
+// mapping project it as an array on both path families.
+func (e *MessageDefinitionElement) Unbounded() bool { return e != nil && e.MaxOccurs == -1 }
 
 // ============================================================================
 // Export Mappings
@@ -935,11 +1491,32 @@ type ExportMapping struct {
 	Excluded      bool   `json:"excluded,omitempty"`
 	ExportLevel   string `json:"exportLevel,omitempty"`
 	// Schema source (at most one is set)
-	JsonStructure     string `json:"jsonStructure,omitempty"`     // qualified name
-	XmlSchema         string `json:"xmlSchema,omitempty"`         // qualified name
-	MessageDefinition string `json:"messageDefinition,omitempty"` // qualified name
+	JsonStructure string `json:"jsonStructure,omitempty"` // qualified name
+	XmlSchema     string `json:"xmlSchema,omitempty"`     // qualified name
+	// MessageDefinition is the pre-11.15 source: a definition inside a
+	// collection, Module.Collection.Definition. It is CARRIED like
+	// MessageDefinition2: nil means the stored document does not have the key.
+	// Mendix 11.15 removed it — a converted or newly made 11.15 mapping has no
+	// MessageDefinition key at all, and writing one is the overlay-rule
+	// mistake (ako/mxcli#987).
+	MessageDefinition *string `json:"messageDefinition,omitempty"`
+	// MessageDefinition2 is a version-introduced sibling (11.10+) that mxcli
+	// CARRIES rather than derives: nil means the stored document does not have
+	// the key, which is not the same as present-and-empty (ako/mxcli#279).
+	// From 11.15 it is the message-definition source, Module.MessageName — a
+	// MessageDefinitions$MessageDefinition2 document (ako/mxcli#987).
+	MessageDefinition2 *string `json:"messageDefinition2,omitempty"`
 	// NullValueOption controls how null values are serialized: "LeaveOutElement" or "SendAsNil"
-	NullValueOption string                  `json:"nullValueOption,omitempty"`
+	NullValueOption string `json:"nullValueOption,omitempty"`
+	// WebServiceSource is the imported web service (SOAP) a mapping can be
+	// sourced from — a FOURTH source kind beside JSON structure, XML schema and
+	// message definition. mxcli does not author one, but it must not destroy
+	// one: the properties are read so a rewrite can be refused rather than
+	// silently dropping the binding (ako/mxcli#365).
+	WebServiceSource WebServiceMappingSource `json:"webServiceSource,omitempty"`
+	// RootElementName is the XML schema element the mapping produces, stored
+	// as XsdRootElementName — see ImportMapping.RootElementName.
+	RootElementName string                  `json:"rootElementName,omitempty"`
 	Elements        []*ExportMappingElement `json:"elements,omitempty"`
 }
 
@@ -958,14 +1535,36 @@ type ExportMappingElement struct {
 	Entity         string `json:"entity,omitempty"`         // qualified entity name
 	Association    string `json:"association,omitempty"`    // qualified association name
 	ObjectHandling string `json:"objectHandling,omitempty"` // "Parameter" for root, "Find" for children
-	MaxOccurs      int    `json:"maxOccurs,omitempty"`      // 1 for Object, -1 for Array; 0 = default (1)
+	// CustomHandler — see the note on ImportMappingElement (#264).
+	CustomHandler *MappingMicroflowCall `json:"customHandler,omitempty"`
+	// 1 for Object, -1 for Array (unbounded). NOT "0 = default": Mendix reads
+	// MaxOccurs=0 literally as "never occurs", and cross-validates this against
+	// the bound JSON structure element (CE5015). Mirror the schema (#841).
+	MaxOccurs int `json:"maxOccurs,omitempty"`
+	// MinOccurs, MaxLength and IsKey mirror the BOUND SCHEMA ELEMENT, exactly as
+	// the import twin does. The export writers used to hardcode MinOccurs 0 and
+	// MaxLength 0 and omit IsKey, so no export mapping mxcli wrote matched its
+	// Studio Pro original: a schema root has MinOccurs 1, and MaxLength is 0 for
+	// a string element but -1 for a numeric one (ako/mxcli#277, #279).
+	MinOccurs int  `json:"minOccurs,omitempty"`
+	MaxLength int  `json:"maxLength,omitempty"`
+	IsKey     bool `json:"isKey,omitempty"`
 	// Value mapping fields
 	Attribute string `json:"attribute,omitempty"` // qualified attribute name (Module.Entity.Attr)
 	DataType  string `json:"dataType,omitempty"`  // "String", "Integer", "Boolean", etc.
+	// Converter — see the note on ImportMappingElement (#266).
+	Converter string `json:"converter,omitempty"`
 	// Shared fields
-	ExposedName string                  `json:"exposedName,omitempty"`
-	JsonPath    string                  `json:"jsonPath,omitempty"`
-	Children    []*ExportMappingElement `json:"children,omitempty"`
+	ExposedName string `json:"exposedName,omitempty"`
+	JsonPath    string `json:"jsonPath,omitempty"`
+	// OriginalValue is the sample parsed out of the JSON structure's snippet.
+	// Carried rather than derived: whether a mapping stores it is a per-document
+	// property mxcli cannot compute, so a rewrite preserves what was there
+	// instead of choosing (ako/mxcli#379).
+	OriginalValue string `json:"originalValue,omitempty"`
+	// XmlPath — see the note on ImportMappingElement.
+	XmlPath  string                  `json:"xmlPath,omitempty"`
+	Children []*ExportMappingElement `json:"children,omitempty"`
 }
 
 // UnknownElement is a generic fallback for BSON elements with unrecognized $Type values.

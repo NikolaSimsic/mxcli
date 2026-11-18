@@ -127,6 +127,32 @@ All operations are registered in an `OperationRegistry`. Custom operations can b
 
 Therefore, in any mode using both, **datasource must come before association** in the mappings array. This is enforced at definition load time -- a validation error is raised if an `association` mapping appears before any `datasource` mapping.
 
+## Which Entity an Attribute Binds To
+
+An attribute property's entity is **not** a side effect of mapping order. It is
+decided per property by the widget's own schema, the same rule Studio Pro uses
+(`resolveBindingScope` in `mdl/executor/widget_attribute_scope.go`):
+
+- a property widget.xml links to a datasource (`dataSource="parts"`) binds to
+  that datasource's entity;
+- a property linked to **no** datasource binds to the context object — the
+  enclosing data container's entity — even when the widget has datasources of
+  its own;
+- a property the template does not declare, or a widget with no enclosing
+  context, falls back to the shared `entityContext`.
+
+Both passes use it: the mapping pass and the explicit-key pass, which re-applies
+a property authored by its schema key after every datasource has run. Before
+ako/mxcli#647 that second pass bound every name to the **last** datasource's
+entity, so a two-datasource widget inside a data view failed `mx check` with
+CE1613 on each attribute.
+
+An unqualified name that is not an attribute of the entity its property binds
+to, but is one of another entity in the widget's scope (the enclosing
+container's or one of its datasources'), is refused by `exec` and by
+`check --references` with the same message, naming the candidates
+(`misboundAttributeError`, shared by both).
+
 ## Source/Operation Compatibility
 
 Not all source/operation combinations are valid. These are rejected at load time:
@@ -202,6 +228,8 @@ Definitions are loaded in priority order. Higher-priority definitions override l
 
 Definitions are looked up by MDL name (case-insensitive): `COMBOBOX`, `GALLERY`, or any custom name.
 
+**DATAGRID has no embedded definition, on purpose.** Its `.def.json` is generated from the project's own package, and an embedded one would sit ahead of that package for every write (`RefreshWidgetDefinitions` skips a widget id the registry already holds). So without a project the registry has no definition for it, and `mxcli check` reads the property list of the template mxcli embeds for the widget (`sdk/widgets/templates/`, via `embeddedSchemaFor`): a key the template declares is accepted and its declared type decides whether an expression is allowed (MDL-WIDGET42). The template is the oldest-supported baseline, so a key it does not declare is reported as one that cannot be verified without a project (MDL-WIDGET07), not as one that is dropped.
+
 ### Validation at Load Time
 
 When a definition is loaded, it is validated:
@@ -271,9 +299,20 @@ CREATE PAGE MyModule.ReviewPage (...) {
 }
 ```
 
+## Object-Lists and DataGrid2 Columns
+
+A widget property can be an **object-list**: a repeated, structured child object rather than a single value or a flat widget slot. DataGrid 2 columns are the canonical example — each column is its own object with a header, an attribute (or custom content), a filter, sortable/width settings, and so on. The engine models this with `ObjectListMapping` (`mdl/executor/widget_engine.go`):
+
+- **`ItemProperties`** — scalar sub-properties of each item (attribute, caption/header, `showContentAs`, sortable, width, …), each with its own operation and MDL aliases.
+- **`ItemSlots`** — *nested widget* slots inside each item, with `AcceptedChildTypes`. This is how a per-column **filter** widget (`textfilter`/`numberfilter`/`datefilter`/`dropdownfilter`) or a custom-content widget lands in the right slot of its column.
+
+**DataGrid 2 is built entirely through this generic path when building a page.** `datagrid` has no dedicated `case` in `buildWidgetV3`; it resolves through the widget registry (a `datagrid.def.json` generated on demand from the project's installed `.mpk`, with columns emitted as an `ObjectListMapping`) and builds via `buildPluggable`. Columns are serialized by `Builder.SetObjectList` → `buildObjectListItemBSON`, walking the template's PropertyType order (the CE0463-safe ordering) and applying the same empty-`ClientTemplate`/null conventions per column kind. There is no DataGrid-specific full-page builder — Gallery, by contrast, needs only child slots (its items are a single repeated template), while DataGrid needs the object-list machinery because each column is a distinct heterogeneous object carrying a nested filter.
+
 ## What Stays Hardcoded
 
 **Native Mendix widgets** (TextBox, DataView, ListView, LayoutGrid, Container, etc.) use `Forms$TextBox`, `Forms$DataView`, etc. -- NOT `CustomWidgets$CustomWidget`. These stay as hardcoded builders because they have fundamentally different BSON structures and don't use the template system.
+
+**ALTER PAGE DataGrid 2 column insert/replace.** The one part of DataGrid 2 that is *not* on the generic engine is the in-place column mutation used by `alter page … insert/replace column` — `Mutator.InsertColumns`/`ReplaceColumn` build a single column's BSON via the hand-coded `BuildDataGrid2Column` (`mdl/backend/widgetobj/datagrid_column.go`) and a bespoke `BuildFilterWidget`, because they splice into an already-serialized grid object rather than building a fresh widget. This duplicates the column conventions the object-list engine already applies; re-expressing it on `SetObjectList` semantics is a tracked follow-up (see `datagrid_column.go`). The full-page build path does **not** use this code.
 
 ## Key Source Files
 

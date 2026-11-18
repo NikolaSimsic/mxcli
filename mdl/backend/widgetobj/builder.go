@@ -14,8 +14,7 @@ import (
 	"sort"
 	"strings"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/mendixlabs/mxcli/mdl/backend"
 	"github.com/mendixlabs/mxcli/mdl/bsonutil"
@@ -53,7 +52,67 @@ type Builder struct {
 	objectTypeID    string
 }
 
-var _ backend.WidgetObjectBuilder = (*Builder)(nil)
+var (
+	_ backend.WidgetObjectBuilder       = (*Builder)(nil)
+	_ backend.WidgetPropertyDeclarer    = (*Builder)(nil)
+	_ backend.WidgetEnumerationDeclarer = (*Builder)(nil)
+)
+
+// DeclaresProperty reports whether the loaded template declares propertyKey —
+// the set every Set* operation silently skips a missing key against.
+func (ob *Builder) DeclaresProperty(propertyKey string) bool {
+	_, ok := ob.propertyTypeIDs[propertyKey]
+	return ok
+}
+
+// EnumerationKeys returns the keys the widget's schema declares for the
+// enumeration property propertyKey, in declaration order — read from the Type
+// this build writes, which the loader has brought in line with the project's
+// installed package. nil when the property is not an enumeration.
+func (ob *Builder) EnumerationKeys(propertyKey string) []string {
+	objType := bsonDocValue(bsonDocValue(ob.embeddedType, "ObjectType"), "PropertyTypes")
+	pts, _ := objType.(bson.A)
+	for _, pt := range pts {
+		ptDoc, ok := pt.(bson.D)
+		if !ok || bsonStringValue(ptDoc, "PropertyKey") != propertyKey {
+			continue
+		}
+		vt, _ := bsonDocValue(ptDoc, "ValueType").(bson.D)
+		if bsonStringValue(vt, "Type") != "Enumeration" {
+			return nil
+		}
+		evs, _ := bsonDocValue(vt, "EnumerationValues").(bson.A)
+		var keys []string
+		for _, ev := range evs {
+			if evDoc, ok := ev.(bson.D); ok {
+				if k := bsonStringValue(evDoc, "_Key"); k != "" {
+					keys = append(keys, k)
+				}
+			}
+		}
+		return keys
+	}
+	return nil
+}
+
+// bsonDocValue is the value of key in d, when d is a document.
+func bsonDocValue(d any, key string) any {
+	doc, ok := d.(bson.D)
+	if !ok {
+		return nil
+	}
+	for _, e := range doc {
+		if e.Key == key {
+			return e.Value
+		}
+	}
+	return nil
+}
+
+func bsonStringValue(d bson.D, key string) string {
+	s, _ := bsonDocValue(d, key).(string)
+	return s
+}
 
 // New constructs a Builder for a loaded template and registers the engine's child
 // serializer for this build.
@@ -77,6 +136,15 @@ func (ob *Builder) SetAttribute(propertyKey string, attributePath string) {
 	})
 }
 
+func (ob *Builder) SetAttributeWithSteps(propertyKey string, attributePath string, steps []pages.AttributeRefStep) {
+	if attributePath == "" {
+		return
+	}
+	ob.object = updateWidgetPropertyValue(ob.object, ob.propertyTypeIDs, propertyKey, func(val bson.D) bson.D {
+		return setAttributeRefField(val, attributePath, steps)
+	})
+}
+
 func (ob *Builder) SetAssociation(propertyKey string, assocPath string, entityName string) {
 	if assocPath == "" {
 		return
@@ -86,12 +154,71 @@ func (ob *Builder) SetAssociation(propertyKey string, assocPath string, entityNa
 	})
 }
 
+// SetSourceVariable stores the Forms$PageVariable an attribute or association
+// property reads from — `$Param.Attr`, a page or snippet parameter — in the
+// property's WidgetValue, where Studio Pro keeps it (TestApp
+// WorkflowCommons.Snip_TaskDashboard_Header: SnippetParameter "DashboardContext"
+// beside the AttributeRef / IndirectEntityRef). Without one the value is read
+// from the enclosing object, as before.
+func (ob *Builder) SetSourceVariable(propertyKey string, sv *pages.WidgetVariable) {
+	if sv == nil || (sv.Widget == "" && sv.Variable == "") {
+		return
+	}
+	ob.object = updateWidgetPropertyValue(ob.object, ob.propertyTypeIDs, propertyKey, func(val bson.D) bson.D {
+		return setBSONField(val, "SourceVariable", PageVariableBSON(sv.Widget, sv.Variable, sv.Kind))
+	})
+}
+
 func (ob *Builder) SetPrimitive(propertyKey string, value string) {
 	if value == "" {
 		return
 	}
 	ob.object = updateWidgetPropertyValue(ob.object, ob.propertyTypeIDs, propertyKey, func(val bson.D) bson.D {
 		return setPrimitiveValue(val, value)
+	})
+}
+
+// SetImage points an image-typed property at an image collection entry, by its
+// three-part qualified name (`Module.Collection.Image`).
+//
+// The Image widget's `imageObject` is the case this exists for: it holds the
+// image the widget shows, and without it the default `ImageType: image` writes a
+// model mxbuild refuses with "No image selected." It is also what a describe →
+// exec copy of an Atlas layout needs in order to keep its brand image
+// (mxcli-formula1 FINDINGS §142).
+func (ob *Builder) SetImage(propertyKey string, imageQN string) {
+	if imageQN == "" {
+		return
+	}
+	ob.object = updateWidgetPropertyValue(ob.object, ob.propertyTypeIDs, propertyKey, func(val bson.D) bson.D {
+		return setImageValue(val, imageQN)
+	})
+}
+
+// SetImageEntity binds an image-typed property to the object in context — an
+// entity that specializes System.Image — instead of an image collection entry
+// (mendixlabs/mxcli#1476). Stored as the WidgetValue's EntityRef, with its
+// Image key cleared; see setImageEntityValue for how that shape was settled.
+func (ob *Builder) SetImageEntity(propertyKey string, entityName string) {
+	if entityName == "" {
+		return
+	}
+	ob.object = updateWidgetPropertyValue(ob.object, ob.propertyTypeIDs, propertyKey, func(val bson.D) bson.D {
+		return setImageEntityValue(val, entityName)
+	})
+}
+
+// SetIcon stores an icon element on an icon-typed property — the Image widget's
+// `imageIcon`, the icon an `ImageType: icon` image shows. Without it such an
+// image named no icon and mxbuild refused it with "No icon selected."
+// (ako/mxcli#2174).
+func (ob *Builder) SetIcon(propertyKey string, icon *pages.Icon) {
+	elem := iconElement(icon)
+	if elem == nil {
+		return
+	}
+	ob.object = updateWidgetPropertyValue(ob.object, ob.propertyTypeIDs, propertyKey, func(val bson.D) bson.D {
+		return setIconValue(val, elem)
 	})
 }
 
@@ -193,6 +320,32 @@ func (ob *Builder) SetTextTemplateWithParams(propertyKey string, text string, en
 	})
 }
 
+// SetTextTemplateWithClientParams sets a text template from author-supplied
+// parameters (MDL `contentparams:`), for a `{1}`-style template.
+//
+// SetTextTemplateWithParams derives parameters by matching `{AttrName}` against
+// the entity context; that covers the named spelling but leaves the numeric one
+// with no route, so a pluggable widget's `imageUrl: '{1}', contentparams: [...]`
+// was stored with Parameters=[2] (empty) and mxbuild answered CE0720 "Place
+// holder index 1 is greater than 0, the number of parameter(s)". (#928)
+func (ob *Builder) SetTextTemplateWithClientParams(propertyKey string, text string, params []*pages.ClientTemplateParameter) {
+	if text == "" {
+		return
+	}
+	tmpl := BuildClientTemplateWithTextAndParams(text, params)
+	ob.object = updateWidgetPropertyValue(ob.object, ob.propertyTypeIDs, propertyKey, func(val bson.D) bson.D {
+		result := make(bson.D, 0, len(val))
+		for _, elem := range val {
+			if elem.Key == "TextTemplate" {
+				result = append(result, bson.E{Key: "TextTemplate", Value: tmpl})
+			} else {
+				result = append(result, elem)
+			}
+		}
+		return result
+	})
+}
+
 func (ob *Builder) SetAction(propertyKey string, action pages.ClientAction) {
 	if action == nil {
 		return
@@ -264,6 +417,13 @@ func buildObjectListItemBSON(widgetID, listPropertyKey string, parentEntry pages
 	}
 
 	itemKind := detectObjectListItemKind(specByKey, item.ChildWidgets)
+	if itemKind == itemKindDefault && effectiveShowContentAs(specByKey, parentEntry) == "attribute" {
+		// No attribute bound, no content widgets — but showContentAs (set, or
+		// its widget default) still makes it an attribute column, and
+		// `mx update-widgets` gives it the attribute column's conventions
+		// (an empty tooltip ClientTemplate, not null — CE0463, ChipCoV8 #11).
+		itemKind = itemKindAttribute
+	}
 
 	propsArr := bson.A{int32(2)}
 	// Use template PropertyTypes order when available — Studio Pro expects
@@ -293,6 +453,8 @@ func buildObjectListItemBSON(widgetID, listPropertyKey string, parentEntry pages
 			prop = buildItemChildWidgetsProperty(nestedEntry, childWidgets)
 		case shouldEmitEmptyClientTemplate(widgetID, listPropertyKey, k, itemKind):
 			prop = buildEmptyClientTemplateProperty(nestedEntry)
+		case isUnsetRequiredTextTemplate(nestedEntry):
+			prop = buildDefaultTextClientTemplateProperty(nestedEntry)
 		default:
 			prop = createDefaultWidgetProperty(nestedEntry)
 		}
@@ -317,6 +479,7 @@ type objectListItemKind string
 const (
 	itemKindAttribute     objectListItemKind = "attribute"
 	itemKindCustomContent objectListItemKind = "customcontent"
+	itemKindDynamicText   objectListItemKind = "dynamictext"
 	itemKindDefault       objectListItemKind = ""
 )
 
@@ -331,10 +494,29 @@ func detectObjectListItemKind(specByKey map[string]backend.ObjectListItemPropert
 	if len(childWidgets["content"]) > 0 {
 		return itemKindCustomContent
 	}
+	// A dynamic-text column (Show: dynamicText) has no attribute binding and no
+	// content widgets, so it would otherwise fall through to itemKindDefault and
+	// miss the tooltip empty-ClientTemplate convention Studio Pro applies to it
+	// (CE0463, ledger #77). Detect it from the showContentAs primitive.
+	if sca, ok := specByKey["showContentAs"]; ok && strings.EqualFold(sca.PrimitiveVal, "dynamicText") {
+		return itemKindDynamicText
+	}
 	if attr, ok := specByKey["attribute"]; ok && attr.AttributePath != "" {
 		return itemKindAttribute
 	}
 	return itemKindDefault
+}
+
+// effectiveShowContentAs returns an item's showContentAs value: the authored
+// one, else the widget's default for it. "" when the item has no such property.
+func effectiveShowContentAs(specByKey map[string]backend.ObjectListItemProperty, parentEntry pages.PropertyTypeIDEntry) string {
+	if sca, ok := specByKey["showContentAs"]; ok && sca.PrimitiveVal != "" {
+		return strings.ToLower(sca.PrimitiveVal)
+	}
+	if e, ok := parentEntry.NestedPropertyIDs["showContentAs"]; ok {
+		return strings.ToLower(e.DefaultValue)
+	}
+	return ""
 }
 
 // emptyClientTemplateRules maps (widgetID, listPropertyKey, itemKind,
@@ -345,14 +527,20 @@ func detectObjectListItemKind(specByKey map[string]backend.ObjectListItemPropert
 // Source: c3d61af1 in datagrid_builder.go — Studio Pro's per-column-kind
 // convention for DataGrid columns (verified against Cars_Overview):
 //
-//	property        attribute column   custom-content column
-//	tooltip         empty CT           null
-//	exportValue     null               empty CT
-//	dynamicText     null               null
+//	property        attribute column   dynamic-text column   custom-content column
+//	tooltip         empty CT           empty CT              null
+//	exportValue     null               null                 empty CT
+//	dynamicText     null               (the cell template)  null
+//
+// The dynamic-text column matches the attribute column for tooltip/exportValue
+// (verified against a Studio-Pro `mx update-widgets` reconciliation, ledger #77).
 var emptyClientTemplateRules = map[string]map[string]map[objectListItemKind]map[string]bool{
 	"com.mendix.widget.web.datagrid.Datagrid": {
 		"columns": {
 			itemKindAttribute: {
+				"tooltip": true,
+			},
+			itemKindDynamicText: {
 				"tooltip": true,
 			},
 			itemKindCustomContent: {
@@ -360,6 +548,80 @@ var emptyClientTemplateRules = map[string]map[string]map[objectListItemKind]map[
 			},
 		},
 	},
+}
+
+// isUnsetRequiredTextTemplate reports whether an object-list item sub-property
+// is a REQUIRED TextTemplate the author did not set (#891).
+//
+// This generalises emptyClientTemplateRules, which is a hardcoded table covering
+// only DataGrid columns; every other object-list widget fell through it to a
+// null. In a stock blank app an Accordion group (required `headerText`) and a
+// Pop-up menu basic item (required `caption`) both raised CE0463, and thirteen
+// shipped widgets declare object lists with texttemplate items.
+//
+// Required-ness comes from the widget's own PropertyTypes, so this needs no
+// per-widget table and cannot go stale against a package upgrade. Note the
+// widget XML schema defaults `required` to TRUE when the attribute is absent —
+// exactly the Accordion's headerText — so a parser reading a missing attribute
+// as false silently disables this (mpk.go encodes the default as
+// `Required: p.Required != "false"`).
+func isUnsetRequiredTextTemplate(e pages.PropertyTypeIDEntry) bool {
+	return e.Required && strings.EqualFold(e.ValueType, "TextTemplate")
+}
+
+// buildDefaultTextClientTemplateProperty emits a required TextTemplate carrying
+// the widget's shipped default text.
+//
+// Both weaker forms fail, which is why this is not simply the empty builder:
+// TextTemplate=null is CE0463 "the definition of this widget has changed", and
+// an EMPTY Forms$ClientTemplate is CE4899 "Property 'Groups/1/Text' is
+// required". Populating from the ValueType's Translations is what
+// `mx update-widgets` itself writes (the Accordion's headerText ships
+// 'Header'/'Koptekst'). With no shipped translations there is nothing better to
+// write than the empty template.
+func buildDefaultTextClientTemplateProperty(entry pages.PropertyTypeIDEntry) bson.D {
+	if len(entry.DefaultTranslations) == 0 {
+		return buildEmptyClientTemplateProperty(entry)
+	}
+	value := createDefaultWidgetValue(entry)
+	value = setBSONField(value, "TextTemplate", buildClientTemplateWithTranslations(entry.DefaultTranslations))
+	return bson.D{
+		{Key: "$ID", Value: types.UUIDToBlob(types.GenerateID())},
+		{Key: "$Type", Value: "CustomWidgets$WidgetProperty"},
+		{Key: "TypePointer", Value: types.UUIDToBlob(entry.PropertyTypeID)},
+		{Key: "Value", Value: value},
+	}
+}
+
+// buildClientTemplateWithTranslations mirrors BuildEmptyClientTemplate but fills
+// Template.Items with one Texts$Translation per shipped language. The Fallback
+// stays empty and Parameters keeps marker 2 — the shape `mx update-widgets`
+// produces.
+func buildClientTemplateWithTranslations(translations []pages.PropertyTranslation) bson.D {
+	items := bson.A{int32(3)}
+	for _, t := range translations {
+		items = append(items, bson.D{
+			{Key: "$ID", Value: bsonutil.NewIDBsonBinary()},
+			{Key: "$Type", Value: "Texts$Translation"},
+			{Key: "LanguageCode", Value: t.LanguageCode},
+			{Key: "Text", Value: t.Text},
+		})
+	}
+	return bson.D{
+		{Key: "$ID", Value: bsonutil.NewIDBsonBinary()},
+		{Key: "$Type", Value: "Forms$ClientTemplate"},
+		{Key: "Fallback", Value: bson.D{
+			{Key: "$ID", Value: bsonutil.NewIDBsonBinary()},
+			{Key: "$Type", Value: "Texts$Text"},
+			{Key: "Items", Value: bson.A{int32(3)}},
+		}},
+		{Key: "Parameters", Value: bson.A{int32(2)}},
+		{Key: "Template", Value: bson.D{
+			{Key: "$ID", Value: bsonutil.NewIDBsonBinary()},
+			{Key: "$Type", Value: "Texts$Text"},
+			{Key: "Items", Value: items},
+		}},
+	}
 }
 
 // shouldEmitEmptyClientTemplate returns true when an unset TextTemplate-typed
@@ -407,12 +669,27 @@ func overlayItemValue(value bson.D, entry pages.PropertyTypeIDEntry, spec backen
 		value = setBSONField(value, "PrimitiveValue", spec.PrimitiveVal)
 	case "attribute":
 		if spec.AttributePath != "" {
-			value = setAttributeRefField(value, spec.AttributePath)
+			value = setAttributeRefField(value, spec.AttributePath, spec.AttributeRefSteps)
 		}
 	case "expression":
 		value = setBSONField(value, "Expression", spec.Expression)
 		value = setBSONField(value, "PrimitiveValue", "")
 	case "texttemplate":
+		// A VISIBLE-but-unset texttemplate sub-property must serialize as an
+		// empty Forms$ClientTemplate, not null, or Studio Pro flags CE0463
+		// (e.g. a chart series' staticName, or a static·/dynamic· name whose
+		// datasource is configured). EmptyTemplate is set by the executor from
+		// the widget.xml dataSource-binding visibility rule. Chart series (9a).
+		if spec.TextTemplate == "" && spec.EmptyTemplate {
+			value = setBSONField(value, "TextTemplate", BuildEmptyClientTemplate())
+			break
+		}
+		// A text the statement states as empty: one empty translation, so a
+		// rewrite does not carry the stored text back (EmptyText).
+		if spec.TextTemplate == "" && spec.EmptyText {
+			value = setBSONField(value, "TextTemplate", BuildClientTemplateWithTextAndParams("", nil))
+			break
+		}
 		// Skip when the spec carries no text — leave the value's existing
 		// TextTemplate untouched (null, set by createDefaultWidgetValue).
 		// Inserting a placeholder ClientTemplate here causes Studio Pro
@@ -481,7 +758,7 @@ func setBSONField(doc bson.D, key string, val any) bson.D {
 // The BSON $Type is DomainModels$AttributeRef — CustomWidgets$AttributeRef
 // is not a registered Mendix type and triggers TypeCacheUnknownTypeException
 // when Studio Pro or mx update-widgets loads the project (issue #64).
-func setAttributeRefField(value bson.D, attributePath string) bson.D {
+func setAttributeRefField(value bson.D, attributePath string, steps []pages.AttributeRefStep) bson.D {
 	if strings.Count(attributePath, ".") < 2 {
 		return setBSONField(value, "AttributeRef", nil)
 	}
@@ -489,9 +766,37 @@ func setAttributeRefField(value bson.D, attributePath string) bson.D {
 		{Key: "$ID", Value: types.UUIDToBlob(types.GenerateID())},
 		{Key: "$Type", Value: "DomainModels$AttributeRef"},
 		{Key: "Attribute", Value: attributePath},
-		{Key: "EntityRef", Value: nil},
+		{Key: "EntityRef", Value: attributeEntityRefBSON(steps)},
 	}
 	return setBSONField(value, "AttributeRef", attrRef)
+}
+
+// attributeEntityRefBSON builds the DomainModels$IndirectEntityRef that navigates
+// an attribute over associations (one EntityRefStep per hop), or nil for an
+// own-entity attribute. Mirrors the codec-form attributeRefWithStepsToGen and the
+// legacy serializeAssociationSource EntityRef structure.
+// AttributeEntityRefBSON is the AttributeRef.EntityRef an attribute over
+// associations stores: its hops as an IndirectEntityRef, or nil for none.
+func AttributeEntityRefBSON(steps []pages.AttributeRefStep) any { return attributeEntityRefBSON(steps) }
+
+func attributeEntityRefBSON(steps []pages.AttributeRefStep) any {
+	if len(steps) == 0 {
+		return nil
+	}
+	stepArr := bson.A{int32(2)}
+	for _, s := range steps {
+		stepArr = append(stepArr, bson.D{
+			{Key: "$ID", Value: types.UUIDToBlob(types.GenerateID())},
+			{Key: "$Type", Value: "DomainModels$EntityRefStep"},
+			{Key: "Association", Value: s.Association},
+			{Key: "DestinationEntity", Value: s.DestinationEntity},
+		})
+	}
+	return bson.D{
+		{Key: "$ID", Value: types.UUIDToBlob(types.GenerateID())},
+		{Key: "$Type", Value: "DomainModels$IndirectEntityRef"},
+		{Key: "Steps", Value: stepArr},
+	}
 }
 
 func (ob *Builder) SetAttributeObjects(propertyKey string, attributePaths []string) {
@@ -555,13 +860,54 @@ func (ob *Builder) PropertyTypeIDs() map[string]pages.PropertyTypeIDEntry {
 	return ob.propertyTypeIDs
 }
 
+// PrimitiveValues returns each property's current comparable value in the object
+// being built, keyed as the widget declares it.
+//
+// Read before the property mappings are applied, this is the TEMPLATE's captured
+// configuration — which is what an UNMAPPED property will actually be stored
+// with, since nothing else ever touches one. That distinction is what a
+// visibility rule has to be evaluated against: the declared default is what the
+// property SHOULD hold, not what it will (see hiddenUnnamedProperties).
+func (ob *Builder) PrimitiveValues() map[string]string {
+	return primitiveValuesOf(ob.object, ob.propertyTypeIDs)
+}
+
 // ---------------------------------------------------------------------------
 // Object list defaults
 // ---------------------------------------------------------------------------
 
-func (ob *Builder) EnsureRequiredObjectLists() {
-	ob.object = ensureRequiredObjectLists(ob.object, ob.propertyTypeIDs)
-}
+// EnsureRequiredObjectLists is intentionally a no-op: mxcli does not seed a
+// placeholder row into an object list the author never wrote.
+//
+// It used to auto-populate any object list whose nested properties were all
+// "simple" (nothing Attribute/Expression/TextTemplate/Widgets/DataSource).
+// Studio Pro leaves such a list EMPTY, so the seeded row made the stored
+// instance disagree with the installed .mpk — CE0463, "the definition of this
+// widget has changed".
+//
+// Measured against the 31 shipped widget templates, the old heuristic fired on
+// exactly two properties and helped neither:
+//
+//	barcodescanner  barcodeFormats  required, nested {Enumeration}
+//	                -> seeded one row carrying the enum default AZTEC; three
+//	                   Barcode Scanners on two pages each raised CE0463 and the
+//	                   app would not deploy until Studio Pro's "Update widget"
+//	                   deleted exactly that row.
+//	htmlelement     events          optional, nested {Action,Boolean,Enumeration}
+//	                -> seeded a phantom event handler Studio Pro never writes.
+//
+// The MCP write path (mdl/backend/mcp.(*mcpWidgetBuilder)) has always had this
+// as a no-op, so removing the seeding also makes the two engines agree rather
+// than making the model depend on which one authored it.
+//
+// This is NOT the sibling fix for issue #891. That one fills an *authored*
+// object-list item's required TextTemplate with the widget's shipped
+// translations, lives in buildObjectListItemBSON, and still applies — an absent
+// `required` attribute in widget XML still means required (mpk.go:
+// `Required: p.Required != "false"`). Nothing here changes that.
+//
+// The method is kept so backend.WidgetBuilder keeps its shape.
+func (ob *Builder) EnsureRequiredObjectLists() {}
 
 // ---------------------------------------------------------------------------
 // Property visibility (#574)
@@ -569,36 +915,204 @@ func (ob *Builder) EnsureRequiredObjectLists() {
 
 // ApplyPropertyVisibility nulls the TextTemplate of any TextTemplate-typed
 // property the rules mark as hidden under the widget's current configuration.
-// Non-TextTemplate properties are left untouched: only the populated-vs-null
-// ClientTemplate choice triggers CE0463, so Phase 1 scopes the action to
-// TextTemplate. The widget's current primitive values (read from the assembled
+// Non-TextTemplate properties are left untouched HERE, not because they are
+// harmless: a hidden enumeration at a non-default value is CE0463 too
+// (ako/mxcli#1762). The engine writes one the script does not name at its
+// declared default (hiddenUnnamedProperties), and MDL-WIDGET10 refuses one it
+// does. The widget's current primitive values (read from the assembled
 // object) drive rule evaluation, so a rule keyed on e.g. `type` sees the value
 // just set from MDL.
+
 func (ob *Builder) ApplyPropertyVisibility(rules []types.WidgetVisibilityRule) {
+	ob.object = ApplyVisibilityRules(ob.object, ob.propertyTypeIDs, rules)
+}
+
+// ApplyVisibilityRules nulls the TextTemplate of any TextTemplate-typed property
+// the rules mark as hidden under the object's current configuration, returning
+// the updated object. It is the engine-agnostic form of ApplyPropertyVisibility
+// so build paths that construct a widget object without a full Builder (e.g. the
+// filter-widget build path) can apply the same #574 nulling. Non-TextTemplate
+// properties are left untouched here; see ApplyPropertyVisibility for where a
+// hidden enumeration's default is enforced instead.
+func ApplyVisibilityRules(object bson.D, propertyTypeIDs map[string]pages.PropertyTypeIDEntry, rules []types.WidgetVisibilityRule) bson.D {
 	if len(rules) == 0 {
-		return
+		return object
 	}
-	values := ob.currentPrimitiveValues()
+	values := primitiveValuesOf(object, propertyTypeIDs)
+
+	// Both directions, because null and empty are each invalid in the other's
+	// state. #574 covered hidden→null; a VISIBLE TextTemplate left null is the
+	// other half, and it is what made an authored ProgressCircle `showLabel:
+	// true` fail CE0463: `labelText` is visible whenever `labelType` is "text"
+	// (its default), and mxcli stored null where Mendix stores an empty
+	// ClientTemplate. Confirmed by handing the failing project to Mendix's own
+	// `mx update-widgets`, whose reconciliation writes exactly that template and
+	// changes nothing else of substance (ledger #104 follow-on).
+	//
+	// Only properties the widget's schema declares CONDITIONAL are touched. A
+	// TextTemplate with no rule is left exactly as it was: Studio Pro's
+	// convention for an unset one is not uniform — a DataGrid custom-content
+	// column stores null for `tooltip` and an empty ClientTemplate for
+	// `exportValue` — so filling every unset template would trade this bug for
+	// its mirror image. Those per-column conventions live in
+	// emptyClientTemplateRules and are reached by a different path.
+	hidden := make(map[string]bool, len(rules))
+	conditional := make([]string, 0, len(rules))
 	for _, rule := range rules {
-		if !rule.HiddenWhen.Hidden(values) {
+		if rule.Nested() {
+			// Its PropertyKey names a sub-property of a list ITEM, not of the
+			// widget — applied per item below.
 			continue
 		}
-		entry, ok := ob.propertyTypeIDs[rule.PropertyKey]
+		entry, ok := propertyTypeIDs[rule.PropertyKey]
 		if !ok || entry.ValueType != "TextTemplate" {
 			continue
 		}
-		ob.object = updateWidgetPropertyValue(ob.object, ob.propertyTypeIDs, rule.PropertyKey, func(val bson.D) bson.D {
+		if _, seen := hidden[rule.PropertyKey]; !seen {
+			conditional = append(conditional, rule.PropertyKey)
+			hidden[rule.PropertyKey] = false
+		}
+		// Several rules may govern one property; any one of them hiding it wins.
+		// Within a rule, every term of its conjunction must hold — reading only
+		// HiddenWhen would hide a template in configurations the editor shows.
+		fires, determinable := rule.Fires(func(c types.WidgetVisibilityCondition) (string, bool) {
+			v, ok := values[c.PropertyKey]
+			return v, ok
+		})
+		if determinable && fires {
+			hidden[rule.PropertyKey] = true
+		}
+	}
+	// Sorted, because the object is serialized and map order is not stable.
+	sort.Strings(conditional)
+
+	for _, key := range conditional {
+		isHidden := hidden[key]
+		object = updateWidgetPropertyValue(object, propertyTypeIDs, key, func(val bson.D) bson.D {
+			if isHidden {
+				return setBSONField(val, "TextTemplate", nil)
+			}
+			// Never clobber real content — only fill in the absent template.
+			if bsonFieldIsNil(val, "TextTemplate") {
+				return setBSONField(val, "TextTemplate", BuildEmptyClientTemplate())
+			}
+			return val
+		})
+	}
+	return applyItemVisibilityRules(object, propertyTypeIDs, rules, values)
+}
+
+// applyItemVisibilityRules is the #574 nulling one level down: a TextTemplate
+// sub-property of an object-list ITEM that a nested rule hides for that item
+// gets TextTemplate: null (mendixlabs/mxcli#1198).
+//
+// File Uploader hides an `allowedFileFormats` item's `typeFormatDescription`
+// while that item's `configMode` is "simple". The sub-property is required, so
+// the item builder fills it with the shipped translations (#891) — correct
+// while it is visible, CE0463 once it is hidden: `mx update-widgets` on a copy
+// changes exactly that slot to null and nothing else of substance.
+//
+// Each condition is resolved in its own scope (types.ConditionScopeItem → the
+// item's values, otherwise the widget's), the same split MDL-WIDGET10 makes in
+// validateWidgetItemVisibility. Only the hidden→null direction is applied here:
+// an unset item TextTemplate is null by default (4ea402c2) and required ones
+// are already filled, so there is no visible-but-null case to repair.
+func applyItemVisibilityRules(object bson.D, propertyTypeIDs map[string]pages.PropertyTypeIDEntry, rules []types.WidgetVisibilityRule, widgetValues map[string]string) bson.D {
+	byList := map[string][]types.WidgetVisibilityRule{}
+	for _, rule := range rules {
+		if !rule.Nested() {
+			continue
+		}
+		entry, ok := propertyTypeIDs[rule.ListPropertyKey]
+		if !ok || len(entry.NestedPropertyIDs) == 0 {
+			continue
+		}
+		if sub, ok := entry.NestedPropertyIDs[rule.PropertyKey]; !ok || sub.ValueType != "TextTemplate" {
+			continue
+		}
+		byList[rule.ListPropertyKey] = append(byList[rule.ListPropertyKey], rule)
+	}
+	lists := make([]string, 0, len(byList))
+	for k := range byList {
+		lists = append(lists, k)
+	}
+	sort.Strings(lists)
+
+	for _, listKey := range lists {
+		nested := propertyTypeIDs[listKey].NestedPropertyIDs
+		listRules := byList[listKey]
+		object = updateWidgetPropertyValue(object, propertyTypeIDs, listKey, func(val bson.D) bson.D {
+			out := make(bson.D, 0, len(val))
+			for _, elem := range val {
+				objects, ok := elem.Value.(bson.A)
+				if elem.Key != "Objects" || !ok {
+					out = append(out, elem)
+					continue
+				}
+				updated := make(bson.A, len(objects))
+				for i, o := range objects {
+					item, ok := o.(bson.D)
+					if !ok {
+						updated[i] = o // the list marker
+						continue
+					}
+					updated[i] = nullHiddenItemTemplates(item, nested, listRules, widgetValues)
+				}
+				out = append(out, bson.E{Key: "Objects", Value: updated})
+			}
+			return out
+		})
+	}
+	return object
+}
+
+// nullHiddenItemTemplates nulls the TextTemplate of every sub-property of one
+// object-list item that rules hide under that item's own configuration.
+func nullHiddenItemTemplates(item bson.D, nested map[string]pages.PropertyTypeIDEntry, rules []types.WidgetVisibilityRule, widgetValues map[string]string) bson.D {
+	itemValues := primitiveValuesOf(item, nested)
+	hidden := map[string]bool{}
+	for _, rule := range rules {
+		fires, determinable := rule.Fires(func(c types.WidgetVisibilityCondition) (string, bool) {
+			values := widgetValues
+			if c.Scope == types.ConditionScopeItem {
+				values = itemValues
+			}
+			v, ok := values[c.PropertyKey]
+			return v, ok
+		})
+		if determinable && fires {
+			hidden[rule.PropertyKey] = true
+		}
+	}
+	keys := make([]string, 0, len(hidden))
+	for k := range hidden {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		item = updateWidgetPropertyValue(item, nested, key, func(val bson.D) bson.D {
 			return setBSONField(val, "TextTemplate", nil)
 		})
 	}
+	return item
 }
 
-// currentPrimitiveValues maps each known property key to its current
-// PrimitiveValue string in the assembled object (e.g. type → "expression",
-// customVisualization → "true"). Properties absent from the object map to "".
-func (ob *Builder) currentPrimitiveValues() map[string]string {
-	byID := make(map[string]string)
-	for _, elem := range ob.object {
+// bsonFieldIsNil reports whether a field is absent or explicitly nil.
+func bsonFieldIsNil(val bson.D, field string) bool {
+	for _, elem := range val {
+		if elem.Key == field {
+			return elem.Value == nil
+		}
+	}
+	return true
+}
+
+// primitiveValuesOf maps each known property key to its current comparable value
+// string in the object (e.g. type → "expression", itemSelection → "Single").
+// Properties absent from the object map to "".
+func primitiveValuesOf(object bson.D, propertyTypeIDs map[string]pages.PropertyTypeIDEntry) map[string]string {
+	rawByID := make(map[string]bson.D)
+	for _, elem := range object {
 		if elem.Key != "Properties" {
 			continue
 		}
@@ -615,17 +1129,55 @@ func (ob *Builder) currentPrimitiveValues() map[string]string {
 			if id == "" {
 				continue
 			}
-			byID[id] = primitiveValueOfProperty(prop)
+			if val := widgetValueOfProperty(prop); val != nil {
+				rawByID[id] = val
+			}
 		}
 	}
 
-	out := make(map[string]string, len(ob.propertyTypeIDs))
-	for key, entry := range ob.propertyTypeIDs {
-		if v, ok := byID[strings.ReplaceAll(entry.PropertyTypeID, "-", "")]; ok {
-			out[key] = v
+	out := make(map[string]string, len(propertyTypeIDs))
+	for key, entry := range propertyTypeIDs {
+		if val, ok := rawByID[strings.ReplaceAll(entry.PropertyTypeID, "-", "")]; ok {
+			out[key] = effectiveValue(val, entry.ValueType)
 		}
 	}
 	return out
+}
+
+// effectiveValue reads the field of a WidgetValue that holds a property's
+// primitive-comparable value, keyed by its ValueType: a Selection-typed property
+// (e.g. DataGrid2 itemSelection = None/Single/Multi) stores its value in the
+// `Selection` field, everything else in `PrimitiveValue`. editorConfig
+// visibility conditions compare against this value, so reading the wrong field
+// (always PrimitiveValue) made selection-conditioned rules evaluate against ""
+// and mis-fire (issue #574: singleSelectionColumnLabel nulled under Selection:Single).
+func effectiveValue(val bson.D, valueType string) string {
+	field := "PrimitiveValue"
+	if valueType == "Selection" {
+		field = "Selection"
+	}
+	for _, ve := range val {
+		if ve.Key == field {
+			if s, ok := ve.Value.(string); ok {
+				return s
+			}
+			return ""
+		}
+	}
+	return ""
+}
+
+// widgetValueOfProperty returns a WidgetProperty's Value document, or nil.
+func widgetValueOfProperty(prop bson.D) bson.D {
+	for _, elem := range prop {
+		if elem.Key == "Value" {
+			if val, ok := elem.Value.(bson.D); ok {
+				return val
+			}
+			return nil
+		}
+	}
+	return nil
 }
 
 // propertyTypePointerID returns a WidgetProperty's TypePointer as a normalized
@@ -636,7 +1188,7 @@ func propertyTypePointerID(prop bson.D) string {
 			continue
 		}
 		switch v := elem.Value.(type) {
-		case primitive.Binary:
+		case bson.Binary:
 			return strings.ReplaceAll(types.BlobToUUID(v.Data), "-", "")
 		case []byte:
 			return strings.ReplaceAll(types.BlobToUUID(v), "-", "")
@@ -784,7 +1336,7 @@ func matchesTypePointer(prop bson.D, propertyTypeID string) bool {
 	for _, elem := range prop {
 		if elem.Key == "TypePointer" {
 			switch v := elem.Value.(type) {
-			case primitive.Binary:
+			case bson.Binary:
 				propID := strings.ReplaceAll(types.BlobToUUID(v.Data), "-", "")
 				return propID == normalizedTarget
 			case []byte:
@@ -833,6 +1385,109 @@ func setPrimitiveValue(val bson.D, value string) bson.D {
 	return result
 }
 
+// setImageValue writes the image reference onto a WidgetValue's `Image` key.
+//
+// The key is REPLACED, never added: a value node that does not declare one
+// belongs to a property that is not image-typed, and a key the widget's
+// definition does not know about is the CE0463 shape. Measured on a Studio
+// Pro-authored widget, the stored form is the bare qualified name —
+// `MyFirstModule.Images._1` — with nothing else on the node changed.
+func setImageValue(val bson.D, imageQN string) bson.D {
+	if imageQN == "" {
+		return val
+	}
+	result := make(bson.D, 0, len(val))
+	for _, elem := range val {
+		if elem.Key == "Image" {
+			result = append(result, bson.E{Key: "Image", Value: imageQN})
+		} else {
+			result = append(result, elem)
+		}
+	}
+	return result
+}
+
+// iconElement is the stored form of an icon, the same three elements a button's
+// Icon holds — measured on ConversationalUI.Snippet_Message_Content (11.16):
+//
+//	Forms$ImageIcon{Image: "ConversationalUI.Image_collection.Traces_icons"}
+//	Forms$IconCollectionIcon{Image: "Atlas_Core.Atlas_Filled.user"}
+//	Forms$GlyphIcon{Code: 57377}
+//
+// The kind decides the $Type; the two named kinds share a payload, so nothing
+// else could. Nil for an icon that identifies nothing — an unknown kind, a glyph
+// with no code, a named kind with no name — rather than an element that shows
+// nothing.
+func iconElement(icon *pages.Icon) bson.D {
+	if icon == nil {
+		return nil
+	}
+	storage := types.MenuIconStorageType(icon.Kind)
+	if storage == "" {
+		return nil
+	}
+	elem := bson.D{
+		{Key: "$ID", Value: types.UUIDToBlob(types.GenerateID())},
+		{Key: "$Type", Value: storage},
+	}
+	if icon.Kind == types.MenuIconGlyph {
+		if icon.Code == 0 {
+			return nil
+		}
+		return append(elem, bson.E{Key: "Code", Value: int32(icon.Code)})
+	}
+	if icon.Image == "" {
+		return nil
+	}
+	return append(elem, bson.E{Key: "Image", Value: icon.Image})
+}
+
+// setIconValue writes an icon element onto a WidgetValue's `Icon` key. Like
+// setImageValue it REPLACES the key and never adds one: a value node without it
+// is not icon-typed, and an invented key is the CE0463 shape.
+func setIconValue(val bson.D, icon bson.D) bson.D {
+	result := make(bson.D, 0, len(val))
+	for _, elem := range val {
+		if elem.Key == "Icon" {
+			result = append(result, bson.E{Key: "Icon", Value: icon})
+		} else {
+			result = append(result, elem)
+		}
+	}
+	return result
+}
+
+// setImageEntityValue points an image value at the context object: EntityRef
+// becomes a DirectEntityRef to entityName and the collection entry is cleared.
+//
+// No project in this repo holds a Studio Pro-authored dynamic image, so the
+// shape is the one mxbuild 11.12.1 accepts, with two controls showing it reads
+// the key: the wrong entity is CE7247 "Entity should be the same as the
+// enclosing …", a non-image entity CE7247 "Widget expects entity of type
+// System.Image." The key set is never extended — a value node without either
+// key is left as it is (an invented key is CE0463).
+func setImageEntityValue(val bson.D, entityName string) bson.D {
+	if entityName == "" {
+		return val
+	}
+	result := make(bson.D, 0, len(val))
+	for _, elem := range val {
+		switch elem.Key {
+		case "EntityRef":
+			result = append(result, bson.E{Key: "EntityRef", Value: bson.D{
+				{Key: "$ID", Value: bsonutil.NewIDBsonBinary()},
+				{Key: "$Type", Value: "DomainModels$DirectEntityRef"},
+				{Key: "Entity", Value: entityName},
+			}})
+		case "Image":
+			result = append(result, bson.E{Key: "Image", Value: ""})
+		default:
+			result = append(result, elem)
+		}
+	}
+	return result
+}
+
 func setDataSource(val bson.D, ds pages.DataSource) bson.D {
 	result := make(bson.D, 0, len(val))
 	for _, elem := range val {
@@ -841,6 +1496,16 @@ func setDataSource(val bson.D, ds pages.DataSource) bson.D {
 		} else {
 			result = append(result, elem)
 		}
+	}
+	// A 9.x pluggable database source declares no SourceVariable: the page or
+	// snippet parameter its association path starts from is stored on the
+	// WidgetValue beside it (mendixlabs/mxcli#1399).
+	if db, ok := ds.(*pages.DatabaseSource); ok && db.UseConstraints && db.ContextVariable != "" {
+		kind := ""
+		if db.IsSnippetParameter {
+			kind = "snippet"
+		}
+		result = setBSONField(result, "SourceVariable", PageVariableBSON("", strings.TrimPrefix(db.ContextVariable, "$"), kind))
 	}
 	return result
 }
@@ -914,7 +1579,22 @@ func setTextTemplateValue(val bson.D, text string) bson.D {
 			if tmpl, ok := elem.Value.(bson.D); ok && tmpl != nil {
 				result = append(result, bson.E{Key: "TextTemplate", Value: updateTemplateText(tmpl, text)})
 			} else {
-				result = append(result, elem)
+				// The slot is nil, which is the NORMAL state of a conditional
+				// template: #574 stores one as null while its condition hides it,
+				// so a script that turns the condition on and writes the text in
+				// the same statement finds nothing to edit. Keeping the nil here
+				// dropped the text in silence — and left a widget whose own
+				// enumeration says it has custom text with no text, which is a
+				// build error (issue #254, Slider `tooltipType: customText`).
+				//
+				// Build the envelope, then write into it. Not a special case for
+				// the visible/hidden question: ApplyVisibilityRules still runs
+				// afterwards and nulls this again if the property turns out to be
+				// hidden, so an authored text can never survive into a pruned slot.
+				result = append(result, bson.E{
+					Key:   "TextTemplate",
+					Value: updateTemplateText(BuildEmptyClientTemplate(), text),
+				})
 			}
 		} else {
 			result = append(result, elem)
@@ -936,7 +1616,7 @@ func updateTemplateText(tmpl bson.D, text string) bson.D {
 							bson.D{
 								{Key: "$ID", Value: bsonutil.IDToBsonBinary(types.GenerateID())},
 								{Key: "$Type", Value: "Texts$Translation"},
-								{Key: "LanguageCode", Value: "en_US"},
+								{Key: "LanguageCode", Value: model.AuthoringLanguage()},
 								{Key: "Text", Value: text},
 							},
 						}})
@@ -1039,7 +1719,7 @@ func createClientTemplateBSONWithParams(text string, entityContext string) bson.
 			{Key: "Items", Value: bson.A{int32(3), bson.D{
 				{Key: "$ID", Value: types.UUIDToBlob(types.GenerateID())},
 				{Key: "$Type", Value: "Texts$Translation"},
-				{Key: "LanguageCode", Value: "en_US"},
+				{Key: "LanguageCode", Value: model.AuthoringLanguage()},
 				{Key: "Text", Value: t},
 			}}},
 		}
@@ -1069,7 +1749,7 @@ func createDefaultClientTemplateBSON(text string) bson.D {
 			{Key: "Items", Value: bson.A{int32(3), bson.D{
 				{Key: "$ID", Value: types.UUIDToBlob(types.GenerateID())},
 				{Key: "$Type", Value: "Texts$Translation"},
-				{Key: "LanguageCode", Value: "en_US"},
+				{Key: "LanguageCode", Value: model.AuthoringLanguage()},
 				{Key: "Text", Value: t},
 			}}},
 		}
@@ -1090,95 +1770,6 @@ func createDefaultClientTemplateBSON(text string) bson.D {
 // ---------------------------------------------------------------------------
 // Default object lists
 // ---------------------------------------------------------------------------
-
-func ensureRequiredObjectLists(obj bson.D, propertyTypeIDs map[string]pages.PropertyTypeIDEntry) bson.D {
-	// Sort keys for deterministic BSON output.
-	keys := make([]string, 0, len(propertyTypeIDs))
-	for k := range propertyTypeIDs {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	for _, propKey := range keys {
-		entry := propertyTypeIDs[propKey]
-		if entry.ObjectTypeID == "" || len(entry.NestedPropertyIDs) == 0 {
-			continue
-		}
-		if !entry.Required {
-			hasNestedDS := false
-			for _, nested := range entry.NestedPropertyIDs {
-				if nested.ValueType == "DataSource" {
-					hasNestedDS = true
-					break
-				}
-			}
-			if hasNestedDS {
-				continue
-			}
-		}
-		// Skip auto-populate when any nested property has a complex ValueType
-		// (Attribute / Expression / TextTemplate / Widgets / DataSource).
-		// Complex types have no sensible empty default — Studio Pro flags an
-		// auto-generated entry with empty Expression/Attribute as CE0463/CE0566.
-		// This also avoids over-populating mode-dependent required lists such as
-		// Combobox optionsSourceStaticDataSource (only used when source=static).
-		hasComplexNested := false
-		for _, nested := range entry.NestedPropertyIDs {
-			switch nested.ValueType {
-			case "Attribute", "Expression", "TextTemplate", "Widgets", "DataSource":
-				hasComplexNested = true
-			}
-			if hasComplexNested {
-				break
-			}
-		}
-		if hasComplexNested {
-			continue
-		}
-		obj = updateWidgetPropertyValue(obj, propertyTypeIDs, propKey, func(val bson.D) bson.D {
-			for _, elem := range val {
-				if elem.Key == "Objects" {
-					if arr, ok := elem.Value.(bson.A); ok && len(arr) <= 1 {
-						defaultObj := createDefaultWidgetObject(entry.ObjectTypeID, entry.NestedPropertyIDs)
-						newArr := bson.A{int32(2), defaultObj}
-						result := make(bson.D, 0, len(val))
-						for _, e := range val {
-							if e.Key == "Objects" {
-								result = append(result, bson.E{Key: "Objects", Value: newArr})
-							} else {
-								result = append(result, e)
-							}
-						}
-						return result
-					}
-				}
-			}
-			return val
-		})
-	}
-	return obj
-}
-
-func createDefaultWidgetObject(objectTypeID string, nestedProps map[string]pages.PropertyTypeIDEntry) bson.D {
-	propsArr := bson.A{int32(2)}
-	// Sort keys for deterministic BSON output.
-	nestedKeys := make([]string, 0, len(nestedProps))
-	for k := range nestedProps {
-		nestedKeys = append(nestedKeys, k)
-	}
-	sort.Strings(nestedKeys)
-	for _, k := range nestedKeys {
-		entry := nestedProps[k]
-		prop := createDefaultWidgetProperty(entry)
-		propsArr = append(propsArr, prop)
-	}
-	return bson.D{
-		{Key: "$ID", Value: types.UUIDToBlob(types.GenerateID())},
-		{Key: "$Type", Value: "CustomWidgets$WidgetObject"},
-		{Key: "TypePointer", Value: types.UUIDToBlob(objectTypeID)},
-		{Key: "Properties", Value: propsArr},
-	}
-}
 
 func createDefaultWidgetProperty(entry pages.PropertyTypeIDEntry) bson.D {
 	return bson.D{
@@ -1207,9 +1798,14 @@ func createDefaultWidgetValue(entry pages.PropertyTypeIDEntry) bson.D {
 			textTemplate = createDefaultClientTemplateBSON(primitiveVal)
 		}
 	case "String":
-		if primitiveVal == "" {
-			primitiveVal = " "
-		}
+		// Leave an unset String property empty (its schema default, "") — do NOT
+		// manufacture a single space. Studio Pro stores "" here, and some widgets
+		// (chart series `customSeriesOptions`, `customLayout`, `customConfigurations`)
+		// feed the value straight to a client-side JSON.parse whose empty-guard is
+		// `value !== "" ? value : "{}"`; a lone space passes that guard and makes
+		// the widget throw `JSON.parse(" ")` → "Unexpected end of JSON input" at
+		// render time (object-list-item path only; the top-level path already
+		// leaves it empty).
 	}
 
 	return bson.D{
@@ -1386,7 +1982,7 @@ func BuildClientTemplateWithTextAndParams(text string, params []*pages.ClientTem
 				bson.D{
 					{Key: "$ID", Value: bsonutil.NewIDBsonBinary()},
 					{Key: "$Type", Value: "Texts$Translation"},
-					{Key: "LanguageCode", Value: "en_US"},
+					{Key: "LanguageCode", Value: model.AuthoringLanguage()},
 					{Key: "Text", Value: text},
 				},
 			}},
@@ -1404,64 +2000,53 @@ func SerializeColumnClientTemplateParameter(param *pages.ClientTemplateParameter
 		paramID = bsonutil.IDToBsonBinary(string(param.ID))
 	}
 
+	// An attribute reached over associations carries its hops in EntityRef. Left
+	// null, mxbuild reads the attribute against the widget's context entity:
+	// CE1365 "Attribute 'M.Child.Label' is not an attribute of entity 'M.Parent'"
+	// (mendixlabs/mxcli#1494). The executor resolved the steps all along.
 	var attrRefBSON any
 	if param.AttributeRef != "" {
 		attrRefBSON = bson.D{
 			{Key: "$ID", Value: bsonutil.NewIDBsonBinary()},
 			{Key: "$Type", Value: "DomainModels$AttributeRef"},
 			{Key: "Attribute", Value: param.AttributeRef},
-			{Key: "EntityRef", Value: nil},
+			{Key: "EntityRef", Value: attributeEntityRefBSON(param.AttributeRefSteps)},
 		}
 	}
 
+	// Use the parameter's per-parameter formatting when present; a nil
+	// FormattingInfo reproduces the previous hardcoded defaults, so every
+	// unformatted column parameter is byte-identical to before. Mirrors
+	// sdk/mpr/writer_widgets.go:serializeClientTemplateParameter so a
+	// `format (...)` block authored on a DataGrid2 dynamic-text column param
+	// reaches the runtime instead of being silently dropped (ledger #77).
+	dateFormat, customDateFormat, enumFormat := "Date", "", "Text"
+	decimalPrecision := int64(2)
+	groupDigits := false
+	if fi := param.FormattingInfo; fi != nil {
+		if fi.DateFormat != "" {
+			dateFormat = fi.DateFormat
+		}
+		customDateFormat = fi.CustomDateFormat
+		if fi.EnumFormat != "" {
+			enumFormat = fi.EnumFormat
+		}
+		decimalPrecision = int64(fi.DecimalPrecision)
+		groupDigits = fi.GroupDigits
+	}
 	formattingInfo := bson.D{
 		{Key: "$ID", Value: bsonutil.NewIDBsonBinary()},
 		{Key: "$Type", Value: "Forms$FormattingInfo"},
-		{Key: "CustomDateFormat", Value: ""},
-		{Key: "DateFormat", Value: "Date"},
-		{Key: "DecimalPrecision", Value: int64(2)},
-		{Key: "EnumFormat", Value: "Text"},
-		{Key: "GroupDigits", Value: false},
+		{Key: "CustomDateFormat", Value: customDateFormat},
+		{Key: "DateFormat", Value: dateFormat},
+		{Key: "DecimalPrecision", Value: decimalPrecision},
+		{Key: "EnumFormat", Value: enumFormat},
+		{Key: "GroupDigits", Value: groupDigits},
 	}
 
 	var sourceVariable any
-	if param.SourceVariable != "" {
-		// Studio Pro distinguishes between three Forms$PageVariable bindings:
-		//   - LocalVariable     → page-level Variables entry (Kind="local")
-		//   - SnippetParameter  → snippet parameter            (Kind="snippet")
-		//   - PageParameter     → page parameter               (Kind="" default)
-		// Emitting a $localVar reference as a literal Expression causes Studio
-		// Pro to interpret the value as an entity attribute path.
-		fields := bson.D{
-			{Key: "$ID", Value: bsonutil.NewIDBsonBinary()},
-			{Key: "$Type", Value: "Forms$PageVariable"},
-		}
-		switch param.SourceVariableKind {
-		case "local":
-			fields = append(fields,
-				bson.E{Key: "LocalVariable", Value: param.SourceVariable},
-				bson.E{Key: "PageParameter", Value: ""},
-				bson.E{Key: "SnippetParameter", Value: ""},
-			)
-		case "snippet":
-			fields = append(fields,
-				bson.E{Key: "LocalVariable", Value: ""},
-				bson.E{Key: "PageParameter", Value: ""},
-				bson.E{Key: "SnippetParameter", Value: param.SourceVariable},
-			)
-		default:
-			fields = append(fields,
-				bson.E{Key: "LocalVariable", Value: ""},
-				bson.E{Key: "PageParameter", Value: param.SourceVariable},
-				bson.E{Key: "SnippetParameter", Value: ""},
-			)
-		}
-		fields = append(fields,
-			bson.E{Key: "SubKey", Value: ""},
-			bson.E{Key: "UseAllPages", Value: false},
-			bson.E{Key: "Widget", Value: ""},
-		)
-		sourceVariable = fields
+	if param.SourceVariable != "" || param.SourceWidget != "" {
+		sourceVariable = PageVariableBSON(param.SourceWidget, param.SourceVariable, param.SourceVariableKind)
 	}
 
 	return bson.D{
@@ -1471,6 +2056,37 @@ func SerializeColumnClientTemplateParameter(param *pages.ClientTemplateParameter
 		{Key: "Expression", Value: param.Expression},
 		{Key: "FormattingInfo", Value: formattingInfo},
 		{Key: "SourceVariable", Value: sourceVariable},
+	}
+}
+
+// PageVariableBSON is a Forms$PageVariable. Studio Pro distinguishes three
+// bindings by the slot the name fills:
+//   - LocalVariable     → page-level Variables entry (kind "local")
+//   - SnippetParameter  → snippet parameter            (kind "snippet")
+//   - PageParameter     → page parameter               (kind "", the default)
+//
+// widget names a data view the binding reads through — `$dataView1.Attr`, the
+// data view in Widget and its own variable in the slot (ako/mxcli#826). A
+// binding read straight from a parameter has none.
+func PageVariableBSON(widget, name, kind string) bson.D {
+	local, page, snippet := "", "", ""
+	switch kind {
+	case "local":
+		local = name
+	case "snippet":
+		snippet = name
+	default:
+		page = name
+	}
+	return bson.D{
+		{Key: "$ID", Value: bsonutil.NewIDBsonBinary()},
+		{Key: "$Type", Value: "Forms$PageVariable"},
+		{Key: "LocalVariable", Value: local},
+		{Key: "PageParameter", Value: page},
+		{Key: "SnippetParameter", Value: snippet},
+		{Key: "SubKey", Value: ""},
+		{Key: "UseAllPages", Value: false},
+		{Key: "Widget", Value: widget},
 	}
 }
 

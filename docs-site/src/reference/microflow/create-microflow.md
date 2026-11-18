@@ -50,26 +50,40 @@ Primitive types: `String`, `Integer`, `Long`, `Decimal`, `Boolean`, `DateTime`. 
 **Object Operations**
 
 ```sql
-$Var = CREATE Module.Entity ( Attr1 = value1, Attr2 = value2 );
-CHANGE $Entity ( Attr = value );
-COMMIT $Entity [ WITH EVENTS ] [ REFRESH ];
-DELETE $Entity;
+$Var = CREATE Module.Entity ( Attr1 = value1, Attr2 = value2 ) [ COMMIT [ WITHOUT EVENTS ] ] [ REFRESH ];
+CHANGE $Entity ( Attr = value ) [ COMMIT [ WITHOUT EVENTS ] ] [ REFRESH ];
+COMMIT $Entity [ WITHOUT EVENTS ] [ REFRESH ];
+DELETE $Entity [ REFRESH ];
 ROLLBACK $Entity [ REFRESH ];
 ```
 
-`CREATE` instantiates a new object with initial attribute values. `CHANGE` modifies attributes on an existing object. `COMMIT` persists changes to the database -- `WITH EVENTS` triggers before/after commit event handlers, `REFRESH` updates client-side state. `ROLLBACK` reverts uncommitted changes to an object.
+`CREATE` instantiates a new object with initial attribute values. `CHANGE` modifies attributes on an existing object. `COMMIT` persists changes to the database -- the before/after commit event handlers run unless you write `WITHOUT EVENTS`, matching Studio Pro's default, and `REFRESH` updates client-side state. `ROLLBACK` reverts uncommitted changes to an object.
+
+Every one of these modifiers is optional, and leaving one out always means Mendix's own default -- `Commit: No` and `Refresh in client: No` throughout, and `With events: Yes` on the standalone `COMMIT`. A bare statement therefore produces the same activity as dragging a fresh one onto the Studio Pro canvas.
 
 **Retrieval**
 
 ```sql
 -- Database retrieve with optional XPath constraint
-RETRIEVE $Var FROM Module.Entity [ WHERE condition ] [ LIMIT n ];
+RETRIEVE $Var FROM Module.Entity [ WHERE condition ] [ FIRST | [ LIMIT n ] [ OFFSET n ] ];
 
 -- Retrieve by association
 RETRIEVE $List FROM $Parent/Module.AssocName;
 ```
 
-`RETRIEVE ... LIMIT 1` returns a single entity. Without `LIMIT` or with `LIMIT` greater than 1, it returns a list. Retrieve by association traverses an association from a known object.
+`RETRIEVE ... FIRST` returns a single entity. Without a range, or with `LIMIT`/`OFFSET`, it returns a list. A bare `LIMIT 1` is a list of one (for a script file without the header, see [Language Versions and Migration](../../language/versions.md)). Retrieve by association traverses an association from a known object.
+
+**List Changes**
+
+```sql
+$List = CREATE LIST OF Module.Entity;
+ADD $Item TO $List;
+REMOVE $Item FROM $List;
+CLEAR $List;
+SET $List = $Other;
+```
+
+These are the four operations of a Change list activity: Add, Remove, Clear and Replace. `SET` on a list variable is Replace (stored as `Set`), not a Change variable activity, which Mendix allows only on primitive variables (CE7247). All four work in nanoflows too.
 
 **Calls**
 
@@ -81,10 +95,14 @@ $Result = CALL JAVA ACTION Module.Name ( Param = value );
 
 Call another microflow, nanoflow, or Java action. Parameters are passed by name. The result can be assigned to a variable when the callee has a return type. If no return value is needed, omit the `$Result =` prefix.
 
+A flow may call itself: the target resolves to the flow the statement creates, with the return type it declares, so a recursive microflow or nanoflow is written in one statement — no stub created first.
+
+A call may also name a flow the script creates further down, so mutually recursive flows can be written in either order. The call is stored by name; plain `mxcli exec` resolves it against every flow the script declares, because it rolls the whole run back if a statement fails. `exec --continue-on-error`, the REPL and `-c` cannot roll back and refuse such a call: there, create the callee first, or create a stub of it first and `create or modify` it after the caller.
+
 **UI Actions**
 
 ```sql
-SHOW PAGE Module.PageName ( $Param = $value );
+SHOW PAGE Module.PageName ( Param = $value );
 CLOSE PAGE;
 ```
 
@@ -135,12 +153,12 @@ RETURN $value;
 -- Suffix on any activity (except EXECUTE DATABASE QUERY)
 activity ON ERROR CONTINUE;
 activity ON ERROR ROLLBACK;
-activity ON ERROR {
+activity ON ERROR BEGIN
     handler_statements
-};
+END ERROR;
 ```
 
-Error handling is attached as a suffix to an individual activity. `ON ERROR CONTINUE` suppresses the error and continues. `ON ERROR ROLLBACK` rolls back the current transaction. `ON ERROR { ... }` executes custom error-handling logic.
+Error handling is attached as a suffix to an individual activity. `ON ERROR CONTINUE` suppresses the error and continues. `ON ERROR ROLLBACK` rolls back the current transaction. `ON ERROR BEGIN ... END ERROR` executes custom error-handling logic.
 
 ### Annotations
 
@@ -148,10 +166,22 @@ Annotations are placed before an activity to control visual appearance in the mi
 
 ```sql
 @position(x, y)          -- Canvas position
+@start(x, y)             -- Canvas position of the start event (first statement only)
 @caption 'text'          -- Custom caption
 @color Green             -- Background color
 @annotation 'text'       -- Visual note attached to next activity
 ```
+
+`@start` positions the start event, which has no statement of its own, so it is
+written on the first statement — the one the start flows into. It is optional:
+omit it and the start is placed one spacing unit left of the first activity, on
+that activity's centre line, and a later rewrite re-derives it so it follows the
+activities when they move.
+
+A start that is *not* at that derived spot — one dragged somewhere in Studio Pro,
+or written with `@start` — is treated as placed on purpose. It survives a rewrite
+that does not mention it, and `DESCRIBE` emits an `@start` line for it so the
+description reproduces the flow exactly. An explicit `@start` overrides both.
 
 ## Parameters
 
@@ -185,7 +215,7 @@ BEGIN
         Status = 'Draft'
     );
     COMMIT $Order;
-    SHOW PAGE Sales.Order_Edit ($Order = $Order);
+    SHOW PAGE Sales.Order_Edit (Order = $Order);
     RETURN $Order;
 END;
 ```
@@ -197,9 +227,9 @@ CREATE MICROFLOW Sales.ACT_ApproveOrder
     (DECLARE $Order: Sales.Order)
     RETURN Boolean
 BEGIN
-    IF $Order/Status = 'Pending' THEN
-        CHANGE $Order (Status = 'Approved');
-        COMMIT $Order WITH EVENTS;
+    IF $Order/Status = Sales.OrderStatus.Pending THEN
+        CHANGE $Order (Status = Sales.OrderStatus.Approved);
+        COMMIT $Order;
         LOG INFO NODE 'OrderProcessing' 'Order approved';
         RETURN true;
     ELSE
@@ -243,11 +273,11 @@ BEGIN
 
     $Result = CALL MICROFLOW Integration.SUB_FetchExternalData (
         SyncResult = $Result
-    ) ON ERROR {
+    ) ON ERROR BEGIN
         CHANGE $Result (Status = 'Failed');
         COMMIT $Result;
         LOG ERROR NODE 'Integration' 'Sync failed';
-    };
+    END ERROR;
 
     CHANGE $Result (
         Status = 'Completed',
@@ -285,7 +315,7 @@ BEGIN
         Status = 'Draft',
         CreatedBy = '[%CurrentUser%]'
     );
-    COMMIT $Order WITH EVENTS;
+    COMMIT $Order;
     RETURN $Order;
 END;
 ```

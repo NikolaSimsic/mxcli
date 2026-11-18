@@ -67,9 +67,9 @@ Comprehensive mapping between MDL data types, Mendix internal types, and backend
 | Constraint | Syntax | Description |
 |------------|--------|-------------|
 | Not Null | `NOT NULL` | Value is required |
-| Not Null with Error | `NOT NULL ERROR 'message'` | Required with custom error |
+| Not Null with Error | `NOT NULL ERROR MESSAGE 'message'` | Required with custom error |
 | Unique | `UNIQUE` | Value must be unique |
-| Unique with Error | `UNIQUE ERROR 'message'` | Unique with custom error |
+| Unique with Error | `UNIQUE ERROR MESSAGE 'message'` | Unique with custom error |
 
 Constraints must appear in this order:
 1. `NOT NULL [ERROR '...']`
@@ -96,7 +96,7 @@ MDL does not perform implicit type conversions. Types must match exactly.
 @Position(100, 100)
 CREATE PERSISTENT ENTITY Demo.AllTypes (
   /** Auto-generated ID */
-  Id: AutoNumber NOT NULL UNIQUE DEFAULT 1,
+  ItemNumber: AutoNumber NOT NULL UNIQUE DEFAULT 1,
 
   /** Short text field */
   Code: String(10) NOT NULL UNIQUE,
@@ -122,8 +122,8 @@ CREATE PERSISTENT ENTITY Demo.AllTypes (
   /** Timestamp */
   CreatedAt: DateTime,
 
-  /** Date only */
-  BirthDate: Date,
+  /** Date of birth (Mendix has no date-only type) */
+  BirthDate: DateTime,
 
   /** File attachment */
   Attachment: Binary,

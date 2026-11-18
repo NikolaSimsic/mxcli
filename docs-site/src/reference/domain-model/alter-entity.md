@@ -2,17 +2,17 @@
 
 ## Synopsis
 
-    ALTER ENTITY module.name ADD ( attribute_definition [, ...] )
+    ALTER ENTITY module.name ADD ATTRIBUTE attribute_definition
 
-    ALTER ENTITY module.name DROP ( attribute_name [, ...] )
+    ALTER ENTITY module.name DROP ATTRIBUTE attribute_name
 
-    ALTER ENTITY module.name MODIFY ( attribute_definition [, ...] )
+    ALTER ENTITY module.name MODIFY ATTRIBUTE attribute_definition
 
-    ALTER ENTITY module.name RENAME old_name TO new_name
+    ALTER ENTITY module.name RENAME ATTRIBUTE old_name TO new_name
 
-    ALTER ENTITY module.name ADD INDEX ( column [ ASC | DESC ] [, ...] )
+    ALTER ENTITY module.name ADD INDEX [ index_name ] ( column [ ASC | DESC ] [, ...] )
 
-    ALTER ENTITY module.name DROP INDEX ( column [, ...] )
+    ALTER ENTITY module.name DROP INDEX index_name
 
     ALTER ENTITY module.name SET DOCUMENTATION 'text'
 
@@ -22,15 +22,19 @@
 
 Each `ALTER ENTITY` statement performs exactly one operation. To make multiple changes, issue multiple statements.
 
-The `ADD` operation appends one or more new attributes to the entity. Attribute definitions follow the same syntax as in `CREATE ENTITY`: a name, a data type, and optional constraints (`NOT NULL`, `UNIQUE`, `DEFAULT`).
+The `ADD ATTRIBUTE` operation appends a new attribute to the entity. Attribute definitions follow the same syntax as in `CREATE ENTITY`: a name, a data type, and optional constraints (`NOT NULL`, `UNIQUE`, `DEFAULT`).
 
-The `DROP` operation removes one or more attributes by name. Dropping an attribute also removes any validation rules and index entries that reference it.
+The `DROP ATTRIBUTE` operation removes an attribute by name. Dropping an attribute also removes any validation rules and index entries that reference it.
 
-The `MODIFY` operation changes the type or constraints of existing attributes. The attribute name must already exist in the entity. The full attribute definition (type and constraints) replaces the current one.
+The `MODIFY ATTRIBUTE` operation changes the type or constraints of an existing attribute. The attribute name must already exist in the entity. The full attribute definition (type and constraints) replaces the current one.
 
-The `RENAME` operation changes an attribute's name. This updates references within the entity but does not automatically update microflows, pages, or access rules that reference the old name.
+The `RENAME ATTRIBUTE` operation changes an attribute's name and rewrites every reference Mendix stores as a reference — microflow create and change activity members, page attribute widgets, and the entity's own validation and access rules — reporting how many documents it touched. Renaming onto a name the entity already uses is refused.
 
-The `ADD INDEX` and `DROP INDEX` operations manage database indexes. Index columns may include an optional `ASC` or `DESC` sort direction.
+XPath constraints are rewritten too, even though they name the attribute as a bare step. Each constraint's target entity is known from where it is stored — a retrieve names its entity, a widget data source names its entity, an access rule lives inside one — and every further hop is an association or entity named in the path, so `[Phone = '...']` and `[Sales.Order_Customer/Sales.Customer/Phone = '...']` both follow the rename while another entity's identically-named attribute does not. A constraint mxcli cannot resolve is listed in a warning and left exactly as it was.
+
+One kind of use is **not** rewritten: microflow expressions (`$obj/Phone`), where a bare name is only resolvable from the type of what precedes it. The command prints a note saying so, and `mx check` reports the leftovers as CE0117.
+
+The `ADD INDEX` and `DROP INDEX` operations manage database indexes. `ADD INDEX` takes an optional index name followed by one or more columns, each with an optional `ASC` or `DESC` sort direction; `DROP INDEX` takes the index name.
 
 The `SET DOCUMENTATION` operation replaces the entity's documentation string.
 
@@ -54,6 +58,9 @@ The `SET DOCUMENTATION` operation replaces the entity's documentation string.
 **column**
 : An attribute name for the index, optionally followed by `ASC` or `DESC`.
 
+**index_name**
+: The name of an index. Optional when adding an index; required when dropping one.
+
 **text**
 : A single-quoted string to use as the entity's documentation.
 
@@ -62,29 +69,27 @@ The `SET DOCUMENTATION` operation replaces the entity's documentation string.
 ### Add new attributes
 
 ```sql
-ALTER ENTITY Sales.Customer
-    ADD (Phone: String(50), Notes: String(unlimited));
+mdl 1;
+ALTER ENTITY Sales.Customer ADD ATTRIBUTE Phone: String(50);
+ALTER ENTITY Sales.Customer ADD ATTRIBUTE Notes: String(unlimited);
 ```
 
 ### Drop an attribute
 
 ```sql
-ALTER ENTITY Sales.Customer
-    DROP (Notes);
+ALTER ENTITY Sales.Customer DROP ATTRIBUTE Notes;
 ```
 
 ### Modify an attribute's type
 
 ```sql
-ALTER ENTITY Sales.Customer
-    MODIFY (Phone: String(100) NOT NULL);
+ALTER ENTITY Sales.Customer MODIFY ATTRIBUTE Phone: String(100) NOT NULL;
 ```
 
 ### Rename an attribute
 
 ```sql
-ALTER ENTITY Sales.Customer
-    RENAME Phone TO PhoneNumber;
+ALTER ENTITY Sales.Customer RENAME ATTRIBUTE Phone TO PhoneNumber;
 ```
 
 ### Add an index
@@ -104,8 +109,7 @@ ALTER ENTITY Sales.Order
 ### Drop an index
 
 ```sql
-ALTER ENTITY Sales.Customer
-    DROP INDEX (Email);
+ALTER ENTITY Sales.Customer DROP INDEX idx_customer_email;
 ```
 
 ### Set documentation
@@ -127,7 +131,7 @@ ALTER ENTITY Sales.Customer
 ## Notes
 
 - Each `ALTER ENTITY` statement performs a single operation. Chain multiple statements for multiple changes.
-- `RENAME` does not update references in microflows, pages, or access rules. Update those separately or use `SHOW IMPACT OF` to find affected elements.
+- `RENAME ATTRIBUTE` updates references in microflows, pages and access rules, and rewrites XPath constraints. It does not rewrite microflow expressions (`$obj/Attr`); use `LIST IMPACT OF` to find the documents to check, or build and read the CE0117s.
 - `DROP` removes the attribute's validation rules and index entries automatically.
 
 ## See Also

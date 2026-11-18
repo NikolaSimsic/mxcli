@@ -6,8 +6,9 @@ import (
 	"fmt"
 	"strings"
 
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 
+	"github.com/mendixlabs/mxcli/mdl/backend/bsonnav"
 	"github.com/mendixlabs/mxcli/mdl/bsonutil"
 	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
@@ -17,6 +18,42 @@ import (
 // not-found page, and menu in place, preserving the rest of the navigation
 // document byte-for-byte (read-unmarshal-patch-marshal). Mirrors the legacy
 // writer field-for-field; pure bson.D manipulation, no codec rebuild.
+// Typed-array markers for the lists these writers emit.
+//
+// The leading int32 of a Mendix array is a per-FIELD constant, not a function of
+// the list's contents: Forms$FormSettings.ParameterMappings is 2 in 816 empty
+// and 306 non-empty real occurrences alike. So each list below takes the value
+// Studio Pro writes for that field, censused over 19,078 unit files in 54
+// projects on this machine:
+//
+//	Forms$FormSettings.ParameterMappings        2  (1122 documents)
+//	Forms$FormAction.PagesForSpecializations    2  (357)
+//	Menus$MenuItemCollection.Items              3  (153)
+//	Menus$MenuItem.Items                        3  (459)
+//	Texts$Text.Items                            3  (169,486 vs 7 at 2)
+//	Navigation$NavigationProfile.HomeItems      2  (51)
+//
+// These writers previously emitted 1 for all of them. Note what that was NOT:
+// 1 is a perfectly legitimate Mendix marker -- a Marketplace .mpk mxcli has
+// never touched carries it on CustomWidgets$WidgetValueType.AllowedTypes (212k
+// occurrences) and on Forms$Page.AllowedModuleRoles. debug-bson.md's rule that
+// "any other value is invalid and Studio Pro ignores the array" is too strong
+// and is corrected there. The defect is narrower: for THESE fields, no
+// Studio Pro document uses 1, and mxcli's own menu-document codec path already
+// writes 3 for the same Menus$ item collections, so the two paths disagreed.
+//
+// HomeItems needed a second source, because all 51 census observations are empty
+// lists and navigation_profile_add.go wrote 3 there from a PED session that
+// cannot be re-run here. ako/TestApp settles it: its Studio Pro-authored profile
+// carries HomeItems [marker 2] holding two Navigation$RoleBasedHomePage
+// elements -- a NON-empty list, which is the case the census could not reach.
+// navigation_profile_add.go now writes 2 as well.
+const (
+	navMarkerItems             = int32(3)
+	navMarkerParameterMappings = int32(2)
+	navMarkerHomeItems         = int32(2)
+)
+
 func (b *Backend) UpdateNavigationProfile(navDocID model.ID, profileName string, spec types.NavigationProfileSpec) error {
 	if b.writer == nil {
 		return fmt.Errorf("UpdateNavigationProfile: not connected for writing")
@@ -47,7 +84,11 @@ func (b *Backend) UpdateNavigationProfile(navDocID model.ID, profileName string,
 		if navGetString(profDoc, "$Type") == "Navigation$NativeNavigationProfile" {
 			profiles[i] = navPatchNativeProfile(profDoc, spec)
 		} else {
-			profiles[i] = navPatchWebProfile(profDoc, spec)
+			patched, err := navPatchWebProfile(profDoc, spec)
+			if err != nil {
+				return fmt.Errorf("UpdateNavigationProfile: %w", err)
+			}
+			profiles[i] = patched
 		}
 		break
 	}
@@ -100,7 +141,10 @@ func navID() any { return bsonutil.NewIDBsonBinary() }
 
 // --- profile patchers ---
 
-func navPatchWebProfile(doc bson.D, spec types.NavigationProfileSpec) bson.D {
+func navPatchWebProfile(doc bson.D, spec types.NavigationProfileSpec) (bson.D, error) {
+	// Patch a copy: navSetField writes in place, and a caller's stored profile
+	// must not change under it when no field is appended.
+	doc = append(bson.D(nil), doc...)
 	var defaultHome *types.NavHomePageSpec
 	var roleHomes []types.NavHomePageSpec
 	for _, hp := range spec.HomePages {
@@ -112,35 +156,59 @@ func navPatchWebProfile(doc bson.D, spec types.NavigationProfileSpec) bson.D {
 		}
 	}
 
+	// An omitted clause keeps what is stored (mendixlabs/mxcli#1522), as the
+	// menu block, the sync block, ON SYNC ERROR and PROGRESSIVE WEB APP already
+	// did. These four were written unconditionally, so a statement that stated
+	// only a menu cleared the home page -- CE0527 at the next build -- along
+	// with the role-based home pages, the login page and the fallback page.
+	// MDL has no clause that clears one of them; describe states every one the
+	// profile has, so describe -> exec is unaffected.
 	if defaultHome != nil {
 		doc = navSetField(doc, "HomePage", navHomePageBson(defaultHome.IsPage, defaultHome.Target, ""))
-	} else {
-		doc = navSetField(doc, "HomePage", navHomePageBson(false, "", ""))
 	}
 
-	homeItems := bson.A{int32(1)}
-	for _, rh := range roleHomes {
-		homeItems = append(homeItems, navHomePageBson(rh.IsPage, rh.Target, rh.ForRole))
+	if len(roleHomes) > 0 {
+		var built []bson.D
+		for _, rh := range roleHomes {
+			built = append(built, navHomePageBson(rh.IsPage, rh.Target, rh.ForRole))
+		}
+		doc = navSetField(doc, "HomeItems", navMergeRoleHomes(navGetArray(doc, "HomeItems"), built))
 	}
-	doc = navSetField(doc, "HomeItems", homeItems)
 
-	doc = navSetField(doc, "LoginPageSettings", navFormSettingsBson(spec.LoginPage))
+	if spec.LoginPage != "" {
+		doc = navSetField(doc, "LoginPageSettings", navFormSettingsBson(spec.LoginPage))
+	}
 
 	if spec.NotFoundPage != "" {
 		doc = navSetField(doc, "NotFoundHomepage", bson.D{
 			{Key: "$ID", Value: navID()},
-			{Key: "$Type", Value: "Navigation$HomePage"},
+			// Studio Pro's "Fallback page". The $Type is
+			// Navigation$NotFoundHomePage, not the Navigation$HomePage the home
+			// page slot takes -- measured on ako/TestApp, whose fallback page
+			// Studio Pro stored as Navigation$NotFoundHomePage/Page.
+			//
+			// The wrong $Type here is not cosmetic: Mendix cannot LOAD the
+			// project. Both `mx check` and `mxbuild --target=deploy` exit 1 with
+			// "Object of type '...Navigation.HomePage' cannot be converted to
+			// type '...Navigation.NotFoundHomePage'" (measured on 11.13, against
+			// a build of this file emitting the old spelling). Nothing caught it
+			// because nothing ever BUILT a project with a fallback page set --
+			// the automated mx-check coverage runs doctype-tests/ only, and no
+			// script there sets one.
+			{Key: "$Type", Value: "Navigation$NotFoundHomePage"},
 			{Key: "Microflow", Value: ""},
 			{Key: "Page", Value: spec.NotFoundPage},
 		})
-	} else {
-		doc = navSetField(doc, "NotFoundHomepage", nil)
 	}
 
 	if spec.HasMenu {
-		menuItems := bson.A{int32(1)}
+		menuItems := bson.A{navMarkerItems}
 		for _, mi := range spec.MenuItems {
-			menuItems = append(menuItems, navMenuItemBson(mi))
+			item, err := navMenuItemBson(mi)
+			if err != nil {
+				return nil, err
+			}
+			menuItems = append(menuItems, item)
 		}
 		doc = navSetField(doc, "Menu", bson.D{
 			{Key: "$ID", Value: navID()},
@@ -148,10 +216,118 @@ func navPatchWebProfile(doc bson.D, spec types.NavigationProfileSpec) bson.D {
 			{Key: "Items", Value: menuItems},
 		})
 	}
-	return doc
+
+	if spec.HasSync {
+		doc = navSetField(doc, "OfflineEntityConfigs",
+			navOfflineConfigs(navGetArray(doc, "OfflineEntityConfigs"), spec.OfflineEntities))
+	}
+
+	// ThrowPartialSyncError is declared by neither generated source, so it can
+	// only be written as a raw key — which is why nil means "the statement said
+	// nothing" and the stored value is left exactly as it is. A non-pointer
+	// would reset the flag on every rewrite that never mentions it.
+	if spec.ThrowSyncError != nil {
+		doc = navSetField(doc, "ThrowPartialSyncError", *spec.ThrowSyncError)
+	}
+
+	if spec.ProgressiveWebApp != nil {
+		doc = navSetField(doc, "ProgressiveWebAppSettings", navPWASettings(navGetDoc(doc, "ProgressiveWebAppSettings"), *spec.ProgressiveWebApp))
+	}
+
+	// APP TITLE / APP ICON (ako/mxcli#1756). nil leaves the stored value alone,
+	// so a statement that never mentions the title does not reset it to
+	// anything -- the browser tab keeps what Studio Pro or an earlier script set.
+	if spec.AppTitle != nil {
+		title, err := navAppTitle(navGetDoc(doc, "AppTitle"), *spec.AppTitle)
+		if err != nil {
+			return nil, err
+		}
+		doc = navSetField(doc, "AppTitle", title)
+	}
+	if spec.AppIcon != nil {
+		// A by-name reference to an Images$Image; "" is Studio Pro's "no icon",
+		// the value a profile it has just created carries.
+		doc = navSetField(doc, "AppIcon", *spec.AppIcon)
+	}
+	return doc, nil
+}
+
+// navAppTitle is the profile's AppTitle with text as the project default
+// language's item. The stored Texts$Text is patched, not rebuilt: its $ID, the
+// item's $ID and every other language's item are kept, which is what Studio Pro
+// does when the title is edited in the default language -- and the rule every
+// text an ALTER sets follows (bsonnav.SetTextsTextTranslation). A profile with
+// no Texts$Text there gets a fresh one, as a menu caption does.
+//
+// The stored element is copied before it is patched: SetTextsTextTranslation
+// writes in place, and the caller's stored profile must not change under it.
+func navAppTitle(stored bson.D, text string) (bson.D, error) {
+	if stored == nil || navGetString(stored, "$Type") != "Texts$Text" {
+		return navCaptionBson(text), nil
+	}
+	raw, err := bson.Marshal(stored)
+	if err != nil {
+		return nil, fmt.Errorf("app title: %w", err)
+	}
+	var title bson.D
+	if err := bson.Unmarshal(raw, &title); err != nil {
+		return nil, fmt.Errorf("app title: %w", err)
+	}
+	if !bsonnav.SetTextsTextTranslation(title, text) {
+		return navCaptionBson(text), nil
+	}
+	return title, nil
+}
+
+// navPWASettings is the profile's ProgressiveWebAppSettings after the clause:
+// null for OFF; otherwise the settings the clause states, a key it leaves out
+// taking its platform default -- the same reading describe relies on when it
+// omits a default (R1, R12), so describe -> exec writes nothing. Only the stored
+// element's $ID is kept. Keys are in the alphabetical order Studio Pro stores a
+// profile's properties in.
+func navPWASettings(stored bson.D, spec types.NavPWASpec) any {
+	if spec.Off {
+		return nil
+	}
+	var id any = navID()
+	if stored != nil && navGetString(stored, "$Type") == "Navigation$ProgressiveWebAppSettings" {
+		for _, e := range stored {
+			if e.Key == "$ID" {
+				id = e.Value
+			}
+		}
+	}
+	installPrompt, precaching := types.NavPWADefaultInstallPrompt, types.NavPWADefaultPrecaching
+	if spec.InstallPrompt != nil {
+		installPrompt = *spec.InstallPrompt
+	}
+	if spec.Precaching != nil {
+		precaching = *spec.Precaching
+	}
+	return bson.D{
+		{Key: "$ID", Value: id},
+		{Key: "$Type", Value: "Navigation$ProgressiveWebAppSettings"},
+		{Key: "InstallPrompt", Value: installPrompt},
+		{Key: "Precaching", Value: precaching},
+	}
+}
+
+// navGetDoc is the value of a field that holds an embedded document, or nil.
+func navGetDoc(doc bson.D, key string) bson.D {
+	for _, e := range doc {
+		if e.Key == key {
+			if d, ok := e.Value.(bson.D); ok {
+				return d
+			}
+		}
+	}
+	return nil
 }
 
 func navPatchNativeProfile(doc bson.D, spec types.NavigationProfileSpec) bson.D {
+	// Patch a copy: navSetField writes in place, and a caller's stored profile
+	// must not change under it when no field is appended.
+	doc = append(bson.D(nil), doc...)
 	var defaultHome *types.NavHomePageSpec
 	var roleHomes []types.NavHomePageSpec
 	for _, hp := range spec.HomePages {
@@ -173,19 +349,69 @@ func navPatchNativeProfile(doc bson.D, spec types.NavigationProfileSpec) bson.D 
 		})
 	}
 
-	roleItems := bson.A{int32(1)}
-	for _, rh := range roleHomes {
-		page, nf := navSplitTarget(rh.IsPage, rh.Target)
-		roleItems = append(roleItems, bson.D{
-			{Key: "$ID", Value: navID()},
-			{Key: "$Type", Value: "Navigation$RoleBasedNativeHomePage"},
-			{Key: "UserRole", Value: rh.ForRole},
-			{Key: "HomePagePage", Value: page},
-			{Key: "HomePageNanoflow", Value: nf},
-		})
+	// Same rule as the web writer: a role the statement does not mention keeps
+	// its home page (mendixlabs/mxcli#1522).
+	if len(roleHomes) > 0 {
+		var built []bson.D
+		for _, rh := range roleHomes {
+			page, nf := navSplitTarget(rh.IsPage, rh.Target)
+			built = append(built, bson.D{
+				{Key: "$ID", Value: navID()},
+				{Key: "$Type", Value: "Navigation$RoleBasedNativeHomePage"},
+				{Key: "UserRole", Value: rh.ForRole},
+				{Key: "HomePagePage", Value: page},
+				{Key: "HomePageNanoflow", Value: nf},
+			})
+		}
+		doc = navSetField(doc, "RoleBasedNativeHomePages",
+			navMergeRoleHomes(navGetArray(doc, "RoleBasedNativeHomePages"), built))
 	}
-	doc = navSetField(doc, "RoleBasedNativeHomePages", roleItems)
+
+	// A native profile stores its offline configs as a web profile does. The
+	// executor refuses the clauses this writer cannot apply to a native
+	// profile (its bottom bar, login and not-found pages, on sync error), so
+	// none is ignored in silence (ako/mxcli#980).
+	if spec.HasSync {
+		doc = navSetField(doc, "OfflineEntityConfigs",
+			navOfflineConfigs(navGetArray(doc, "OfflineEntityConfigs"), spec.OfflineEntities))
+	}
 	return doc
+}
+
+// navMergeRoleHomes is a profile's role-based home pages after a statement that
+// states some of them: a stated role's element replaces the stored one in its
+// position, a role the statement does not mention is kept verbatim, and a new
+// role is appended. Roles match case-insensitively, as profile names do.
+//
+// So MDL can add or change a role's home page but not remove one; describe ->
+// exec, which states every stored role, is unaffected (mendixlabs/mxcli#1522).
+func navMergeRoleHomes(stored bson.A, built []bson.D) bson.A {
+	out := bson.A{navMarkerHomeItems}
+	used := make([]bool, len(built))
+	for _, item := range stored {
+		d, ok := item.(bson.D)
+		if !ok {
+			continue // the leading marker
+		}
+		role := navGetString(d, "UserRole")
+		replaced := false
+		for i, b := range built {
+			if !used[i] && strings.EqualFold(navGetString(b, "UserRole"), role) {
+				out = append(out, b)
+				used[i], replaced = true, true
+				break
+			}
+		}
+		if !replaced {
+			out = append(out, d)
+		}
+	}
+	for i, b := range built {
+		if !used[i] {
+			out = append(out, b)
+		}
+	}
+	return out
 }
 
 func navSplitTarget(isPage bool, target string) (page, nanoflow string) {
@@ -215,26 +441,74 @@ func navFormSettingsBson(formName string) bson.D {
 		{Key: "$ID", Value: navID()},
 		{Key: "$Type", Value: "Forms$FormSettings"},
 		{Key: "Form", Value: formName},
-		{Key: "ParameterMappings", Value: bson.A{int32(1)}},
-		{Key: "TitleOverride", Value: navEmptyTextTemplate()},
+		{Key: "ParameterMappings", Value: bson.A{navMarkerParameterMappings}},
+		// No override is an explicit null. An empty template overrides the page
+		// title with "" and produces CW0263 for every authored menu item (#812).
+		{Key: "TitleOverride", Value: nil},
 	}
 }
 
-func navMenuItemBson(mi types.NavMenuItemSpec) bson.D {
+func navMenuItemBson(mi types.NavMenuItemSpec) (bson.D, error) {
+	action, err := navMenuAction(mi)
+	if err != nil {
+		return nil, fmt.Errorf("menu item '%s': %w", mi.Caption, err)
+	}
 	item := bson.D{
 		{Key: "$ID", Value: navID()},
 		{Key: "$Type", Value: "Menus$MenuItem"},
-		{Key: "Action", Value: navMenuAction(mi)},
+		{Key: "Action", Value: action},
 		{Key: "AlternativeText", Value: nil},
 		{Key: "Caption", Value: navCaptionBson(mi.Caption)},
-		{Key: "Icon", Value: nil},
+		{Key: "Icon", Value: navMenuIconBson(mi)},
 	}
-	subItems := bson.A{int32(1)}
+	subItems := bson.A{navMarkerItems}
 	for _, sub := range mi.Items {
-		subItems = append(subItems, navMenuItemBson(sub))
+		subDoc, err := navMenuItemBson(sub)
+		if err != nil {
+			return nil, err
+		}
+		subItems = append(subItems, subDoc)
 	}
 	item = append(item, bson.E{Key: "Items", Value: subItems})
-	return item
+	return item, nil
+}
+
+// navMenuIconBson mirrors sdk/mpr's buildMenuIconBson. The storage names are
+// Forms$… (not the metamodel's Pages$…) — "Form" was the original term for
+// "Page".
+//
+// All THREE variants are emitted. Only the icon-collection one used to be, so a
+// glyph or image icon read off a real project came back as no icon at all, and
+// `create or replace navigation` — a full replacement — wrote that nothing over
+// the user's icon. Measured on testdata/expr-checker: exec of DESCRIBE's own
+// output destroyed the Home item's glyph icon at exit 0.
+func navMenuIconBson(spec types.NavMenuItemSpec) interface{} {
+	kind := spec.IconKind
+	if kind == types.MenuIconNone && spec.Icon != "" {
+		// A spec built before the kind existed carries a name and nothing else.
+		// That name has only ever meant an icon-collection icon.
+		kind = types.MenuIconCollection
+	}
+	storage := types.MenuIconStorageType(kind)
+	if storage == "" {
+		return nil
+	}
+	doc := bson.D{
+		{Key: "$ID", Value: navID()},
+		{Key: "$Type", Value: storage},
+	}
+	if kind == types.MenuIconGlyph {
+		// A glyph with no code identifies no glyph; writing one would store an
+		// icon nobody can see. Emit no icon rather than an empty element.
+		if spec.IconCode == 0 {
+			return nil
+		}
+		return append(doc, bson.E{Key: "Code", Value: int32(spec.IconCode)})
+	}
+	if spec.Icon == "" {
+		return nil
+	}
+	return append(doc, bson.E{Key: "Image", Value: spec.Icon})
 }
 
 func navCaptionBson(text string) bson.D {
@@ -242,18 +516,46 @@ func navCaptionBson(text string) bson.D {
 		{Key: "$ID", Value: navID()},
 		{Key: "$Type", Value: "Texts$Text"},
 		{Key: "Items", Value: bson.A{
-			int32(1),
+			navMarkerItems,
 			bson.D{
 				{Key: "$ID", Value: navID()},
 				{Key: "$Type", Value: "Texts$Translation"},
-				{Key: "LanguageCode", Value: "en_US"},
+				{Key: "LanguageCode", Value: model.AuthoringLanguage()},
 				{Key: "Text", Value: text},
 			},
 		}},
 	}
 }
 
-func navMenuAction(mi types.NavMenuItemSpec) bson.D {
+func navMenuAction(mi types.NavMenuItemSpec) (bson.D, error) {
+	// An action the script could not state, carried from storage verbatim
+	// (ako/mxcli#980). Falling through to Forms$NoAction below is what deleted a
+	// nanoflow menu item's action on every describe -> exec.
+	if len(mi.KeepAction) > 0 {
+		var kept bson.D
+		if err := bson.Unmarshal(mi.KeepAction, &kept); err != nil {
+			return nil, fmt.Errorf("kept action: %w", err)
+		}
+		return kept, nil
+	}
+	// The script's action, written by the widget client-action serializer.
+	if mi.Action != nil {
+		raw, err := menuActionBSON(mi.Action, mi.StoredAction)
+		if err != nil {
+			return nil, err
+		}
+		var d bson.D
+		if err := bson.Unmarshal(raw, &d); err != nil {
+			return nil, err
+		}
+		return d, nil
+	}
+	return navMenuActionFromTargets(mi), nil
+}
+
+// navMenuActionFromTargets builds the action of a spec that carries only the
+// simple targets (no built Action) — a caller other than the executor.
+func navMenuActionFromTargets(mi types.NavMenuItemSpec) bson.D {
 	if mi.Page != "" {
 		return bson.D{
 			{Key: "$ID", Value: navID()},
@@ -261,7 +563,7 @@ func navMenuAction(mi types.NavMenuItemSpec) bson.D {
 			{Key: "DisabledDuringExecution", Value: false},
 			{Key: "FormSettings", Value: navFormSettingsBson(mi.Page)},
 			{Key: "NumberOfPagesToClose2", Value: ""},
-			{Key: "PagesForSpecializations", Value: bson.A{int32(1)}},
+			{Key: "PagesForSpecializations", Value: bson.A{navMarkerParameterMappings}},
 		}
 	}
 	if mi.Microflow != "" {
@@ -276,21 +578,107 @@ func navMenuAction(mi types.NavMenuItemSpec) bson.D {
 			}},
 		}
 	}
+	if mi.SignOut {
+		// Same element a sign-out BUTTON carries, pinned against the sign-out
+		// menu item in ako/TestApp: two properties and nothing else.
+		return bson.D{
+			{Key: "$ID", Value: navID()},
+			{Key: "$Type", Value: "Forms$SignOutClientAction"},
+			{Key: "DisabledDuringExecution", Value: true},
+		}
+	}
+	// DisabledDuringExecution true is on every Forms$NoAction Studio Pro stores
+	// on a menu item (3 of 3 in ako/TestApp's navigation, 3 of 3 in
+	// testapp-views) and is what the widget serializer writes; leaving it out
+	// made a describe -> exec of any item without an action a rewrite.
 	return bson.D{
 		{Key: "$ID", Value: navID()},
 		{Key: "$Type", Value: "Forms$NoAction"},
+		{Key: "DisabledDuringExecution", Value: true},
 	}
 }
 
-func navEmptyTextTemplate() bson.D {
-	return bson.D{
-		{Key: "$ID", Value: navID()},
-		{Key: "$Type", Value: "Microflows$TextTemplate"},
-		{Key: "Parameters", Value: bson.A{int32(2)}},
-		{Key: "Text", Value: bson.D{
-			{Key: "$ID", Value: navID()},
-			{Key: "$Type", Value: "Texts$Text"},
-			{Key: "Items", Value: bson.A{int32(2)}},
-		}},
+// navOfflineConfigs rebuilds the OfflineEntityConfigs list from the spec while
+// carrying forward the properties MDL cannot express.
+//
+// The carry is the whole point. Studio Pro writes four properties on a web
+// profile's config and MDL can spell three; CompatibilityMode is read (phase 1)
+// and put back here, keyed by entity. Building the element from the spec alone
+// would clear it on every rewrite — silently, because the document stays valid
+// and `mx check` reports 0 errors either way. That is the defect that had
+// `create or modify entity` deleting access rules.
+//
+// DownloadMode and ShouldDownload are NOT written, though modelsdk/gen declares
+// them: they occur zero times in ako/TestApp's configs. A property absent from
+// every real document is one Studio Pro fills in on load, and emitting it is
+// how a document mxbuild accepts becomes one Studio Pro cannot open.
+func navOfflineConfigs(stored bson.A, specs []types.NavOfflineEntitySpec) bson.A {
+	// Index what is stored by entity so a rewrite of the same entity keeps its
+	// unauthorable properties. An entity the spec adds has no stored config and
+	// takes the default every reference config carries.
+	compat := map[string]bool{}
+	constraint := map[string]string{}
+	for _, item := range stored {
+		cfg, ok := item.(bson.D)
+		if !ok {
+			continue // the leading typed-array marker
+		}
+		if e := navGetString(cfg, "Entity"); e != "" {
+			compat[e] = navGetBool(cfg, "CompatibilityMode")
+			constraint[e] = navGetString(cfg, "Constraint")
+		}
 	}
+
+	out := bson.A{navMarkerItems}
+	for _, s := range specs {
+		// Studio Pro lays a constraint out over several lines; describe folds it
+		// onto one, and the rewrite stored the folded text — a change to every
+		// constrained entity on each describe -> exec. The same constraint
+		// written with other whitespace keeps the stored layout.
+		if st, ok := constraint[s.Entity]; ok && st != s.Constraint &&
+			xpathWithoutLayout(st) == xpathWithoutLayout(s.Constraint) {
+			s.Constraint = st
+		}
+		out = append(out, bson.D{
+			{Key: "$ID", Value: navID()},
+			{Key: "$Type", Value: "Navigation$OfflineEntityConfig"},
+			{Key: "CompatibilityMode", Value: compat[s.Entity]},
+			{Key: "Constraint", Value: s.Constraint},
+			{Key: "Entity", Value: s.Entity},
+			{Key: "SyncMode", Value: s.SyncMode},
+		})
+	}
+	return out
+}
+
+// navGetBool reads a bool field, defaulting to false for an absent or
+// wrong-typed value — which is what every reference config carries.
+func navGetBool(doc bson.D, key string) bool {
+	for _, e := range doc {
+		if e.Key == key {
+			if b, ok := e.Value.(bool); ok {
+				return b
+			}
+		}
+	}
+	return false
+}
+
+// xpathWithoutLayout is an XPath constraint with the whitespace outside its
+// string literals removed, so two layouts of the same constraint compare equal.
+// A doubled quote inside a literal toggles twice and stays inside it.
+func xpathWithoutLayout(x string) string {
+	var b strings.Builder
+	inLiteral := false
+	for _, r := range x {
+		switch {
+		case r == '\'':
+			inLiteral = !inLiteral
+			b.WriteRune(r)
+		case !inLiteral && (r == ' ' || r == '\t' || r == '\n' || r == '\r'):
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }

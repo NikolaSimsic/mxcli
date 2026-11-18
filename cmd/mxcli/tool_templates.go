@@ -149,7 +149,7 @@ The mxcli tool is in the PROJECT ROOT, not in system PATH. Always use:
 
 ### Validate MDL Scripts
 `+"```bash"+`
-./mxcli check script.mdl                    # Syntax only
+./mxcli check script.mdl --no-project       # Syntax only (else the .mpr here is auto-detected)
 ./mxcli check script.mdl -p %s --references  # With refs
 `+"```"+`
 
@@ -166,6 +166,12 @@ The mxcli tool is in the PROJECT ROOT, not in system PATH. Always use:
 `+"```"+`
 
 ## MDL Syntax Quick Guide
+
+### Scripts
+- Every script starts with `+"`mdl 1;`"+` and every statement ends with `+"`;`"+`.
+- A script without the header is the older mdl 0. Before editing one, upgrade it:
+  `+"`./mxcli fmt --upgrade --header -p %s -w file.mdl`"+`, then check it. Never mix the two in one file.
+- Exec a change twice: the second run must write nothing (unchanged), so use create or modify.
 
 ### Microflows
 - Variable: `+"`DECLARE $var Type = value;`"+`
@@ -186,10 +192,10 @@ See AGENTS.md for complete documentation and .ai-context/skills/ for patterns.
 
 ## Before Writing MDL
 
-1. Read relevant skill file: .ai-context/skills/write-microflows.md or create-page.md
+1. Read relevant skill file: .ai-context/skills/write-microflows/SKILL.md or create-page/SKILL.md
 2. Validate: ./mxcli check script.mdl -p %s --references
 3. Execute: ./mxcli exec script.mdl -p %s
-`, projectName, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile)
+`, projectName, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile)
 }
 
 func generateWindsurfRules(projectName, mprPath string) string {
@@ -237,12 +243,12 @@ func generateContinueConfig(projectName, mprPath string) string {
     {
       "name": "mdl-syntax",
       "description": "Show MDL syntax reference",
-      "prompt": "Read and summarize: .ai-context/skills/write-microflows.md"
+      "prompt": "Read and summarize: .ai-context/skills/write-microflows/SKILL.md"
     },
     {
       "name": "page-syntax",
       "description": "Show page creation syntax",
-      "prompt": "Read and summarize: .ai-context/skills/create-page.md"
+      "prompt": "Read and summarize: .ai-context/skills/create-page/SKILL.md"
     }
   ]
 }
@@ -257,7 +263,7 @@ func generateAiderConfig(projectName, mprPath string) string {
 # Files to read for context
 read-files:
   - AGENTS.md
-  - .ai-context/skills/*.md
+  - .ai-context/skills/*/SKILL.md
 
 # Project description
 description: |
@@ -312,7 +318,7 @@ func generateDevcontainerJSON(projectName, mprPath, containerRuntime string) str
   "containerEnv": {
     %s
   },
-  "postCreateCommand": "curl -fsSL https://claude.ai/install.sh | bash && if [ -f ./mxcli ] && file ./mxcli | grep -q Linux; then echo 'mxcli binary OK'; else ./mxcli setup mxcli --output ./mxcli 2>/dev/null || { ARCH=$(uname -m); [ \"$ARCH\" = x86_64 ] && ARCH=amd64; [ \"$ARCH\" = aarch64 ] && ARCH=arm64; curl -fsSL https://github.com/mendixlabs/mxcli/releases/latest/download/mxcli-linux-${ARCH} -o ./mxcli && chmod +x ./mxcli; }; fi",
+  "postCreateCommand": "curl -fsSL https://claude.ai/install.sh | bash && if [ -f ./mxcli ] && file ./mxcli | grep -q Linux; then echo 'mxcli binary OK'; else ./mxcli setup mxcli --output ./mxcli 2>/dev/null || { ARCH=$(uname -m); [ \"$ARCH\" = x86_64 ] && ARCH=amd64; [ \"$ARCH\" = aarch64 ] && ARCH=arm64; curl -fsSL https://github.com/mendixlabs/mxcli/releases/latest/download/mxcli-linux-${ARCH} -o ./mxcli && { chmod +x ./mxcli 2>/dev/null || true; }; }; fi",
   "customizations": {
     "vscode": {
       "extensions": [
@@ -352,7 +358,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 	return `FROM mcr.microsoft.com/devcontainers/base:bookworm
 
-# Install Adoptium JDK 21 (required by MxBuild), Node.js 22, and utility tools
+# Install Adoptium JDK 21 (required by MxBuild), Node.js 22, and utility tools.
+#
+# The postgresql SERVER (not just -client) is required: the standalone runtime
+# 'mxcli run --local' boots needs a real database, and 'mxcli run --local
+# --ensure-db' provisions it in-container by starting the local service and
+# creating the role + database through a 'sudo -u postgres' superuser. With only
+# postgresql-client installed there is no service to start and no superuser, so
+# --ensure-db fails on a fresh container.
 RUN apt-get update && apt-get install -y --no-install-recommends wget apt-transport-https gpg ca-certificates curl && \
     wget -qO - https://packages.adoptium.net/artifactory/api/gpg/key/public | gpg --dearmor -o /etc/apt/keyrings/adoptium.gpg && \
     echo "deb [signed-by=/etc/apt/keyrings/adoptium.gpg] https://packages.adoptium.net/artifactory/deb bookworm main" > /etc/apt/sources.list.d/adoptium.list && \
@@ -361,14 +374,36 @@ RUN apt-get update && apt-get install -y --no-install-recommends wget apt-transp
     apt-get install -y --no-install-recommends \
        temurin-21-jdk \
        nodejs \
+       postgresql \
        postgresql-client \
+       file \
        kafkacat \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Install playwright-cli and Chromium with all system dependencies (must run as root)
-RUN npm install -g @playwright/cli@latest && \
-    npx playwright install --with-deps chromium
+# Install playwright-cli plus the bundled Chromium (headless shell).
+# @playwright/cli ships its OWN playwright-core, so browsers must be installed
+# via that bundled core (matching revision) — NOT via a transient "npx
+# playwright", which resolves a different package and cache. Browsers go under a
+# world-readable PLAYWRIGHT_BROWSERS_PATH so the non-root "vscode" user finds
+# them (a root-owned ~/.cache/ms-playwright would be invisible to it).
+#
+# On Linux arm64 the chrome/msedge *channels* have no distribution and the alpha
+# CLI's browserName:chromium resolution is unreliable, so we pin the bundled
+# Chromium headless-shell through a stable symlink referenced by
+# .playwright/cli.config.json (executablePath). The symlink keeps the config
+# revision-proof as the headless-shell build number changes.
+# @playwright/cli is pinned (not @latest): it is a young package whose CLI
+# surface still shifts between releases, and an unexpected bump has silently
+# broken browser provisioning before. Bump deliberately after re-verifying the
+# flow below. NOTE: the npm package version (0.1.x) is independent of the
+# playwright-core version the CLI's --version reports (e.g. 1.59.0-alpha).
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+RUN npm install -g @playwright/cli@0.1.15 && \
+    CORE="$(npm root -g)/@playwright/cli/node_modules/playwright-core/cli.js" && \
+    node "$CORE" install --with-deps chromium chromium-headless-shell && \
+    chmod -R a+rX "$PLAYWRIGHT_BROWSERS_PATH" && \
+    ln -sf "$PLAYWRIGHT_BROWSERS_PATH"/chromium_headless_shell-*/chrome-linux/headless_shell /usr/local/bin/mx-headless-shell
 ` + podmanSetup
 }
 
@@ -378,7 +413,8 @@ func generatePlaywrightConfig() string {
     "browserName": "chromium",
     "isolated": true,
     "launchOptions": {
-      "headless": true
+      "headless": true,
+      "executablePath": "/usr/local/bin/mx-headless-shell"
     }
   },
   "timeouts": {
@@ -413,7 +449,7 @@ system_prompt_id = "mendix-mdl"
 
 # Skills from .vibe/skills/ are auto-discovered
 # Additional context files
-# skill_paths = [".ai-context/skills"]
+# skill_paths = [".ai-context/skills"]  # <name>/SKILL.md per skill
 
 # Tool permissions for MDL workflow
 [tools.bash]
@@ -443,6 +479,9 @@ MPR file: %s
 - The mxcli tool is in the project root. Always use ./mxcli, not mxcli.
 - Read AGENTS.md for full project documentation.
 - Read .ai-context/skills/ for MDL syntax patterns before writing scripts.
+- Every script starts with `+"`mdl 1;`"+`. Before editing a script without that header, upgrade it:
+  ./mxcli fmt --upgrade --header -p %s -w file.mdl, then check it. Never mix mdl 0 and mdl 1 in one file.
+- Execute a change twice: the second run must write nothing (unchanged), so use create or modify.
 - Always validate MDL scripts: ./mxcli check script.mdl -p %s --references
 - Microflow variables start with $. Entity declarations have no AS keyword.
 - Page widgets nest with curly braces { }. Properties use (Key: value).
@@ -450,11 +489,11 @@ MPR file: %s
 
 ## Quick Commands
 
-- Explore: ./mxcli -p %s -c "SHOW STRUCTURE"
+- Explore: ./mxcli -p %s -c "DESCRIBE STRUCTURE"
 - Check: ./mxcli check script.mdl -p %s --references
 - Execute: ./mxcli exec script.mdl -p %s
 - Search: ./mxcli search -p %s "keyword"
-`, projectName, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile)
+`, projectName, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile)
 }
 
 // wrapSkillForVibe wraps a plain markdown skill file with Vibe SKILL.md frontmatter.
@@ -501,7 +540,7 @@ func generateCopilotInstructions(projectName, mprPath string) string {
 		"## Quick Commands\n\n"+
 		"```bash\n"+
 		"# Explore project structure\n"+
-		"./mxcli -p %s -c \"SHOW STRUCTURE\"\n\n"+
+		"./mxcli -p %s -c \"DESCRIBE STRUCTURE\"\n\n"+
 		"# Validate an MDL script (always do this before executing)\n"+
 		"./mxcli check script.mdl -p %s --references\n\n"+
 		"# Execute an MDL script\n"+
@@ -519,23 +558,28 @@ func generateCopilotInstructions(projectName, mprPath string) string {
 		"- **Page widgets:** nest with `{ }`, properties use `(Key: value, ...)`.\n"+
 		"- **Single quotes in expressions:** escape by doubling — `'it''s here'`.\n"+
 		"- **No `AS` keyword** in entity attribute declarations.\n"+
-		"- **Statements** end with `;` or `/` on a line by itself.\n\n"+
+		"- **Scripts** start with `mdl 1;`, and every statement ends with `;`. A script without the header is the\n"+
+		"  older mdl 0: upgrade it before editing (`./mxcli fmt --upgrade --header -p %s -w file.mdl`, then check it),\n"+
+		"  and never mix the two in one file.\n\n"+
 		"## Workflow\n\n"+
 		"1. Explore: read `AGENTS.md` and the relevant `.ai-context/skills/` file first.\n"+
-		"2. Write MDL in a `.mdl` file.\n"+
+		"2. Write MDL in a `.mdl` file that starts with `mdl 1;`.\n"+
 		"3. Validate: `./mxcli check <file>.mdl -p %s --references`.\n"+
 		"4. Execute: `./mxcli exec <file>.mdl -p %s`.\n"+
-		"5. Verify: `./mxcli -p %s -c \"DESCRIBE ENTITY Mod.Name\"`.\n",
-		projectName, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile)
+		"5. Verify: `./mxcli -p %s -c \"DESCRIBE ENTITY Mod.Name\"`. Execute the script again: the second run must write nothing (unchanged).\n",
+		projectName, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile, mprFile)
 }
 
 func generateOpenCodeConfig(projectName, mprPath string) string {
+	// AGENTS.md only. `instructions` inlines each matched file's whole body
+	// into the system prompt; the two skill globs this listed put 150 files,
+	// 2.7 MB — ~73% of a 1M window — in front of every session (ako/mxcli#1822).
+	// OpenCode discovers .opencode/skills/ itself and loads a skill's body when
+	// its description matches, which is what the skills are written for.
 	return `{
   "$schema": "https://opencode.ai/config.json",
   "instructions": [
-    "AGENTS.md",
-    ".opencode/skills/**/SKILL.md",
-    ".ai-context/skills/*.md"
+    "AGENTS.md"
   ]
 }
 `

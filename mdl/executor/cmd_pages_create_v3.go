@@ -8,6 +8,7 @@ import (
 	"github.com/mendixlabs/mxcli/mdl/ast"
 	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
 	"github.com/mendixlabs/mxcli/model"
+	"github.com/mendixlabs/mxcli/sdk/pages"
 )
 
 // ============================================================================
@@ -19,14 +20,20 @@ func execCreatePageV3(ctx *ExecContext, s *ast.CreatePageStmtV3) error {
 	if !ctx.ConnectedForWrite() {
 		return mdlerrors.NewNotConnectedWrite()
 	}
+	// A parameter named with a platform-reserved word is CE7247 (MDL-PARAM01,
+	// ako/mxcli#1651) — refused here too, so --no-check cannot write it.
+	if err := refuseReservedParameterNames(s); err != nil {
+		return err
+	}
 
-	// Version pre-check: page parameters require 11.0+
-	if len(s.Parameters) > 0 {
-		if err := checkFeature(ctx, "pages", "page_parameters",
-			"create page with parameters",
-			"pass data via a non-persistent entity or microflow parameter instead"); err != nil {
-			return err
-		}
+	// Version pre-check: page parameters exist from Mendix 9.4, not 11.0. The
+	// registry used to say 11.0 — a figure that came from an illustrative sample
+	// table in PROPOSAL_version_aware_agent_support.md, never from a measurement —
+	// which locked every 10.x project out of parameterised pages entirely
+	// (mendixlabs/mxcli#1121). The gate stays because 9.0–9.3 genuinely has no
+	// Pages$PageParameter; only the floor and the hint were wrong.
+	if err := checkVersionGates(ctx, s); err != nil {
+		return err
 	}
 
 	// Find or auto-create module
@@ -41,23 +48,66 @@ func execCreatePageV3(ctx *ExecContext, s *ast.CreatePageStmtV3) error {
 	var pagesToDelete []model.ID
 	var existingAllowedRoles []model.ID
 	preserveAllowedRoles := false
+	// Mendix allows several pages in one module to share a name as long as all
+	// but one are excluded, so the replace set is the LIVE pages only. An
+	// excluded twin is a different document that the app does not render: it is
+	// neither rewritten nor deleted here, and its exclusion is carried forward
+	// when it is the only match (#914).
+	existingExcluded := false
+	// Where the page being rewritten currently sits, so a statement that says
+	// nothing about folders leaves it there (#932).
+	var existingContainerID model.ID
+	var existingDocumentation string
+	haveExistingPage := false
+	var excludedMatches []*pages.Page
+	matches := 0
 	for _, p := range existingPages {
 		modID := getModuleID(ctx, p.ContainerID)
 		modName := getModuleName(ctx, modID)
-		if modName == s.Name.Module && p.Name == s.Name.Name {
-			if !s.IsReplace && !s.IsModify && len(pagesToDelete) == 0 {
-				return mdlerrors.NewAlreadyExists("page", s.Name.String())
-			}
-			if len(pagesToDelete) == 0 {
-				existingAllowedRoles = cloneRoleIDs(p.AllowedRoles)
-				preserveAllowedRoles = true
-			}
-			pagesToDelete = append(pagesToDelete, p.ID)
+		if modName != s.Name.Module || p.Name != s.Name.Name {
+			continue
+		}
+		matches++
+		if !s.IsReplace && !s.IsModify && matches == 1 {
+			return mdlerrors.NewAlreadyExists("page", s.Name.String())
+		}
+		if p.Excluded {
+			excludedMatches = append(excludedMatches, p)
+			continue
+		}
+		if len(pagesToDelete) == 0 {
+			existingAllowedRoles = cloneRoleIDs(p.AllowedRoles)
+			preserveAllowedRoles = true
+			existingContainerID = p.ContainerID
+			existingDocumentation = p.Documentation
+			haveExistingPage = true
+		}
+		pagesToDelete = append(pagesToDelete, p.ID)
+	}
+	if len(pagesToDelete) == 0 && len(excludedMatches) > 0 {
+		// Every page with this name is excluded: rewrite the first of them in
+		// place and keep it excluded, rather than adding an active page the
+		// script never asked to un-exclude.
+		p := excludedMatches[0]
+		existingAllowedRoles = cloneRoleIDs(p.AllowedRoles)
+		preserveAllowedRoles = true
+		existingExcluded = true
+		existingContainerID = p.ContainerID
+		existingDocumentation = p.Documentation
+		haveExistingPage = true
+		pagesToDelete = append(pagesToDelete, p.ID)
+	}
+
+	// A rewrite must not delete widgets MDL cannot author (mendixlabs/mxcli#1622).
+	if len(pagesToDelete) > 0 {
+		if err := checkNoUnauthorableWidgetsDropped(ctx, "page", s.Name, pagesToDelete[0], allPageWidgets(s)); err != nil {
+			return err
 		}
 	}
 
 	// Build the page BEFORE deleting the old one (atomic: if build fails, old page is preserved)
 	pb := &pageBuilder{
+		ctx:              ctx,
 		backend:          ctx.Backend,
 		moduleID:         moduleID,
 		moduleName:       s.Name.Module,
@@ -68,24 +118,56 @@ func execCreatePageV3(ctx *ExecContext, s *ast.CreatePageStmtV3) error {
 		fragments:        ctx.Fragments,
 		themeRegistry:    ctx.GetThemeRegistry(),
 		widgetBackend:    ctx.Backend,
+		// The root of a document that this pass walks in full: there is no
+		// enclosing data widget, so there is no context object. #1029.
+		argCtx:           atDocumentRoot(),
+		isDocumentWidget: widgetNameSet(allPageWidgets(s)),
+		// An excluded page may name documents that do not exist; Mendix does
+		// not validate it, and the check reports them as warnings. The page
+		// stays excluded whether the statement says so or the carry does.
+		tolerateDanglingRefs: s.Excluded || existingExcluded,
+	}
+
+	// A rewrite of one stored page keeps the pluggable widgets the statement
+	// did not change (#721 L4). Duplicates are skipped: which one describe
+	// would print is then not the one being rewritten.
+	if len(pagesToDelete) == 1 {
+		id := pagesToDelete[0]
+		pb.storedPluggables = loadPluggablePassthrough(ctx, id, func() error {
+			prev := ctx.describeID
+			ctx.describeID = id
+			defer func() { ctx.describeID = prev }()
+			return describePage(ctx, s.Name)
+		})
 	}
 
 	page, err := pb.buildPageV3(s)
 	if err != nil {
 		return mdlerrors.NewBackend("build page", err)
 	}
+	page.Excluded = page.Excluded || existingExcluded
+	// A rewrite that carried no doc comment keeps the stored one (#1018).
+	if haveExistingPage {
+		page.Documentation = carriedDocumentation(s.DocumentationSet, s.Documentation, existingDocumentation)
+	}
+	// A new page starts with no allowed roles: access is the author's grant
+	// (mendixlabs/mxcli#1474).
 	if preserveAllowedRoles {
 		page.AllowedRoles = existingAllowedRoles
-	} else if len(page.AllowedRoles) == 0 {
-		page.AllowedRoles = defaultDocumentAccessRoles(ctx, module)
 	}
 
 	// Replace or create the page in the MPR
 	if len(pagesToDelete) > 0 {
 		// Reuse first existing page's UUID to avoid git delete+add (which crashes Studio Pro RevStatusCache)
 		page.ID = pagesToDelete[0]
+		if s.Folder == "" {
+			page.ContainerID = existingContainerID
+		}
 		if err := ctx.Backend.UpdatePage(page); err != nil {
 			return mdlerrors.NewBackend("update page", err)
+		}
+		if _, err := applyDocumentFolder(ctx, page.ID, existingContainerID, page.ContainerID); err != nil {
+			return err
 		}
 		// Delete any additional duplicates
 		for _, id := range pagesToDelete[1:] {
@@ -105,7 +187,19 @@ func execCreatePageV3(ctx *ExecContext, s *ast.CreatePageStmtV3) error {
 	// Invalidate hierarchy cache so the new page's container is visible
 	invalidateHierarchy(ctx)
 
-	fmt.Fprintf(ctx.Output, "Created page %s\n", s.Name.String())
+	// "Created" was printed for the replace path too, so re-running a script
+	// against an unchanged page claimed to have created it every time. Duplicate
+	// pages of the same name are deleted above, and a delete is a real change
+	// that unit-write counting does not see — so only a plain one-for-one
+	// replacement is eligible to be reported as unchanged.
+	switch {
+	case len(pagesToDelete) == 1:
+		ctx.ReportMutation("Replaced", "page %s", s.Name.String())
+	case len(pagesToDelete) > 1:
+		fmt.Fprintf(ctx.Output, "Replaced page %s\n", s.Name.String())
+	default:
+		fmt.Fprintf(ctx.Output, "Created page %s\n", s.Name.String())
+	}
 	return nil
 }
 
@@ -113,6 +207,11 @@ func execCreatePageV3(ctx *ExecContext, s *ast.CreatePageStmtV3) error {
 func execCreateSnippetV3(ctx *ExecContext, s *ast.CreateSnippetStmtV3) error {
 	if !ctx.ConnectedForWrite() {
 		return mdlerrors.NewNotConnectedWrite()
+	}
+	// A parameter named with a platform-reserved word is CE7247 (MDL-PARAM01,
+	// ako/mxcli#1651) — refused here too, so --no-check cannot write it.
+	if err := refuseReservedParameterNames(s); err != nil {
+		return err
 	}
 
 	// Find or auto-create module
@@ -125,19 +224,52 @@ func execCreateSnippetV3(ctx *ExecContext, s *ast.CreateSnippetStmtV3) error {
 	// Check if snippet already exists - collect ALL duplicates
 	existingSnippets, _ := ctx.Backend.ListSnippets()
 	var snippetsToDelete []model.ID
+	// As for pages: an excluded twin of this name is a separate document that
+	// Mendix allows, so it is neither replaced nor deleted, and an exclusion is
+	// carried forward when every match is excluded (#914).
+	existingExcluded := false
+	// Where the snippet being replaced currently sits. A snippet is rewritten
+	// as delete+create, so unlike the Update* doctypes its container really is
+	// re-applied on every statement — leaving this unset filed a foldered
+	// snippet back into the module root whenever a script that says nothing
+	// about folders was re-run (#932).
+	var existingContainerID model.ID
+	var existingSnipDoc string
+	haveExistingSnip := false
+	var excludedSnippets []*pages.Snippet
+	matches := 0
 	for _, snip := range existingSnippets {
 		modID := getModuleID(ctx, snip.ContainerID)
 		modName := getModuleName(ctx, modID)
-		if modName == s.Name.Module && snip.Name == s.Name.Name {
-			if !s.IsReplace && !s.IsModify && len(snippetsToDelete) == 0 {
-				return mdlerrors.NewAlreadyExists("snippet", s.Name.String())
-			}
-			snippetsToDelete = append(snippetsToDelete, snip.ID)
+		if modName != s.Name.Module || snip.Name != s.Name.Name {
+			continue
 		}
+		matches++
+		if !s.IsReplace && !s.IsModify && matches == 1 {
+			return mdlerrors.NewAlreadyExists("snippet", s.Name.String())
+		}
+		if snip.Excluded {
+			excludedSnippets = append(excludedSnippets, snip)
+			continue
+		}
+		if len(snippetsToDelete) == 0 {
+			existingContainerID = snip.ContainerID
+			existingSnipDoc = snip.Documentation
+			haveExistingSnip = true
+		}
+		snippetsToDelete = append(snippetsToDelete, snip.ID)
+	}
+	if len(snippetsToDelete) == 0 && len(excludedSnippets) > 0 {
+		existingExcluded = true
+		existingContainerID = excludedSnippets[0].ContainerID
+		existingSnipDoc = excludedSnippets[0].Documentation
+		haveExistingSnip = true
+		snippetsToDelete = append(snippetsToDelete, excludedSnippets[0].ID)
 	}
 
 	// Build the snippet BEFORE deleting the old one (atomic: if build fails, old snippet is preserved)
 	pb := &pageBuilder{
+		ctx:              ctx,
 		backend:          ctx.Backend,
 		moduleID:         moduleID,
 		moduleName:       s.Name.Module,
@@ -148,6 +280,35 @@ func execCreateSnippetV3(ctx *ExecContext, s *ast.CreateSnippetStmtV3) error {
 		fragments:        ctx.Fragments,
 		themeRegistry:    ctx.GetThemeRegistry(),
 		widgetBackend:    ctx.Backend,
+		// The root of a document that this pass walks in full: there is no
+		// enclosing data widget, so there is no context object. #1029.
+		argCtx:           atDocumentRoot(),
+		isDocumentWidget: widgetNameSet(s.Widgets),
+		// A snippet has no @excluded of its own; it stays excluded through the
+		// carry, and an excluded one may name documents that do not exist.
+		tolerateDanglingRefs: existingExcluded,
+	}
+
+	// As for pages (mendixlabs/mxcli#1622). describe finds a snippet by name,
+	// so only a name with a single stored document can be described.
+	if matches == 1 && len(snippetsToDelete) == 1 {
+		if err := checkNoUnauthorableWidgetsDropped(ctx, "snippet", s.Name, snippetsToDelete[0], s.Widgets); err != nil {
+			return err
+		}
+	}
+
+	// As for pages (#721 L4). describe finds a snippet by name, so only a name
+	// with a single stored document is described.
+	if matches == 1 && len(snippetsToDelete) == 1 {
+		pb.storedPluggables = loadPluggablePassthrough(ctx, snippetsToDelete[0], func() error {
+			return describeSnippet(ctx, s.Name)
+		})
+	}
+	// A rewrite keeps the stored snippet's Type (the header carry), so a native
+	// snippet's widgets take the native design-property definitions
+	// (ako/mxcli#1679).
+	if len(snippetsToDelete) > 0 && storedSnippetIsNative(ctx, snippetsToDelete[0]) {
+		pb.themeRegistry = pb.themeRegistry.ForPlatform(true)
 	}
 
 	snippet, err := pb.buildSnippetV3(s)
@@ -155,16 +316,47 @@ func execCreateSnippetV3(ctx *ExecContext, s *ast.CreateSnippetStmtV3) error {
 		return mdlerrors.NewBackend("build snippet", err)
 	}
 
-	// Delete old snippets only after successful build
-	for _, id := range snippetsToDelete {
-		if err := ctx.Backend.DeleteSnippet(id); err != nil {
-			return mdlerrors.NewBackend("delete existing snippet", err)
-		}
+	// A rewrite that carried no doc comment keeps the stored one (#1018).
+	if haveExistingSnip {
+		snippet.Documentation = carriedDocumentation(s.DocumentationSet, s.Documentation, existingSnipDoc)
+	}
+	snippet.Excluded = snippet.Excluded || existingExcluded
+	if s.Folder == "" && existingContainerID != "" {
+		snippet.ContainerID = existingContainerID
 	}
 
-	// Create the snippet in the MPR
-	if err := ctx.Backend.CreateSnippet(snippet); err != nil {
-		return mdlerrors.NewBackend("create snippet", err)
+	// Replace or create the snippet in the MPR, the same way a page does.
+	//
+	// This used to be an unconditional delete-then-create, and that destroyed
+	// everything the stored document carried that a rebuild cannot express —
+	// most visibly its TRANSLATIONS. A `create or replace snippet` reset a
+	// translated label to its source language in every language, silently:
+	// the run reported "Created snippet", `mx check` reported 0 errors, and the
+	// app rendered in one language (ako/mxcli-ledger #143).
+	//
+	// Delete-then-create is not a write that canon.Reconcile can preserve
+	// anything through, because by the time the create runs there is no stored
+	// document left to reconcile against — the identity transplant and the
+	// unchanged-elision both have nothing to work from. Reusing the stored
+	// unit's ID and going through Update puts the snippet back on the same
+	// choke point every other document type uses (ADR-0008). It also fixes the
+	// second consequence the page path documents: a delete+add churns the file
+	// in git and crashes Studio Pro's RevStatusCache.
+	if len(snippetsToDelete) > 0 {
+		snippet.ID = snippetsToDelete[0]
+		if err := ctx.Backend.UpdateSnippet(snippet); err != nil {
+			return mdlerrors.NewBackend("update snippet", err)
+		}
+		// Any further documents of the same name are genuine duplicates.
+		for _, id := range snippetsToDelete[1:] {
+			if err := ctx.Backend.DeleteSnippet(id); err != nil {
+				return mdlerrors.NewBackend("delete duplicate snippet", err)
+			}
+		}
+	} else {
+		if err := ctx.Backend.CreateSnippet(snippet); err != nil {
+			return mdlerrors.NewBackend("create snippet", err)
+		}
 	}
 
 	// Track the created snippet so it can be resolved by subsequent snippet references
@@ -173,6 +365,18 @@ func execCreateSnippetV3(ctx *ExecContext, s *ast.CreateSnippetStmtV3) error {
 	// Invalidate hierarchy cache so the new snippet's container is visible
 	invalidateHierarchy(ctx)
 
-	fmt.Fprintf(ctx.Output, "Created snippet %s\n", s.Name.String())
+	// Same rule as pages: "Created" was printed for the replace path too, so
+	// re-running a script against an unchanged snippet claimed to create it every
+	// time. Only a plain one-for-one replacement is eligible to be reported as
+	// unchanged — deleting a duplicate is a real change unit-write counting
+	// cannot see.
+	switch {
+	case len(snippetsToDelete) == 1:
+		ctx.ReportMutation("Replaced", "snippet %s", s.Name.String())
+	case len(snippetsToDelete) > 1:
+		fmt.Fprintf(ctx.Output, "Replaced snippet %s\n", s.Name.String())
+	default:
+		fmt.Fprintf(ctx.Output, "Created snippet %s\n", s.Name.String())
+	}
 	return nil
 }

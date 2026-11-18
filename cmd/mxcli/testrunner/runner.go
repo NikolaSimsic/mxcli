@@ -6,15 +6,26 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/mendixlabs/mxcli/cmd/mxcli/docker"
+)
+
+const (
+	// mxTestModule is the module Run generates the test runner into.
+	mxTestModule = "MxTest"
+	// mxTestRunner is the generated after-startup microflow.
+	mxTestRunner = "MxTest.TestRunner"
 )
 
 // RunOptions configures the test runner.
@@ -28,11 +39,95 @@ type RunOptions struct {
 	// SkipBuild skips the MxBuild step (reuse existing deployment).
 	SkipBuild bool
 
+	// execPrograms, keyed on test ID, sends those tests to the endpoint's exec
+	// route instead of running a generated microflow (interp.go). Set only by
+	// an attach to an app started with --allow-call.
+	execPrograms map[string]*execProgram
+
+	// ReuseBuild (--reuse-build, local runs) skips the injection and the build when
+	// the deployment left by the previous run is the build this run would make:
+	// same project files, same test microflows, same mxcli (see reusebuild.go).
+	// Any difference builds as usual.
+	ReuseBuild bool
+	recordKey  string // set by runEndpoint on a reuse miss: the key to record once the build booted
+
+	// Local runs the app with mxcli's own local runtime (`run --local`) instead
+	// of a Docker container, and drives the tests over the test endpoint.
+	Local bool
+
+	// LegacyRunner forces the after-startup mechanism on a local run — the suite
+	// compiled into one startup microflow, results read back from the runtime
+	// log. An escape hatch for the case where the endpoint misbehaves; the
+	// Docker path uses this mechanism regardless.
+	LegacyRunner bool
+
+	// Watch keeps the runtime and the build server up and re-runs the suite on
+	// every change to a test file or to the project's model, until interrupted.
+	// Requires the test endpoint, so it is incompatible with LegacyRunner and
+	// with the Docker path — both of which can only re-run by restarting.
+	Watch bool
+
+	// Attach runs against an app already started with
+	// `mxcli run --local --test-endpoint`, skipping the boot entirely. The tests
+	// then run against that app's database rather than a scratch one.
+	Attach bool
+
+	// SkipAppStartup stops the project's own after-startup microflow from running
+	// during a --local test run.
+	//
+	// It normally does run: the generated startup flow registers the endpoint and
+	// then chains it, so tests see the app in the state it actually boots into.
+	// Set this when the suite wants an empty, deterministic baseline instead —
+	// e.g. the app seeds demo data at startup and the tests are asserting on
+	// counts.
+	SkipAppStartup bool
+
+	// ConstantOverrides are the constant values the app should run with, layered
+	// over the defaults in the deployment. Resolved by the caller from the
+	// project's configuration (and, in future, the higher layers of
+	// docs/11-proposals/PROPOSAL_constant_values.md) so the runner stays a
+	// carrier rather than a second place that decides precedence.
+	//
+	// Only --local uses these: --attach runs against an app someone else booted
+	// and inherits ITS constants, and the Docker path configures the container.
+	ConstantOverrides map[string]string
+
+	// JVMArgs are the same configuration's JVM options (Java heap maximum, Extra
+	// JVM parameters), resolved by the caller and carried like ConstantOverrides.
+	// Only --local uses them.
+	JVMArgs []string
+
+	// DBType is the database a --local run boots its scratch app against, in the
+	// canonical spelling docker.NormalizeDBType returns ("postgresql" or
+	// "hsqldb"; empty means PostgreSQL). Set it through ResolveTestDBType, which
+	// validates the --db-type flag — a raw flag value is not normalised here.
+	DBType string
+
+	// MxBuildPath overrides mxbuild resolution for a --local run, as
+	// `run --local --mxbuild-path` does. Empty means resolve: Studio Pro's
+	// bundled mxbuild on macOS/Windows, the cached CDN download on Linux.
+	MxBuildPath string
+
+	// AppPort, AdminPort and ServePort move the ports a --local run boots on —
+	// the app, the M2EE admin API and mxbuild --serve. Zero means the default
+	// (8081, 8091, 6544), chosen to sit beside `run --local`'s 8080/8090/6543.
+	// --attach and the Docker path refuse them (see validatePorts).
+	AppPort   int
+	AdminPort int
+	ServePort int
+
 	// Timeout for runtime startup and test execution.
 	Timeout time.Duration
 
 	// JUnitOutput is the path for JUnit XML output (empty = no file output).
 	JUnitOutput string
+
+	// RequireAssertions turns a test that asserts nothing into an ERROR.
+	//
+	// Off by default: a smoke test — "this microflow runs without throwing" — is
+	// a legitimate thing to write. The summary line reports vacuous tests either
+	// way; this is for a project that has decided every test must assert.
+	RequireAssertions bool
 
 	// Verbose shows all runtime log output.
 	Verbose bool
@@ -47,14 +142,22 @@ type RunOptions struct {
 	Stderr io.Writer
 }
 
-// Run executes the test suite using the after-startup pattern:
-// 1. Parse test files
-// 2. Generate TestRunner microflow
-// 3. Inject into project, set as after-startup
-// 4. Build and restart runtime
-// 5. Parse logs for results
-// 6. Cleanup (restore original settings)
-// 7. Output results
+// Run executes the test suite.
+//
+// There are two mechanisms, and which one is used follows from opts.Local:
+//
+//   - Local runs go through the test endpoint (runEndpoint). Boot registers an
+//     HTTP handler and nothing else; each test is then invoked by name against a
+//     runtime that stays up, and returns its verdict in the response.
+//   - Docker runs go through the after-startup runner (runAfterStartup), which
+//     compiles the suite into the project's after-startup microflow, restarts the
+//     container, and recovers results from its log.
+//
+// The endpoint is the better mechanism — a re-run is an HTTP call rather than a
+// restart, a failing test is a result rather than a failed boot, and results are
+// returned rather than scraped. It is confined to the local path because it
+// needs to hand the runtime a secret through its environment and to reach it on
+// loopback, neither of which is wired through docker-compose yet.
 func Run(opts RunOptions) (*SuiteResult, error) {
 	w := opts.Stdout
 	if w == nil {
@@ -65,24 +168,272 @@ func Run(opts RunOptions) (*SuiteResult, error) {
 		stderr = os.Stderr
 	}
 
+	if err := validateOptions(opts); err != nil {
+		return nil, err
+	}
+	// Probe the ports before the project is touched: a taken port found after
+	// injection costs a build and a cleanup, and StartLocalApp's own guard cannot
+	// name the flag that moves it.
+	if opts.Local && !opts.Attach {
+		if err := checkTestPortsFree(opts); err != nil {
+			return nil, err
+		}
+	}
+
 	timeout := opts.Timeout
 	if timeout == 0 {
 		timeout = 5 * time.Minute
 	}
 
-	// Step 1: Parse test files
+	// Resolve the project path up front so everything derived from it — the
+	// runtime log path, the deployment directory, the paths named in error
+	// messages — is absolute and agrees.
+	if opts.ProjectPath != "" && !filepath.IsAbs(opts.ProjectPath) {
+		if abs, err := filepath.Abs(opts.ProjectPath); err == nil {
+			opts.ProjectPath = abs
+		}
+	}
+
 	fmt.Fprintln(w, "Parsing test files...")
 	suite, err := parseTestFiles(opts.TestFiles)
 	if err != nil {
 		return nil, fmt.Errorf("parsing test files: %w", err)
 	}
-	fmt.Fprintf(w, "  Found %d test(s) in %d file(s)\n", len(suite.Tests), len(opts.TestFiles))
-
-	if len(suite.Tests) == 0 {
-		return nil, fmt.Errorf("no tests found in the provided files")
+	fmt.Fprintf(w, "  Found %d test(s) in %d file(s)\n", len(suite.Tests), suite.FilesRead)
+	if line := skippedDirsLine(suite.SkippedDirs); line != "" {
+		fmt.Fprintln(w, line)
+	}
+	for _, fe := range suite.FileErrors {
+		fmt.Fprintf(w, "  ERROR %s: %v\n", fe.Path, fe.Err)
 	}
 
-	// Step 2: Generate TestRunner microflow MDL
+	if len(suite.Tests) == 0 {
+		// A directory whose every file is malformed is not an empty directory,
+		// and must not be reported as one (#903).
+		if len(suite.FileErrors) > 0 {
+			return nil, noTestsParsedError(suite.FileErrors)
+		}
+		return nil, emptySuiteError(opts.TestFiles)
+	}
+
+	result, err := dispatchRun(opts, suite, timeout, w)
+	if result != nil {
+		// Appended after execution so an unparseable file lands in the summary,
+		// the JUnit report and the exit code alongside the tests that did run.
+		result.Tests = append(result.Tests, suiteFileErrorResults(suite.FileErrors)...)
+	}
+	return result, err
+}
+
+// dispatchRun hands the suite to the runner the options select.
+func dispatchRun(opts RunOptions, suite *TestSuite, timeout time.Duration, w io.Writer) (*SuiteResult, error) {
+	if opts.Attach {
+		return runAttached(opts, suite, timeout, w)
+	}
+	if opts.Local && !opts.LegacyRunner {
+		return runEndpoint(opts, suite, timeout, w)
+	}
+	// @verify needs a seam after each test's call, and a reachable admin API to
+	// query — neither of which the after-startup runner has: its tests execute
+	// during boot and its results are recovered from the log. Refuse rather than
+	// run the suite with those assertions quietly skipped.
+	if err := rejectVerifyOnLegacyRunner(suite); err != nil {
+		return nil, err
+	}
+	return runAfterStartup(opts, suite, timeout, w)
+}
+
+// rejectVerifyOnLegacyRunner refuses a suite the after-startup runner cannot
+// fully evaluate.
+func rejectVerifyOnLegacyRunner(suite *TestSuite) error {
+	for _, tc := range suite.Tests {
+		if len(tc.Verify) > 0 {
+			return fmt.Errorf(
+				"test %q uses @verify, which the after-startup runner cannot evaluate: "+
+					"its tests run during boot, so there is no point at which to query the app. "+
+					"Run with --local (the default test endpoint) or --attach", tc.Name)
+		}
+	}
+	return nil
+}
+
+// validateOptions rejects combinations that cannot work, with a message that
+// says what to do instead. Watching depends on re-invoking tests without a
+// restart, which only the test endpoint can do.
+func validateOptions(opts RunOptions) error {
+	if err := validatePorts(opts); err != nil {
+		return err
+	}
+	if opts.Attach {
+		if opts.LegacyRunner {
+			return fmt.Errorf("--attach cannot be combined with --legacy-runner: the after-startup runner can only run tests by restarting, which is what attaching avoids")
+		}
+		if opts.SkipBuild {
+			return fmt.Errorf("--attach cannot be combined with --skip-build: the attached app must be rebuilt to pick up the test microflows")
+		}
+		// --attach implies a local app; requiring --local as well would be noise.
+		return nil
+	}
+	if !opts.Watch {
+		return nil
+	}
+	if !opts.Local {
+		return fmt.Errorf("--watch requires --local: the Docker path can only re-run tests by restarting the container")
+	}
+	if opts.LegacyRunner {
+		return fmt.Errorf("--watch cannot be combined with --legacy-runner: the after-startup runner can only re-run tests by restarting the runtime")
+	}
+	if opts.SkipBuild {
+		return fmt.Errorf("--watch cannot be combined with --skip-build: watching exists to rebuild on every change")
+	}
+	return nil
+}
+
+// runEndpoint injects the test endpoint plus one microflow per test, boots the
+// app once, and drives the suite over HTTP.
+func runEndpoint(opts RunOptions, suite *TestSuite, timeout time.Duration, w io.Writer) (*SuiteResult, error) {
+	token, err := newEndpointToken()
+	if err != nil {
+		return nil, err
+	}
+
+	// An endpoint a dead run left behind would be captured as the project's own
+	// after-startup and chained to (ako/mxcli#2119); take it out first, as `run`
+	// does.
+	if _, err := RestoreAbandonedEndpoint(opts.ProjectPath, w); err != nil {
+		return nil, err
+	}
+	// Capture what cleanup will need to restore, before touching anything. This
+	// must succeed: without it cleanup cannot tell an existing MxTest module from
+	// the one it is about to create, nor restore the original after-startup — and
+	// the generated startup flow needs to know what to chain.
+	state, err := captureProjectState(opts.ProjectPath)
+	if err != nil {
+		return nil, fmt.Errorf("capturing project state: %w", err)
+	}
+
+	// A `run --local --watch` dev loop on this project would rebuild — and may
+	// restart its app — for the endpoint and test microflows this run injects
+	// (ako/mxcli#2063). Held, it waits, and on release finds the model as it
+	// was: the cleanup puts the project file back byte for byte. Released when
+	// this function returns, after that cleanup.
+	if err := docker.HoldWatch(opts.ProjectPath, os.Getpid()); err == nil {
+		defer docker.ReleaseWatch(opts.ProjectPath)
+	}
+
+	fmt.Fprintln(w, "Generating test endpoint and test microflows...")
+	chain := state.chain()
+	if opts.SkipAppStartup {
+		chain = ""
+	}
+	endpointMDL := GenerateEndpointMDL(chain)
+	flowsMDL := GenerateTestFlows(suite)
+
+	if opts.Verbose {
+		fmt.Fprintln(w, "--- Generated MDL ---")
+		fmt.Fprintln(w, endpointMDL)
+		fmt.Fprintln(w, flowsMDL)
+		fmt.Fprintln(w, "--- End MDL ---")
+	}
+
+	// Build reuse: nothing to inject and nothing to build when the deployment on
+	// disk is already this run's build. Not for --watch (it exists to rebuild).
+	if opts.ReuseBuild && !opts.Watch && !opts.SkipBuild {
+		if k, kerr := testBuildKey(opts, endpointMDL, flowsMDL); kerr != nil {
+			fmt.Fprintf(w, "  build reuse off (%v)\n", kerr)
+		} else if reusableBuild(opts.ProjectPath, k) {
+			fmt.Fprintln(w, "Reusing the previous build: project, tests and mxcli unchanged; no injection, no mxbuild.")
+			ropts := opts
+			ropts.SkipBuild = true
+			forgetBuild(opts.ProjectPath) // re-recorded only after a clean run
+			result, rerr := runViaEndpoint(ropts, suite, token, timeout, w)
+			if rerr != nil {
+				return nil, rerr
+			}
+			recordBuild(opts.ProjectPath, k)
+			PrintResults(w, result, opts.Color)
+			if jerr := writeJUnit(opts, result, w); jerr != nil {
+				return result, jerr
+			}
+			return result, nil
+		} else {
+			forgetBuild(opts.ProjectPath) // a build that fails half way must not leave a record behind
+			opts.recordKey = k
+		}
+	}
+
+	fmt.Fprintln(w, "Injecting test endpoint into project...")
+
+	// From here on the project is modified, so every exit runs cleanup.
+	//
+	// cleanupSuite, not the suite captured here: --watch re-parses on every
+	// change, so by the time cleanup runs the set of injected test microflows may
+	// differ from the one injected at boot. Dropping the wrong list would leave
+	// generated microflows in the user's project.
+	cleanupSuite := suite
+	finish := func(result *SuiteResult, runErr error) (*SuiteResult, error) {
+		fmt.Fprintln(w, "Cleaning up...")
+		cleanupErr := cleanupEndpoint(opts.ProjectPath, state, cleanupSuite, w)
+		if !state.hosted { // the hosting dev loop's endpoint keeps its source
+			removeGeneratedJavaSource(opts.ProjectPath, w)
+		}
+		restoreProjectFile(state, cleanupErr, w)
+		reportCleanup(w, cleanupErr, survivingTestFlows(opts.ProjectPath))
+		if cleanupErr == nil {
+			fmt.Fprintln(w, "  project restored")
+		}
+		if runErr != nil {
+			return nil, runErr
+		}
+		if cleanupErr != nil {
+			return result, fmt.Errorf("cleanup failed, project left modified: %w", cleanupErr)
+		}
+		return result, nil
+	}
+
+	if err := execMDLScript(opts.ProjectPath, endpointMDL, "mxtest-endpoint-*.mdl"); err != nil {
+		return finish(nil, fmt.Errorf("injecting test endpoint: %w", err))
+	}
+	if err := execMDLScript(opts.ProjectPath, flowsMDL, "mxtest-flows-*.mdl"); err != nil {
+		return finish(nil, fmt.Errorf("injecting test microflows: %w", err))
+	}
+	for _, cmd := range setupCommands(endpointStartupFlow) {
+		if err := execMxcliCmd(opts.ProjectPath, cmd); err != nil {
+			return finish(nil, fmt.Errorf("preparing project for the test run (%s): %w", cmd, err))
+		}
+	}
+	fmt.Fprintln(w, "  "+describeStartup(state.chain(), opts.SkipAppStartup))
+	if state.hosted {
+		fmt.Fprintf(w, "  the dev loop hosting %s keeps it; this run removes only its test microflows\n", endpointStartupFlow)
+	}
+
+	// --watch keeps the runtime and the build server up and re-runs on every
+	// change, so it owns the loop — including printing each run's results, which
+	// it must do before cleanup rather than after. It reports each re-injected
+	// suite back so cleanup drops what is actually in the project.
+	if opts.Watch {
+		return runEndpointWatch(opts, suite, token, timeout, w, finish, func(s *TestSuite) { cleanupSuite = s })
+	}
+
+	result, err := runViaEndpoint(opts, suite, token, timeout, w)
+	if err != nil {
+		return finish(nil, err)
+	}
+
+	result, err = finish(result, nil)
+	if result != nil {
+		PrintResults(w, result, opts.Color)
+		if jerr := writeJUnit(opts, result, w); jerr != nil && err == nil {
+			err = jerr
+		}
+	}
+	return result, err
+}
+
+// runAfterStartup is the original mechanism: compile the suite into the
+// after-startup microflow, restart the runtime, and read results out of the log.
+// Always the Docker path, and the local path under --legacy-runner.
+func runAfterStartup(opts RunOptions, suite *TestSuite, timeout time.Duration, w io.Writer) (*SuiteResult, error) {
 	fmt.Fprintln(w, "Generating test runner microflow...")
 	runnerMDL := GenerateTestRunner(suite)
 
@@ -92,125 +443,194 @@ func Run(opts RunOptions) (*SuiteResult, error) {
 		fmt.Fprintln(w, "--- End MDL ---")
 	}
 
-	// Step 3: Save original settings and inject test runner
+	// Save original settings and inject the test runner.
 	fmt.Fprintln(w, "Injecting test runner into project...")
-	origAfterStartup, err := getAfterStartup(opts.ProjectPath)
+	state, err := captureProjectState(opts.ProjectPath)
 	if err != nil {
-		fmt.Fprintf(w, "  Warning: could not read original after-startup setting: %v\n", err)
+		return nil, fmt.Errorf("capturing project state: %w", err)
 	}
 
-	// Write the runner MDL to a temp file and execute it
-	tmpFile, err := os.CreateTemp("", "mxtest-runner-*.mdl")
-	if err != nil {
-		return nil, fmt.Errorf("creating temp file: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-
-	if _, err := tmpFile.WriteString(runnerMDL); err != nil {
-		tmpFile.Close()
-		return nil, fmt.Errorf("writing runner MDL: %w", err)
-	}
-	tmpFile.Close()
-
-	// Execute the MDL to create the TestRunner microflow
-	if err := execMxcli(opts.ProjectPath, "exec", tmpPath, "-p", opts.ProjectPath); err != nil {
+	if err := execMDLScript(opts.ProjectPath, runnerMDL, "mxtest-runner-*.mdl"); err != nil {
 		return nil, fmt.Errorf("injecting test runner: %w", err)
 	}
 
-	// Set security OFF for testing
-	if err := execMxcliCmd(opts.ProjectPath, "ALTER PROJECT SECURITY LEVEL OFF"); err != nil {
-		fmt.Fprintf(w, "  Warning: could not set security OFF: %v\n", err)
-	}
-
 	// Set after-startup microflow
-	if err := execMxcliCmd(opts.ProjectPath, "ALTER SETTINGS MODEL AfterStartupMicroflow = 'MxTest.TestRunner'"); err != nil {
-		return nil, fmt.Errorf("setting after-startup: %w", err)
-	}
-	fmt.Fprintln(w, "  After-startup set to MxTest.TestRunner")
-
-	// Step 4: Build and restart
-	dockerDir := filepath.Join(filepath.Dir(opts.ProjectPath), ".docker")
-	if err := ensureDockerStack(opts.ProjectPath, dockerDir, w); err != nil {
-		cleanup(opts.ProjectPath, origAfterStartup, w)
-		return nil, fmt.Errorf("docker init: %w", err)
-	}
-
-	if !opts.SkipBuild {
-		fmt.Fprintln(w, "Building project...")
-		if err := execMxcli(opts.ProjectPath, "docker", "build", "-p", opts.ProjectPath, "--skip-check"); err != nil {
-			cleanup(opts.ProjectPath, origAfterStartup, w)
-			return nil, fmt.Errorf("docker build: %w", err)
+	for _, cmd := range setupCommands(mxTestRunner) {
+		if err := execMxcliCmd(opts.ProjectPath, cmd); err != nil {
+			return nil, fmt.Errorf("preparing project for the test run (%s): %w", cmd, err)
 		}
 	}
+	fmt.Fprintf(w, "  After-startup set to %s\n", mxTestRunner)
 
-	fmt.Fprintln(w, "Restarting runtime...")
-	// Stop existing containers
-	runCompose(dockerDir, "down")
-	// Start fresh
-	if err := runCompose(dockerDir, "up", "--detach", "--force-recreate"); err != nil {
-		cleanup(opts.ProjectPath, origAfterStartup, w)
-		return nil, fmt.Errorf("docker up: %w", err)
+	var logOutput string
+	if opts.Local {
+		logOutput, err = runLocalAndCapture(opts, timeout, w)
+	} else {
+		logOutput, err = runDockerAndCapture(opts, timeout, w)
 	}
-
-	// Step 5: Wait for runtime and capture logs
-	fmt.Fprintf(w, "Waiting for test execution (timeout: %s)...\n", timeout)
-	logOutput, err := captureRuntimeLogs(dockerDir, timeout, w, opts.Verbose)
 	if err != nil {
-		cleanup(opts.ProjectPath, origAfterStartup, w)
-		return nil, fmt.Errorf("runtime execution: %w", err)
+		cleanupErr := cleanup(opts.ProjectPath, state, w)
+		restoreProjectFile(state, cleanupErr, w)
+		reportCleanup(w, cleanupErr, survivingTestFlows(opts.ProjectPath))
+		return nil, err
 	}
 
-	// Step 6: Parse results from logs
 	fmt.Fprintln(w, "Parsing test results...")
-	result := ParseLogResults(strings.NewReader(logOutput), suite)
+	result := ParseLogResults(strings.NewReader(logOutput), suite, opts.RequireAssertions)
 
-	// Step 7: Cleanup
 	fmt.Fprintln(w, "Cleaning up...")
-	cleanup(opts.ProjectPath, origAfterStartup, w)
+	cleanupErr := cleanup(opts.ProjectPath, state, w)
+	restoreProjectFile(state, cleanupErr, w)
+	reportCleanup(w, cleanupErr, survivingTestFlows(opts.ProjectPath))
 
-	// Step 8: Output results
 	PrintResults(w, result, opts.Color)
 
-	// Write JUnit XML if requested
-	if opts.JUnitOutput != "" {
-		f, err := os.Create(opts.JUnitOutput)
-		if err != nil {
-			return result, fmt.Errorf("creating JUnit output: %w", err)
-		}
-		defer f.Close()
-		if err := WriteJUnitXML(f, result); err != nil {
-			return result, fmt.Errorf("writing JUnit XML: %w", err)
-		}
-		fmt.Fprintf(w, "JUnit XML written to: %s\n", opts.JUnitOutput)
+	if err := writeJUnit(opts, result, w); err != nil {
+		return result, err
 	}
 
+	// A failed cleanup leaves the project modified, so the run must not be
+	// reported as clean even when every test passed.
+	if cleanupErr != nil {
+		return result, fmt.Errorf("cleanup failed, project left modified: %w", cleanupErr)
+	}
 	return result, nil
 }
 
+// writeJUnit writes the JUnit XML report when one was asked for.
+func writeJUnit(opts RunOptions, result *SuiteResult, w io.Writer) error {
+	if opts.JUnitOutput == "" {
+		return nil
+	}
+	f, err := os.Create(opts.JUnitOutput)
+	if err != nil {
+		return fmt.Errorf("creating JUnit output: %w", err)
+	}
+	defer f.Close()
+	if err := WriteJUnitXML(f, result); err != nil {
+		return fmt.Errorf("writing JUnit XML: %w", err)
+	}
+	fmt.Fprintf(w, "JUnit XML written to: %s\n", opts.JUnitOutput)
+	return nil
+}
+
 // ListTests parses test files and prints the test names without executing.
-func ListTests(files []string, w io.Writer) error {
+//
+// When nothing was found it also says why, on hints (stderr for the command, so
+// a script reading the listing on w is unaffected; nil discards it). The exit
+// status does not change: listing an empty tree is not an error, a run of one is
+// (#1363).
+func ListTests(files []string, w, hints io.Writer) error {
 	suite, err := parseTestFiles(files)
 	if err != nil {
 		return err
 	}
 
 	fmt.Fprintf(w, "Found %d test(s):\n", len(suite.Tests))
-	for _, tc := range suite.Tests {
-		fmt.Fprintf(w, "  %s: %s\n", tc.ID, tc.Name)
-		if len(tc.Expects) > 0 {
-			for _, exp := range tc.Expects {
-				fmt.Fprintf(w, "    @expect %s %s %s\n", exp.Variable, exp.Operator, exp.Value)
-			}
-		}
-		if tc.Throws != "" {
-			fmt.Fprintf(w, "    @throws '%s'\n", tc.Throws)
-		}
-		for _, v := range tc.Verify {
-			fmt.Fprintf(w, "    @verify %s\n", v)
+	if len(suite.Tests) == 0 && hints != nil {
+		// Same decision as Run: a directory whose every file is malformed is not
+		// an empty one.
+		if len(suite.FileErrors) > 0 {
+			fmt.Fprintf(hints, "%v\n", noTestsParsedError(suite.FileErrors))
+		} else {
+			fmt.Fprintf(hints, "%v\n", emptySuiteError(files))
 		}
 	}
-	return nil
+	for _, tc := range suite.Tests {
+		fmt.Fprintf(w, "  %s: %s\n", tc.ID, tc.Name)
+		for _, flow := range tc.Setups {
+			fmt.Fprintf(w, "    @setup %s\n", flow)
+		}
+		for _, exp := range tc.Expects {
+			fmt.Fprintf(w, "    @expect %s\n", exp.Raw)
+		}
+		for _, v := range tc.Verify {
+			fmt.Fprintf(w, "    @verify %s\n", v.Raw)
+		}
+		if tc.expectsThrow() {
+			if tc.Throws == "" {
+				fmt.Fprintf(w, "    @throws\n")
+			} else {
+				fmt.Fprintf(w, "    @throws '%s'\n", tc.Throws)
+			}
+		}
+		for _, e := range tc.AssertionErrors {
+			fmt.Fprintf(w, "    ERROR: %s\n", e)
+		}
+		if tc.AssertionCount() == 0 && len(tc.AssertionErrors) == 0 {
+			fmt.Fprintf(w, "    (no assertions — this test can only report that the body did not throw)\n")
+		}
+	}
+	// After the list, so the colon of the Found line still introduces the tests.
+	if line := skippedDirsLine(suite.SkippedDirs); line != "" {
+		fmt.Fprintln(w, line)
+	}
+	return reportFileErrors(suite.FileErrors, w)
+}
+
+// reportFileErrors prints the files that could not be parsed and the folders
+// that could not be read, and returns an error when there were any, so listing a
+// partly-readable directory exits non-zero instead of looking like a clean
+// listing.
+func reportFileErrors(errs []FileError, w io.Writer) error {
+	if len(errs) == 0 {
+		return nil
+	}
+	summary := failureSummary(errs)
+	fmt.Fprintf(w, "\n%s:\n", summary)
+	for _, fe := range errs {
+		fmt.Fprintf(w, "  ERROR %s: %v\n", fe.Path, fe.Err)
+	}
+	return errors.New(summary)
+}
+
+// failureSummary counts what discovery could not use, in words that fit each
+// kind: a test file fails to parse, a folder fails to be read. Calling an
+// unreadable folder a parse failure sends the reader looking for a syntax error
+// that is not there.
+func failureSummary(errs []FileError) string {
+	files, dirs := countFailures(errs)
+	var parts []string
+	if files > 0 {
+		parts = append(parts, fmt.Sprintf("%d test file(s) could not be parsed", files))
+	}
+	if dirs > 0 {
+		parts = append(parts, fmt.Sprintf("%d folder(s) could not be read", dirs))
+	}
+	return strings.Join(parts, " and ")
+}
+
+// countFailures splits errs into unparseable test files and unreadable folders.
+func countFailures(errs []FileError) (files, dirs int) {
+	for _, fe := range errs {
+		if fe.Dir {
+			dirs++
+		} else {
+			files++
+		}
+	}
+	return files, dirs
+}
+
+// suiteFileErrorResults turns unparseable files into ERROR results so they are
+// counted in the summary and in the JUnit report, and so the run's exit code is
+// non-zero — the same fail-closed handling assertionErrorResult gives an
+// @expect that cannot be compiled.
+func suiteFileErrorResults(errs []FileError) []TestResult {
+	out := make([]TestResult, 0, len(errs))
+	for _, fe := range errs {
+		what := "file could not be parsed"
+		if fe.Dir {
+			what = "folder could not be read"
+		}
+		out = append(out, TestResult{
+			Name:       fmt.Sprintf("%s (%s)", filepath.Base(fe.Path), what),
+			Status:     StatusError,
+			Message:    fe.Err.Error(),
+			SourceFile: fe.Path,
+		})
+	}
+	return out
 }
 
 // parseTestFiles parses one or more test files or directories.
@@ -234,10 +654,18 @@ func parseTestFiles(paths []string) (*TestSuite, error) {
 				combined.Name = dirSuite.Name
 			}
 			combined.Tests = append(combined.Tests, dirSuite.Tests...)
+			combined.FileErrors = append(combined.FileErrors, dirSuite.FileErrors...)
+			combined.FilesRead += dirSuite.FilesRead
+			combined.SkippedDirs = append(combined.SkippedDirs, dirSuite.SkippedDirs...)
 		} else {
+			combined.FilesRead++
 			fileSuite, err := ParseTestFile(path)
 			if err != nil {
-				return nil, err
+				// Isolated rather than fatal, for the same reason as in a
+				// directory (#903): naming three files should not cost the two
+				// that parse. The run is still red — see suiteFileErrorResults.
+				combined.FileErrors = append(combined.FileErrors, FileError{Path: path, Err: err})
+				continue
 			}
 			if combined.Name == "mxtest" && fileSuite.Name != "" {
 				combined.Name = fileSuite.Name
@@ -246,12 +674,110 @@ func parseTestFiles(paths []string) (*TestSuite, error) {
 		}
 	}
 
+	combined.SkippedDirs = sortedUnique(combined.SkippedDirs)
+
 	// Re-number test IDs to be globally unique
 	for i := range combined.Tests {
 		combined.Tests[i].ID = fmt.Sprintf("test_%d", i+1)
 	}
 
+	// One suite is one generated script, so its tests share one language
+	// version (ako/mxcli#847).
+	if _, err := suiteLanguageVersion(combined.Tests); err != nil {
+		return nil, err
+	}
+
 	return combined, nil
+}
+
+// projectState records what Run changed in the project, captured before the first
+// mutation so cleanup can put things back exactly rather than guessing.
+type projectState struct {
+	// snapshot is the project file as it was before anything was injected,
+	// restored on the way out so a run that changes nothing leaves it
+	// byte-identical.
+	snapshot projectSnapshot
+
+	// afterStartup is the project's original after-startup microflow ("" = none).
+	afterStartup string
+	// createdMxTest reports whether Run created the MxTest module, i.e. it did not
+	// already exist. A pre-existing MxTest module belongs to the user and must
+	// survive cleanup with everything but the generated TestRunner intact.
+	createdMxTest bool
+
+	// hosted reports that a live `run --local --test-endpoint` dev loop owns the
+	// endpoint already in the project: afterStartup is then that endpoint's
+	// MxTest.RegisterEndpoint, and hostedChain the after-startup microflow it
+	// chains to — the project's own (ako/mxcli#2119). A test run chains to
+	// hostedChain, and its cleanup leaves the dev loop's endpoint as it found it.
+	hosted      bool
+	hostedChain string
+}
+
+// chain is the after-startup microflow a run's endpoint chains to: the
+// project's own, never the endpoint's own startup flow — which a run made while
+// a dev loop hosts the endpoint read as "the after-startup microflow", chained
+// to itself, and failed to boot with a StackOverflowError (ako/mxcli#2119).
+func (st projectState) chain() string {
+	if st.hosted {
+		return st.hostedChain
+	}
+	return st.afterStartup
+}
+
+// classifyHostedEndpoint decides what an after-startup setting that is already
+// the endpoint's means. rec is the restore record a hosting run wrote; alive
+// tells whether its owner still runs.
+//
+// The endpoint's own startup flow with a live owner is hosted: chain to what the
+// owner recorded. With no live owner it is a leftover nothing should chain to —
+// the caller removes an abandoned one first, so what remains has no record of
+// what it replaced, and the run refuses rather than guess.
+func classifyHostedEndpoint(projectPath, afterStartup string, rec *restoreRecord, alive func(int) bool) (hosted bool, chain string, err error) {
+	if afterStartup != endpointStartupFlow {
+		return false, "", nil
+	}
+	if rec != nil && rec.PID > 0 && alive(rec.PID) {
+		return true, rec.AfterStartup, nil
+	}
+	msg := LeftoverEndpointWarning(projectPath)
+	if msg == "" {
+		msg = "the project's after-startup microflow is " + endpointStartupFlow + ", the mxcli test endpoint's, and no run of this project is hosting it"
+	}
+	return false, "", fmt.Errorf("%s", msg)
+}
+
+// captureProjectState reads everything cleanup needs to restore, before anything
+// is injected.
+func captureProjectState(projectPath string) (projectState, error) {
+	var st projectState
+	af, err := getAfterStartup(projectPath)
+	if err != nil {
+		return st, fmt.Errorf("reading after-startup setting: %w", err)
+	}
+	st.afterStartup = af
+	rec, _, _ := readRestoreRecord(projectPath)
+	if st.hosted, st.hostedChain, err = classifyHostedEndpoint(projectPath, af, rec, pidAlive); err != nil {
+		return st, err
+	}
+
+	exists, err := moduleExists(projectPath, mxTestModule)
+	if err != nil {
+		return st, fmt.Errorf("listing modules: %w", err)
+	}
+	st.createdMxTest = !exists
+
+	st.snapshot = takeProjectSnapshot(projectPath)
+	return st, nil
+}
+
+// restoreProjectFile puts the .mpr back byte-for-byte once cleanup has genuinely
+// undone every injection, so a test run is a no-op on disk. See projectSnapshot
+// for why restoring the model's content is not enough on its own.
+func restoreProjectFile(st projectState, cleanupErr error, w io.Writer) {
+	if err := st.snapshot.restore(cleanupErr == nil); err != nil {
+		fmt.Fprintf(w, "  note: could not restore the project file: %v\n", err)
+	}
 }
 
 // getAfterStartup reads the current after-startup microflow setting.
@@ -268,46 +794,232 @@ func getAfterStartup(projectPath string) (string, error) {
 		return "", err
 	}
 
-	// Parse output for AfterStartupMicroflow
 	for _, line := range strings.Split(string(output), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, "AfterStartupMicroflow") {
-			// Extract the value from: AfterStartupMicroflow = 'Module.Name'
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) == 2 {
-				val := strings.TrimSpace(parts[1])
-				val = strings.Trim(val, "'\"")
-				val = strings.TrimSuffix(val, ";")
-				val = strings.TrimSpace(val)
-				return val, nil
-			}
+		if strings.HasPrefix(strings.TrimSpace(line), "AfterStartupMicroflow") {
+			return parseSettingValue(line), nil
 		}
 	}
-
 	return "", nil
 }
 
-// cleanup restores original project settings after testing.
-func cleanup(projectPath, origAfterStartup string, w io.Writer) {
-	// Restore original after-startup
-	if origAfterStartup != "" {
-		cmd := fmt.Sprintf("ALTER SETTINGS MODEL AfterStartupMicroflow = '%s'", origAfterStartup)
+// parseSettingValue extracts the value from one DESCRIBE SETTINGS line, e.g.
+//
+//	AfterStartupMicroflow: 'Module.Name',
+//
+// or the older `AfterStartupMicroflow = 'Module.Name',`. The value starts after
+// the first separator, whichever it is: splitting only on `=` kept the whole
+// colon-form line, and the restore wrote the key into the setting's value.
+//
+// DESCRIBE SETTINGS separates properties with commas and ends the statement with
+// a semicolon, so the trailing punctuation must come off *before* the quotes:
+// trimming quotes first stops at the comma and leaves `Module.Name',`, which was
+// then re-interpolated into unparseable MDL and silently failed to restore the
+// setting (mendixlabs/mxcli#803).
+func parseSettingValue(line string) string {
+	val := strings.TrimSpace(line)
+	if i := strings.IndexAny(val, ":="); i >= 0 {
+		val = val[i+1:]
+	}
+	val = strings.TrimSpace(val)
+	val = strings.TrimRight(val, ",;")
+	val = strings.TrimSpace(val)
+	val = strings.Trim(val, "'\"")
+	return strings.ReplaceAll(val, "''", "'")
+}
+
+// quoteMDLString renders a value as an MDL single-quoted literal. Mendix escapes
+// an embedded quote by doubling it; a qualified name should never contain one, but
+// emitting a broken literal is how #803 turned a parse slip into a mutated project.
+func quoteMDLString(v string) string {
+	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
+}
+
+// moduleExists reports whether the project has a module with the given name.
+func moduleExists(projectPath, name string) (bool, error) {
+	mxcliPath, err := findMxcli()
+	if err != nil {
+		return false, err
+	}
+	cmd := exec.Command(mxcliPath, "-p", projectPath, "-c", "SHOW MODULES", "--json")
+	cmd.Env = append(os.Environ(), "MXCLI_QUIET=1")
+	output, err := cmd.Output()
+	if err != nil {
+		return false, err
+	}
+	var modules []struct {
+		Module string `json:"Module"`
+	}
+	if err := json.Unmarshal(output, &modules); err != nil {
+		return false, fmt.Errorf("parsing module list: %w", err)
+	}
+	for _, m := range modules {
+		if strings.EqualFold(m.Module, name) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// setupCommands returns the MDL statements Run issues to put the project into its
+// testing state, pointing after-startup at startupFlow. The project's Security
+// Level is deliberately absent: the after-startup microflow runs in an
+// administrative context and is not subject to it, so forcing it OFF bought
+// nothing — while breaking any project with a published REST/OData service using
+// custom authentication ("App security is off, but custom authentication is
+// enabled for this service"), and the restore hardcoded PRODUCTION, silently
+// changing projects that run at another level (mendixlabs/mxcli#802).
+func setupCommands(startupFlow string) []string {
+	return []string{
+		"ALTER SETTINGS RUNTIME (AfterStartupMicroflow: " + quoteMDLString(startupFlow) + ")",
+	}
+}
+
+// runMDLCommands executes each statement, attempting all of them even after one
+// fails, and joins the failures. Restores must not stop at the first error: a
+// half-restored project is worse than a fully failed one, because it looks fine
+// (#803).
+func runMDLCommands(projectPath string, cmds []string) error {
+	var errs []error
+	for _, cmd := range cmds {
 		if err := execMxcliCmd(projectPath, cmd); err != nil {
-			fmt.Fprintf(w, "  Warning: could not restore after-startup: %v\n", err)
+			errs = append(errs, fmt.Errorf("%s: %w", cmd, err))
 		}
+	}
+	return errors.Join(errs...)
+}
+
+// lowerModule maps a module name to the javasource/ directory Mendix generates
+// for it, which is always lowercased.
+func lowerModule(name string) string { return strings.ToLower(name) }
+
+// execMDLScript writes MDL to a temp file and executes it against the project.
+func execMDLScript(projectPath, mdl, namePattern string) error {
+	f, err := os.CreateTemp("", namePattern)
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	path := f.Name()
+	defer os.Remove(path)
+
+	if _, err := f.WriteString(mdl); err != nil {
+		f.Close()
+		return fmt.Errorf("writing MDL: %w", err)
+	}
+	f.Close()
+
+	return execMxcli(projectPath, injectionExecArgs(path, projectPath)...)
+}
+
+// injectionExecArgs are the arguments of the `mxcli exec` that injects a
+// generated script. Everything it writes is removed again at cleanup — the
+// endpoint's Java source included (removeGeneratedJavaSource) — so exec must
+// not tell the user to commit the files it writes beside the model
+// (ako/mxcli#1618).
+func injectionExecArgs(scriptPath, projectPath string) []string {
+	return []string{"exec", scriptPath, "-p", projectPath, "--no-source-file-report"}
+}
+
+// cleanupCommands returns the MDL statements that put the project back the way it
+// was, in order. Kept separate from execution so the restore can be tested without
+// a project. mxTestPresent says whether the generated module is still there —
+// nothing is dropped when it is already gone, so a run that failed before the
+// injection landed does not report a spurious cleanup failure.
+func cleanupCommands(st projectState, mxTestPresent bool) []string {
+	// Restore the original after-startup microflow, or clear it if there was none.
+	restore := "ALTER SETTINGS RUNTIME (AfterStartupMicroflow: '')"
+	if st.afterStartup != "" {
+		restore = "ALTER SETTINGS RUNTIME (AfterStartupMicroflow: " + quoteMDLString(st.afterStartup) + ")"
+	}
+	cmds := []string{restore}
+	if !mxTestPresent {
+		return cmds
+	}
+
+	// Remove the generated runner. Drop the whole module only when Run created it;
+	// a pre-existing MxTest module is the user's, so only the generated microflow
+	// comes out of it.
+	if st.createdMxTest {
+		cmds = append(cmds, "DROP MODULE "+mxTestModule)
 	} else {
-		if err := execMxcliCmd(projectPath, "ALTER SETTINGS MODEL AfterStartupMicroflow = ''"); err != nil {
-			fmt.Fprintf(w, "  Warning: could not clear after-startup: %v\n", err)
+		cmds = append(cmds, "DROP MICROFLOW "+mxTestRunner, "DROP MICROFLOW "+errorMessageFlow)
+	}
+	return cmds
+}
+
+// cleanup restores the project to the state captured before injection and removes
+// the generated test runner.
+//
+// Every statement is attempted even if an earlier one fails, and the failures are
+// returned rather than printed as warnings: a half-restored project is left with
+// its after-startup pointing at a microflow this function is about to delete, and
+// that has to be loud (#803).
+func cleanup(projectPath string, st projectState, w io.Writer) error {
+	// Re-check rather than assume: on failure fall back to attempting the drop, so
+	// a genuine problem still surfaces instead of being skipped.
+	mxTestPresent := true
+	if exists, err := moduleExists(projectPath, mxTestModule); err == nil {
+		mxTestPresent = exists
+	}
+	if mxTestPresent && !st.createdMxTest {
+		fmt.Fprintf(w, "  %s module already existed; dropping only %s\n", mxTestModule, mxTestRunner)
+	}
+
+	return runMDLCommands(projectPath, cleanupCommands(st, mxTestPresent))
+}
+
+// reportCleanup prints a cleanup failure prominently. The project is left mutated,
+// so this must not read as a passing run.
+// left names the generated documents still in the project, so the reader does
+// not have to find them by hand — which is the step mendixlabs/mxcli#1104 says
+// cost them a debugging cycle. A surviving test microflow is not inert: it fails
+// the build of every later run of any test file.
+func reportCleanup(w io.Writer, err error, left []string) {
+	if err == nil {
+		return
+	}
+	fmt.Fprintf(w, "\nERROR: cleanup failed — the project has been left modified:\n%v\n", err)
+	if len(left) > 0 {
+		fmt.Fprintf(w, "\nStill in the project (generated by this run or an earlier one):\n")
+		for _, name := range left {
+			fmt.Fprintf(w, "  %s\n", name)
+		}
+		fmt.Fprintf(w, "\nRemove them with:\n")
+		for _, name := range left {
+			fmt.Fprintf(w, "  mxcli -p <project.mpr> -c \"DROP MICROFLOW %s\"\n", name)
+		}
+	}
+	fmt.Fprintf(w, "Check the after-startup microflow and the %s module before committing.\n", mxTestModule)
+}
+
+// runDockerAndCapture builds the project, restarts the compose stack, and reads
+// the test runner's output from the container log.
+func runDockerAndCapture(opts RunOptions, timeout time.Duration, w io.Writer) (string, error) {
+	dockerDir := filepath.Join(filepath.Dir(opts.ProjectPath), ".docker")
+	if err := ensureDockerStack(opts.ProjectPath, dockerDir, w); err != nil {
+		return "", fmt.Errorf("docker init: %w", err)
+	}
+
+	if !opts.SkipBuild {
+		fmt.Fprintln(w, "Building project...")
+		if err := execMxcli(opts.ProjectPath, "docker", "build", "-p", opts.ProjectPath, "--skip-check"); err != nil {
+			return "", fmt.Errorf("docker build: %w", err)
 		}
 	}
 
-	// Restore security level
-	if err := execMxcliCmd(projectPath, "ALTER PROJECT SECURITY LEVEL PRODUCTION"); err != nil {
-		fmt.Fprintf(w, "  Warning: could not restore security: %v\n", err)
+	fmt.Fprintln(w, "Restarting runtime...")
+	runCompose(dockerDir, "down")
+	if err := runCompose(dockerDir, "up", "--detach", "--force-recreate"); err != nil {
+		return "", fmt.Errorf("docker up: %w\n"+
+			"  hint: this environment has no Docker daemon. Pass --local to run the tests "+
+			"against mxcli's own runtime instead — no container needed.", err)
 	}
 
-	// Drop the test runner microflow
-	execMxcliCmd(projectPath, "DROP MICROFLOW MxTest.TestRunner")
+	fmt.Fprintf(w, "Waiting for test execution (timeout: %s)...\n", timeout)
+	logOutput, err := captureRuntimeLogs(dockerDir, timeout, w, opts.Verbose)
+	if err != nil {
+		return logOutput, fmt.Errorf("runtime execution: %w", err)
+	}
+	return logOutput, nil
 }
 
 // captureRuntimeLogs tails the docker compose logs, waiting for MXTEST:END or timeout.
@@ -465,4 +1177,128 @@ func runCompose(dockerDir string, args ...string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+// emptySuiteError says WHY a run found nothing.
+//
+// "no tests found in the provided files" is true and useless. Discovery matches
+// on the file NAME — a directory contributes only its .test.mdl and .test.md
+// files — so a directory holding workflow.mdl is reported as empty with no hint
+// that the name is the reason (ako/mxcli-maintenance §5). The same message also
+// appears after "Found 0 test(s) in 1 file(s)", where the 1 is the directory
+// itself, which reads as though a file had been read and found wanting.
+//
+// So name the skipped candidates. A .mdl file in a test directory is almost
+// always the intended test under the wrong name, and printing it turns a dead end
+// into a rename.
+func emptySuiteError(paths []string) error {
+	var skipped, skippedDirs []string
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		// Same walk as ParseTestDir, so a misnamed file in tests/Sales/ is
+		// named too.
+		dirs, _ := walkTestTree(path, func(file string, d fs.DirEntry) {
+			if isTestFile(d.Name()) {
+				return
+			}
+			if l := strings.ToLower(d.Name()); strings.HasSuffix(l, ".mdl") || strings.HasSuffix(l, ".md") {
+				skipped = append(skipped, file)
+			}
+		}, nil)
+		skippedDirs = append(skippedDirs, dirs...)
+	}
+	sort.Strings(skipped)
+	skippedDirs = sortedUnique(skippedDirs)
+
+	var msg string
+	if len(skipped) == 0 {
+		msg = "no tests found: a test file is named *.test.mdl or *.test.md, " +
+			"and holds one or more `/** @test ... */` blocks"
+	} else {
+		named, more := capNamed(skipped)
+		msg = fmt.Sprintf("no tests found: discovery matches on the file NAME, so these were not read%s:\n"+
+			"  %s\n"+
+			"Rename one to *.test.mdl (or *.test.md) to have it picked up",
+			more, strings.Join(named, "\n  "))
+	}
+	if len(skippedDirs) > 0 {
+		// The suites may sit in a folder that was left out on purpose.
+		named, more := capNamed(slashed(skippedDirs))
+		msg += fmt.Sprintf("\nFolders starting with _ are skipped below the folder you name%s; name one to run it:\n  %s",
+			more, strings.Join(named, "\n  "))
+	}
+	return errors.New(msg)
+}
+
+// noTestsParsedError is the run's answer when files or folders were found and
+// none yielded a test: not an empty directory, so not emptySuiteError.
+func noTestsParsedError(errs []FileError) error {
+	files, dirs := countFailures(errs)
+	var parts []string
+	if files > 0 {
+		parts = append(parts, fmt.Sprintf("%d file(s) failed to parse", files))
+	}
+	if dirs > 0 {
+		parts = append(parts, fmt.Sprintf("%d folder(s) could not be read", dirs))
+	}
+	if files == 0 {
+		return fmt.Errorf("no tests could be read: %s", strings.Join(parts, " and "))
+	}
+	return fmt.Errorf("no tests could be parsed: %s", strings.Join(parts, " and "))
+}
+
+// maxNamed is how many paths a report names before "and N more".
+const maxNamed = 5
+
+// capNamed returns at most maxNamed of items and, when some were left out, the
+// text " (and N more)" to append to the sentence that lists them.
+func capNamed(items []string) (named []string, more string) {
+	named = items
+	if len(named) > maxNamed {
+		named = named[:maxNamed]
+	}
+	if len(items) > len(named) {
+		more = fmt.Sprintf(" (and %d more)", len(items)-len(named))
+	}
+	return named, more
+}
+
+// skippedDirsLine is the one line that says discovery left folders out. The run
+// and --list both print it after "Found N test(s)", so nothing disappears
+// silently. Empty when there is nothing to say.
+func skippedDirsLine(dirs []string) string {
+	if len(dirs) == 0 {
+		return ""
+	}
+	named, more := capNamed(slashed(dirs))
+	return fmt.Sprintf("  Skipped folder(s) starting with _: %s%s (name one explicitly to run it)",
+		strings.Join(named, ", "), more)
+}
+
+// slashed returns paths with forward slashes, so a line reads the same on every
+// platform.
+func slashed(paths []string) []string {
+	out := make([]string, len(paths))
+	for i, p := range paths {
+		out[i] = filepath.ToSlash(p)
+	}
+	return out
+}
+
+// sortedUnique sorts items in place and returns the distinct values.
+func sortedUnique(items []string) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	sort.Strings(items)
+	out := items[:1]
+	for _, it := range items[1:] {
+		if it != out[len(out)-1] {
+			out = append(out, it)
+		}
+	}
+	return out
 }

@@ -22,7 +22,7 @@ This is useful for understanding existing logic before modifying it, or for extr
 Describe a microflow:
 
 ```sql
-DESCRIBE MICROFLOW Sales.ACT_CreateOrder
+DESCRIBE MICROFLOW Sales.ACT_CreateOrder;
 ```
 
 Example output:
@@ -37,7 +37,7 @@ BEGIN
     Status = 'Draft'
   );
   COMMIT $Order;
-  SHOW PAGE Sales.Order_Edit ($Order = $Order);
+  SHOW PAGE Sales.Order_Edit (Order = $Order);
   RETURN $Order;
 END;
 ```
@@ -45,9 +45,9 @@ END;
 Describe a nanoflow:
 
 ```sql
-DESCRIBE NANOFLOW MyModule.NAV_ValidateInput
+DESCRIBE NANOFLOW MyModule.NAV_ValidateInput;
 ```
 
 ## See Also
 
-[SHOW MICROFLOWS](show-microflows.md), [DESCRIBE PAGE](describe-page.md), [DESCRIBE ENTITY](describe-entity.md)
+[LIST MICROFLOWS](list-microflows.md), [DESCRIBE PAGE](describe-page.md), [DESCRIBE ENTITY](describe-entity.md)

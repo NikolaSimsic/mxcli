@@ -6,7 +6,9 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/backend"
@@ -14,6 +16,7 @@ import (
 	"github.com/mendixlabs/mxcli/mdl/executor"
 	"github.com/mendixlabs/mxcli/mdl/repl"
 	"github.com/mendixlabs/mxcli/mdl/visitor"
+	mpr "github.com/mendixlabs/mxcli/modelsdk/mpr"
 	"github.com/spf13/cobra"
 )
 
@@ -29,12 +32,49 @@ func main() {
 	// Show warning banner unless --quiet, -q, --help, -h, or --version is passed
 	if !shouldSuppressWarning() {
 		fmt.Fprint(os.Stderr, warningBanner)
+		// The first command on a project (after an upgrade, or on a fresh
+		// clone) opens every unit file to build the unit index; say so
+		// rather than stall unexplained (ako/mxcli#1806).
+		mpr.ColdUnitIndexNotice = os.Stderr
+		mpr.PackagedModuleNotice = os.Stderr
 	}
 
+	// Open the process session before cobra sees argv. Cobra validates a
+	// command's Args before any hook runs, so a session started from
+	// PersistentPreRun missed every run with the wrong number of arguments
+	// (ako/mxcli#633).
+	startSession(os.Args[1:])
+
+	stopProfile := startCPUProfile()
+	code := runCLI()
+	stopProfile()
+	if code != 0 {
+		os.Exit(code)
+	}
+}
+
+// runCLI runs the root command and returns the process exit code, ending the
+// session on both paths.
+//
+// Closing here rather than in PersistentPostRun covers --help and --version,
+// which cobra answers before any hook and which would otherwise read as failed
+// runs. Closing on the ERROR path too is what gives a failed run a recorded
+// duration: this used to exit straight through os.Exit, so `diag loop-report`
+// summed wall time over the runs that happened to succeed and the rest landed
+// in `unclosed` with no time at all — 4 of 30 `run` invocations counted on one
+// measured project (PROPOSAL_agent_loop_efficiency.md item 2d).
+//
+// A command that calls os.Exit itself still skips this, and so does a process
+// killed with SIGKILL; both stay `unclosed`, which is now what the word means.
+func runCLI() int {
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+		code := exitCodeFor(err)
+		diaglog.CloseCurrentWithExit(code)
+		return code
 	}
+	diaglog.CloseCurrent()
+	return 0
 }
 
 // shouldSuppressWarning checks if the warning should be suppressed
@@ -55,12 +95,18 @@ func shouldSuppressWarning() bool {
 	return false
 }
 
-// discoverProjectPath looks for a single .mpr file in the current directory.
-// Returns the filename if exactly one is found, otherwise returns "".
-func discoverProjectPath() string {
-	entries, err := os.ReadDir(".")
+// discoverProject looks for .mpr files in dir, for a command run without -p.
+// With exactly one it returns its file name (the value -p is set to) and a
+// notice naming its absolute path. With several it picks none and returns a
+// note listing them and asking for -p. With none it returns ("", "").
+//
+// The notice is the only sign that the project was guessed rather than given,
+// so it has to name where the file is: "Using project: App.mpr" read the same
+// for the intended project and a stray copy (mendixlabs/mxcli#1444).
+func discoverProject(dir string) (path, note string) {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	var mprFiles []string
 	for _, e := range entries {
@@ -68,10 +114,43 @@ func discoverProjectPath() string {
 			mprFiles = append(mprFiles, e.Name())
 		}
 	}
-	if len(mprFiles) == 1 {
-		return mprFiles[0]
+	switch len(mprFiles) {
+	case 0:
+		return "", ""
+	case 1:
+		abs := filepath.Join(dir, mprFiles[0])
+		if a, err := filepath.Abs(abs); err == nil {
+			abs = a
+		}
+		return mprFiles[0], fmt.Sprintf("Using project: %s (auto-detected in the current directory; pass -p to use another)", abs)
+	default:
+		return "", fmt.Sprintf("No project auto-detected: the current directory has %d .mpr files (%s); pass -p to choose one",
+			len(mprFiles), strings.Join(mprFiles, ", "))
 	}
-	return ""
+}
+
+// noProjectFlag is the opt-out from project auto-detection, registered on the
+// commands that are meaningful without a project (check). The root
+// PersistentPreRun honours it on any command that registers it.
+const noProjectFlag = "no-project"
+
+// noProjectOptOut reports whether cmd registers --no-project and, if so, the
+// line that tells a user who got an auto-detected project how to avoid it —
+// the notice is where they meet the guess, so it is where the way out goes.
+func noProjectOptOut(cmd *cobra.Command) (bool, string) {
+	if cmd.Flags().Lookup(noProjectFlag) == nil {
+		return false, ""
+	}
+	return true, fmt.Sprintf("(pass --%s to %s without a project)", noProjectFlag, cmd.Name())
+}
+
+// skipsProjectDiscovery reports whether cmd was given --no-project.
+func skipsProjectDiscovery(cmd *cobra.Command) bool {
+	if ok, _ := noProjectOptOut(cmd); !ok {
+		return false
+	}
+	v, _ := cmd.Flags().GetBool(noProjectFlag)
+	return v
 }
 
 var rootCmd = &cobra.Command{
@@ -93,26 +172,51 @@ Examples:
   mxcli exec script.mdl
 
   # Execute MDL commands directly
-  mxcli -c "CONNECT LOCAL 'app.mpr'; SHOW ENTITIES;"
+  mxcli -c "connect local 'app.mpr'; list entities;"
 
-  # Connect to project and show entities
-  mxcli -p app.mpr -c "SHOW ENTITIES"
+  # Connect to project and list entities
+  mxcli -p app.mpr -c "list entities"
+
+The REPL and -c read input without a language header as mdl 1, the frozen
+beta language; --mdl 0 starts them in the alpha language, and in the REPL an
+"mdl 0;" or "mdl 1;" statement switches the session. A script file run with
+"mxcli exec" is read by its own header, and without one as mdl 0.
 `,
 	Version: version,
 	PersistentPreRun: func(cmd *cobra.Command, args []string) {
 		projectPath, _ := cmd.Flags().GetString("project")
-		if projectPath == "" {
-			if discovered := discoverProjectPath(); discovered != "" {
+		// A command with a --no-project opt-out (check) skips auto-detection
+		// when it is given: run from a project directory, `check script.mdl`
+		// otherwise resolves every reference against the .mpr it finds, and
+		// the syntax-only check its help offered could not be had there at
+		// all (mendixlabs/mxcli#1817). Without the flag nothing changes.
+		_, optOut := noProjectOptOut(cmd)
+		if projectPath == "" && !skipsProjectDiscovery(cmd) {
+			discovered, note := discoverProject(".")
+			if discovered != "" {
 				_ = cmd.Flags().Set("project", discovered)
-				fmt.Fprintf(os.Stderr, "Using project: %s\n", discovered)
+				if optOut != "" {
+					note += "\n" + optOut
+				}
+				fmt.Fprintln(os.Stderr, note)
+			} else if note != "" && !shouldSuppressWarning() {
+				fmt.Fprintln(os.Stderr, note)
 			}
 		}
+		// A binary older than the mxcli that wrote this project's tooling is
+		// the cause of failures that otherwise read as project defects: a
+		// CLAUDE.md asking for statements this parser lacks, lint rules
+		// reading fields this binary does not expose (ako/mxcli#952). Once,
+		// on stderr, so it cannot corrupt --json or piped output. `init`
+		// reports the same skew itself, in the terms of what it will do.
+		if cmd != initCmd {
+			projectPath, _ = cmd.Flags().GetString("project")
+			warnIfToolingNewer(os.Stderr, projectPath)
+		}
 		globalJSONFlag, _ = cmd.Flags().GetBool("json")
+		globalQuietFlag, _ = cmd.Flags().GetBool("quiet")
 		globalMCPURL, _ = cmd.Flags().GetString("mcp")
 		globalMCPDial, _ = cmd.Flags().GetString("mcp-dial")
-		globalMCPConcord, _ = cmd.Flags().GetString("mcp-concord")
-		globalMCPConcordDial, _ = cmd.Flags().GetString("mcp-concord-dial")
-		globalMCPSave, _ = cmd.Flags().GetBool("mcp-save")
 		globalMCPCheck, _ = cmd.Flags().GetBool("mcp-check")
 		globalMCPRun, _ = cmd.Flags().GetBool("mcp-run")
 		globalMCPVerbose, _ = cmd.Flags().GetBool("mcp-verbose")
@@ -124,37 +228,13 @@ Examples:
 		commands, _ := cmd.Flags().GetString("command")
 		projectPath, _ := cmd.Flags().GetString("project")
 
-		if commands != "" {
-			// Execute commands from -c flag
-			exec, logger := newLoggedExecutor("batch")
-			defer logger.Close()
-			defer exec.Close()
-
-			// Suppress status messages when stdout is a pipe so that
-			// output can be piped directly to other tools (e.g. mxcli fmt).
-			if fi, statErr := os.Stdout.Stat(); statErr == nil && (fi.Mode()&os.ModeCharDevice) == 0 {
-				exec.SetQuiet(true)
-			}
-
-			// Auto-connect if project specified
-			if projectPath != "" {
-				commands = fmt.Sprintf("CONNECT LOCAL '%s'; %s", visitor.QuoteString(projectPath), commands)
-			}
-
-			prog, errs := visitor.Build(commands)
-			if len(errs) > 0 {
-				for _, err := range errs {
-					fmt.Fprintf(os.Stderr, "Parse error: %v\n", err)
-				}
-				os.Exit(1)
-			}
-
-			if err := exec.ExecuteProgram(prog); err != nil {
-				if errors.Is(err, executor.ErrExit) {
-					return
-				}
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+		// -c given at all — even empty — is a one-liner run, never the REPL:
+		// an empty -c from a generator used to open the interactive prompt and
+		// hang its caller (mendixlabs/mxcli#1218).
+		if cmd.Flags().Changed("command") {
+			continueOnError, _ := cmd.Flags().GetBool("continue-on-error")
+			if code := runCommandLine(cmd, commands, projectPath, continueOnError, os.Stderr); code != 0 {
+				os.Exit(code)
 			}
 		} else {
 			// Start interactive REPL
@@ -162,11 +242,11 @@ Examples:
 			defer logger.Close()
 
 			r := repl.New(os.Stdin, os.Stdout)
-			// Honor MXCLI_ENGINE/--engine AND --mcp in interactive mode (the REPL
-			// defaulted to the legacy local .mpr backend and ignored both). The
-			// unified factory routes writes to the modelsdk engine or a live Studio
-			// Pro as configured. Must precede the auto-connect below, since CONNECT
-			// consumes the factory.
+			r.SetLanguage(mdlFlag(cmd))
+			// Honor --mcp in interactive mode; the REPL ignored it and used its
+			// own local backend. The unified factory routes writes to the model
+			// engine or to a live Studio Pro as configured. Must precede the
+			// auto-connect below, since CONNECT consumes the factory.
 			r.SetBackendFactory(newBackendFactory())
 			r.SetTracer(mcpTracer())
 			r.SetLogger(logger)
@@ -199,20 +279,24 @@ Examples:
 // globalJSONFlag is set by PersistentPreRun when --json is passed.
 var globalJSONFlag bool
 
+// globalQuietFlag is --quiet / -q: no warning banner (shouldSuppressWarning
+// reads argv for that, before cobra runs) and no connection or status
+// messages from the executor. The banner check named -q for a long time while
+// no command but `search` accepted it, so `mxcli -q -c …` failed outright
+// (ako/mxcli#1860).
+var globalQuietFlag bool
+
 // globalMCPURL / globalMCPDial are set by PersistentPreRun from --mcp / --mcp-dial.
 // When globalMCPURL is non-empty, newLoggedExecutor builds an MCP backend that
 // routes model writes to a live Studio Pro while reads come from the local
 // .mpr given by -p. See docs/11-proposals/PROPOSAL_mcp_backend.md.
 var (
-	globalMCPURL         string
-	globalMCPDial        string
-	globalMCPConcord     string
-	globalMCPConcordDial string
-	globalMCPSave        bool
-	globalMCPCheck       bool
-	globalMCPRun         bool
-	globalMCPVerbose     bool
-	globalMCPTrace       bool
+	globalMCPURL     string
+	globalMCPDial    string
+	globalMCPCheck   bool
+	globalMCPRun     bool
+	globalMCPVerbose bool
+	globalMCPTrace   bool
 )
 
 // resolveFormat returns the effective output format for a command.
@@ -251,22 +335,36 @@ func mcpTracer() *backend.Tracer {
 // newLoggedExecutor creates an executor with diagnostics logging attached.
 // The caller must call logger.Close() when done (safe on nil).
 func newLoggedExecutor(mode string) (*executor.Executor, *diaglog.Logger) {
+	return newLoggedExecutorTo(mode, os.Stdout)
+}
+
+// newLoggedExecutorTo is newLoggedExecutor with the progress stream chosen by
+// the caller. A command whose stdout carries a machine-readable payload passes
+// progressSink(format) so its commentary lands on stderr instead of corrupting
+// the payload.
+func newLoggedExecutorTo(mode string, out io.Writer) (*executor.Executor, *diaglog.Logger) {
 	logger := diaglog.Init(version, mode)
-	exec := executor.New(os.Stdout)
+	exec := executor.New(out)
 	exec.SetBackendFactory(newBackendFactory())
 	exec.SetTracer(mcpTracer())
 	exec.SetLogger(logger)
 	if globalJSONFlag {
 		exec.SetFormat(executor.FormatJSON)
 	}
+	if globalQuietFlag {
+		exec.SetQuiet(true)
+	}
 	return exec, logger
 }
 
 // executeMDL is a helper to execute MDL commands with a project.
-func executeMDL(projectPath, mdlCmd string) {
+func executeMDL(projectPath, mdlCmd string, setup ...func(*executor.Executor)) {
 	exec, logger := newLoggedExecutor("subcommand")
 	defer logger.Close()
 	defer exec.Close()
+	for _, f := range setup {
+		f(exec)
+	}
 
 	fullCmd := fmt.Sprintf("CONNECT LOCAL '%s'; %s", visitor.QuoteString(projectPath), mdlCmd)
 	prog, errs := visitor.Build(fullCmd)
@@ -299,27 +397,33 @@ func init() {
 	// Global flags
 	rootCmd.PersistentFlags().StringP("project", "p", "", "Path to Mendix project (.mpr file)")
 	rootCmd.PersistentFlags().Bool("json", false, "Output in JSON format")
+	rootCmd.PersistentFlags().BoolP("quiet", "q", false, "No warning banner, and no connection or status messages (catalog build progress included)")
 	rootCmd.PersistentFlags().String("mcp", "", "Route model writes to a live Studio Pro MCP server (e.g. http://localhost:7782/mcp); reads come from -p")
 	rootCmd.PersistentFlags().String("mcp-dial", "", "Override the TCP address dialed for --mcp (e.g. host.docker.internal:7782 from a devcontainer)")
-	rootCmd.PersistentFlags().String("mcp-concord", "", "Optional second MCP server (Concord) for capabilities the built-in server lacks: delete, save, validate, run (e.g. http://localhost:7783/mcp)")
-	rootCmd.PersistentFlags().String("mcp-concord-dial", "", "Override the TCP address dialed for --mcp-concord")
-	rootCmd.PersistentFlags().Bool("mcp-save", false, "After the command, save all changes in Studio Pro via Concord (requires --mcp-concord; the built-in server has no save tool)")
-	rootCmd.PersistentFlags().Bool("mcp-check", false, "After the command, run Studio Pro's model consistency check via Concord and print the report (requires --mcp-concord)")
-	rootCmd.PersistentFlags().Bool("mcp-run", false, "After the command, start the app in Studio Pro via Concord (run_app) and print its URL (requires --mcp-concord)")
+	rootCmd.PersistentFlags().Bool("mcp-check", false, "After the command, run Studio Pro's project-wide error check (ped_check_errors, Studio Pro 11.15+) and print the report")
+	rootCmd.PersistentFlags().Bool("mcp-run", false, "After the command, start the app in Studio Pro (mendix_app handler, Studio Pro 11.16+) and print its URL")
 	rootCmd.PersistentFlags().Bool("mcp-verbose", false, "Print each PED tool call the MCP backend makes (requires --mcp)")
 	rootCmd.PersistentFlags().Bool("mcp-trace", false, "Print each MDL command with the PED tool calls it makes (implies --mcp-verbose; requires --mcp)")
-	rootCmd.PersistentFlags().String("engine", "", "Model engine: modelsdk (default), legacy (fallback for unsupported writes, e.g. SOAP). Overrides MXCLI_ENGINE.")
-	rootCmd.Flags().StringP("command", "c", "", "Execute MDL command(s) and exit")
+	rootCmd.PersistentFlags().String("engine", "", "Deprecated and ignored: there is one model engine. Kept so scripts pinning the old one keep running.")
+	rootCmd.Flags().StringP("command", "c", "", "Execute MDL command(s) and exit (an empty value is an error, never the REPL)")
+	rootCmd.Flags().Bool("continue-on-error", false,
+		"With -c: run every statement, reporting each failure instead of stopping at the first (exits non-zero if any failed)")
 
 	// Check command flags
-	checkCmd.Flags().BoolP("references", "r", false, "Validate references against the project")
+	checkCmd.Flags().BoolP("references", "r", false, "Validate references against the project (implied by -p; kept for compatibility)")
 	checkCmd.Flags().String("format", "text", "Output format: text, json, sarif")
 	checkCmd.Flags().Bool("post-migration", false, "Scan the project for legacy native widgets that survived a Mendix upgrade (requires -p)")
+	checkCmd.Flags().Bool(noProjectFlag, false,
+		"Check syntax and the no-model rules only: do not auto-detect the .mpr in the current directory (conflicts with -p, --references, --post-migration)")
 
 	// Diff command flags
 	diffCmd.Flags().StringP("format", "f", "unified", "Output format: unified, side, struct")
 	diffCmd.Flags().BoolP("color", "", false, "Use colored output")
 	diffCmd.Flags().IntP("width", "w", 120, "Terminal width for side-by-side format")
+	diffCmd.Flags().Bool("no-check", false, "Skip exec's pre-flight checks, as exec --no-check does")
+	diffCmd.Flags().Bool("verbose", false, "Print the pre-flight checks' info notes in full, as exec --verbose does")
+	diffCmd.Flags().Bool("continue-on-error", false, "Run every statement, as exec --continue-on-error does, instead of stopping at the first error")
+	diffCmd.Flags().Bool("exec-output", false, "Also print what exec reports while it runs the script on the scratch copy")
 
 	// Diff-local command flags
 	diffLocalCmd.Flags().StringP("ref", "r", "HEAD", "Git ref or range (e.g., HEAD, main, main..feature)")
@@ -328,11 +432,14 @@ func init() {
 	diffLocalCmd.Flags().IntP("width", "w", 120, "Terminal width for side-by-side format")
 
 	// Describe command flags
-	describeCmd.Flags().StringP("format", "f", "mdl", "Output format: mdl, json, mermaid, elk")
+	describeCmd.Flags().StringP("format", "f", "mdl", "Output format: mdl, json, mermaid, elk, svg")
+	describeCmd.Flags().Bool("all", false, "With module: describe everything in the module (DESCRIBE MODULE ... WITH ALL), not only the module and its roles")
 
 	// Search command flags
-	searchCmd.Flags().StringP("format", "f", "table", "Output format: table, names, json")
-	searchCmd.Flags().BoolP("quiet", "q", false, "Suppress connection and status messages (for piping)")
+	searchCmd.Flags().StringP("format", "f", "table", "Output format: table, names (for JSON use --json; \"json\" is accepted as a deprecated alias)")
+	searchCmd.Flags().Bool("fail-on-match", false, "Exit 1 when there is at least one hit, 0 when there is none (an error exits 2)")
+	searchCmd.Flags().Bool("exclude-marketplace", false, "Leave out hits inside modules downloaded from the Marketplace")
+	searchCmd.Flags().Bool("no-build", false, "Never build the source index; without one, exit 3 because flow, page and expression bodies were not searched")
 
 	// Callers/callees command flags
 	callersCmd.Flags().BoolP("transitive", "t", false, "Find transitive (indirect) callers")
@@ -351,11 +458,18 @@ func init() {
 	lintCmd.Flags().BoolP("color", "", false, "Use colored output")
 	lintCmd.Flags().BoolP("list-rules", "l", false, "List available lint rules")
 	lintCmd.Flags().StringSliceP("exclude", "e", nil, "Modules to exclude from linting")
+	lintCmd.Flags().StringSliceP("rules", "r", nil, "Only run these rule IDs (e.g. -r MPR001 -r SEC001)")
+	lintCmd.Flags().StringSliceP("modules", "m", nil, "Only lint the specified modules (comma-separated or repeated)")
+	lintCmd.Flags().StringSliceP("documents", "d", nil, "Only lint these documents, by qualified name (e.g. Sales.ACT_Order); comma-separated or repeated")
+	lintCmd.Flags().Bool("show-accepted", false, "List the findings that decisions in the project brain accept (they are not counted)")
+	lintCmd.Flags().String("baseline", "", "Report only findings not recorded in this baseline file (exit code follows the new ones)")
+	lintCmd.Flags().Bool("update-baseline", false, "Record the current findings in the --baseline file instead of comparing")
 
 	// Report command flags
 	reportCmd.Flags().StringP("format", "f", "markdown", "Output format: markdown, json, html")
 	reportCmd.Flags().StringP("output", "o", "", "Output file path (default: stdout)")
 	reportCmd.Flags().StringSliceP("exclude", "e", nil, "Modules to exclude from report")
+	reportCmd.Flags().StringSliceP("modules", "m", nil, "Only score the specified modules (comma-separated or repeated)")
 
 	// Graph-report command flags
 	graphReportCmd.Flags().StringP("format", "f", "markdown", "Output format: markdown, json")
@@ -367,7 +481,20 @@ func init() {
 	// Test command flags
 	testRunCmd.Flags().BoolP("list", "l", false, "List tests without executing")
 	testRunCmd.Flags().StringP("junit", "j", "", "Write JUnit XML results to file")
+	testRunCmd.Flags().Bool("require-assertions", false,
+		"Report a test that asserts nothing as an ERROR instead of a pass")
+	testRunCmd.Flags().Bool("reuse-build", false, "With --local, skip the injection and the build when the previous run's deployment is the build this run would make (same project files, tests and mxcli); any difference builds as usual")
 	testRunCmd.Flags().BoolP("skip-build", "s", false, "Skip build step (reuse existing deployment)")
+	testRunCmd.Flags().Bool("local", false, "Run on mxcli's local runtime instead of Docker (no daemon needed)")
+	testRunCmd.Flags().Bool("legacy-runner", false, "With --local, run tests from the after-startup microflow and parse the log, instead of over the test endpoint")
+	testRunCmd.Flags().BoolP("watch", "w", false, "With --local, keep the runtime warm and re-run the suite on every test or model change (Ctrl-C to stop)")
+	testRunCmd.Flags().Bool("skip-app-startup", false, "With --local, do not run the project's own after-startup microflow during the test run (it runs by default, so tests see the app as it really boots)")
+	testRunCmd.Flags().Bool("attach", false, "Run against an app already started with 'mxcli run --local --test-endpoint' instead of booting one (tests hit that app's database)")
+	testRunCmd.Flags().String("configuration", "", "With --local, which project configuration's constant values to run the tests with (default: the only one, or \"Default\") — the same resolution 'mxcli run --local' uses, so a suite sees the same constants either way")
+	testRunCmd.Flags().StringArray("constant", nil, "With --local, set a constant for THIS RUN only: Module.Name=value (repeatable). Never written to the project. A literal value is visible in shell history and in ps; Module.Name=@env:VAR reads an environment variable and Module.Name=@file:path reads a file (owner-only permissions, checked on Unix and not on Windows) instead, and @@ starts a literal value with @ — see docs/11-proposals/PROPOSAL_constant_values.md")
+	testRunCmd.Flags().String("mxbuild-path", "", "With --local, the mxbuild to build with, overriding resolution (Studio Pro's bundled mxbuild on macOS/Windows, the cached CDN download on Linux); also settable as MXCLI_MXBUILD_PATH")
+	testRunCmd.Flags().String("db-type", "", "With --local, the database the scratch app boots on: postgresql (default) or hsqldb (the runtime's built-in file database — no server and no provisioning, so it works without PostgreSQL). Either way each run starts the <app>_test database empty. Same values as 'run --local --db-type'")
+	registerTestPortFlags(testRunCmd)
 	testRunCmd.Flags().BoolP("verbose", "v", false, "Show all runtime log output")
 	testRunCmd.Flags().BoolP("color", "", false, "Use colored output")
 	testRunCmd.Flags().StringP("timeout", "t", "5m", "Timeout for runtime startup and test execution")
@@ -407,4 +534,5 @@ func init() {
 	rootCmd.AddCommand(evalCmd)
 	rootCmd.AddCommand(tuiCmd)
 	rootCmd.AddCommand(fmtCmd)
+	rootCmd.AddCommand(constantCmd)
 }

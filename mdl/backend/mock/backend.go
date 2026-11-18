@@ -47,6 +47,7 @@ type MockBackend struct {
 	ListModuleSettingsFunc   func() ([]*types.ModuleSettings, error)
 	GetModuleSettingsFunc    func(moduleID model.ID) (*types.ModuleSettings, error)
 	UpdateModuleSettingsFunc func(ms *types.ModuleSettings) error
+	SetModuleUIResourcesFunc func(id model.ID, on bool) error
 
 	// FolderBackend
 	ListFoldersFunc  func() ([]*types.FolderInfo, error)
@@ -54,15 +55,24 @@ type MockBackend struct {
 	DeleteFolderFunc func(id model.ID) error
 	MoveFolderFunc   func(id model.ID, newContainerID model.ID) error
 
+	// DocumentPlacementBackend
+	MoveDocumentFunc      func(unitID, containerID model.ID) error
+	FindDocumentUnitFunc  func(moduleName, name string) (*types.DocumentUnit, error)
+	FindDocumentUnitsFunc func(moduleName, name string) ([]*types.DocumentUnit, error)
+	ListDocumentUnitsFunc func() ([]*types.DocumentUnit, error)
+
 	// DomainModelBackend
 	ListDomainModelsFunc                       func() ([]*domainmodel.DomainModel, error)
 	GetDomainModelFunc                         func(moduleID model.ID) (*domainmodel.DomainModel, error)
 	GetDomainModelByIDFunc                     func(id model.ID) (*domainmodel.DomainModel, error)
+	ParseDomainModelFromRawFunc                func(raw map[string]any, unitID, containerID model.ID) (*domainmodel.DomainModel, error)
 	UpdateDomainModelFunc                      func(dm *domainmodel.DomainModel) error
+	SetDomainModelAnnotationsFunc              func(domainModelID model.ID, annotations []*domainmodel.Annotation) error
+	SetDomainModelDocumentationFunc            func(domainModelID model.ID, documentation string) error
 	CreateEntityFunc                           func(domainModelID model.ID, entity *domainmodel.Entity) error
 	UpdateEntityFunc                           func(domainModelID model.ID, entity *domainmodel.Entity) error
 	DeleteEntityFunc                           func(domainModelID model.ID, entityID model.ID) error
-	MoveEntityFunc                             func(entity *domainmodel.Entity, sourceDMID, targetDMID model.ID, sourceModuleName, targetModuleName string) ([]string, error)
+	MoveEntityFunc                             func(entity *domainmodel.Entity, sourceDMID, targetDMID model.ID, sourceModuleName, targetModuleName string) ([]types.MovedAssociation, error)
 	AddAttributeFunc                           func(domainModelID model.ID, entityID model.ID, attr *domainmodel.Attribute) error
 	UpdateAttributeFunc                        func(domainModelID model.ID, entityID model.ID, attr *domainmodel.Attribute) error
 	DeleteAttributeFunc                        func(domainModelID model.ID, entityID model.ID, attrID model.ID) error
@@ -71,8 +81,10 @@ type MockBackend struct {
 	DeleteAssociationFunc                      func(domainModelID model.ID, assocID model.ID) error
 	DeleteCrossAssociationFunc                 func(domainModelID model.ID, assocID model.ID) error
 	CreateViewEntitySourceDocumentFunc         func(moduleID model.ID, moduleName, docName, oqlQuery, documentation string) (model.ID, error)
+	WriteViewEntitySourceDocumentFunc          func(moduleID model.ID, moduleName, docName, oqlQuery, documentation string) (model.ID, error)
 	DeleteViewEntitySourceDocumentFunc         func(id model.ID) error
 	DeleteViewEntitySourceDocumentByNameFunc   func(moduleName, docName string) error
+	RenameViewEntitySourceDocumentFunc         func(moduleName, oldName, newName string) error
 	FindViewEntitySourceDocumentIDFunc         func(moduleName, docName string) (model.ID, error)
 	FindAllViewEntitySourceDocumentIDsFunc     func(moduleName, docName string) ([]model.ID, error)
 	MoveViewEntitySourceDocumentFunc           func(sourceModuleName string, targetModuleID model.ID, docName string) error
@@ -84,14 +96,23 @@ type MockBackend struct {
 	GetMicroflowFunc          func(id model.ID) (*microflows.Microflow, error)
 	CreateMicroflowFunc       func(mf *microflows.Microflow) error
 	UpdateMicroflowFunc       func(mf *microflows.Microflow) error
+	ReadBackMicroflowFunc     func(mf *microflows.Microflow) (*microflows.Microflow, error)
 	DeleteMicroflowFunc       func(id model.ID) error
 	MoveMicroflowFunc         func(mf *microflows.Microflow) error
 	ParseMicroflowFromRawFunc func(raw map[string]any, unitID, containerID model.ID) *microflows.Microflow
+	ParseNanoflowFromRawFunc  func(raw map[string]any, unitID, containerID model.ID) *microflows.Nanoflow
 	ParseMicroflowBSONFunc    func(contents []byte, unitID, containerID model.ID) (*microflows.Microflow, error)
+	ListRulesFunc             func() ([]*microflows.Rule, error)
+	GetRuleFunc               func(id model.ID) (*microflows.Rule, error)
+	CreateRuleFunc            func(rule *microflows.Rule) error
+	UpdateRuleFunc            func(rule *microflows.Rule) error
+	DeleteRuleFunc            func(id model.ID) error
+	MoveRuleFunc              func(rule *microflows.Rule) error
 	ListNanoflowsFunc         func() ([]*microflows.Nanoflow, error)
 	GetNanoflowFunc           func(id model.ID) (*microflows.Nanoflow, error)
 	CreateNanoflowFunc        func(nf *microflows.Nanoflow) error
 	UpdateNanoflowFunc        func(nf *microflows.Nanoflow) error
+	ReadBackNanoflowFunc      func(nf *microflows.Nanoflow) (*microflows.Nanoflow, error)
 	DeleteNanoflowFunc        func(id model.ID) error
 	MoveNanoflowFunc          func(nf *microflows.Nanoflow) error
 	IsRuleFunc                func(qualifiedName string) (bool, error)
@@ -104,6 +125,8 @@ type MockBackend struct {
 	DeletePageFunc         func(id model.ID) error
 	MovePageFunc           func(page *pages.Page) error
 	ListLayoutsFunc        func() ([]*pages.Layout, error)
+	LayoutPlaceholdersFunc func(id model.ID) ([]string, error)
+	PageLayoutNameFunc     func(id model.ID) (string, error)
 	GetLayoutFunc          func(id model.ID) (*pages.Layout, error)
 	CreateLayoutFunc       func(layout *pages.Layout) error
 	UpdateLayoutFunc       func(layout *pages.Layout) error
@@ -136,8 +159,14 @@ type MockBackend struct {
 	GetProjectSecurityFunc               func() (*security.ProjectSecurity, error)
 	SetProjectSecurityLevelFunc          func(unitID model.ID, level string) error
 	SetProjectDemoUsersEnabledFunc       func(unitID model.ID, enabled bool) error
+	SetProjectStrictModeFunc             func(unitID model.ID, enabled bool) error
+	SetProjectAdminUserNameFunc          func(unitID model.ID, name string) error
+	SetProjectAdminUserRoleFunc          func(unitID model.ID, role string) error
+	SetProjectAdminPasswordFunc          func(unitID model.ID, password string) error
+	SetProjectGuestAccessFunc            func(unitID model.ID, enabled bool, guestUserRole string) error
 	AddUserRoleFunc                      func(unitID model.ID, name string, moduleRoles []string, manageAllRoles bool) error
 	AlterUserRoleModuleRolesFunc         func(unitID model.ID, userRoleName string, add bool, moduleRoles []string) error
+	SetUserRolePropertiesFunc            func(unitID model.ID, userRoleName string, props backend.UserRoleProperties) error
 	RemoveUserRoleFunc                   func(unitID model.ID, name string) error
 	AddDemoUserFunc                      func(unitID model.ID, userName, password, entity string, userRoles []string) error
 	RemoveDemoUserFunc                   func(unitID model.ID, userName string) error
@@ -159,6 +188,11 @@ type MockBackend struct {
 	ListNavigationDocumentsFunc func() ([]*types.NavigationDocument, error)
 	GetNavigationFunc           func() (*types.NavigationDocument, error)
 	UpdateNavigationProfileFunc func(navDocID model.ID, profileName string, spec types.NavigationProfileSpec) error
+	// OpenNavigationProfileForMutationFunc / OpenMenuDocumentForMutationFunc
+	// back ALTER NAVIGATION / ALTER MENU; MenuMutator in this package is an
+	// in-memory mutator for them.
+	OpenNavigationProfileForMutationFunc func(profileName string) (backend.NavigationProfileMutator, error)
+	OpenMenuDocumentForMutationFunc      func(id model.ID) (backend.MenuMutator, error)
 
 	// ServiceBackend
 	ListConsumedODataServicesFunc   func() ([]*model.ConsumedODataService, error)
@@ -173,6 +207,7 @@ type MockBackend struct {
 	ListPublishedRestServicesFunc   func() ([]*model.PublishedRestService, error)
 	CreateConsumedRestServiceFunc   func(svc *model.ConsumedRestService) error
 	UpdateConsumedRestServiceFunc   func(svc *model.ConsumedRestService) error
+	EditConsumedRestServiceFunc     func(id model.ID, edit *backend.ConsumedRestServiceEdit) error
 	DeleteConsumedRestServiceFunc   func(id model.ID) error
 	CreatePublishedRestServiceFunc  func(svc *model.PublishedRestService) error
 	UpdatePublishedRestServiceFunc  func(svc *model.PublishedRestService) error
@@ -185,6 +220,8 @@ type MockBackend struct {
 	CreateDatabaseConnectionFunc    func(conn *model.DatabaseConnection) error
 	UpdateDatabaseConnectionFunc    func(conn *model.DatabaseConnection) error
 	MoveDatabaseConnectionFunc      func(conn *model.DatabaseConnection) error
+	MoveJavaActionFunc              func(ja *javaactions.JavaAction) error
+	MovePublishedODataServiceFunc   func(svc *model.PublishedODataService) error
 	DeleteDatabaseConnectionFunc    func(id model.ID) error
 	ListDataTransformersFunc        func() ([]*model.DataTransformer, error)
 	CreateDataTransformerFunc       func(dt *model.DataTransformer) error
@@ -192,23 +229,32 @@ type MockBackend struct {
 	DeleteDataTransformerFunc       func(id model.ID) error
 
 	// MappingBackend
-	ListImportMappingsFunc              func() ([]*model.ImportMapping, error)
-	GetImportMappingByQualifiedNameFunc func(moduleName, name string) (*model.ImportMapping, error)
-	CreateImportMappingFunc             func(im *model.ImportMapping) error
-	UpdateImportMappingFunc             func(im *model.ImportMapping) error
-	DeleteImportMappingFunc             func(id model.ID) error
-	MoveImportMappingFunc               func(im *model.ImportMapping) error
-	ListExportMappingsFunc              func() ([]*model.ExportMapping, error)
-	GetExportMappingByQualifiedNameFunc func(moduleName, name string) (*model.ExportMapping, error)
-	CreateExportMappingFunc             func(em *model.ExportMapping) error
-	UpdateExportMappingFunc             func(em *model.ExportMapping) error
-	DeleteExportMappingFunc             func(id model.ID) error
-	MoveExportMappingFunc               func(em *model.ExportMapping) error
-	ListJsonStructuresFunc              func() ([]*types.JsonStructure, error)
-	GetJsonStructureByQualifiedNameFunc func(moduleName, name string) (*types.JsonStructure, error)
-	CreateJsonStructureFunc             func(js *types.JsonStructure) error
-	UpdateJsonStructureFunc             func(js *types.JsonStructure) error
-	DeleteJsonStructureFunc             func(id string) error
+	ListImportMappingsFunc                func() ([]*model.ImportMapping, error)
+	GetImportMappingByQualifiedNameFunc   func(moduleName, name string) (*model.ImportMapping, error)
+	CreateImportMappingFunc               func(im *model.ImportMapping) error
+	UpdateImportMappingFunc               func(im *model.ImportMapping) error
+	DeleteImportMappingFunc               func(id model.ID) error
+	MoveImportMappingFunc                 func(im *model.ImportMapping) error
+	ListExportMappingsFunc                func() ([]*model.ExportMapping, error)
+	GetExportMappingByQualifiedNameFunc   func(moduleName, name string) (*model.ExportMapping, error)
+	CreateExportMappingFunc               func(em *model.ExportMapping) error
+	UpdateExportMappingFunc               func(em *model.ExportMapping) error
+	DeleteExportMappingFunc               func(id model.ID) error
+	MoveExportMappingFunc                 func(em *model.ExportMapping) error
+	ListXmlSchemasFunc                    func() ([]*types.XmlSchema, error)
+	ListJsonStructuresFunc                func() ([]*types.JsonStructure, error)
+	ListMessageDefinitionCollectionsFunc  func() ([]*model.MessageDefinitionCollection, error)
+	CreateMessageDefinitionCollectionFunc func(c *model.MessageDefinitionCollection) error
+	UpdateMessageDefinitionCollectionFunc func(c *model.MessageDefinitionCollection) error
+	DeleteMessageDefinitionCollectionFunc func(id string) error
+	ListMessageDefinitionDocumentsFunc    func() ([]*model.MessageDefinitionDocument, error)
+	CreateMessageDefinitionDocumentFunc   func(d *model.MessageDefinitionDocument) error
+	UpdateMessageDefinitionDocumentFunc   func(d *model.MessageDefinitionDocument) error
+	DeleteMessageDefinitionDocumentFunc   func(id string) error
+	GetJsonStructureByQualifiedNameFunc   func(moduleName, name string) (*types.JsonStructure, error)
+	CreateJsonStructureFunc               func(js *types.JsonStructure) error
+	UpdateJsonStructureFunc               func(js *types.JsonStructure) error
+	DeleteJsonStructureFunc               func(id string) error
 
 	// JavaBackend
 	ListJavaActionsFunc            func() ([]*types.JavaAction, error)
@@ -219,10 +265,18 @@ type MockBackend struct {
 	CreateJavaActionFunc           func(ja *javaactions.JavaAction) error
 	UpdateJavaActionFunc           func(ja *javaactions.JavaAction) error
 	DeleteJavaActionFunc           func(id model.ID) error
-	WriteJavaSourceFileFunc        func(moduleName, actionName string, javaCode string, params []*javaactions.JavaActionParameter, returnType javaactions.CodeActionReturnType, extraImports []string, extraCode string) error
+	WriteJavaSourceFileFunc        func(moduleName, actionName string, javaCode string, params []*javaactions.JavaActionParameter, returnType javaactions.CodeActionReturnType, extraImports []string, extraCode *string, documentation string) error
 	DeleteJavaSourceFileFunc       func(moduleName, actionName string) error
 	RenameJavaSourceFileFunc       func(moduleName, oldName, newName string) error
+	MoveJavaSourceFileFunc         func(fromModule, toModule, actionName string) (string, error)
 	ReadJavaSourceFileFunc         func(moduleName, actionName string) (string, error)
+	CreateJavaScriptActionFunc     func(jsa *types.JavaScriptAction) error
+	UpdateJavaScriptActionFunc     func(jsa *types.JavaScriptAction) error
+	DeleteJavaScriptActionFunc     func(id model.ID) error
+	WriteJavaScriptSourceFileFunc  func(moduleName, actionName string, jsCode string, params []*types.JavaActionParameter, returnType types.CodeActionReturnType) error
+	DeleteJavaScriptSourceFileFunc func(moduleName, actionName string) error
+	RenameJavaScriptSourceFileFunc func(moduleName, oldName, newName string) error
+	MoveJavaScriptSourceFileFunc   func(fromModule, toModule, actionName string) (string, error)
 
 	// WorkflowBackend
 	ListWorkflowsFunc  func() ([]*workflows.Workflow, error)
@@ -232,23 +286,47 @@ type MockBackend struct {
 	DeleteWorkflowFunc func(id model.ID) error
 
 	// SettingsBackend
-	GetProjectSettingsFunc    func() (*model.ProjectSettings, error)
-	UpdateProjectSettingsFunc func(ps *model.ProjectSettings) error
+	GetProjectSettingsFunc          func() (*model.ProjectSettings, error)
+	AddNavigationProfileFunc        func(navDocID model.ID, name string) error
+	UpdateProjectSettingsFunc       func(ps *model.ProjectSettings) error
+	ParseProjectSettingsFromRawFunc func(raw map[string]any) (*model.ProjectSettings, error)
 
 	// ImageBackend
-	ListImageCollectionsFunc  func() ([]*types.ImageCollection, error)
-	CreateImageCollectionFunc func(ic *types.ImageCollection) error
-	UpdateImageCollectionFunc func(ic *types.ImageCollection) error
-	DeleteImageCollectionFunc func(id string) error
+	ListImageCollectionsFunc func() ([]*types.ImageCollection, error)
+	ListIconCollectionsFunc  func() ([]*types.IconCollection, error)
+
+	ListMenuDocumentsFunc              func() ([]*types.MenuDocument, error)
+	GetMenuDocumentByQualifiedNameFunc func(moduleName, name string) (*types.MenuDocument, error)
+	CreateMenuDocumentFunc             func(md *types.MenuDocument) error
+	UpdateMenuDocumentFunc             func(md *types.MenuDocument) error
+	DeleteMenuDocumentFunc             func(id model.ID) error
+	CreateImageCollectionFunc          func(ic *types.ImageCollection) error
+	UpdateImageCollectionFunc          func(ic *types.ImageCollection) error
+	DeleteImageCollectionFunc          func(id string) error
+
+	// QueueBackend
+	ListQueuesFunc  func() ([]*types.Queue, error)
+	CreateQueueFunc func(q *types.Queue) error
+	UpdateQueueFunc func(q *types.Queue) error
+	DeleteQueueFunc func(id string) error
 
 	// ScheduledEventBackend
-	ListScheduledEventsFunc func() ([]*model.ScheduledEvent, error)
-	GetScheduledEventFunc   func(id model.ID) (*model.ScheduledEvent, error)
+	ListScheduledEventsFunc  func() ([]*model.ScheduledEvent, error)
+	GetScheduledEventFunc    func(id model.ID) (*model.ScheduledEvent, error)
+	CreateScheduledEventFunc func(ev *model.ScheduledEvent) error
+	UpdateScheduledEventFunc func(ev *model.ScheduledEvent) error
+	DeleteScheduledEventFunc func(id string) error
+
+	// RegularExpressionBackend
+	ListRegularExpressionsFunc  func() ([]*model.RegularExpression, error)
+	CreateRegularExpressionFunc func(re *model.RegularExpression) error
+	UpdateRegularExpressionFunc func(re *model.RegularExpression) error
+	DeleteRegularExpressionFunc func(id string) error
 
 	// RenameBackend
 	UpdateQualifiedNameInAllUnitsFunc func(oldName, newName string) (int, error)
 	RenameReferencesFunc              func(oldName, newName string, dryRun bool) ([]types.RenameHit, error)
-	RenameDocumentByNameFunc          func(moduleName, oldName, newName string) error
+	RenameDocumentFunc                func(id model.ID, oldName, newName string) error
 
 	// RawUnitBackend
 	GetRawUnitFunc            func(id model.ID) (map[string]any, error)
@@ -257,12 +335,22 @@ type MockBackend struct {
 	ListRawUnitsFunc          func(objectType string) ([]*types.RawUnitInfo, error)
 	GetRawUnitByNameFunc      func(objectType, qualifiedName string) (*types.RawUnitInfo, error)
 	GetRawMicroflowByNameFunc func(qualifiedName string) ([]byte, error)
+	AddRawUnitFunc            func(unitID, containerID, containmentName, unitType string, contents []byte) error
 	UpdateRawUnitFunc         func(unitID string, contents []byte) error
+	// UpdateRawUnitOwningTranslationsFunc stubs the write path that is
+	// authoritative about a unit's translations. Falls back to UpdateRawUnitFunc
+	// when unset, because most tests do not care about the distinction.
+	UpdateRawUnitOwningTranslationsFunc func(unitID string, contents []byte) error
+
+	// UpdateRawUnitOwningStorageGUIDsFunc stubs the write path that deliberately
+	// transplants storage GUIDs (the marketplace module update). Separate from
+	// UpdateRawUnitFunc so a test cannot satisfy it by accident: a write that
+	// moves a GUID without meaning to is the #1119 data-loss defect.
+	UpdateRawUnitOwningStorageGUIDsFunc func(unitID string, contents []byte) error
 
 	// MetadataBackend
 	ListAllUnitIDsFunc   func() ([]string, error)
 	ListUnitsFunc        func() ([]*types.UnitInfo, error)
-	GetUnitTypesFunc     func() (map[string]int, error)
 	GetProjectRootIDFunc func() (string, error)
 	ContentsDirFunc      func() string
 	ExportJSONFunc       func() ([]byte, error)
@@ -278,11 +366,10 @@ type MockBackend struct {
 	// WorkflowMutationBackend
 	OpenWorkflowForMutationFunc func(unitID model.ID) (backend.WorkflowMutator, error)
 
+	// MicroflowMutationBackend
+	OpenMicroflowForMutationFunc func(unitID model.ID) (backend.MicroflowMutator, error)
+
 	// WidgetSerializationBackend
-	SerializeWidgetFunc           func(w pages.Widget) (any, error)
-	SerializeClientActionFunc     func(a pages.ClientAction) (any, error)
-	SerializeDataSourceFunc       func(ds pages.DataSource) (any, error)
-	SerializeWorkflowActivityFunc func(a workflows.WorkflowActivity) (any, error)
 
 	// WidgetBuilderBackend
 	LoadWidgetTemplateFunc          func(widgetID string, projectPath string) (backend.WidgetObjectBuilder, error)
@@ -292,20 +379,24 @@ type MockBackend struct {
 	BuildFilterWidgetFunc           func(spec backend.FilterWidgetSpec, projectPath string) (pages.Widget, error)
 
 	// AgentEditorBackend
-	ListAgentEditorModelsFunc               func() ([]*agenteditor.Model, error)
-	ListAgentEditorKnowledgeBasesFunc       func() ([]*agenteditor.KnowledgeBase, error)
-	ListAgentEditorConsumedMCPServicesFunc  func() ([]*agenteditor.ConsumedMCPService, error)
-	ListAgentEditorAgentsFunc               func() ([]*agenteditor.Agent, error)
-	CreateAgentEditorModelFunc              func(m *agenteditor.Model) error
-	UpdateAgentEditorModelFunc              func(m *agenteditor.Model) error
-	DeleteAgentEditorModelFunc              func(id string) error
-	CreateAgentEditorKnowledgeBaseFunc      func(kb *agenteditor.KnowledgeBase) error
-	UpdateAgentEditorKnowledgeBaseFunc      func(kb *agenteditor.KnowledgeBase) error
-	DeleteAgentEditorKnowledgeBaseFunc      func(id string) error
-	CreateAgentEditorConsumedMCPServiceFunc func(svc *agenteditor.ConsumedMCPService) error
-	UpdateAgentEditorConsumedMCPServiceFunc func(svc *agenteditor.ConsumedMCPService) error
-	DeleteAgentEditorConsumedMCPServiceFunc func(id string) error
-	CreateAgentEditorAgentFunc              func(a *agenteditor.Agent) error
-	UpdateAgentEditorAgentFunc              func(a *agenteditor.Agent) error
-	DeleteAgentEditorAgentFunc              func(id string) error
+	ListAgentEditorModelsFunc                func() ([]*agenteditor.Model, error)
+	ListAgentEditorKnowledgeBasesFunc        func() ([]*agenteditor.KnowledgeBase, error)
+	ListAgentEditorConsumedMCPServicesFunc   func() ([]*agenteditor.ConsumedMCPService, error)
+	ListAgentEditorAgentsFunc                func() ([]*agenteditor.Agent, error)
+	CreateAgentEditorModelFunc               func(m *agenteditor.Model) error
+	UpdateAgentEditorModelFunc               func(m *agenteditor.Model) error
+	DeleteAgentEditorModelFunc               func(id string) error
+	CreateAgentEditorKnowledgeBaseFunc       func(kb *agenteditor.KnowledgeBase) error
+	UpdateAgentEditorKnowledgeBaseFunc       func(kb *agenteditor.KnowledgeBase) error
+	DeleteAgentEditorKnowledgeBaseFunc       func(id string) error
+	CreateAgentEditorConsumedMCPServiceFunc  func(svc *agenteditor.ConsumedMCPService) error
+	UpdateAgentEditorConsumedMCPServiceFunc  func(svc *agenteditor.ConsumedMCPService) error
+	DeleteAgentEditorConsumedMCPServiceFunc  func(id string) error
+	ListAgentEditorPublishedMCPServicesFunc  func() ([]*agenteditor.PublishedMCPService, error)
+	CreateAgentEditorPublishedMCPServiceFunc func(svc *agenteditor.PublishedMCPService) error
+	UpdateAgentEditorPublishedMCPServiceFunc func(svc *agenteditor.PublishedMCPService) error
+	DeleteAgentEditorPublishedMCPServiceFunc func(id string) error
+	CreateAgentEditorAgentFunc               func(a *agenteditor.Agent) error
+	UpdateAgentEditorAgentFunc               func(a *agenteditor.Agent) error
+	DeleteAgentEditorAgentFunc               func(id string) error
 }

@@ -6,8 +6,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -316,6 +319,85 @@ func TestExecuteOQL_ColumnOrder(t *testing.T) {
 	}
 }
 
+// TestParseOQLFeedback_ColumnUnionAcrossRows covers the runtime's habit of
+// omitting a column from a row's JSON object when its value is null. Taking the
+// column set from row 1 alone dropped such a column from the entire result, so
+// the table silently answered a narrower query than the one that was asked.
+func TestParseOQLFeedback_ColumnUnionAcrossRows(t *testing.T) {
+	tests := []struct {
+		name     string
+		feedback string
+		want     []string
+		wantRows [][]any
+	}{
+		{
+			name:     "column null in first row survives",
+			feedback: `{"data":[{"Name":"Alice"},{"Name":"Bob","Nickname":"Bobby"}]}`,
+			want:     []string{"Name", "Nickname"},
+			wantRows: [][]any{{"Alice", nil}, {"Bob", "Bobby"}},
+		},
+		{
+			name:     "missing middle column keeps its SELECT position",
+			feedback: `{"data":[{"A":"a1","C":"c1"},{"A":"a2","B":"b2","C":"c2"}]}`,
+			want:     []string{"A", "B", "C"},
+			wantRows: [][]any{{"a1", nil, "c1"}, {"a2", "b2", "c2"}},
+		},
+		{
+			name:     "column null in every row but one is still reported",
+			feedback: `{"data":[{"A":"a1"},{"A":"a2"},{"A":"a3","B":"b3"}]}`,
+			want:     []string{"A", "B"},
+			wantRows: [][]any{{"a1", nil}, {"a2", nil}, {"a3", "b3"}},
+		},
+		{
+			name:     "uniform rows keep first-row order",
+			feedback: `{"data":[{"Zebra":"z","Alpha":"a"},{"Zebra":"z2","Alpha":"a2"}]}`,
+			want:     []string{"Zebra", "Alpha"},
+			wantRows: [][]any{{"z", "a"}, {"z2", "a2"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := parseOQLFeedback(json.RawMessage(tt.feedback))
+			if err != nil {
+				t.Fatalf("parseOQLFeedback: %v", err)
+			}
+			if got := fmt.Sprintf("%v", result.Columns); got != fmt.Sprintf("%v", tt.want) {
+				t.Errorf("columns: got %v, want %v", result.Columns, tt.want)
+			}
+			if got, want := fmt.Sprintf("%v", result.Rows), fmt.Sprintf("%v", tt.wantRows); got != want {
+				t.Errorf("rows: got %s, want %s", got, want)
+			}
+		})
+	}
+}
+
+func TestMergeColumnOrder(t *testing.T) {
+	tests := []struct {
+		name    string
+		columns []string
+		keys    []string
+		want    string
+	}{
+		{"first row seeds the order", nil, []string{"A", "B"}, "[A B]"},
+		{"known keys change nothing", []string{"A", "B"}, []string{"A", "B"}, "[A B]"},
+		{"new key inserted in position", []string{"A", "C"}, []string{"A", "B", "C"}, "[A B C]"},
+		{"new leading key goes first", []string{"B"}, []string{"A", "B"}, "[A B]"},
+		{"new trailing key goes last", []string{"A"}, []string{"A", "B"}, "[A B]"},
+		{"two new keys keep their order", []string{"A", "D"}, []string{"A", "B", "C", "D"}, "[A B C D]"},
+		{"row with only unknown keys appends", []string{"A"}, []string{"B", "C"}, "[B C A]"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := fmt.Sprintf("%v", mergeColumnOrder(tt.columns, tt.keys))
+			if got != tt.want {
+				t.Errorf("mergeColumnOrder(%v, %v) = %s, want %s", tt.columns, tt.keys, got, tt.want)
+			}
+		})
+	}
+}
+
 // parseTestServerAddr extracts host and port from an httptest server URL.
 func parseTestServerAddr(t *testing.T, rawURL string) (string, int) {
 	t.Helper()
@@ -482,4 +564,119 @@ func TestSplitCurlStatus(t *testing.T) {
 // base64Encode mirrors m2eeAuthHeader's encoding for test assertions.
 func base64Encode(s string) string {
 	return m2eeAuthHeader(s)
+}
+
+func TestOqlDevError(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		want    string // "" = no error; otherwise a substring the result must contain
+		wantErr bool
+	}{
+		{"valid rows", `{"data":[{"N":"3"}]}`, "", false},
+		{"valid empty", `{"data":[]}`, "", false},
+		{"query error", `{"error":"parse error near FROM"}`, "parse error", true},
+		{"action not found", `{"result":-5,"message":"Action not found."}`, "not found", true},
+		{"action not found hint", `{"result":-5,"message":"Action not found."}`, "live-preview", true},
+		{"auth failed", `{"result":-4,"message":"Authentication failed."}`, "Authentication failed", true},
+		{"empty body", ``, "", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := oqlDevError([]byte(c.body))
+			if c.wantErr && got == "" {
+				t.Fatalf("expected an error message, got empty")
+			}
+			if !c.wantErr && got != "" {
+				t.Fatalf("expected no error, got %q", got)
+			}
+			if c.want != "" && !contains(got, c.want) {
+				t.Errorf("message %q does not contain %q", got, c.want)
+			}
+		})
+	}
+}
+
+func contains(s, sub string) bool {
+	return len(sub) == 0 || (len(s) >= len(sub) && indexOf(s, sub) >= 0)
+}
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestParseOQLFeedbackSurfacesAQueryError pins that a rejected query is an error
+// rather than an empty result.
+//
+// The legacy admin action reports a bad query inside the feedback with a
+// successful result code, so M2EEError() says nothing about it. Parsing that
+// body as data reported "0 rows" for a query the runtime refused — a wrong
+// answer delivered as a benign one.
+func TestParseOQLFeedbackSurfacesAQueryError(t *testing.T) {
+	raw := []byte(`{"error":"All OQL select columns must have a name"}`)
+	res, err := parseOQLFeedback(raw)
+	if err == nil {
+		t.Fatalf("a rejected query parsed as a result: %+v", res)
+	}
+	if !strings.Contains(err.Error(), "must have a name") {
+		t.Errorf("error = %v, want the runtime's message", err)
+	}
+}
+
+// TestOQLDevErrorKindDetectsAnAbsentRoute pins the fallback signal. A runtime
+// older than 11.11 has no /dev/ route, so the admin API dispatches the POST as
+// an ordinary request and answers 200 with "Action not found" — not a 404. Only
+// treating the 404 as absence meant the legacy action, which works on those
+// runtimes, was never tried.
+func TestOQLDevErrorKindDetectsAnAbsentRoute(t *testing.T) {
+	msg, absent := oqlDevErrorKind([]byte(`{"result":1,"message":"Action not found."}`))
+	if !absent {
+		t.Errorf("Action not found was not recognised as an absent route (msg=%q)", msg)
+	}
+	if _, absent := oqlDevErrorKind([]byte(`{"error":"syntax error near FROM"}`)); absent {
+		t.Error("a query error was mistaken for an absent route")
+	}
+	if _, absent := oqlDevErrorKind([]byte(`{"data":[{"c":"1"}]}`)); absent {
+		t.Error("a successful result was mistaken for an absent route")
+	}
+}
+
+// TestExecuteOQLPrefersTheLegacyError pins which of two failures is reported.
+//
+// When the /dev/ route is absent the legacy action is the real attempt, so its
+// error is the informative one. Reporting the dev route's "Action not found"
+// instead blames the transport for a query the runtime rejected on its merits —
+// an unknown entity would come back as "upgrade mxcli".
+func TestExecuteOQLPrefersTheLegacyError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasPrefix(r.URL.Path, "/dev/") {
+			// Pre-11.11: no /dev/ route, dispatched as an ordinary admin request.
+			fmt.Fprint(w, `{"result":1,"message":"Action not found."}`)
+			return
+		}
+		fmt.Fprint(w, `{"feedback":{"error":"Unknown entity Mod.NoSuch"},"result":0}`)
+	}))
+	defer srv.Close()
+
+	u, _ := url.Parse(srv.URL)
+	port, _ := strconv.Atoi(u.Port())
+	_, err := ExecuteOQL(OQLOptions{
+		Host: u.Hostname(), Port: port, Direct: true,
+		Stdout: io.Discard, Stderr: io.Discard,
+	}, "select count(*) as n from Mod.NoSuch")
+
+	if err == nil {
+		t.Fatal("a rejected query returned a result")
+	}
+	if !strings.Contains(err.Error(), "Unknown entity") {
+		t.Errorf("error = %v, want the runtime's own message", err)
+	}
+	if strings.Contains(err.Error(), "upgrade mxcli") {
+		t.Errorf("the transport hint masked the query error: %v", err)
+	}
 }

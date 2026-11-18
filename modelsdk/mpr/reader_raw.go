@@ -9,9 +9,9 @@ package mpr
 
 import (
 	"fmt"
-	"strings"
-
+	"github.com/mendixlabs/mxcli/modelsdk/bsoncompat"
 	"go.mongodb.org/mongo-driver/v2/bson"
+	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
@@ -28,10 +28,73 @@ func (r *Reader) GetRawUnit(id model.ID) (map[string]any, error) {
 		return nil, err
 	}
 	var raw map[string]any
-	if err := bson.Unmarshal(contents, &raw); err != nil {
+	if err := bsoncompat.UnmarshalDocMap(contents, &raw); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal BSON: %w", err)
 	}
+	// bson v2 decodes nested documents/arrays in interface{} slots as bson.D /
+	// bson.A, whereas the legacy reader (bson v1) yields nested map[string]any /
+	// []any. The raw-BSON consumers (DESCRIBE PAGE's widget-tree walk, snippet
+	// variables, etc.) type-assert map[string]any and []any, so normalise the
+	// whole tree to the legacy shape — otherwise every nested assertion fails and
+	// pages render as empty shells.
+	for k, v := range raw {
+		raw[k] = normalizeBSONValue(v)
+	}
 	return raw, nil
+}
+
+// RawDocumentMap decodes one BSON document into the legacy map shape GetRawUnit
+// returns (nested map[string]any / []any, binaries as v1 bson.Binary), for
+// a raw-BSON consumer handed an element rather than a whole unit — a navigation
+// menu item's client action, which describe renders with the same code a
+// button's goes through (ako/mxcli#980).
+func RawDocumentMap(contents []byte) (map[string]any, error) {
+	var raw map[string]any
+	if err := bsoncompat.UnmarshalDocMap(contents, &raw); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal BSON: %w", err)
+	}
+	for k, v := range raw {
+		raw[k] = normalizeBSONValue(v)
+	}
+	return raw, nil
+}
+
+// normalizeBSONValue recursively converts bson.D → map[string]any and bson.A →
+// []any so raw-BSON consumers written against the legacy (bson v1) shape work
+// unchanged against the modelsdk (bson v2) reader.
+func normalizeBSONValue(v any) any {
+	switch t := v.(type) {
+	case bson.D:
+		m := make(map[string]any, len(t))
+		for _, e := range t {
+			m[e.Key] = normalizeBSONValue(e.Value)
+		}
+		return m
+	case bson.A:
+		out := make([]any, len(t))
+		for i, e := range t {
+			out[i] = normalizeBSONValue(e)
+		}
+		return out
+	case map[string]any:
+		for k, e := range t {
+			t[k] = normalizeBSONValue(e)
+		}
+		return t
+	case []any:
+		for i, e := range t {
+			t[i] = normalizeBSONValue(e)
+		}
+		return t
+	case bson.Binary:
+		// Reference IDs (entity/attribute/widget refs) are stored as binary. The
+		// raw-BSON consumers (extractBinaryID, blobToUUID, …) type-assert the v1
+		// bson.Binary the legacy reader produces, so convert to match — else
+		// reference properties (Attribute / DataSource / CaptionAttribute) read empty.
+		return bson.Binary{Subtype: t.Subtype, Data: t.Data}
+	default:
+		return v
+	}
 }
 
 // GetUnitTypes returns a count of units by type.
@@ -50,7 +113,13 @@ func (r *Reader) GetUnitTypes() (map[string]int, error) {
 // ListRawUnitsByType returns all raw units matching the given BSON type prefix.
 // Returns types.RawUnit values keyed off model.ID for cross-package consumers.
 func (r *Reader) ListRawUnitsByType(typePrefix string) ([]*types.RawUnit, error) {
-	units, err := r.listUnitsByType(typePrefix)
+	return r.ListRawUnitsByTypeWhere(typePrefix, nil)
+}
+
+// ListRawUnitsByTypeWhere is ListRawUnitsByType for the units whose ID keep
+// accepts (nil keeps all); on v2 the others' contents are never read.
+func (r *Reader) ListRawUnitsByTypeWhere(typePrefix string, keep func(id string) bool) ([]*types.RawUnit, error) {
+	units, err := r.listUnitsByTypeWhere(typePrefix, keep)
 	if err != nil {
 		return nil, err
 	}
@@ -104,18 +173,18 @@ func rawUnitBSONType(objectType string) string {
 	}
 }
 
-// PERF NOTE (from the misc branch's catalog work — issue #651): this resolves
-// by re-reading and re-bson.Unmarshalling every unit of the type on EVERY call.
-// `refresh catalog source` calls it once per document (thousands of times), so
-// it is O(N²) — it took ~6 hours on a large app. sdk/mpr fixed this by building
-// a one-time index keyed by "$Type\x00QualifiedName" → unit, decoding only the
-// `Name` field (a small struct, not map[string]any). This engine inherits the
-// same O(N²); it should adopt the same name index (the contentCache here helps
-// the constant factor but not the algorithm).
-//
 // GetRawUnitByName returns the raw BSON contents for a unit by qualified
 // name. Supported object types match sdk/mpr.Reader.GetRawUnitByName.
 // Entity and association names dispatch to the domain-model walker.
+//
+// A lookup used to read every unit of the type on every call (issue #651). A
+// flow build resolves each `call microflow` target through here, so one large
+// flow in a large project read every microflow once per callee — past the
+// statement limit (ako/mxcli#2043). The scan now records where each name is
+// (nameIndex), and a later lookup reads that one unit. The entry is only a
+// hint: the unit is read and its name, type and module checked again, so a
+// unit renamed, moved or removed behind the reader's back is not returned;
+// a miss, or a stale hint, scans as before.
 func (r *Reader) GetRawUnitByName(objectType, qualifiedName string) (*types.RawUnitInfo, error) {
 	switch strings.ToLower(objectType) {
 	case "entity":
@@ -129,43 +198,139 @@ func (r *Reader) GetRawUnitByName(objectType, qualifiedName string) (*types.RawU
 		return nil, fmt.Errorf("unsupported object type: %s", objectType)
 	}
 
-	units, err := r.listUnitsByType(typePrefix)
-	if err != nil {
-		return nil, err
-	}
-
 	moduleMap, containerParent, err := r.buildModuleResolution()
 	if err != nil {
 		return nil, err
 	}
 
+	if u, ok := r.indexedUnit(typePrefix, qualifiedName); ok {
+		if info := r.unitNamed(u, qualifiedName, moduleMap, containerParent); info != nil {
+			return info, nil
+		}
+	}
+
+	units, err := r.listUnitsByType(typePrefix)
+	if err != nil {
+		return nil, err
+	}
+
+	// The whole type is read, so every name is recorded, and the match is
+	// returned after: the next lookup of any of them reads one unit.
+	index := make(map[string]rawUnit, len(units))
+	var found *types.RawUnitInfo
 	for _, u := range units {
 		contents, err := r.resolveContents(u.ID, u.Contents)
 		if err != nil {
 			continue
 		}
-		var raw map[string]any
-		if err := bson.Unmarshal(contents, &raw); err != nil {
+		// Only the name is compared, so only the name is read: decoding every
+		// document of the type into a map was most of a lookup's cost, and
+		// check makes several per statement (mendixlabs/mxcli#1272).
+		name, ok := rawUnitName(contents)
+		if !ok {
 			continue
 		}
-		name, _ := raw["Name"].(string)
 		moduleName := ResolveModuleName(u.ContainerID, moduleMap, containerParent)
 
 		fullName := name
 		if moduleName != "" {
 			fullName = moduleName + "." + name
 		}
-		if fullName == qualifiedName {
-			return &types.RawUnitInfo{
+		index[fullName] = rawUnit{ID: u.ID, ContainerID: u.ContainerID, Type: u.Type}
+		if fullName == qualifiedName && found == nil {
+			found = &types.RawUnitInfo{
 				ID:            u.ID,
 				QualifiedName: fullName,
 				Type:          u.Type,
 				ModuleName:    moduleName,
 				Contents:      contents,
-			}, nil
+			}
 		}
 	}
+	r.storeNameIndex(typePrefix, index)
+	if found != nil {
+		return found, nil
+	}
 	return nil, fmt.Errorf("%s not found: %s", objectType, qualifiedName)
+}
+
+// indexedUnit is the unit the name index last recorded under qualifiedName
+// for the type, if any. A hint only — see unitNamed.
+func (r *Reader) indexedUnit(typePrefix, qualifiedName string) (rawUnit, bool) {
+	r.nameIndexMu.Lock()
+	defer r.nameIndexMu.Unlock()
+	u, ok := r.nameIndex[typePrefix][qualifiedName]
+	return u, ok
+}
+
+func (r *Reader) storeNameIndex(typePrefix string, index map[string]rawUnit) {
+	r.nameIndexMu.Lock()
+	defer r.nameIndexMu.Unlock()
+	if r.nameIndex == nil {
+		r.nameIndex = map[string]map[string]rawUnit{}
+	}
+	r.nameIndex[typePrefix] = index
+}
+
+// clearNameIndex drops every recorded name; InvalidateCache calls it with
+// every write.
+func (r *Reader) clearNameIndex() {
+	r.nameIndexMu.Lock()
+	r.nameIndex = nil
+	r.nameIndexMu.Unlock()
+}
+
+// unitNamed reads u and returns it when it is still qualifiedName, of the type
+// it was indexed as and in the module that name says; nil when anything has
+// changed since the index was made, or it cannot be read.
+func (r *Reader) unitNamed(u rawUnit, qualifiedName string, moduleMap, containerParent map[string]string) *types.RawUnitInfo {
+	var contents []byte
+	if p, ok := r.packagedUnit(u.ID); ok {
+		contents = p.Contents
+	} else if r.version == MPRVersionV2 {
+		c, err := r.readMprContents(u.ID)
+		if err != nil {
+			return nil
+		}
+		contents = c
+	} else {
+		return nil // v1 keeps contents in the Unit table; the scan reads them
+	}
+	raw := bson.Raw(contents)
+	if raw.Validate() != nil {
+		return nil
+	}
+	if t, _ := raw.Lookup("$Type").StringValueOK(); t != "" && t != u.Type {
+		return nil
+	}
+	name, _ := raw.Lookup("Name").StringValueOK()
+	moduleName := ResolveModuleName(u.ContainerID, moduleMap, containerParent)
+	fullName := name
+	if moduleName != "" {
+		fullName = moduleName + "." + name
+	}
+	if fullName != qualifiedName {
+		return nil
+	}
+	return &types.RawUnitInfo{
+		ID:            u.ID,
+		QualifiedName: fullName,
+		Type:          u.Type,
+		ModuleName:    moduleName,
+		Contents:      contents,
+	}
+}
+
+// rawUnitName is a unit's top-level Name ("" when it has none), read without
+// decoding the document; ok is false for bytes that are not a valid document,
+// which the map decode this replaces skipped too.
+func rawUnitName(contents []byte) (name string, ok bool) {
+	raw := bson.Raw(contents)
+	if raw.Validate() != nil {
+		return "", false
+	}
+	name, _ = raw.Lookup("Name").StringValueOK()
+	return name, true
 }
 
 // ListRawUnits returns all units of the given object type with metadata.
@@ -191,11 +356,13 @@ func (r *Reader) ListRawUnits(objectType string) ([]*types.RawUnitInfo, error) {
 		if err != nil {
 			continue
 		}
-		var raw map[string]any
-		if err := bson.Unmarshal(contents, &raw); err != nil {
+		// Only the name is compared, so only the name is read: decoding every
+		// document of the type into a map was most of a lookup's cost, and
+		// check makes several per statement (mendixlabs/mxcli#1272).
+		name, ok := rawUnitName(contents)
+		if !ok {
 			continue
 		}
-		name, _ := raw["Name"].(string)
 		moduleName := ResolveModuleName(u.ContainerID, moduleMap, containerParent)
 		fullName := name
 		if moduleName != "" {
@@ -370,7 +537,7 @@ func (r *Reader) FindViewEntitySourceDocumentID(moduleName, docName string) (mod
 			continue
 		}
 		var raw map[string]any
-		if err := bson.Unmarshal(contents, &raw); err != nil {
+		if err := bsoncompat.UnmarshalDocMap(contents, &raw); err != nil {
 			continue
 		}
 		name, _ := raw["Name"].(string)
@@ -398,7 +565,7 @@ func (r *Reader) FindAllViewEntitySourceDocumentIDs(moduleName, docName string) 
 			continue
 		}
 		var raw map[string]any
-		if err := bson.Unmarshal(contents, &raw); err != nil {
+		if err := bsoncompat.UnmarshalDocMap(contents, &raw); err != nil {
 			continue
 		}
 		name, _ := raw["Name"].(string)

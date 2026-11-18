@@ -7,12 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/mendixlabs/mxcli/cmd/mxcli/syntax"
 	"github.com/mendixlabs/mxcli/mdl/ast"
 	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
+	"github.com/mendixlabs/mxcli/mdl/srctext"
 	"github.com/mendixlabs/mxcli/mdl/visitor"
 )
 
@@ -61,17 +61,18 @@ func execSet(ctx *ExecContext, s *ast.SetStmt) error {
 // execHelp handles HELP statements. With topic words, queries the syntax registry.
 func execHelp(ctx *ExecContext, s *ast.HelpStmt) error {
 	if len(s.Topic) > 0 {
-		path := syntax.ResolveAlias(resolveHelpPath(s.Topic))
-		features := syntax.ByPrefix(path)
-		if len(features) == 0 {
-			fmt.Fprintf(ctx.Output, "No syntax help found for: %s\n", path)
+		// Same resolver as `mxcli syntax` — see syntax.Lookup.
+		m := syntax.Lookup(s.Topic)
+		if len(m.Features) == 0 {
+			fmt.Fprintf(ctx.Output, "No syntax help found for: %s\n", m.Path)
 			fmt.Fprintln(ctx.Output, "Use HELP; for a command overview.")
 			return nil
 		}
 		if ctx.Format == FormatJSON {
-			return syntax.WriteJSON(ctx.Output, features)
+			return syntax.WriteJSON(ctx.Output, m.Features)
 		}
-		syntax.WriteText(ctx.Output, features)
+		fmt.Fprint(ctx.Output, m.Heading())
+		m.WriteText(ctx.Output)
 		return nil
 	}
 	help := `MDL Commands:
@@ -89,7 +90,7 @@ Domain Model - Enumerations:
   );
 
   drop enumeration Module.Name;
-  show enumerations [in Module];
+  list enumerations [in Module];
   describe enumeration Module.Name;
 
 Domain Model - Entities:
@@ -109,7 +110,7 @@ Domain Model - Entities:
   /
 
   drop entity Module.Name;
-  show entities [in Module];
+  list entities [in Module];
   describe entity Module.Name;
 
 Domain Model - Associations:
@@ -118,11 +119,11 @@ Domain Model - Associations:
     to Module.Child
     type Reference|ReferenceSet
     [owner Default|Both|Parent|Child]
-    [delete_behavior DELETE_BUT_KEEP_REFERENCES|DELETE_CASCADE];
+    [on delete set null|cascade|restrict [error message '...']];
   /
 
   drop association Module.Name;
-  show associations [in Module];
+  list associations [in Module];
   describe association Module.Name;
 
 Microflows:
@@ -143,8 +144,8 @@ Microflows:
     change $Object (attr = value);
     commit $Object [with events] [refresh];
     retrieve $List from Module.Entity where condition;
-    $Var = call microflow Module.Name($param = value);
-    $Var = call java action Module.Name($param = value);
+    $Var = call microflow Module.Name(param = value);
+    $Var = call java action Module.Name(param = value);
     validation feedback $Var/Attr message 'Error';  -- Show validation error
     close page [n];                      -- Close page(s)
     log info|warning|error [node 'name'] 'message';
@@ -152,13 +153,14 @@ Microflows:
     @caption 'text'                      -- Custom caption for activity
     @color Green                         -- Background color for activity
     @position(100, 200)                  -- Canvas position for activity
+    @start(60, 200)                      -- Canvas position for the start event
     return $ReturnVar;
   end;
   /
 
   drop microflow Module.Name;
-  show microflows [in Module];
-  show nanoflows [in Module];
+  list microflows [in Module];
+  list nanoflows [in Module];
   describe microflow Module.Name;
 
 Pages, Snippets, Layouts, Java Actions:
@@ -166,17 +168,17 @@ Pages, Snippets, Layouts, Java Actions:
   drop page Module.Name;
   create [or replace] snippet Module.Name (...) { ... };
   drop snippet Module.Name;
-  show pages [in Module];
-  show snippets [in Module];
-  show layouts [in Module];
-  show java actions [in Module];
+  list pages [in Module];
+  list snippets [in Module];
+  list layouts [in Module];
+  list java actions [in Module];
   describe page Module.Name;
   describe snippet Module.Name;
 
 Widget Discovery and Bulk Updates (requires refresh catalog full):
   *** EXPERIMENTAL: Untested proof-of-concept. Use dry run first! ***
 
-  show widgets [where condition] [in Module];
+  list widgets [where condition] [in Module];
     where conditions: WidgetType like '%pattern%', Name = 'value'
 
   update widgets
@@ -186,13 +188,13 @@ Widget Discovery and Bulk Updates (requires refresh catalog full):
     [dry run];
 
   Examples:
-    show widgets where WidgetType like '%combobox%';
+    list widgets where WidgetType like '%combobox%';
     update widgets set 'showLabel' = false where WidgetType like '%DataGrid%' dry run;
 
   Always backup your project before applying changes without dry RUN.
 
 Catalog Queries:
-  show catalog tables;
+  list catalog tables;
   show catalog status;             Show cache information
   describe CATALOG.tablename;      Show table columns and required mode
   refresh catalog;                 Rebuild catalog (uses cache if valid)
@@ -209,23 +211,26 @@ Catalog Queries:
   Tables: modules, entities, attributes, microflows, nanoflows, pages,
           snippets, layouts, enumerations, JAVA_ACTIONS, ACTIVITIES*,
           widgets*, XPATH_EXPRESSIONS, REFS*, PROJECTS, SNAPSHOTS,
-          objects, ODATA_CLIENTS, ODATA_SERVICES,
+          objects, CONSUMED_ODATA_SERVICES, PUBLISHED_ODATA_SERVICES,
           BUSINESS_EVENT_SERVICES, STRINGS*, source**
   (* only populated with refresh catalog full)
   (** only populated with refresh catalog full source)
 
-  Cache is stored in .mxcli/catalog.db next to the .mpr file.
+  Cache is stored in .mxcli/catalog.db next to the .mpr file. Its mode is
+  sticky: once a project has a full or source cache, a refresh rebuilds at
+  that level and a command needing less never writes a narrower one over it.
+  To drop back to a cheaper level, delete .mxcli/catalog.db and refresh.
 
 Code Search (requires refresh catalog full):
-  show callers of Module.Microflow [transitive];
-  show callees of Module.Microflow [transitive];
-  show references to Module.Element;
-  show impact of Module.Element;
+  list callers of Module.Microflow [transitive];
+  list callees of Module.Microflow [transitive];
+  list references to Module.Element;
+  list impact of Module.Element;
   show context of Module.Element [depth n];  -- Assemble context for LLM
 
 Security - Roles:
-  create module role Module.Role [description 'text'];
-  drop module role Module.Role;
+  create [or modify] module role Module.Role [description 'text'];
+  drop module role [if exists] Module.Role;
   create user role Name (Module.Role [, ...]) [manage all roles];
   alter user role Name add module roles (Module.Role [, ...]);
   alter user role Name remove module roles (Module.Role [, ...]);
@@ -236,44 +241,46 @@ Security - Access Control:
   revoke execute on microflow Module.Name from Role [, Role...];
   grant view on page Module.Name to Role [, Role...];
   revoke view on page Module.Name from Role [, Role...];
-  grant Role on Module.Entity (create, delete, read *, write *) [where 'xpath'];
+  grant create, delete, read *, write * on entity Module.Entity to Role [, Role...] [where [xpath]];
   revoke Role on Module.Entity;
 
 Security - Project Settings:
-  alter project security level off|prototype|production;
-  alter project security demo users on|off;
-  create demo user 'name' password 'pass' (UserRole [, ...]);
+  alter app security ( SecurityLevel: off|prototype|production );
+  alter app security ( EnableDemoUsers: true|false, StrictMode: true|false );
+  alter app security ( EnableGuestAccess: true|false [, GuestUserRole: <UserRole>] );
+  alter app security ( AdminUserName: '<name>', AdminUserRole: <UserRole>, AdminPassword: '<password>' );
+  create demo user 'name' ( Password: 'pass', UserRoles: (UserRole [, ...]) );
   drop demo user 'name';
 
 Security - Queries:
   show project security;
-  show module roles [in Module];
-  show user roles;
-  show demo users;
-  show access on microflow Module.Name;
-  show access on page Module.Name;
-  show access on Module.Entity;
+  list module roles [in Module];
+  list user roles;
+  list demo users;
+  list access on microflow Module.Name;
+  list access on page Module.Name;
+  list access on Module.Entity;
   show security matrix [in Module];
   describe module role Module.Role;
   describe user role Name;
   describe demo user 'name';
 
 Navigation:
-  show navigation;
-  show navigation menu [Profile];
-  show navigation homes;
+  list navigation;
+  list navigation menu [Profile];
+  list navigation homes;
   describe navigation Profile;
-  create or replace navigation Profile
+  create or modify navigation Profile
     home page Module.Page
-    [home page Module.Page for Module.Role]
+    [home page Module.Page for UserRole]
     [login page Module.Page]
     [not found page Module.Page]
-    [menu (
-      menu item 'Caption' page Module.Page;
-      menu 'SubMenu' (
-        menu item 'Child' microflow Module.Flow;
-      );
-    )];
+    [{
+      menu item 'Caption' ( OnClick: show page Module.Page )
+      menu 'SubMenu' {
+        menu item 'Child' ( OnClick: call microflow Module.Flow )
+      }
+    }];
 
 Data Types:
   String[(length)]  Integer  Long  Decimal[(p,s)]
@@ -286,7 +293,7 @@ Scripts:
 Modules:
   create module Name;
   drop module Name;                -- Cascade-deletes all contents
-  show modules;
+  list modules;
 
 External sql:
   sql connect <driver> '<dsn>' as <alias>;
@@ -330,17 +337,19 @@ Image Collections:
   create image collection Module.Name
     [export level 'Hidden'|'Public']
     [comment 'description']
-    [(image Name from file 'path', ...)];
-  /
+    [{ image Name ( File: 'path' ) ... }];
 
   drop image collection Module.Name;
-  show image collection [in Module];
+  list image collections [in Module];
   describe image collection Module.Name;
 
 Other:
   commit [message 'message'];
   set key = value;
   HELP or ?
+  HELP <topic>;                 Syntax reference — the topics mxcli syntax lists.
+                                Words, hyphens or the dotted path all work:
+                                HELP workflow user task | HELP workflow.user-task
   EXIT or QUIT
 
 Statement Terminator:
@@ -348,32 +357,6 @@ Statement Terminator:
 `
 	fmt.Fprint(ctx.Output, help)
 	return nil
-}
-
-// resolveHelpPath converts space-separated words like ["workflow", "user", "task"]
-// into a registry path like "workflow.user-task" by greedily merging adjacent words
-// with hyphens to find the longest matching prefix at each level.
-func resolveHelpPath(words []string) string {
-	var segments []string
-	i := 0
-	for i < len(words) {
-		matched := false
-		for j := len(words); j > i; j-- {
-			candidate := strings.Join(words[i:j], "-")
-			testPath := strings.Join(append(segments, candidate), ".")
-			if syntax.HasPrefix(testPath) {
-				segments = append(segments, candidate)
-				i = j
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			segments = append(segments, words[i])
-			i++
-		}
-	}
-	return strings.Join(segments, ".")
 }
 
 // listVersion displays Mendix project version information.
@@ -410,20 +393,23 @@ func execExecuteScript(ctx *ExecContext, s *ast.ExecuteScriptStmt) error {
 		return mdlerrors.NewValidationf("maximum script nesting depth (%d) exceeded — possible recursive EXECUTE SCRIPT", maxScriptDepth)
 	}
 
-	// Resolve path relative to current working directory
-	scriptPath := s.Path
-	if !filepath.IsAbs(scriptPath) {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return mdlerrors.NewBackend("get current directory", err)
-		}
-		scriptPath = filepath.Join(cwd, scriptPath)
+	// Resolve against the including script's directory first, so a script that
+	// pulls in a sibling works from any working directory.
+	scriptPath, err := ctx.ResolveScriptRelative(s.Path)
+	if err != nil {
+		return mdlerrors.NewBackend("get current directory", err)
 	}
 
 	// Read the script file
-	content, err := os.ReadFile(scriptPath)
-	if err != nil {
-		return mdlerrors.NewBackend("read script file '"+s.Path+"'", err)
+	raw, readErr := os.ReadFile(scriptPath)
+	if readErr != nil {
+		return mdlerrors.NewBackend("read script file '"+s.Path+"'", readErr)
+	}
+	// A BOM or UTF-16 is decoded as for a script given to check/exec
+	// (mendixlabs/mxcli#1253).
+	content, readErr := srctext.Decode(raw)
+	if readErr != nil {
+		return mdlerrors.NewBackend("read script file '"+s.Path+"'", readErr)
 	}
 
 	// Pre-process: remove "/" statement separators (SQL*Plus style)

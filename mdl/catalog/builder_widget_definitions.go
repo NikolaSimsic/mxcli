@@ -12,7 +12,6 @@ package catalog
 
 import (
 	"crypto/sha1"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -108,29 +107,43 @@ func (b *Builder) buildWidgetDefinitions() error {
 		if err != nil {
 			return fmt.Errorf("scan widgets directory: %w", err)
 		}
+		defs := defFilesByWidgetID(defsDir)
 		for _, mpkPath := range matches {
-			mpkDef, err := mpk.ParseMPK(mpkPath)
+			mpkDefs, err := mpk.ParseMPKAll(mpkPath)
 			if err != nil {
 				continue
 			}
-			mdlName := strings.ToUpper(lastSegment(mpkDef.ID))
-			defPath := filepath.Join(defsDir, strings.ToLower(mdlName)+".def.json")
-			defFields := loadDefFields(defPath)
-			kind := "custom"
-			if mpkDef.IsPluggable {
-				kind = "pluggable"
+			// A single .mpk can bundle many widgets (e.g. Charts.mpk).
+			for _, mpkDef := range mpkDefs {
+				// The definition is found by widget ID, not by a file name
+				// derived from it: two widgets can derive one name, and the
+				// definition generator then names one of them differently
+				// (#1848).
+				mdlName := strings.ToUpper(lastSegment(mpkDef.ID))
+				defPath := filepath.Join(defsDir, strings.ToLower(mdlName)+".def.json")
+				var defFields defFields
+				if d, ok := defs[mpkDef.ID]; ok {
+					defPath, defFields = d.path, d.fields
+					if d.mdlName != "" {
+						mdlName = strings.ToUpper(d.mdlName)
+					}
+				}
+				kind := "custom"
+				if mpkDef.IsPluggable {
+					kind = "pluggable"
+				}
+				if err := insertWidgetDef(
+					defStmt, propStmt,
+					mpkDef.ID, mdlName, mpkDef.Name, kind, mpkDef.Version,
+					relPath(projectDir, mpkPath), relPath(projectDir, defPath),
+					mpkProperties(mpkDef), defFields.ChildSlots, defFields.ObjectLists,
+					projectID, snapshotID,
+				); err != nil {
+					return err
+				}
+				seen[mpkDef.ID] = true
+				count++
 			}
-			if err := insertWidgetDef(
-				defStmt, propStmt,
-				mpkDef.ID, mdlName, mpkDef.Name, kind, mpkDef.Version,
-				relPath(projectDir, mpkPath), relPath(projectDir, defPath),
-				mpkProperties(mpkDef), defFields.ChildSlots, defFields.ObjectLists,
-				projectID, snapshotID,
-			); err != nil {
-				return err
-			}
-			seen[mpkDef.ID] = true
-			count++
 		}
 	}
 
@@ -152,9 +165,7 @@ func (b *Builder) buildWidgetDefinitions() error {
 		count++
 	}
 
-	if b.progress != nil {
-		b.progress("widget_definitions", count)
-	}
+	b.count("widget_definitions", count)
 	return nil
 }
 
@@ -165,15 +176,38 @@ type defFields struct {
 	ObjectLists []WidgetDefinitionSlotMeta
 }
 
-// loadDefFields reads a .def.json file and extracts its childSlots and
-// objectLists. Returns empty values if the file is missing or malformed.
-func loadDefFields(path string) defFields {
-	var out defFields
+// projectDef is one .def.json of the project.
+type projectDef struct {
+	path    string
+	mdlName string
+	fields  defFields
+}
+
+// defFilesByWidgetID reads every .def.json in dir and indexes it by the widget
+// ID it defines.
+func defFilesByWidgetID(dir string) map[string]projectDef {
+	out := map[string]projectDef{}
+	files, _ := filepath.Glob(filepath.Join(dir, "*.def.json"))
+	for _, path := range files {
+		id, mdlName, fields := loadDefFields(path)
+		if id != "" {
+			out[id] = projectDef{path: path, mdlName: mdlName, fields: fields}
+		}
+	}
+	return out
+}
+
+// loadDefFields reads a .def.json file and extracts the widget it defines, its
+// MDL name, and its childSlots and objectLists. Returns empty values if the
+// file is missing or malformed.
+func loadDefFields(path string) (widgetID, mdlName string, out defFields) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return out
+		return
 	}
 	var parsed struct {
+		WidgetID   string `json:"widgetId"`
+		MDLName    string `json:"mdlName"`
 		ChildSlots []struct {
 			PropertyKey  string `json:"propertyKey"`
 			MDLContainer string `json:"mdlContainer"`
@@ -184,8 +218,9 @@ func loadDefFields(path string) defFields {
 		} `json:"objectLists"`
 	}
 	if jsonErr := json.Unmarshal(data, &parsed); jsonErr != nil {
-		return out
+		return
 	}
+	widgetID, mdlName = parsed.WidgetID, parsed.MDLName
 	for _, s := range parsed.ChildSlots {
 		out.ChildSlots = append(out.ChildSlots, WidgetDefinitionSlotMeta{
 			PropertyKey: s.PropertyKey,
@@ -198,7 +233,7 @@ func loadDefFields(path string) defFields {
 			MdlKeyword:  ol.MDLContainer,
 		})
 	}
-	return out
+	return
 }
 
 // mpkProperties translates mpk.PropertyDef into the catalog's prop meta.
@@ -224,7 +259,7 @@ func mpkProperties(mpkDef *mpk.WidgetDefinition) []WidgetDefinitionPropMeta {
 // widget_definition_properties rows for its properties, child slots, and
 // object lists.
 func insertWidgetDef(
-	defStmt, propStmt *sql.Stmt,
+	defStmt, propStmt *Stmt,
 	widgetID, mdlName, displayName, kind, version, mpkPath, defPath string,
 	properties []WidgetDefinitionPropMeta,
 	childSlots []WidgetDefinitionSlotMeta,

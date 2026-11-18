@@ -44,7 +44,7 @@ The `CLAUDE.md` file gives Claude Code project-level context. It describes what 
 
 ### Skills
 
-The `.claude/skills/` directory (and `.ai-context/skills/` for the universal copy) contains markdown files that teach Claude specific MDL patterns. For example, `write-microflows.md` explains microflow syntax, common mistakes, and a validation checklist. Claude reads the relevant skill before generating MDL, which dramatically improves output quality.
+The `.claude/skills/` directory (and `.ai-context/skills/` for the universal copy) holds one directory per skill, each with a `SKILL.md`. For example, `write-microflows/SKILL.md` explains microflow syntax, common mistakes, and a validation checklist. Claude Code discovers them from `.claude/skills/` automatically and reads the relevant one before generating MDL, which dramatically improves output quality.
 
 ### Commands
 
@@ -94,16 +94,16 @@ Claude uses mxcli commands to understand your project before making changes:
 
 ```sql
 -- What modules exist?
-SHOW MODULES;
+LIST MODULES;
 
 -- What entities are in this module?
-SHOW ENTITIES IN Sales;
+LIST ENTITIES IN Sales;
 
 -- What does this entity look like?
 DESCRIBE ENTITY Sales.Customer;
 
 -- What microflows exist?
-SHOW MICROFLOWS IN Sales;
+LIST MICROFLOWS IN Sales;
 
 -- Search for something specific
 SEARCH 'validation';
@@ -161,13 +161,14 @@ Here is a typical conversation with Claude Code:
 
 **Claude** (explores the project):
 ```bash
-./mxcli -p app.mpr -c "SHOW MODULES"
-./mxcli -p app.mpr -c "SHOW ENTITIES IN Sales"
-./mxcli -p app.mpr -c "SHOW PAGES IN Sales"
+./mxcli -p app.mpr -c "LIST MODULES"
+./mxcli -p app.mpr -c "LIST ENTITIES IN Sales"
+./mxcli -p app.mpr -c "LIST PAGES IN Sales"
 ```
 
 **Claude** (reads skills, writes MDL, validates, and executes):
 ```sql
+mdl 1;
 /** Customer contact information */
 @Position(100, 100)
 CREATE PERSISTENT ENTITY Sales.Customer (
@@ -186,20 +187,20 @@ CREATE PAGE Sales.Customer_Overview
 )
 {
   LAYOUTGRID mainGrid {
-    ROW row1 {
-      COLUMN col1 (DesktopWidth: 12) {
+    ROW {
+      COLUMN (DesktopWidth: 12) {
         DATAGRID dgCustomers (
           DataSource: DATABASE FROM Sales.Customer SORT BY Name ASC
         ) {
-          COLUMN colName (Attribute: Name, Caption: 'Name')
-          COLUMN colEmail (Attribute: Email, Caption: 'Email')
-          COLUMN colPhone (Attribute: Phone, Caption: 'Phone')
-          COLUMN colActive (Attribute: IsActive, Caption: 'Active')
+          COLUMN (Attribute: Name, Caption: 'Name')
+          COLUMN (Attribute: Email, Caption: 'Email')
+          COLUMN (Attribute: Phone, Caption: 'Phone')
+          COLUMN (Attribute: IsActive, Caption: 'Active')
         }
       }
     }
   }
-}
+};
 ```
 
 Claude validates the script, executes it, and reports back. You can then open the project in Studio Pro to review the result.

@@ -22,7 +22,7 @@ This is particularly useful before using `ALTER PAGE` or `ALTER SNIPPET`, as it 
 Describe a page:
 
 ```sql
-DESCRIBE PAGE Sales.Customer_Edit
+DESCRIBE PAGE Sales.Customer_Edit;
 ```
 
 Example output:
@@ -30,7 +30,7 @@ Example output:
 ```sql
 CREATE PAGE Sales.Customer_Edit
 (
-  Params: { $Customer: Sales.Customer },
+  Params: ( $Customer: Sales.Customer ),
   Title: 'Edit Customer',
   Layout: Atlas_Core.PopupLayout
 )
@@ -38,20 +38,20 @@ CREATE PAGE Sales.Customer_Edit
   DATAVIEW dvCustomer (DataSource: $Customer) {
     TEXTBOX txtName (Label: 'Name', Attribute: Name)
     TEXTBOX txtEmail (Label: 'Email', Attribute: Email)
-    FOOTER footer1 {
-      ACTIONBUTTON btnSave (Caption: 'Save', Action: SAVE_CHANGES, ButtonStyle: Primary)
-      ACTIONBUTTON btnCancel (Caption: 'Cancel', Action: CANCEL_CHANGES)
+    FOOTER {
+      ACTIONBUTTON btnSave (Caption: 'Save', Action: SAVE CHANGES, ButtonStyle: Primary)
+      ACTIONBUTTON btnCancel (Caption: 'Cancel', Action: CANCEL CHANGES)
     }
   }
-}
+};
 ```
 
 Describe a snippet:
 
 ```sql
-DESCRIBE SNIPPET Common.NavigationMenu
+DESCRIBE SNIPPET Common.NavigationMenu;
 ```
 
 ## See Also
 
-[SHOW PAGES](show-pages.md), [SHOW WIDGETS](show-widgets.md), [DESCRIBE MICROFLOW](describe-microflow.md)
+[LIST PAGES](list-pages.md), [LIST WIDGETS](list-widgets.md), [DESCRIBE MICROFLOW](describe-microflow.md)

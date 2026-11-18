@@ -11,7 +11,6 @@ import (
 	"github.com/mendixlabs/mxcli/modelsdk/element"
 	genDt "github.com/mendixlabs/mxcli/modelsdk/gen/datatransformers"
 	mmpr "github.com/mendixlabs/mxcli/modelsdk/mpr"
-	"github.com/mendixlabs/mxcli/modelsdk/mprread"
 	"github.com/mendixlabs/mxcli/modelsdk/property"
 )
 
@@ -19,14 +18,15 @@ import (
 // plus source type and transform steps). Used by SHOW DATA TRANSFORMERS, the
 // CREATE OR MODIFY existence check, and DROP.
 func (b *Backend) ListDataTransformers() ([]*model.DataTransformer, error) {
-	units, err := mprread.ListUnitsWithContainer[*genDt.DataTransformer](b.reader)
+	units, err := listUnits[*genDt.DataTransformer](b)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]*model.DataTransformer, 0, len(units))
 	for _, u := range units {
 		g := u.Element
-		dt := &model.DataTransformer{ContainerID: model.ID(u.ContainerID), Name: g.Name(), Excluded: g.Excluded()}
+		dt := &model.DataTransformer{ContainerID: model.ID(u.ContainerID), Name: g.Name(), Excluded: g.Excluded(),
+			Documentation: g.Documentation()} // mendixlabs/mxcli#1510
 		dt.ID = model.ID(g.ID())
 		dt.TypeName = "DataTransformers$DataTransformer"
 		if src := g.Source(); src != nil {
@@ -106,6 +106,11 @@ func (b *Backend) UpdateDataTransformer(dt *model.DataTransformer) error {
 	if err != nil {
 		return fmt.Errorf("UpdateDataTransformer: encode: %w", err)
 	}
+	// dataTransformerToGen writes ExportLevel "Hidden" as a constant (#816).
+	contents, err = b.keepStoredExportLevel(string(dt.ID), contents)
+	if err != nil {
+		return fmt.Errorf("UpdateDataTransformer: %w", err)
+	}
 	return b.writer.UpdateRawUnit(string(dt.ID), contents)
 }
 
@@ -149,7 +154,7 @@ func dataTransformerToGen(dt *model.DataTransformer) element.Element {
 
 	g := newElem("DataTransformers$DataTransformer", string(dt.ID))
 	addStr(g, "Name", dt.Name)
-	addStr(g, "Documentation", "")
+	addStr(g, "Documentation", dt.Documentation)
 	addBool(g, "Excluded", dt.Excluded)
 	addStr(g, "ExportLevel", "Hidden")
 	addPart(g, "Source", source)

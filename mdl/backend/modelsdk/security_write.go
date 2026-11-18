@@ -6,11 +6,29 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/mendixlabs/mxcli/mdl/backend"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/modelsdk/codec"
 	"github.com/mendixlabs/mxcli/modelsdk/element"
 	genSec "github.com/mendixlabs/mxcli/modelsdk/gen/security"
 )
+
+// Studio Pro writes Security$ProjectSecurity's UserRoles and DemoUsers lists
+// with typed-array marker 2, not the encoder's default 3 (measured on PedApp
+// 11.13.0, TestApp 11.14.0 and the expr-checker fixture: every document
+// agrees). Without these, rewriting a user role or demo user with an unchanged
+// definition changed the marker, so running `describe user role` output wrote
+// the unit (#731).
+func init() {
+	codec.RegisterPropertyListMarker("Security$ProjectSecurity", "UserRoles", 2)
+	codec.RegisterPropertyListMarker("Security$ProjectSecurity", "DemoUsers", 2)
+	// Studio Pro gives every user role a GUID; mxcli wrote new ones without, so
+	// Mendix minted one on its next save and the two revisions of the role no
+	// longer had the same properties — which Mendix's merge engine refuses to
+	// compare (mendixlabs/mxcli#1373). A new role gets GUID = $ID, as a new
+	// entity does; a stored role passes through with the GUID it has.
+	codec.RegisterTypeDefaults("Security$UserRole", codec.TypeDefaults{EmitGUID: true})
+}
 
 // loadModuleSecurityGen decodes a Security$ModuleSecurity unit by ID.
 func (b *Backend) loadModuleSecurityGen(unitID model.ID) (*genSec.ModuleSecurity, error) {
@@ -184,6 +202,72 @@ func (b *Backend) SetProjectDemoUsersEnabled(unitID model.ID, enabled bool) erro
 	return b.persistUnit(unitID, ps)
 }
 
+// SetProjectStrictMode toggles security strict mode.
+//
+// StrictMode is a plain bool declared by BOTH generated sources — gen binds it
+// as property.NewPrimitive[bool]("StrictMode") and generated/metamodel declares
+// it on ProjectSecurity — and mxcli already reads it back from real projects,
+// so this writes a property Studio Pro knows rather than one gen merely offers.
+func (b *Backend) SetProjectStrictMode(unitID model.ID, enabled bool) error {
+	ps, err := b.loadProjectSecurityGen(unitID)
+	if err != nil {
+		return err
+	}
+	ps.SetStrictMode(enabled)
+	return b.persistUnit(unitID, ps)
+}
+
+// SetProjectAdminUserName renames the built-in administrator account
+// (Security$ProjectSecurity.AdminUserName, MxAdmin by default). The password
+// is left as stored.
+func (b *Backend) SetProjectAdminUserName(unitID model.ID, name string) error {
+	ps, err := b.loadProjectSecurityGen(unitID)
+	if err != nil {
+		return err
+	}
+	ps.SetAdminUserName(name)
+	return b.persistUnit(unitID, ps)
+}
+
+// SetProjectAdminUserRole sets the built-in administrator's user role
+// (Security$ProjectSecurity.AdminUserRole), stored by name like the guest user
+// role (ako/mxcli#2015).
+func (b *Backend) SetProjectAdminUserRole(unitID model.ID, role string) error {
+	ps, err := b.loadProjectSecurityGen(unitID)
+	if err != nil {
+		return err
+	}
+	ps.SetAdminUserRoleName(role)
+	return b.persistUnit(unitID, ps)
+}
+
+// SetProjectAdminPassword sets the built-in administrator's password
+// (Security$ProjectSecurity.AdminPassword), which Studio Pro stores in the
+// model as entered. The user name is left as stored (mendixlabs/mxcli#624).
+func (b *Backend) SetProjectAdminPassword(unitID model.ID, password string) error {
+	ps, err := b.loadProjectSecurityGen(unitID)
+	if err != nil {
+		return err
+	}
+	ps.SetAdminPassword(password)
+	return b.persistUnit(unitID, ps)
+}
+
+// SetProjectGuestAccess toggles anonymous (guest) access. An empty
+// guestUserRole leaves the stored role alone, so turning access off and back on
+// does not lose it.
+func (b *Backend) SetProjectGuestAccess(unitID model.ID, enabled bool, guestUserRole string) error {
+	ps, err := b.loadProjectSecurityGen(unitID)
+	if err != nil {
+		return err
+	}
+	ps.SetEnableGuestAccess(enabled)
+	if guestUserRole != "" {
+		ps.SetGuestUserRoleName(guestUserRole)
+	}
+	return b.persistUnit(unitID, ps)
+}
+
 // AlterUserRoleModuleRoles adds or removes module-role mappings on a project user
 // role (by name). add=true unions, add=false subtracts.
 func (b *Backend) AlterUserRoleModuleRoles(unitID model.ID, userRoleName string, add bool, moduleRoles []string) error {
@@ -225,6 +309,41 @@ func (b *Backend) AlterUserRoleModuleRoles(unitID model.ID, userRoleName string,
 		return b.persistUnit(unitID, ps)
 	}
 	return fmt.Errorf("AlterUserRoleModuleRoles: user role not found: %s", userRoleName)
+}
+
+// SetUserRoleProperties sets the properties props states on a project user
+// role (by name); a nil property is left as stored.
+func (b *Backend) SetUserRoleProperties(unitID model.ID, userRoleName string, props backend.UserRoleProperties) error {
+	if b.writer == nil {
+		return fmt.Errorf("SetUserRoleProperties: not connected for writing")
+	}
+	ps, err := b.loadProjectSecurityGen(unitID)
+	if err != nil {
+		return err
+	}
+	for _, el := range ps.UserRolesItems() {
+		r, ok := el.(*genSec.UserRole)
+		if !ok || !strings.EqualFold(r.Name(), userRoleName) {
+			continue
+		}
+		if props.Description != nil {
+			r.SetDescription(*props.Description)
+		}
+		if props.ManageAllRoles != nil {
+			r.SetManageAllRoles(*props.ManageAllRoles)
+		}
+		if props.ManageUsersWithoutRoles != nil {
+			r.SetManageUsersWithoutRoles(*props.ManageUsersWithoutRoles)
+		}
+		if props.CheckSecurity != nil {
+			r.SetCheckSecurity(*props.CheckSecurity)
+		}
+		if props.ManageableRoles != nil {
+			r.SetManageableRolesQualifiedNames(props.ManageableRoles)
+		}
+		return b.persistUnit(unitID, ps)
+	}
+	return fmt.Errorf("SetUserRoleProperties: user role not found: %s", userRoleName)
 }
 
 // RemoveDemoUser removes a demo user by (case-insensitive) username.

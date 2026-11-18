@@ -9,6 +9,7 @@ import (
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
 	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
+	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/agenteditor"
 )
 
@@ -21,6 +22,14 @@ func execCreateConsumedMCPService(ctx *ExecContext, s *ast.CreateConsumedMCPServ
 		return mdlerrors.NewNotConnected()
 	}
 
+	// Agent Editor documents need Studio Pro 11.9+ and the AgentEditorCommons
+	// module. Nothing downstream catches an older project: the documents are
+	// custom blobs, so mxbuild does not validate them and the build stays green
+	// while Studio Pro cannot open the result.
+	if err := checkVersionGates(ctx, s); err != nil {
+		return err
+	}
+
 	existing := findAgentEditorConsumedMCPService(ctx, s.Name.Module, s.Name.Name)
 	if existing != nil && !s.CreateOrModify {
 		return mdlerrors.NewAlreadyExists("consumed mcp service", s.Name.String())
@@ -31,8 +40,17 @@ func execCreateConsumedMCPService(ctx *ExecContext, s *ast.CreateConsumedMCPServ
 		return err
 	}
 
+	var existingContainerC model.ID
+	if existing != nil {
+		existingContainerC = existing.ContainerID
+	}
+	containerIDC, err := containerForDocument(ctx, module.ID, s.Folder, existingContainerC)
+	if err != nil {
+		return err
+	}
+
 	c := &agenteditor.ConsumedMCPService{
-		ContainerID:              module.ID,
+		ContainerID:              containerIDC,
 		Name:                     s.Name.Name,
 		Documentation:            s.OuterDocumentation,
 		ProtocolVersion:          s.ProtocolVersion,
@@ -40,14 +58,34 @@ func execCreateConsumedMCPService(ctx *ExecContext, s *ast.CreateConsumedMCPServ
 		InnerDocumentation:       s.InnerDocumentation,
 		ConnectionTimeoutSeconds: s.ConnectionTimeoutSeconds,
 	}
+	// A rewrite that carried no doc comment keeps the stored one (#1018).
+	if existing != nil {
+		c.Documentation = carriedDocumentation(s.DocumentationSet, s.OuterDocumentation, existing.Documentation)
+		c.Endpoint, c.AuthenticationMicroflow = existing.Endpoint, existing.AuthenticationMicroflow
+	}
+	if s.Endpoint != nil {
+		if c.Endpoint, err = consumedMCPEndpointRef(ctx, *s.Endpoint); err != nil {
+			return fmt.Errorf("consumed mcp service %s: %w", s.Name, err)
+		}
+	}
+	if s.AuthenticationMicroflow != nil {
+		if c.AuthenticationMicroflow, err = publishedMCPMicroflowRef(ctx, *s.AuthenticationMicroflow); err != nil {
+			return fmt.Errorf("consumed mcp service %s: AuthenticationMicroflow: %w", s.Name, err)
+		}
+	}
 
 	if existing != nil {
 		c.ID = existing.ID
+		// Excluded is model state, not script state (#914).
+		c.Excluded = existing.Excluded
 		if err := ctx.Backend.UpdateAgentEditorConsumedMCPService(c); err != nil {
 			return mdlerrors.NewBackend("update consumed mcp service", err)
 		}
 		invalidateHierarchy(ctx)
-		fmt.Fprintf(ctx.Output, "Modified consumed mcp service: %s\n", s.Name)
+		if _, err := applyDocumentFolder(ctx, c.ID, existingContainerC, containerIDC); err != nil {
+			return err
+		}
+		ctx.ReportMutation("Modified", "consumed mcp service: %s", s.Name)
 		return nil
 	}
 
@@ -83,6 +121,14 @@ func execCreateKnowledgeBase(ctx *ExecContext, s *ast.CreateKnowledgeBaseStmt) e
 		return mdlerrors.NewNotConnected()
 	}
 
+	// Agent Editor documents need Studio Pro 11.9+ and the AgentEditorCommons
+	// module. Nothing downstream catches an older project: the documents are
+	// custom blobs, so mxbuild does not validate them and the build stays green
+	// while Studio Pro cannot open the result.
+	if err := checkVersionGates(ctx, s); err != nil {
+		return err
+	}
+
 	existing := findAgentEditorKnowledgeBase(ctx, s.Name.Module, s.Name.Name)
 	if existing != nil && !s.CreateOrModify {
 		return mdlerrors.NewAlreadyExists("knowledge base", s.Name.String())
@@ -106,8 +152,17 @@ func execCreateKnowledgeBase(ctx *ExecContext, s *ast.CreateKnowledgeBaseStmt) e
 		provider = "MxCloudGenAI"
 	}
 
+	var existingContainerK model.ID
+	if existing != nil {
+		existingContainerK = existing.ContainerID
+	}
+	containerIDK, err := containerForDocument(ctx, module.ID, s.Folder, existingContainerK)
+	if err != nil {
+		return err
+	}
+
 	k := &agenteditor.KnowledgeBase{
-		ContainerID:      module.ID,
+		ContainerID:      containerIDK,
 		Name:             s.Name.Name,
 		Documentation:    s.Documentation,
 		Provider:         provider,
@@ -119,14 +174,25 @@ func execCreateKnowledgeBase(ctx *ExecContext, s *ast.CreateKnowledgeBaseStmt) e
 		Environment:      s.Environment,
 		DeepLinkURL:      s.DeepLinkURL,
 	}
+	// A rewrite that carried no doc comment keeps the stored one (#1018).
+	if existing != nil {
+		k.Documentation = carriedDocumentation(s.DocumentationSet, s.Documentation, existing.Documentation)
+	}
 
 	if existing != nil {
+		// The Portal knowledge base name: MDL has no spelling for it.
+		k.InnerName = existing.InnerName
 		k.ID = existing.ID
+		// Excluded is model state, not script state (#914).
+		k.Excluded = existing.Excluded
 		if err := ctx.Backend.UpdateAgentEditorKnowledgeBase(k); err != nil {
 			return mdlerrors.NewBackend("update knowledge base", err)
 		}
 		invalidateHierarchy(ctx)
-		fmt.Fprintf(ctx.Output, "Modified knowledge base: %s\n", s.Name)
+		if _, err := applyDocumentFolder(ctx, k.ID, existingContainerK, containerIDK); err != nil {
+			return err
+		}
+		ctx.ReportMutation("Modified", "knowledge base: %s", s.Name)
 		return nil
 	}
 
@@ -162,6 +228,14 @@ func execCreateAgent(ctx *ExecContext, s *ast.CreateAgentStmt) error {
 		return mdlerrors.NewNotConnected()
 	}
 
+	// Agent Editor documents need Studio Pro 11.9+ and the AgentEditorCommons
+	// module. Nothing downstream catches an older project: the documents are
+	// custom blobs, so mxbuild does not validate them and the build stays green
+	// while Studio Pro cannot open the result.
+	if err := checkVersionGates(ctx, s); err != nil {
+		return err
+	}
+
 	existingAgent := findAgentEditorAgent(ctx, s.Name.Module, s.Name.Name)
 	if existingAgent != nil && !s.CreateOrModify {
 		return mdlerrors.NewAlreadyExists("agent", s.Name.String())
@@ -172,8 +246,17 @@ func execCreateAgent(ctx *ExecContext, s *ast.CreateAgentStmt) error {
 		return err
 	}
 
+	var existingContainerA model.ID
+	if existingAgent != nil {
+		existingContainerA = existingAgent.ContainerID
+	}
+	containerIDA, err := containerForDocument(ctx, module.ID, s.Folder, existingContainerA)
+	if err != nil {
+		return err
+	}
+
 	a := &agenteditor.Agent{
-		ContainerID:   module.ID,
+		ContainerID:   containerIDA,
 		Name:          s.Name.Name,
 		Documentation: s.Documentation,
 		Description:   s.Description,
@@ -184,27 +267,32 @@ func execCreateAgent(ctx *ExecContext, s *ast.CreateAgentStmt) error {
 		ToolChoice:    s.ToolChoice,
 		Temperature:   s.Temperature,
 		TopP:          s.TopP,
+
+		EnableBackendStreaming: s.EnableBackendStreaming,
+		EnableUIStreaming:      s.EnableUIStreaming,
+	}
+	// A rewrite that carried no doc comment keeps the stored one (#1018).
+	if existingAgent != nil {
+		a.Documentation = carriedDocumentation(s.DocumentationSet, s.Documentation, existingAgent.Documentation)
 	}
 
 	// Resolve Model reference
 	if s.Model != nil {
-		m := findAgentEditorModel(ctx, s.Model.Module, s.Model.Name)
-		if m == nil {
-			return fmt.Errorf("create agent %s: model not found: %s", s.Name, s.Model)
+		ref, err := agentModelRef(ctx, "create agent", s.Name.String(), *s.Model)
+		if err != nil {
+			return err
 		}
-		a.Model = &agenteditor.DocRef{
-			DocumentID:    string(m.ID),
-			QualifiedName: s.Model.String(),
-		}
+		a.Model = ref
 	}
 
-	// Resolve Entity reference. The documentId for entity references is an
-	// opaque agent-editor-internal ID (not a unit UUID), so we set only
-	// qualifiedName here. ASU_AgentEditor populates documentId at runtime.
+	// Resolve Entity reference: its documentId is the entity element's $ID,
+	// which Studio Pro stores there (ako/mxcli#2289).
 	if s.Entity != nil {
-		a.Entity = &agenteditor.DocRef{
-			QualifiedName: s.Entity.String(),
+		ref, err := agentEntityRef(ctx, "create agent", s.Name.String(), *s.Entity)
+		if err != nil {
+			return err
 		}
+		a.Entity = ref
 	}
 
 	// Variables
@@ -217,55 +305,41 @@ func execCreateAgent(ctx *ExecContext, s *ast.CreateAgentStmt) error {
 
 	// Tools (MCP SERVICE and TOOL blocks)
 	for _, td := range s.Tools {
-		at := agenteditor.AgentTool{
-			Name:        td.Name,
-			Description: td.Description,
-			Enabled:     td.Enabled,
-			ToolType:    td.ToolType,
+		at, err := buildAgentToolFromDef(ctx, "create agent", &s.Name, td)
+		if err != nil {
+			return err
 		}
-		if td.Document != nil && td.ToolType == "mcp" {
-			// Resolve MCP service document reference
-			svc := findAgentEditorConsumedMCPService(ctx, td.Document.Module, td.Document.Name)
-			if svc == nil {
-				return fmt.Errorf("create agent %s: consumed mcp service not found: %s", s.Name, td.Document)
-			}
-			at.Document = &agenteditor.DocRef{
-				DocumentID:    string(svc.ID),
-				QualifiedName: td.Document.String(),
-			}
-		}
-		a.Tools = append(a.Tools, at)
+		a.Tools = append(a.Tools, *at)
 	}
 
 	// Knowledge base tools
 	for _, kbd := range s.KBTools {
-		akt := agenteditor.AgentKBTool{
-			Name:                 kbd.Name,
-			Description:          kbd.Description,
-			Enabled:              kbd.Enabled,
-			CollectionIdentifier: kbd.Collection,
-			MaxResults:           kbd.MaxResults,
+		akt, err := buildAgentKBToolFromDef(ctx, "create agent", &s.Name, kbd)
+		if err != nil {
+			return err
 		}
-		if kbd.Source != nil {
-			kb := findAgentEditorKnowledgeBase(ctx, kbd.Source.Module, kbd.Source.Name)
-			if kb == nil {
-				return fmt.Errorf("create agent %s: knowledge base not found: %s", s.Name, kbd.Source)
-			}
-			akt.Document = &agenteditor.DocRef{
-				DocumentID:    string(kb.ID),
-				QualifiedName: kbd.Source.String(),
-			}
-		}
-		a.KBTools = append(a.KBTools, akt)
+		a.KBTools = append(a.KBTools, *akt)
 	}
+
+	var storedModel *agenteditor.SelectedModel
+	if existingAgent != nil {
+		carryAgentIdentity(a, existingAgent)
+		storedModel = existingAgent.SelectedModel
+	}
+	a.SelectedModel = selectedModelFrom(s.SelectedModel, s.SelectedModelName, storedModel)
 
 	if existingAgent != nil {
 		a.ID = existingAgent.ID
+		// Excluded is model state, not script state (#914).
+		a.Excluded = existingAgent.Excluded
 		if err := ctx.Backend.UpdateAgentEditorAgent(a); err != nil {
 			return mdlerrors.NewBackend("update agent", err)
 		}
 		invalidateHierarchy(ctx)
-		fmt.Fprintf(ctx.Output, "Modified agent: %s\n", s.Name)
+		if _, err := applyDocumentFolder(ctx, a.ID, existingContainerA, containerIDA); err != nil {
+			return err
+		}
+		ctx.ReportMutation("Modified", "agent: %s", s.Name)
 		return nil
 	}
 

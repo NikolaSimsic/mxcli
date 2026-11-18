@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/mendixlabs/mxcli/internal/testutil"
 )
 
 func TestResolveMxBuild_ExplicitPath(t *testing.T) {
@@ -80,9 +82,11 @@ func TestResolveMxBuild_NoExplicitPath_FallsThrough(t *testing.T) {
 	}
 }
 
-func TestIsJDK21_InvalidPath(t *testing.T) {
-	if isJDK21("/nonexistent/jdk") {
-		t.Error("expected false for nonexistent path")
+func TestIsJDK_InvalidPath(t *testing.T) {
+	for _, major := range []int{21, 25} {
+		if isJDK("/nonexistent/jdk", major) {
+			t.Errorf("expected false for nonexistent path (major %d)", major)
+		}
 	}
 }
 
@@ -94,7 +98,7 @@ func TestMxbuildSearchPaths_NonEmpty(t *testing.T) {
 }
 
 func TestJdkSearchPaths_NonEmpty(t *testing.T) {
-	paths := jdkSearchPaths()
+	paths := jdkSearchPaths(21)
 	if len(paths) == 0 {
 		t.Error("expected non-empty search paths")
 	}
@@ -186,7 +190,7 @@ func TestJdkSearchPaths_NoHardcodedDriveLetter(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("windows-only test")
 	}
-	paths := jdkSearchPaths()
+	paths := jdkSearchPaths(21)
 	for _, p := range paths {
 		if len(p) >= 3 && p[0] == 'C' && p[1] == ':' {
 			sysDrive := os.Getenv("SystemDrive")
@@ -283,7 +287,7 @@ func TestResolveMxBuild_PrefersStudioProOverCache(t *testing.T) {
 
 func TestResolveMxBuild_PrefersExactCachedVersion(t *testing.T) {
 	dir := t.TempDir()
-	setTestHomeDir(t, dir)
+	testutil.SetHome(t, dir)
 	setTestApplicationsDir(t, t.TempDir()) // prevent real macOS Studio Pro from matching
 	// Point PATH at an empty temp dir (rather than clearing it) so exec.LookPath
 	// still works for any other testing infrastructure but can't find mxbuild.

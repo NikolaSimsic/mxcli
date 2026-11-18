@@ -1,10 +1,30 @@
+# mxcli-template-version: 3
+# Regenerate with `mxcli docker init --force` when mxcli reports this file is
+# out of date — template fixes (e.g. the OQL dev-servlet flags) only reach an
+# existing .docker/ when the compose file is rewritten.
+#
+# Compose project name: prefixes every container, network and volume of this
+# stack (<name>-db-1, <name>_postgres-data), so each project needs its own —
+# before v3 it was the ".docker" folder name, i.e. "docker" for every project,
+# and the stacks and databases of different apps collided (mxcli#1364).
+# The name identifies the stack's data: change it and Compose starts NEW
+# containers with an EMPTY database volume, leaving the old one behind. Keep it
+# stable; `mxcli docker init --force` keeps whatever is here. `docker compose -p`
+# and COMPOSE_PROJECT_NAME override it.
+name: __COMPOSE_PROJECT_NAME__
+
 services:
   mendix:
     image: eclipse-temurin:21-jre
     working_dir: /mendix
     volumes:
       - ./build:/mendix
-    command: ["./bin/start", "-J", "-Dmendix.live-preview=enabled"]
+    # live-preview + the "running locally by Studio Pro" flag together mount the
+    # runtime's development servlets — including /dev/preview_execute_oql, which
+    # `mxcli oql` uses. Without the studiopro flag the servlet is never registered
+    # (AppContainer.addDevelopmentServlet gates on it) and OQL returns "Action not
+    # found" — silently 0 rows. Each JVM option needs its own -J for bin/start.
+    command: ["./bin/start", "-J", "-Dmendix.live-preview=enabled", "-J", "-Dmendix.running.locally.by.studiopro=true"]
     ports:
       - "${APP_PORT:-8080}:8080"
       - "${ADMIN_PORT:-8090}:8090"   # admin API — bound to * by build patch

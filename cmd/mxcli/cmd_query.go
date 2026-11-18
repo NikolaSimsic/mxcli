@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/mendixlabs/mxcli/mdl/executor"
 	"github.com/mendixlabs/mxcli/mdl/visitor"
 	"github.com/spf13/cobra"
 )
@@ -74,11 +75,14 @@ Examples:
 var refsCmd = &cobra.Command{
 	Use:   "refs <qualified-name>",
 	Short: "Find references to an element",
-	Long: `Find all references to the specified element (entity, microflow, page, etc.).
+	Long: `Find all references to the specified element (entity, microflow, page, etc.,
+or an attribute Module.Entity.Attribute, an enumeration, or an enumeration
+value Module.Enum.Value). Each (source, kind) is listed once.
 
 Examples:
   mxcli refs -p app.mpr Module.Customer
   mxcli refs -p app.mpr Module.OrderPage
+  mxcli refs -p app.mpr Module.Customer.Email
 `,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -98,10 +102,15 @@ var impactCmd = &cobra.Command{
 	Use:   "impact <qualified-name>",
 	Short: "Show impact of changing an element",
 	Long: `Analyze the impact of changing an element by showing all elements that reference it.
+The summary counts distinct elements. For an enumeration, the uses of its values are
+included. When nothing is found for an attribute or an enumeration value, the message
+says which usage sites were checked: one named only through a variable in a free-text
+expression ($Order/Total) is not resolved, so run 'mxcli search' before deleting.
 
 Examples:
   mxcli impact -p app.mpr Module.Customer
   mxcli impact -p app.mpr Module.OrderStatus
+  mxcli impact -p app.mpr Module.Customer.Email
 `,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -148,7 +157,7 @@ Examples:
 			os.Exit(1)
 		}
 
-		mdlCmd := "SHOW STRUCTURE"
+		mdlCmd := "DESCRIBE STRUCTURE"
 		if depth != 2 {
 			mdlCmd += fmt.Sprintf(" DEPTH %d", depth)
 		}
@@ -180,12 +189,19 @@ Supported element types:
   OData services service info, published entities
 
 Use --depth to control how deep to traverse call chains (default: 2).
+The MDL sources are written in mdl 1, each headed by "mdl 1;"; --mdl 0
+writes them in the alpha language instead.
+
+With --json the assembled context is wrapped in one JSON object,
+{"name", "type", "depth", "context"}, where "context" is the markdown text
+above; progress goes to stderr.
 
 Examples:
   mxcli context -p app.mpr Module.ProcessOrder
   mxcli context -p app.mpr Module.Customer --depth 3
   mxcli context -p app.mpr Module.OrderPage
   mxcli context -p app.mpr Module.ImportCsvData
+  mxcli context -p app.mpr Module.Customer --json | jq -r .context
 `,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -197,12 +213,27 @@ Examples:
 			os.Exit(1)
 		}
 
-		mdlCmd := fmt.Sprintf("SHOW CONTEXT OF %s", args[0])
+		mdlCmd := fmt.Sprintf("DESCRIBE CONTEXT OF %s", args[0])
 		if depth > 0 {
 			mdlCmd += fmt.Sprintf(" DEPTH %d", depth)
 		}
-		executeMDL(projectPath, mdlCmd)
+		lang := mdlFlag(cmd)
+		executeMDL(projectPath, mdlCmd, func(e *executor.Executor) { e.SetDescribeLanguage(lang) })
 	},
+}
+
+// searchExitCode is the exit status of a search that ran. Under --fail-on-match a
+// hit is 1, a definite answer whatever else is missing. An answer that left MDL
+// source unsearched (--no-build without a source index) is 3, so a script never
+// reads it as "nothing matched" (ako/mxcli#2004). Anything else is 0.
+func searchExitCode(res executor.SearchOutcome, failOnMatch bool) int {
+	switch {
+	case failOnMatch && res.Hits > 0:
+		return 1
+	case res.Incomplete:
+		return 3
+	}
+	return 0
 }
 
 var searchCmd = &cobra.Command{
@@ -210,32 +241,91 @@ var searchCmd = &cobra.Command{
 	Short: "Search the project catalog using full-text search",
 	Long: `Search the project catalog for matching strings and source code.
 
-Searches across string literals (captions, labels, messages) and MDL source
-definitions. Requires at least a FULL catalog build (done automatically).
+Searches across string literals (captions, labels, messages), the documentation
+of project elements, and MDL source definitions. Requires at least a FULL
+catalog build (done automatically).
+
+Besides captions, labels and messages, it searches the documentation of every
+element that has documentation (entities, attributes, constants, pages,
+microflows, Java actions, REST services, ... and a module's domain model
+documentation). The full list is the catalog tables with a Description or
+Documentation column:
+  mxcli -p app.mpr -c "list catalog tables"
+  mxcli -p app.mpr -c "describe CATALOG.entities"
+Not searched: the documentation of an enumeration value (Mendix has no such
+field) and the summary text of a remote service's contract.
+A hit names the element (qualified name, type) and the field: the context
+column says "documentation" for a documentation hit.
+
+MDL source (flow, page and expression bodies) is searched through the source
+index. The first search builds it, saying so on stderr; on a large project that
+takes a while, once. After a model change it is brought up to date
+incrementally, which is quick.
+
+  --no-build        never build the source index. Without one, only string
+                    literals and documentation are searched: a warning on
+                    stderr says so and the command exits 3, so "no matches"
+                    is never mistaken for a complete answer. With one, the
+                    search is complete and exits as usual.
 
 Output Formats:
   table   - Human-readable table (default)
   names   - Just qualified names, one per line (for piping)
-  json    - JSON output
+  --json  - JSON array on stdout, progress on stderr (the same flag every
+            query command takes). "--format json" is still accepted as a
+            deprecated spelling of it.
+
+Gating on a word:
+  --fail-on-match   exit 1 when there is at least one hit, 0 when there is none
+                    (results are printed as usual, JSON included). A query the
+                    index cannot run, or any other error, exits 2 so that 1
+                    always means "something matched". With --no-build and no
+                    source index, a search that found nothing exits 3.
+
+Marketplace modules:
+  --exclude-marketplace
+                    leave out hits inside modules downloaded from the
+                    Marketplace. Off by default: every module is searched.
 
 Examples:
   mxcli search -p app.mpr "validation"
+  mxcli search -p app.mpr "Customer" --json | jq '.[].qualifiedName'
   mxcli search -p app.mpr "Customer" --format names
   mxcli search -p app.mpr "error" -q --format names | xargs -I {} mxcli describe -p app.mpr microflow {}
+  mxcli search -p app.mpr "TODO" --fail-on-match
+  mxcli search -p app.mpr "TODO" --exclude-marketplace
+  mxcli search -p app.mpr "SUB_Do" --no-build
 `,
 	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		projectPath, _ := cmd.Flags().GetString("project")
 		format := resolveFormat(cmd, "table")
 		quiet, _ := cmd.Flags().GetBool("quiet")
+		failOnMatch, _ := cmd.Flags().GetBool("fail-on-match")
+		excludeMarketplace, _ := cmd.Flags().GetBool("exclude-marketplace")
+		noBuild, _ := cmd.Flags().GetBool("no-build")
+
+		// Under --fail-on-match, exit status 1 means "something matched", so a
+		// search that could not run says so with 2 rather than with 1.
+		errorExit := 1
+		if failOnMatch {
+			errorExit = 2
+		}
 
 		if projectPath == "" {
 			fmt.Fprintln(os.Stderr, "Error: --project (-p) is required")
-			os.Exit(1)
+			os.Exit(errorExit)
 		}
 
+		// A JSON-format executor sends "Connected to:" and catalog progress to
+		// stderr (ExecContext.progress). Set from the resolved format, not
+		// from --json alone: `--format json` is the older spelling of the same
+		// request and must be exactly as clean.
 		exec, logger := newLoggedExecutor("subcommand")
 		defer logger.Close()
+		if isMachineReadableFormat(format) {
+			exec.SetFormat(executor.FormatJSON)
+		}
 		if quiet {
 			exec.SetQuiet(true)
 		}
@@ -246,15 +336,27 @@ Examples:
 		for _, stmt := range connectProg.Statements {
 			if err := exec.Execute(stmt); err != nil {
 				fmt.Fprintf(os.Stderr, "Error connecting: %v\n", err)
-				os.Exit(1)
+				os.Exit(errorExit)
 			}
 		}
 
 		// Execute search with format option
 		query := strings.ReplaceAll(args[0], "'", "''")
-		if err := exec.Search(query, format); err != nil {
+		res, err := exec.SearchReport(query, format, executor.SearchOptions{
+			ExcludeMarketplace: excludeMarketplace,
+			// A gate must not read "the index refused the query" as "no match".
+			Strict:  failOnMatch,
+			NoBuild: noBuild,
+		})
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			os.Exit(errorExit)
+		}
+		if code := searchExitCode(res, failOnMatch); code != 0 {
+			// os.Exit skips the deferred closes, and the log file would stay open.
+			exec.Close()
+			logger.Close()
+			os.Exit(code)
 		}
 	},
 }

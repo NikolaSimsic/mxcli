@@ -32,16 +32,35 @@ func createDatabaseConnection(ctx *ExecContext, stmt *ast.CreateDatabaseConnecti
 	h, _ := getHierarchy(ctx)
 
 	var existingConnID model.ID
-	for _, ex := range existing {
-		modID := h.FindModuleID(ex.ContainerID)
-		modName := h.GetModuleName(modID)
-		if strings.EqualFold(modName, stmt.Name.Module) && strings.EqualFold(ex.Name, stmt.Name.Name) {
-			if stmt.CreateOrModify {
-				existingConnID = ex.ID
-			} else {
-				return mdlerrors.NewAlreadyExistsMsg("database connection", modName+"."+ex.Name, fmt.Sprintf("database connection already exists: %s.%s (use create or modify to update)", modName, ex.Name))
-			}
+	var existingContainer model.ID
+	// Target the live connection and carry its exclusion forward (#914).
+	existingExcluded := false
+	if ex, ok := pickLive(existing,
+		func(c *model.DatabaseConnection) bool {
+			return strings.EqualFold(h.GetModuleName(h.FindModuleID(c.ContainerID)), stmt.Name.Module) &&
+				strings.EqualFold(c.Name, stmt.Name.Name)
+		},
+		func(c *model.DatabaseConnection) bool { return c.Excluded },
+	); ok {
+		if !stmt.CreateOrModify {
+			modName := h.GetModuleName(h.FindModuleID(ex.ContainerID))
+			return mdlerrors.NewAlreadyExistsMsg("database connection", modName+"."+ex.Name, fmt.Sprintf("database connection already exists: %s.%s (use create or modify to update)", modName, ex.Name))
 		}
+		existingConnID = ex.ID
+		existingExcluded = ex.Excluded
+		existingContainer = ex.ContainerID
+	}
+
+	// A literal where Mendix stores a ConstantIdentifier writes a project that
+	// cannot be LOADED, so this must fail before the write — `check` reporting it
+	// is not enough for a script that never ran `check` (the #833 lesson).
+	if vs := ValidateDatabaseConnection(stmt); len(vs) > 0 {
+		msgs := make([]string, 0, len(vs))
+		for _, v := range vs {
+			msgs = append(msgs, fmt.Sprintf("[%s] %s\n    %s", v.RuleID, v.Message, v.Suggestion))
+		}
+		return mdlerrors.NewValidationf("database connection '%s' has validation errors:\n  - %s",
+			stmt.Name.String(), strings.Join(msgs, "\n  - "))
 	}
 
 	// Build connection string ref
@@ -55,8 +74,13 @@ func createDatabaseConnection(ctx *ExecContext, stmt *ast.CreateDatabaseConnecti
 		connInputValue = resolveConstantDefault(ctx, connStr)
 	}
 
+	containerID, err := containerForDocument(ctx, module.ID, stmt.Folder, existingContainer)
+	if err != nil {
+		return err
+	}
+
 	conn := &model.DatabaseConnection{
-		ContainerID:          module.ID,
+		ContainerID:          containerID,
 		Name:                 stmt.Name.Name,
 		DatabaseType:         stmt.DatabaseType,
 		ConnectionString:     connStr,
@@ -64,6 +88,7 @@ func createDatabaseConnection(ctx *ExecContext, stmt *ast.CreateDatabaseConnecti
 		UserName:             userName,
 		Password:             password,
 		ExportLevel:          "Hidden",
+		Excluded:             existingExcluded,
 	}
 
 	// Build queries
@@ -116,8 +141,11 @@ func createDatabaseConnection(ctx *ExecContext, stmt *ast.CreateDatabaseConnecti
 		if err := ctx.Backend.UpdateDatabaseConnection(conn); err != nil {
 			return mdlerrors.NewBackend("update database connection", err)
 		}
+		if _, err := applyDocumentFolder(ctx, conn.ID, existingContainer, containerID); err != nil {
+			return err
+		}
 		invalidateHierarchy(ctx)
-		fmt.Fprintf(ctx.Output, "Modified database connection: %s.%s\n", stmt.Name.Module, stmt.Name.Name)
+		ctx.ReportMutation("Modified", "database connection: %s.%s", stmt.Name.Module, stmt.Name.Name)
 		return nil
 	}
 
@@ -128,6 +156,33 @@ func createDatabaseConnection(ctx *ExecContext, stmt *ast.CreateDatabaseConnecti
 	invalidateHierarchy(ctx)
 	fmt.Fprintf(ctx.Output, "Created database connection: %s.%s\n", stmt.Name.Module, stmt.Name.Name)
 	return nil
+}
+
+// execDropDatabaseConnection handles DROP DATABASE CONNECTION.
+func execDropDatabaseConnection(ctx *ExecContext, s *ast.DropDatabaseConnectionStmt) error {
+	if !ctx.ConnectedForWrite() {
+		return mdlerrors.NewNotConnectedWrite()
+	}
+	connections, err := ctx.Backend.ListDatabaseConnections()
+	if err != nil {
+		return mdlerrors.NewBackend("list database connections", err)
+	}
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return mdlerrors.NewBackend("build hierarchy", err)
+	}
+	for _, conn := range connections {
+		modName := h.GetModuleName(h.FindModuleID(conn.ContainerID))
+		if strings.EqualFold(modName, s.Name.Module) && strings.EqualFold(conn.Name, s.Name.Name) {
+			if err := ctx.Backend.DeleteDatabaseConnection(conn.ID); err != nil {
+				return mdlerrors.NewBackend("drop database connection", err)
+			}
+			invalidateHierarchy(ctx)
+			ctx.ReportMutation("Dropped", "database connection: %s.%s", modName, conn.Name)
+			return nil
+		}
+	}
+	return mdlerrors.NewNotFound("database connection", s.Name.String())
 }
 
 // listDatabaseConnections handles SHOW DATABASE CONNECTIONS command.
@@ -209,73 +264,59 @@ func describeDatabaseConnection(ctx *ExecContext, name ast.QualifiedName) error 
 
 // outputDatabaseConnectionMDL outputs a database connection definition in MDL format.
 func outputDatabaseConnectionMDL(ctx *ExecContext, conn *model.DatabaseConnection, moduleName string) error {
-	fmt.Fprintf(ctx.Output, "create database connection %s.%s\n", moduleName, conn.Name)
-	fmt.Fprintf(ctx.Output, "type '%s'\n", conn.DatabaseType)
+	// R2 (ako/mxcli#754): the connection's properties in ( ), its queries as
+	// children in { }, each query's properties in its own ( ).
+	w := ctx.Output
+	fmt.Fprintf(w, "create or modify database connection %s.%s%s (\n", moduleName, conn.Name, describeFolderClause(ctx, conn.ContainerID))
+	fmt.Fprintf(w, "  Type: %s,\n", mdlQuoted(conn.DatabaseType))
+	fmt.Fprintf(w, "  ConnectionString: @%s,\n", conn.ConnectionString)
+	fmt.Fprintf(w, "  Username: @%s,\n", conn.UserName)
+	fmt.Fprintf(w, "  Password: @%s\n", conn.Password)
 
-	// Connection string
-	fmt.Fprintf(ctx.Output, "connection string @%s\n", conn.ConnectionString)
-
-	// Username
-	fmt.Fprintf(ctx.Output, "username @%s\n", conn.UserName)
-
-	// Password
-	fmt.Fprintf(ctx.Output, "password @%s\n", conn.Password)
-
-	// Queries
-	if len(conn.Queries) > 0 {
-		fmt.Fprintln(ctx.Output, "begin")
-		for _, q := range conn.Queries {
-			fmt.Fprintf(ctx.Output, "  query %s\n", q.Name)
-
-			// SQL string
-			if q.SQL != "" {
-				escaped := strings.ReplaceAll(q.SQL, "'", "''")
-				fmt.Fprintf(ctx.Output, "    sql '%s'\n", escaped)
-			}
-
-			// PARAMETER clauses
-			for _, p := range q.Parameters {
-				typeName := dbTypeToMDLType(p.DataType)
-				if p.EmptyValueBecomesNull {
-					fmt.Fprintf(ctx.Output, "    parameter %s: %s null\n", p.ParameterName, typeName)
-				} else if p.DefaultValue != "" {
-					escaped := strings.ReplaceAll(p.DefaultValue, "'", "''")
-					fmt.Fprintf(ctx.Output, "    parameter %s: %s default '%s'\n", p.ParameterName, typeName, escaped)
-				} else {
-					fmt.Fprintf(ctx.Output, "    parameter %s: %s\n", p.ParameterName, typeName)
-				}
-			}
-
-			// RETURNS and MAP from table mapping
-			if len(q.TableMappings) > 0 {
-				tm := q.TableMappings[0]
-				fmt.Fprintf(ctx.Output, "    returns %s\n", tm.Entity)
-
-				// MAP clause
-				if len(tm.Columns) > 0 {
-					fmt.Fprintln(ctx.Output, "    map (")
-					for i, c := range tm.Columns {
-						// Extract attribute name from qualified ref (Module.Entity.Attr → Attr)
-						attrName := c.Attribute
-						if parts := strings.Split(attrName, "."); len(parts) >= 3 {
-							attrName = parts[len(parts)-1]
-						}
-						sep := ","
-						if i == len(tm.Columns)-1 {
-							sep = ""
-						}
-						fmt.Fprintf(ctx.Output, "      %s as %s%s\n", c.ColumnName, attrName, sep)
-					}
-					fmt.Fprintln(ctx.Output, "    )")
-				}
-			}
-			fmt.Fprintln(ctx.Output, "  ;")
-		}
-		fmt.Fprintln(ctx.Output, "end")
+	if len(conn.Queries) == 0 {
+		fmt.Fprintln(w, ");")
+		return nil
 	}
-
-	fmt.Fprintln(ctx.Output, ";")
-	fmt.Fprintln(ctx.Output, "/")
+	fmt.Fprintln(w, ") {")
+	for _, q := range conn.Queries {
+		var props []string
+		if q.SQL != "" {
+			props = append(props, "Sql: "+mdlQuoted(q.SQL))
+		}
+		if len(q.Parameters) > 0 {
+			var params []string
+			for _, p := range q.Parameters {
+				param := fmt.Sprintf("%s: %s", p.ParameterName, dbTypeToMDLType(p.DataType))
+				if p.EmptyValueBecomesNull {
+					param += " null"
+				} else if p.DefaultValue != "" {
+					param += " default " + mdlQuoted(p.DefaultValue)
+				}
+				params = append(params, param)
+			}
+			props = append(props, "Parameters: ( "+strings.Join(params, ", ")+" )")
+		}
+		if len(q.TableMappings) > 0 {
+			tm := q.TableMappings[0]
+			props = append(props, "Returns: "+tm.Entity)
+			if len(tm.Columns) > 0 {
+				var cols []string
+				for _, c := range tm.Columns {
+					// Extract attribute name from qualified ref (Module.Entity.Attr → Attr)
+					attrName := c.Attribute
+					if parts := strings.Split(attrName, "."); len(parts) >= 3 {
+						attrName = parts[len(parts)-1]
+					}
+					// A column map binds the attribute to the column, as a
+					// mapping side does: Attr = column.
+					cols = append(cols, fmt.Sprintf("%s = %s", attrName, c.ColumnName))
+				}
+				props = append(props, "Map: (\n      "+strings.Join(cols, ",\n      ")+"\n    )")
+			}
+		}
+		fmt.Fprintf(w, "  query %s (\n    %s\n  )\n", q.Name, strings.Join(props, ",\n    "))
+	}
+	fmt.Fprintln(w, "};")
 
 	return nil
 }

@@ -30,7 +30,7 @@ func TestTraverseFlow_LinearSequence(t *testing.T) {
 		},
 		mkID("commit"): &microflows.ActionActivity{
 			BaseActivity: microflows.BaseActivity{BaseMicroflowObject: mkObj("commit")},
-			Action:       &microflows.CommitObjectsAction{CommitVariable: "Obj"},
+			Action:       &microflows.CommitObjectsAction{CommitVariable: "Obj", WithEvents: true},
 		},
 		mkID("end"): &microflows.EndEvent{BaseMicroflowObject: mkObj("end")},
 	}
@@ -231,6 +231,83 @@ func TestTraverseFlow_IfWithoutElse(t *testing.T) {
 	}
 }
 
+// TestTraverseFlow_UnrecognizedTrueBranchCaseValue guards against a class of
+// bug reported as "DESCRIBE MICROFLOW skips the then part of if/then/else".
+//
+// The then body is only emitted when findBranchFlows can identify the TRUE
+// branch, which it does by matching the SequenceFlow's CaseValue against the
+// literal "true" sentinel. If a project stores the true branch's case value in
+// a shape the matcher doesn't recognize (here: an ExpressionCase carrying the
+// condition text rather than the literal "true"), findBranchFlows used to
+// return trueFlow=nil while still recognizing the false branch — producing
+//
+//	if $x > 0 then
+//	else
+//	  <false body>
+//	end if;
+//
+// i.e. the entire then body vanished. A binary exclusive split has exactly one
+// true and one false branch, so when one side is recognized and a single other
+// branch is left unmatched, that branch must be the missing side. This test
+// asserts the then body survives by elimination.
+func TestTraverseFlow_UnrecognizedTrueBranchCaseValue(t *testing.T) {
+	e := newTestExecutor()
+
+	activityMap := map[model.ID]microflows.MicroflowObject{
+		mkID("start"): &microflows.StartEvent{BaseMicroflowObject: mkObj("start")},
+		mkID("split"): &microflows.ExclusiveSplit{
+			BaseMicroflowObject: mkObj("split"),
+			SplitCondition:      &microflows.ExpressionSplitCondition{Expression: "$x > 0"},
+		},
+		mkID("true_act"): &microflows.ActionActivity{
+			BaseActivity: microflows.BaseActivity{BaseMicroflowObject: mkObj("true_act")},
+			Action:       &microflows.LogMessageAction{LogLevel: "Info", LogNodeName: "'App'", MessageTemplate: &model.Text{Translations: map[string]string{"en_US": "positive"}}},
+		},
+		mkID("false_act"): &microflows.ActionActivity{
+			BaseActivity: microflows.BaseActivity{BaseMicroflowObject: mkObj("false_act")},
+			Action:       &microflows.LogMessageAction{LogLevel: "Info", LogNodeName: "'App'", MessageTemplate: &model.Text{Translations: map[string]string{"en_US": "negative"}}},
+		},
+		mkID("merge"): &microflows.ExclusiveMerge{BaseMicroflowObject: mkObj("merge")},
+		mkID("end"):   &microflows.EndEvent{BaseMicroflowObject: mkObj("end")},
+	}
+
+	flowsByOrigin := map[model.ID][]*microflows.SequenceFlow{
+		mkID("start"): {mkFlow("start", "split")},
+		mkID("split"): {
+			// TRUE branch carries an unrecognized case value (the condition text,
+			// not the literal "true" sentinel) — findBranchFlows can't match it.
+			mkBranchFlow("split", "true_act", &microflows.ExpressionCase{Expression: "$x > 0"}),
+			mkBranchFlow("split", "false_act", &microflows.ExpressionCase{Expression: "false"}),
+		},
+		mkID("true_act"):  {mkFlow("true_act", "merge")},
+		mkID("false_act"): {mkFlow("false_act", "merge")},
+		mkID("merge"):     {mkFlow("merge", "end")},
+	}
+
+	splitMergeMap := map[model.ID]model.ID{
+		mkID("split"): mkID("merge"),
+	}
+
+	var lines []string
+	visited := make(map[model.ID]bool)
+	e.traverseFlow(mkID("start"), activityMap, flowsByOrigin, splitMergeMap, visited, nil, nil, &lines, 1, nil, 0, nil)
+
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "positive") {
+		t.Errorf("then body was dropped — expected 'positive' in output:\n%s", joined)
+	}
+	if !strings.Contains(joined, "negative") {
+		t.Errorf("else body was dropped — expected 'negative' in output:\n%s", joined)
+	}
+
+	// The then body must appear before the else keyword, not be swallowed into it.
+	thenIdx := strings.Index(joined, "positive")
+	elseIdx := strings.Index(joined, "else")
+	if thenIdx >= 0 && elseIdx >= 0 && thenIdx > elseIdx {
+		t.Errorf("then body emitted after else — branches mis-ordered:\n%s", joined)
+	}
+}
+
 func TestTraverseFlow_LoopBodyMergesParentFlowsForExistingOrigin(t *testing.T) {
 	e := newTestExecutor()
 
@@ -319,11 +396,11 @@ func TestTraverseFlow_LoopBodyMergesParentFlowsForExistingOrigin(t *testing.T) {
 
 	out := strings.Join(lines, "\n")
 	for _, want := range []string{
-		"log info node 'Synthetic' 'setup';",
-		"log info node 'Synthetic' 'fetch';",
+		"log node 'Synthetic' 'setup';",
+		"log node 'Synthetic' 'fetch';",
 		"loop $role in $roles",
-		"log info node 'Synthetic' 'nested';",
-		"log info node 'Synthetic' 'nested-tail';",
+		"log node 'Synthetic' 'nested';",
+		"log node 'Synthetic' 'nested-tail';",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("expected %q in output:\n%s", want, out)
@@ -867,6 +944,7 @@ func TestResolveNestedMergeID_UsesParentMergeBeforeDownstreamJoin(t *testing.T) 
 	falseFlow := mkFlow("nested_split", "false_branch")
 
 	got := resolveNestedMergeID(
+		mkID("nested_split"),
 		mkID("downstream_join"),
 		mkID("parent_merge"),
 		trueFlow,
@@ -887,6 +965,7 @@ func TestResolveNestedMergeID_KeepsIndependentNestedJoin(t *testing.T) {
 	falseFlow := mkFlow("nested_split", "nested_join")
 
 	got := resolveNestedMergeID(
+		mkID("nested_split"),
 		mkID("nested_join"),
 		mkID("parent_merge"),
 		trueFlow,
@@ -926,10 +1005,8 @@ func TestTraverseFlow_LoopBodyUsesNestedAnnotationFlows(t *testing.T) {
 			},
 		},
 	}
-	annotationsByTarget := mergeAnnotationsByTarget(
-		buildAnnotationsByTarget(&microflows.MicroflowObjectCollection{}),
-		buildAnnotationsByTarget(loopObjects),
-	)
+	annotationsByTarget := buildAnnotationsByTarget(&microflows.MicroflowObjectCollection{}).
+		withOverlay(buildAnnotationsByTarget(loopObjects))
 
 	var lines []string
 	e.traverseFlow(
@@ -948,7 +1025,10 @@ func TestTraverseFlow_LoopBodyUsesNestedAnnotationFlows(t *testing.T) {
 	)
 
 	out := strings.Join(lines, "\n")
-	if !strings.Contains(out, "@annotation 'nested split note'") {
+	// The long form because this note sits at (1000, 100) while the split it
+	// documents is at (100, 100) — nowhere near where the writer would place an
+	// unpositioned note, so its position is spelled out rather than lost (#1077).
+	if !strings.Contains(out, "@annotation(text: 'nested split note', position: (1000, 100))") {
 		t.Fatalf("expected nested loop annotation in output:\n%s", out)
 	}
 }
@@ -978,7 +1058,9 @@ func TestCollectErrorHandlerStatements_Simple(t *testing.T) {
 		mkID("err_log"): {mkFlow("err_log", "err_end")},
 	}
 
-	stmts := e.collectErrorHandlerStatements(mkID("err_log"), activityMap, flowsByOrigin, nil, nil)
+	// Annotation lines are left out: a handler-body statement now carries its
+	// @position/@anchor like any other (mendixlabs/mxcli#991).
+	stmts := statementLines(e.collectErrorHandlerStatements(mkID("err_log"), activityMap, flowsByOrigin, nil, nil, nil))
 	if len(stmts) != 2 {
 		t.Fatalf("expected 2 statements, got %d: %v", len(stmts), stmts)
 	}
@@ -1002,12 +1084,15 @@ func TestCollectErrorHandlerStatements_StopsAtMerge(t *testing.T) {
 		},
 	}
 
+	// The main path enters the merge too: that is what makes it the rejoin.
+	// A merge with one way in joins nothing and is walked through.
 	flowsByOrigin := map[model.ID][]*microflows.SequenceFlow{
 		mkID("err_log"): {mkFlow("err_log", "merge")},
+		mkID("main"):    {mkFlow("main", "merge")},
 		mkID("merge"):   {mkFlow("merge", "after")},
 	}
 
-	stmts := e.collectErrorHandlerStatements(mkID("err_log"), activityMap, flowsByOrigin, nil, nil)
+	stmts := statementLines(e.collectErrorHandlerStatements(mkID("err_log"), activityMap, flowsByOrigin, nil, nil, nil))
 	// Should stop at merge, not include "after"
 	if len(stmts) != 1 {
 		t.Fatalf("expected 1 statement (stop at merge), got %d: %v", len(stmts), stmts)
@@ -1037,10 +1122,11 @@ func TestCollectErrorHandlerStatements_StructuredIfEmitsEndIf(t *testing.T) {
 			mkBranchFlow("split", "return_error", &microflows.ExpressionCase{Expression: "true"}),
 			mkBranchFlow("split", "merge", &microflows.ExpressionCase{Expression: "false"}),
 		},
+		mkID("main"):  {mkFlow("main", "merge")}, // the main path's way in: a rejoin
 		mkID("merge"): {mkFlow("merge", "after")},
 	}
 
-	stmts := e.collectErrorHandlerStatements(mkID("split"), activityMap, flowsByOrigin, nil, nil)
+	stmts := e.collectErrorHandlerStatements(mkID("split"), activityMap, flowsByOrigin, nil, nil, nil)
 	got := strings.Join(stmts, "\n")
 
 	assertContains(t, got, "if $latestHttpResponse != empty then")
@@ -1054,7 +1140,7 @@ func TestCollectErrorHandlerStatements_StructuredIfEmitsEndIf(t *testing.T) {
 
 func TestCollectErrorHandlerStatements_EmptyID(t *testing.T) {
 	e := newTestExecutor()
-	stmts := e.collectErrorHandlerStatements("", nil, nil, nil, nil)
+	stmts := e.collectErrorHandlerStatements("", nil, nil, nil, nil, nil)
 	if len(stmts) != 0 {
 		t.Errorf("expected 0 statements for empty ID, got %d", len(stmts))
 	}
@@ -1185,41 +1271,17 @@ func TestTraverseFlowWithSourceMap_RecordsRange(t *testing.T) {
 }
 
 // =============================================================================
-// negateIfCondition
+// Empty then-branch: printed as stored, not folded (ako/mxcli#1963)
 // =============================================================================
 
-func TestNegateIfCondition(t *testing.T) {
-	tests := []struct {
-		in, want string
-	}{
-		{"if $Active then", "if not($Active) then"},
-		{"if $X = 42 then", "if not($X = 42) then"},
-		{"if not($Done) then", "if $Done then"},                           // double-negation removal
-		{"if not($A and $B) then", "if $A and $B then"},                   // unwrap not()
-		{"if true then", "if not(true) then"},                             // literal
-		{"something else", "something else"},                              // no match — passthrough
-		{"if find($S,'{{') >= 0 then", "if not(find($S,'{{') >= 0) then"}, // complex expression
-		{"if not($A) or $B) then", "if not(not($A) or $B)) then"},         // unbalanced — do NOT unwrap
-	}
-	for _, tt := range tests {
-		got := negateIfCondition(tt.in)
-		if got != tt.want {
-			t.Errorf("negateIfCondition(%q) = %q, want %q", tt.in, got, tt.want)
-		}
-	}
-}
-
-// =============================================================================
-// Empty-then swap: true branch → merge produces negated condition
-// =============================================================================
-
-func TestTraverseFlow_EmptyThenSwap(t *testing.T) {
+func TestTraverseFlow_EmptyThenPrintedAsStored(t *testing.T) {
 	e := newTestExecutor()
 
 	// Graph: start → split → (true) → merge → end
 	//                      → (false) → log → merge
-	// Without swap: if cond then else log end if;
-	// With swap: if not(cond) then log end if;
+	// Printed: if $Active then else log end if; — the folded
+	// `if not($Active) then log end if;` stored not($Active) with the
+	// outcomes swapped when executed (ako/mxcli#1963).
 	activityMap := map[model.ID]microflows.MicroflowObject{
 		mkID("start"): &microflows.StartEvent{BaseMicroflowObject: mkObj("start")},
 		mkID("split"): &microflows.ExclusiveSplit{
@@ -1258,17 +1320,18 @@ func TestTraverseFlow_EmptyThenSwap(t *testing.T) {
 		output += l + "\n"
 	}
 
-	if !strings.Contains(output, "not($Active)") {
-		t.Errorf("expected negated condition 'not($Active)', got:\n%s", output)
+	if strings.Contains(output, "not(") || !strings.Contains(output, "if $Active then") {
+		t.Errorf("expected the stored condition, not its negation, got:\n%s", output)
 	}
 	if strings.Count(output, "if ") != 1 {
 		t.Errorf("expected split header to be emitted once, got:\n%s", output)
 	}
-	if !strings.Contains(output, "log info") {
-		t.Errorf("expected 'log info' in output, got:\n%s", output)
+	if !strings.Contains(output, "log node 'Test'") {
+		t.Errorf("expected a log statement in output, got:\n%s", output)
 	}
-	if strings.Contains(output, "else") {
-		t.Errorf("expected no empty else block, got:\n%s", output)
+	then, els := strings.Index(output, "if $Active then"), strings.Index(output, "else")
+	if els < 0 || els > strings.Index(output, "log node 'Test'") || then > els {
+		t.Errorf("expected the log on the false path, after else, got:\n%s", output)
 	}
 }
 
@@ -1309,7 +1372,7 @@ func TestTraverseFlowUntilMerge_NestedEmptyThenSwapEmitsHeaderOnce(t *testing.T)
 	var lines []string
 	visited := map[model.ID]bool{}
 
-	traverseFlowUntilMerge(e.newExecContext(context.Background()), mkID("split"), mkID("parentMerge"), activityMap, flowsByOrigin, nil, splitMergeMap, visited, nil, nil, &lines, 0, nil, 0, nil)
+	traverseFlowUntilMerge(e.newExecContext(context.Background()), mkID("split"), mkID("parentMerge"), activityMap, flowsByOrigin, nil, splitMergeMap, visited, nil, nil, &lines, 0, nil, 0, nil, mergeLabels{})
 
 	output := strings.Join(lines, "\n")
 	if strings.Count(output, "if ") != 1 {
@@ -1415,7 +1478,7 @@ func TestTraverseFlow_Issue528_NestedGuardDoesNotSwallowSharedActivities(t *test
 		mkID("outer_merge"):  &microflows.ExclusiveMerge{BaseMicroflowObject: mkObjAt("outer_merge", 300, 60)},
 		mkID("shared_act"): &microflows.ActionActivity{
 			BaseActivity: microflows.BaseActivity{BaseMicroflowObject: mkObjAt("shared_act", 400, 60)},
-			Action:       &microflows.CommitObjectsAction{CommitVariable: "Deal"},
+			Action:       &microflows.CommitObjectsAction{CommitVariable: "Deal", WithEvents: true},
 		},
 		mkID("end"): &microflows.EndEvent{BaseMicroflowObject: mkObjAt("end", 500, 60)},
 	}
@@ -1458,4 +1521,65 @@ func TestTraverseFlow_Issue528_NestedGuardDoesNotSwallowSharedActivities(t *test
 	if sharedIdx <= endIfIdx {
 		t.Errorf("issue #528: shared activity emitted inside outer if block instead of after end if;\n%s", out)
 	}
+}
+
+// TestTraverseFlow_InheritanceSplitOmitsEmptyElse covers the `else` DESCRIBE
+// used to invent on a type split.
+//
+// An object-type decision always has an `(empty)` outgoing flow — the
+// null-object case, which the builder emits whether or not an `else` was
+// written, because without it the build fails CE0089. DESCRIBE rendered that
+// flow as a bare `else`, so describing a split the author wrote without one
+// produced MDL with an `else`, and each describe→exec pass accumulated another.
+//
+// The empty rendering is dropped, matching what the if/else emitters already
+// do. Exec re-creates the flow, so nothing is lost. An else that HAS a body
+// still renders.
+func TestTraverseFlow_InheritanceSplitOmitsEmptyElse(t *testing.T) {
+	e := &Executor{}
+	run := func(emptyGoesToMerge bool) string {
+		activityMap := map[model.ID]microflows.MicroflowObject{
+			mkID("split"): &microflows.InheritanceSplit{
+				BaseMicroflowObject: mkObj("split"),
+				VariableName:        "A",
+			},
+			mkID("log"):   &microflows.ActionActivity{BaseActivity: microflows.BaseActivity{BaseMicroflowObject: mkObj("log")}, Action: &microflows.LogMessageAction{LogLevel: "Info", LogNodeName: "'T'"}},
+			mkID("merge"): &microflows.ExclusiveMerge{BaseMicroflowObject: mkObj("merge")},
+		}
+		// The (empty) case flow: straight to the merge means "no else body".
+		emptyDest := mkID("merge")
+		if !emptyGoesToMerge {
+			emptyDest = mkID("log")
+		}
+		flowsByOrigin := map[model.ID][]*microflows.SequenceFlow{
+			mkID("split"): {
+				{OriginID: mkID("split"), DestinationID: mkID("merge"), CaseValue: &microflows.InheritanceCase{EntityQualifiedName: "SP.Dog"}},
+				{OriginID: mkID("split"), DestinationID: emptyDest, CaseValue: &microflows.InheritanceCase{EntityQualifiedName: ""}},
+			},
+			mkID("log"): {{OriginID: mkID("log"), DestinationID: mkID("merge")}},
+		}
+		var lines []string
+		traverseFlowUntilMerge(e.newExecContext(context.Background()), mkID("split"), mkID("merge"),
+			activityMap, flowsByOrigin, nil, map[model.ID]model.ID{mkID("split"): mkID("merge")},
+			map[model.ID]bool{}, nil, nil, &lines, 0, nil, 0, nil, mergeLabels{})
+		return strings.Join(lines, "\n")
+	}
+
+	if out := run(true); strings.Contains(out, "(empty)") {
+		t.Errorf("DESCRIBE invented an empty branch for the (empty) flow with no body:\n%s", out)
+	}
+	if out := run(false); !strings.Contains(out, "when (empty) then") {
+		t.Errorf("an (empty) branch WITH a body must still render:\n%s", out)
+	}
+}
+
+// statementLines drops the @annotation lines from described statements.
+func statementLines(lines []string) []string {
+	var out []string
+	for _, l := range lines {
+		if !strings.HasPrefix(strings.TrimSpace(l), "@") {
+			out = append(out, l)
+		}
+	}
+	return out
 }

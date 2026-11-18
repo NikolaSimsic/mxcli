@@ -1,3 +1,4 @@
+mdl 1;
 -- Nanoflow examples — representative real-world patterns.
 -- Patterns are distilled from the example projects:
 --   EnquiriesManagement, LatoProductInventory, Evora-FactoryManagement
@@ -16,6 +17,7 @@
 -- Setup
 -- ============================================================
 create module NanoflowExamples;
+create module role NanoflowExamples.User;
 
 create entity NanoflowExamples.Product (
     Name : String(200),
@@ -155,7 +157,7 @@ create nanoflow NanoflowExamples.SUB_Notification_GetOrCreate ()
 begin
     retrieve $Existing from NanoflowExamples.Notification
         where Displayed = false()
-        limit 1;
+        first;
     if $Existing != empty then
         return $Existing;
     end if;
@@ -195,7 +197,7 @@ create nanoflow NanoflowExamples.DS_HasPendingNotification ()
 begin
     retrieve $Pending from NanoflowExamples.Notification
         where Displayed = false()
-        limit 1;
+        first;
     if $Pending != empty then
         return true;
     else
@@ -293,8 +295,8 @@ grant execute on nanoflow NanoflowExamples.SUB_FormatPrice to NanoflowExamples.U
 -- Management commands
 -- ============================================================
 
-show nanoflows;
-show nanoflows in NanoflowExamples;
+list nanoflows;
+list nanoflows in NanoflowExamples;
 
 describe nanoflow NanoflowExamples.VAL_Product;
 describe nanoflow NanoflowExamples.ACT_SubmitProduct;
@@ -303,7 +305,7 @@ describe nanoflow NanoflowExamples.ACT_MarkAllNotificationsRead;
 rename nanoflow NanoflowExamples.NF_Empty to NF_Placeholder;
 move nanoflow NanoflowExamples.NF_Placeholder to NanoflowExamples;
 
-show access on nanoflow NanoflowExamples.VAL_Product;
+list access on nanoflow NanoflowExamples.VAL_Product;
 revoke execute on nanoflow NanoflowExamples.VAL_Product from NanoflowExamples.User;
 
 drop nanoflow NanoflowExamples.NF_Placeholder;

@@ -4,6 +4,8 @@
 package microflows
 
 import (
+	"strings"
+
 	"github.com/mendixlabs/mxcli/model"
 )
 
@@ -22,6 +24,7 @@ type CreateObjectAction struct {
 	EntityQualifiedName string            `json:"entityQualifiedName"` // BY_NAME_REFERENCE
 	OutputVariable      string            `json:"outputVariable,omitempty"`
 	Commit              CommitType        `json:"commit"`
+	RefreshInClient     bool              `json:"refreshInClient"`
 	InitialMembers      []*MemberChange   `json:"initialMembers,omitempty"`
 }
 
@@ -42,13 +45,23 @@ func (ChangeObjectAction) isMicroflowAction() {}
 // DeleteObjectAction deletes an object.
 type DeleteObjectAction struct {
 	model.BaseElement
-	DeleteVariable  string `json:"deleteVariable"`
-	RefreshInClient bool   `json:"refreshInClient"`
+	// ErrorHandlingType is set only when the author wrote an ON ERROR clause.
+	// Studio Pro writes no key at all for a delete, so an empty value keeps the
+	// document byte-identical to what it has always been.
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
+	DeleteVariable    string            `json:"deleteVariable"`
+	RefreshInClient   bool              `json:"refreshInClient"`
 }
 
 func (DeleteObjectAction) isMicroflowAction() {}
 
 // CommitObjectsAction commits one or more objects.
+//
+// WithEvents mirrors the stored BSON property, so unlike ast.MfCommitStmt —
+// which models the MDL statement, where an absent modifier means the Mendix
+// default — its zero value is a real setting and not the default one. Studio Pro
+// writes true for a fresh Commit activity (#895), so anything constructing this
+// action has to say so; leaving the field out means events OFF.
 type CommitObjectsAction struct {
 	model.BaseElement
 	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
@@ -64,9 +77,35 @@ type RollbackObjectAction struct {
 	model.BaseElement
 	RollbackVariable string `json:"rollbackVariable"`
 	RefreshInClient  bool   `json:"refreshInClient"`
+	// ErrorHandlingType is empty unless the author wrote an `on error` clause:
+	// the writer has never stored one on a rollback (mendixlabs/mxcli#1252).
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
 }
 
 func (RollbackObjectAction) isMicroflowAction() {}
+
+// SendExternalObjectAction is Studio Pro's "Send external object"
+// (Microflows$SendExternalObject): it saves a changed external (OData) object
+// through its consumed service, which a plain commit on one cannot do.
+type SendExternalObjectAction struct {
+	model.BaseElement
+	Variable          string            `json:"variable"`
+	RefreshInClient   bool              `json:"refreshInClient"`
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
+}
+
+func (SendExternalObjectAction) isMicroflowAction() {}
+
+// DeleteExternalObjectAction is Studio Pro's "Delete external object"
+// (Microflows$DeleteExternalObject).
+type DeleteExternalObjectAction struct {
+	model.BaseElement
+	Variable          string            `json:"variable"`
+	RefreshInClient   bool              `json:"refreshInClient"`
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
+}
+
+func (DeleteExternalObjectAction) isMicroflowAction() {}
 
 // MemberChange represents a change to a member (attribute or association).
 type MemberChange struct {
@@ -91,11 +130,16 @@ const (
 // CommitType represents how objects are committed.
 type CommitType string
 
+// Mendix defines exactly three values (Microflows$Commit). "YesWithEvents" and
+// "NoEvent" were never among them — they matched nothing in a real project and
+// forced mfCommitType to translate CommitTypeNoEvent into "YesWithoutEvents" to
+// stay correct. The set below is the canonical one; see
+// modelsdk/gen/microflows/enums.go (CommitEnum) and
+// docs/05-mdl-specification/10-bson-mapping.md.
 const (
-	CommitTypeYes           CommitType = "Yes"
-	CommitTypeNo            CommitType = "No"
-	CommitTypeYesWithEvents CommitType = "YesWithEvents"
-	CommitTypeNoEvent       CommitType = "NoEvent"
+	CommitTypeYes              CommitType = "Yes"
+	CommitTypeYesWithoutEvents CommitType = "YesWithoutEvents"
+	CommitTypeNo               CommitType = "No"
 )
 
 // Retrieve Actions
@@ -103,8 +147,13 @@ const (
 // RetrieveAction retrieves objects from the database.
 type RetrieveAction struct {
 	model.BaseElement
-	OutputVariable string         `json:"outputVariable"`
-	Source         RetrieveSource `json:"source,omitempty"`
+	// ErrorHandlingType is set only when the author wrote an ON ERROR clause;
+	// empty means "leave the writer's default alone". Measured on 11.14.0: a
+	// retrieve accepts every handling type, which is why the clause is carried
+	// here and refused on the activities that do not (see MDL076).
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
+	OutputVariable    string            `json:"outputVariable"`
+	Source            RetrieveSource    `json:"source,omitempty"`
 }
 
 func (RetrieveAction) isMicroflowAction() {}
@@ -185,6 +234,21 @@ type AggregateListAction struct {
 	AttributeQualifiedName string            `json:"attributeQualifiedName,omitempty"` // BY_NAME_REFERENCE: Module.Entity.Attribute
 	UseExpression          bool              `json:"useExpression,omitempty"`          // true when Expression is used instead of Attribute
 	Expression             string            `json:"expression,omitempty"`             // Mendix expression string (when UseExpression=true)
+	// ErrorHandlingType is the `on error` clause (mendixlabs/mxcli#1252), else
+	// the flow flavour's default: Rollback in a microflow, Abort in a nanoflow,
+	// where "Rollback" is CE6035 (mendixlabs/mxcli#591). Empty means the
+	// writer's historical "Rollback".
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
+
+	// ReduceInitialValue and ReduceReturnType are what REDUCE folds from, and
+	// the type it folds to. Studio Pro writes both on *every* AggregateAction it
+	// stores, not only on Reduce: measured on the three reference activities in
+	// ako/TestApp (Reduce, All, Any), where All and Any carry an empty initial
+	// value and a Boolean return type even though Mendix's own reference guide
+	// says a return type is "not applicable" to them. Carrying both here is what
+	// keeps a stored Reduce from losing its fold on rewrite (#1004).
+	ReduceInitialValue string   `json:"reduceInitialValue,omitempty"`
+	ReduceReturnType   DataType `json:"reduceReturnType,omitempty"`
 }
 
 func (AggregateListAction) isMicroflowAction() {}
@@ -199,13 +263,53 @@ const (
 	AggregateFunctionMin     AggregateFunction = "Minimum"
 	AggregateFunctionMax     AggregateFunction = "Maximum"
 	AggregateFunctionReduce  AggregateFunction = "Reduce"
+	AggregateFunctionAll     AggregateFunction = "All"
+	AggregateFunctionAny     AggregateFunction = "Any"
 )
+
+// AllAggregateFunctions is every value Mendix's AggregateFunction enumeration
+// can hold. DESCRIBE used to render an aggregate by lowercasing whatever was
+// stored, so each function Mendix added came back out as MDL the grammar could
+// not read (#1004). Anything rendering or parsing these must cover this list.
+var AllAggregateFunctions = []AggregateFunction{
+	AggregateFunctionCount,
+	AggregateFunctionSum,
+	AggregateFunctionAverage,
+	AggregateFunctionMin,
+	AggregateFunctionMax,
+	AggregateFunctionReduce,
+	AggregateFunctionAll,
+	AggregateFunctionAny,
+}
+
+// WritesReduceProperties reports whether Mendix stores
+// ReduceInitialValueExpression and ReduceReturnDataType for this function.
+//
+// Measured true for Reduce, All and Any against Studio Pro reference documents
+// (ako/TestApp): All and Any carry an empty initial value and a Boolean return
+// type, so the two properties are not Reduce-only. No reference document exists
+// for the five older functions, so mxcli writes the pair for those only when a
+// stored document already carried it — inventing a key is the mistake that makes
+// a document mxbuild accepts and Studio Pro cannot open.
+func (f AggregateFunction) WritesReduceProperties() bool {
+	switch f {
+	case AggregateFunctionReduce, AggregateFunctionAll, AggregateFunctionAny:
+		return true
+	default:
+		return false
+	}
+}
 
 // ListOperationAction performs list operations.
 type ListOperationAction struct {
 	model.BaseElement
 	Operation      ListOperation `json:"operation,omitempty"`
 	OutputVariable string        `json:"outputVariable,omitempty"`
+	// ErrorHandlingType is the `on error` clause (mendixlabs/mxcli#1252), else
+	// the flow flavour's default: Rollback in a microflow, Abort in a nanoflow,
+	// where "Rollback" is CE6035 (mendixlabs/mxcli#591). Empty means the
+	// writer's historical "Rollback".
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
 }
 
 func (ListOperationAction) isMicroflowAction() {}
@@ -343,6 +447,11 @@ type CreateListAction struct {
 	EntityID            model.ID `json:"entityId,omitempty"`
 	EntityQualifiedName string   `json:"entityQualifiedName,omitempty"`
 	OutputVariable      string   `json:"outputVariable"`
+	// ErrorHandlingType is the `on error` clause (mendixlabs/mxcli#1252), else
+	// the flow flavour's default: Rollback in a microflow, Abort in a nanoflow,
+	// where "Rollback" is CE6035 (mendixlabs/mxcli#591). Empty means the
+	// writer's historical "Rollback".
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
 }
 
 func (CreateListAction) isMicroflowAction() {}
@@ -353,6 +462,11 @@ type ChangeListAction struct {
 	ChangeVariable string         `json:"changeVariable"`
 	Type           ChangeListType `json:"type"`
 	Value          string         `json:"value,omitempty"`
+	// ErrorHandlingType is the `on error` clause (mendixlabs/mxcli#1252), else
+	// the flow flavour's default: Rollback in a microflow, Abort in a nanoflow,
+	// where "Rollback" is CE6035 (mendixlabs/mxcli#591). Empty means the
+	// writer's historical "Rollback".
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
 }
 
 func (ChangeListAction) isMicroflowAction() {}
@@ -395,6 +509,11 @@ type CastAction struct {
 	model.BaseElement
 	ObjectVariable string `json:"objectVariable"`
 	OutputVariable string `json:"outputVariable"`
+	// ErrorHandlingType is the `on error` clause (mendixlabs/mxcli#1252), else
+	// the flow flavour's default: Rollback in a microflow, Abort in a nanoflow,
+	// where "Rollback" is CE6035 (mendixlabs/mxcli#591). Empty means the
+	// writer's historical "Rollback".
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
 }
 
 func (CastAction) isMicroflowAction() {}
@@ -412,6 +531,9 @@ type ShowPageAction struct {
 	PassedObject          string                  `json:"passedObject,omitempty"`
 	OverridePageTitle     *model.Text             `json:"overridePageTitle,omitempty"`
 	PageParameterMappings []*PageParameterMapping `json:"pageParameterMappings,omitempty"`
+	// NumberOfPagesToClose is the expression for how many pages to close before
+	// the page opens; "" (Studio Pro's default) closes none (mendixlabs/mxcli#1617).
+	NumberOfPagesToClose string `json:"numberOfPagesToClose,omitempty"`
 }
 
 func (ShowPageAction) isMicroflowAction() {}
@@ -442,6 +564,9 @@ const (
 // ShowHomePageAction shows the home page.
 type ShowHomePageAction struct {
 	model.BaseElement
+	// ErrorHandlingType is empty unless the author wrote an `on error` clause:
+	// the writer has never stored one here (mendixlabs/mxcli#1252).
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
 }
 
 func (ShowHomePageAction) isMicroflowAction() {}
@@ -476,6 +601,22 @@ const (
 	MessageTypeError       MessageType = "Error"
 )
 
+// MessageTypes lists the values of Microflows$ShowMessageType, in Studio Pro's order.
+var MessageTypes = []MessageType{MessageTypeInformation, MessageTypeWarning, MessageTypeError}
+
+// CanonicalMessageType matches s case-insensitively against the
+// ShowMessageType values and returns the enumeration's own spelling.
+// The stored value is case-sensitive: the runtime does not recognise "error"
+// and shows an Information dialog instead (mendixlabs/mxcli#1280).
+func CanonicalMessageType(s string) (MessageType, bool) {
+	for _, t := range MessageTypes {
+		if strings.EqualFold(s, string(t)) {
+			return t, true
+		}
+	}
+	return MessageType(s), false
+}
+
 // ValidationFeedbackAction shows validation feedback.
 type ValidationFeedbackAction struct {
 	model.BaseElement
@@ -500,6 +641,74 @@ type DownloadFileAction struct {
 }
 
 func (DownloadFileAction) isMicroflowAction() {}
+
+// EmailSecurityType is the transport security of a Send Email action's SMTP
+// connection. Values are the Mendix Model SDK's `SecurityType` enum.
+type EmailSecurityType string
+
+const (
+	EmailSecurityNone EmailSecurityType = "None"
+	EmailSecuritySSL  EmailSecurityType = "SSL"
+	// EmailSecurityTLS is the platform default.
+	EmailSecurityTLS EmailSecurityType = "TLS"
+)
+
+// DefaultEmailConnectionTimeout is EmailConnectionConfig.ConnectionTimeout's
+// platform default, in milliseconds.
+const DefaultEmailConnectionTimeout = 20000
+
+// EmailTemplate is one Microflows$StringTemplate of a Send Email action: fixed
+// text with {1}, {2}, … placeholders and one expression per placeholder.
+type EmailTemplate struct {
+	Text       string   `json:"text,omitempty"`
+	Parameters []string `json:"parameters,omitempty"`
+}
+
+// EmailCustomHeader is one custom header line. Name and Value are plain
+// strings, not expressions.
+type EmailCustomHeader struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// SendEmailAction is the built-in Send Email activity (Microflows$SendEmailAction,
+// Studio Pro 11.13+ beta): it sends mail over SMTP without the Email Connector
+// module. The address, host, port and credential fields are microflow
+// expressions; Attachment is a bare variable name (no `$`).
+//
+// It models the 11.13+ shape only — subject and bodies as string templates and
+// basic authentication. The reader leaves any other stored shape as an
+// UnsupportedAction, so it can be described but never rewritten smaller.
+type SendEmailAction struct {
+	model.BaseElement
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
+
+	// Connection (Microflows$EmailConnectionConfig).
+	From                string            `json:"from,omitempty"` // EmailId
+	Host                string            `json:"host,omitempty"`
+	Port                string            `json:"port,omitempty"`
+	SecurityType        EmailSecurityType `json:"securityType,omitempty"`
+	CheckServerIdentity bool              `json:"checkServerIdentity,omitempty"`
+	ConnectionTimeout   int               `json:"connectionTimeout,omitempty"`
+
+	// Authentication (Microflows$BasicAuthConfig). UseAuthentication is false
+	// when the action stores no authentication config.
+	UseAuthentication bool   `json:"useAuthentication,omitempty"`
+	Username          string `json:"username,omitempty"`
+	Password          string `json:"password,omitempty"`
+
+	// Message (Microflows$EmailMessage).
+	To            string              `json:"to,omitempty"`
+	Cc            string              `json:"cc,omitempty"`
+	Bcc           string              `json:"bcc,omitempty"`
+	Subject       EmailTemplate       `json:"subject"`
+	BodyPlainText EmailTemplate       `json:"bodyPlainText"`
+	BodyHTML      EmailTemplate       `json:"bodyHtml"`
+	CustomHeaders []EmailCustomHeader `json:"customHeaders,omitempty"`
+	Attachment    string              `json:"attachment,omitempty"`
+}
+
+func (SendEmailAction) isMicroflowAction() {}
 
 // Integration Actions
 
@@ -547,6 +756,46 @@ type MicroflowCall struct {
 	model.BaseElement
 	Microflow         string                           `json:"microflow,omitempty"` // Qualified name string
 	ParameterMappings []*MicroflowCallParameterMapping `json:"parameterMappings,omitempty"`
+	QueueSettings     *QueueSettings                   `json:"queueSettings,omitempty"`
+}
+
+// QueueSettings binds a call activity to a task queue (Queues$QueueSettings).
+//
+// The load-bearing property is this element, NOT the call's sibling `Queue`
+// string: measured on Mendix 11.13, a call carrying only `Queue` with
+// QueueSettings null draws no complaint from mx check at all, while one carrying
+// QueueSettings does (CE1613 when the named queue is missing). `generated/metamodel`
+// — the arbiter — has no top-level `Queue` on either call type, only this.
+//
+// Retry is the stored Queues$QueueRetry as raw storage, so the rewrite guard can
+// tell one is there even when it cannot be decoded (guard-don't-drop, ADR-0005).
+// RetryPolicy is the same value decoded — set by the reader for the two retry
+// types Mendix has, and by the builder for `in queue … retry …`
+// (mendixlabs/mxcli#1729). The writer writes RetryPolicy; nil writes no retry.
+type QueueSettings struct {
+	model.BaseElement
+	Queue       string      `json:"queue,omitempty"` // Qualified name of the Queues$Queue
+	Retry       any         `json:"retry,omitempty"` // Stored Queues$QueueRetry, raw
+	RetryPolicy *QueueRetry `json:"retryPolicy,omitempty"`
+}
+
+// Retry policy kinds: the two concrete Queues$QueueRetry types (Mendix 9.10+).
+const (
+	QueueRetryFixed       = "Fixed"       // Queues$QueueFixedRetry
+	QueueRetryExponential = "Exponential" // Queues$QueueExponentialRetry
+)
+
+// QueueRetry is a queued call's retry policy. Fixed uses Interval; Exponential
+// uses InitialInterval and MaximumInterval. IntervalType is the unit of all of
+// them: Seconds, Minutes or Hours (Queues$IntervalType).
+type QueueRetry struct {
+	model.BaseElement
+	Kind            string `json:"kind"`
+	Retries         int    `json:"retries"`
+	Interval        int    `json:"interval,omitempty"`
+	InitialInterval int    `json:"initialInterval,omitempty"`
+	MaximumInterval int    `json:"maximumInterval,omitempty"`
+	IntervalType    string `json:"intervalType,omitempty"`
 }
 
 // MicroflowCallParameterMapping maps a parameter to an argument.
@@ -562,6 +811,7 @@ type JavaActionCallAction struct {
 	ErrorHandlingType  ErrorHandlingType             `json:"errorHandlingType,omitempty"`
 	JavaAction         string                        `json:"javaAction,omitempty"` // Qualified name string
 	ParameterMappings  []*JavaActionParameterMapping `json:"parameterMappings,omitempty"`
+	QueueSettings      *QueueSettings                `json:"queueSettings,omitempty"`
 	ResultVariableName string                        `json:"resultVariableName,omitempty"`
 	UseReturnVariable  bool                          `json:"useReturnVariable"`
 }
@@ -607,12 +857,37 @@ type StringTemplateParameterValue struct {
 
 func (StringTemplateParameterValue) isCodeActionParameterValue() {}
 
-// TypedTemplate represents a typed template with arguments.
+// TypedTemplate represents a typed template with arguments: the value of a
+// Java action parameter of type StringTemplate (Text or Sql). Text holds {1},
+// {2}, … placeholders, one argument per placeholder.
 type TypedTemplate struct {
 	model.BaseElement
-	Arguments []string `json:"arguments,omitempty"`
-	Text      string   `json:"text,omitempty"`
+	Arguments []*TypedTemplateArgument `json:"arguments,omitempty"`
+	Text      string                   `json:"text,omitempty"`
 }
+
+// TypedTemplateArgument is one {n} argument of a TypedTemplate
+// (Microflows$PrimitiveTypedTemplateArgument): an expression and the type of
+// its result, one of String, Integer, Decimal, Boolean, DateTime. mxbuild
+// checks the expression against Type (CE0117 on a mismatch, and an absent Type
+// reads as String); the runtime hands Type to the Java action with the value
+// (ITemplateParameter.getParameterType).
+type TypedTemplateArgument struct {
+	model.BaseElement
+	Expression string `json:"expression,omitempty"`
+	Type       string `json:"type,omitempty"`
+}
+
+// CustomBlobDocumentCodeActionParameterValue is the document passed to a Java
+// action parameter of a custom document type (CodeActions$
+// CustomBlobDocumentParameterType, e.g. an agent-editor Agent): a by-name
+// reference to the document, never an expression.
+type CustomBlobDocumentCodeActionParameterValue struct {
+	model.BaseElement
+	CustomDocument string `json:"customDocument,omitempty"` // BY_NAME_REFERENCE: qualified document name
+}
+
+func (CustomBlobDocumentCodeActionParameterValue) isCodeActionParameterValue() {}
 
 // ExpressionBasedCodeActionParameterValue is an expression-based parameter value.
 type ExpressionBasedCodeActionParameterValue struct {
@@ -663,6 +938,12 @@ type CallExternalAction struct {
 	// triggers Mendix's CE7269 "return type has changed" when the schema
 	// declares any return type.
 	ResultDataType string `json:"resultDataType,omitempty"`
+	// ResultEntity is the qualified name of the external entity a returned
+	// object or list is typed on. Required when ResultDataType is "Object" or
+	// "List" — DataTypes$ObjectType and DataTypes$ListType both store an
+	// Entity, and one without it is as unaligned as no type at all. Empty for
+	// every primitive kind.
+	ResultEntity string `json:"resultEntity,omitempty"`
 }
 
 func (CallExternalAction) isMicroflowAction() {}
@@ -673,6 +954,32 @@ type ExternalActionParameterMapping struct {
 	ParameterName string `json:"parameterName,omitempty"`
 	Argument      string `json:"argument,omitempty"` // Expression
 	CanBeEmpty    bool   `json:"canBeEmpty,omitempty"`
+	// ParameterDataType / ParameterEntity type the parameter, resolved from the
+	// consumed service's cached $metadata, and are written as the mapping's
+	// ParameterType sub-document. generated/metamodel declares ParameterType
+	// WITHOUT omitempty — it is not optional — and omitting it is CE7252 "the
+	// parameters for remote action '<x>' have changed" plus a CE0117
+	// "Error(s) in expression" per argument, because an argument cannot be
+	// type-checked against a parameter that has no type (mendixlabs/mxcli#1020).
+	ParameterDataType string `json:"parameterDataType,omitempty"`
+	ParameterEntity   string `json:"parameterEntity,omitempty"`
+	// IncludedAssociations is Studio Pro's "Associations to include" for an
+	// object parameter: the associations whose objects are sent with it in the
+	// OData request. It is a tree, not a flag — an association ticked under
+	// another is stored nested in it. Without it the request carries only the
+	// object's own attributes (#1914).
+	IncludedAssociations []*IncludedAssociation `json:"includedAssociations,omitempty"`
+}
+
+// IncludedAssociation is one ticked association under an external action
+// parameter (Microflows$IncludedAssociation).
+type IncludedAssociation struct {
+	model.BaseElement
+	Association string `json:"association,omitempty"` // BY_NAME reference
+	// IsParent is true when the object on this side of the tree is the
+	// association's owner (its ParentPointer, the FROM entity).
+	IsParent             bool                   `json:"isParent,omitempty"`
+	IncludedAssociations []*IncludedAssociation `json:"includedAssociations,omitempty"`
 }
 
 // WebServiceCallAction calls a web service.
@@ -681,15 +988,64 @@ type WebServiceCallAction struct {
 	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
 	RawBSON           []byte            `json:"-"`
 	ServiceID         model.ID          `json:"serviceId,omitempty"`
-	OperationName     string            `json:"operationName,omitempty"`
-	SendMappingID     model.ID          `json:"sendMappingId,omitempty"`
-	ReceiveMappingID  model.ID          `json:"receiveMappingId,omitempty"`
-	OutputVariable    string            `json:"outputVariable,omitempty"`
-	UseReturnVariable bool              `json:"useReturnVariable"`
-	TimeoutExpression string            `json:"timeoutExpression,omitempty"`
+	// ServiceName is the WSDL <wsdl:service name=…>, which is NOT the local
+	// part of ServiceID's qualified name — Mendix stores both and resolves the
+	// operation within this one. Resolved from the imported service document by
+	// the executor (see resolveWebServiceName); empty means it could not be
+	// established, and the writers fall back to deriving it from ServiceID.
+	ServiceName   string `json:"serviceName,omitempty"`
+	OperationName string `json:"operationName,omitempty"`
+	// Arguments binds the operation's parameters — Mendix's
+	// Microflows$SimpleRequestHandling. Mutually exclusive with SendMappingID:
+	// a call stores ONE RequestBodyHandling, and the executor refuses a
+	// statement that asks for both.
+	Arguments     []WebServiceArgument `json:"arguments,omitempty"`
+	SendMappingID model.ID             `json:"sendMappingId,omitempty"`
+	// SendMappingVariable is the variable the send mapping maps FROM
+	// (MappingRequestHandling.MappingVariableName). An export mapping always
+	// maps an object, so a send mapping without it is incomplete.
+	SendMappingVariable string `json:"sendMappingVariable,omitempty"`
+	// SendMappingContentType is the stored ContentType of a send mapping,
+	// carried through a rewrite rather than normalised. Studio Pro wrote "Json"
+	// on the one reference document available (ako/TestApp Clients.SaveOrder),
+	// which is surprising on an XML protocol and is why this is preserved
+	// rather than derived. Empty means "write the default".
+	SendMappingContentType string   `json:"sendMappingContentType,omitempty"`
+	ReceiveMappingID       model.ID `json:"receiveMappingId,omitempty"`
+	OutputVariable         string   `json:"outputVariable,omitempty"`
+	UseReturnVariable      bool     `json:"useReturnVariable"`
+	TimeoutExpression      string   `json:"timeoutExpression,omitempty"`
+	// UseRequestTimeOut is the stored "Use a timeout" toggle. Read-only: the
+	// writers always store true, and a call stored with false is carried as
+	// RawBSON, so this field is what the catalog reports, not what is written.
+	UseRequestTimeOut bool `json:"useRequestTimeOut,omitempty"`
+	// ResultEntity is the qualified entity the RECEIVE mapping produces, which
+	// Mendix stores as the call's result VariableType. Resolved from the mapping
+	// document by the executor; empty means it could not be established and the
+	// writers keep DataTypes$VoidType.
+	ResultEntity string `json:"resultEntity,omitempty"`
 }
 
 func (WebServiceCallAction) isMicroflowAction() {}
+
+// WebServiceArgument binds one SOAP operation parameter to an expression —
+// a Microflows$WebServiceOperationSimpleParameterMapping.
+//
+// Name is the bare parameter name as MDL spells it ("OrderId"). Path is the
+// stored ParameterPath, which is the operation's escaped RequestBodyElementName
+// plus "|" plus the name ("http%3A//www.example.com/:GetOrder|OrderId"). The
+// executor derives Path from the operation document; a Path that could not be
+// established stays empty and the call is refused rather than written with a
+// fabricated one, since a wrong path reproduces CE0178 with different text in it.
+type WebServiceArgument struct {
+	Name       string `json:"name"`
+	Path       string `json:"path,omitempty"`
+	Expression string `json:"expression,omitempty"`
+	// Checked mirrors the stored IsChecked. Both reference mappings carry true
+	// and no false has been observed, so it defaults to true on a fresh write
+	// and is preserved on a rewrite rather than normalised.
+	Checked bool `json:"checked"`
+}
 
 // RestCallAction calls a REST service.
 type RestCallAction struct {
@@ -701,7 +1057,11 @@ type RestCallAction struct {
 	ErrorHandlingType ErrorHandlingType  `json:"errorHandlingType,omitempty"`
 	OutputVariable    string             `json:"outputVariable,omitempty"`
 	UseReturnVariable bool               `json:"useReturnVariable"`
-	TimeoutExpression string             `json:"timeoutExpression,omitempty"`
+	// UseRequestTimeOut is Studio Pro's "Use a timeout" toggle. Stored as
+	// UseRequestTimeOut; TimeoutExpression (stored TimeOutExpression) holds the
+	// number of seconds as an expression, e.g. "300".
+	UseRequestTimeOut bool   `json:"useRequestTimeOut,omitempty"`
+	TimeoutExpression string `json:"timeoutExpression,omitempty"`
 }
 
 func (RestCallAction) isMicroflowAction() {}
@@ -851,6 +1211,20 @@ type ResultHandlingHttpResponse struct {
 
 func (ResultHandlingHttpResponse) isResultHandling() {}
 
+// ResultHandlingFileDocument stores the response in a file document.
+//
+// EntityRef is always a SPECIALIZATION of System.FileDocument, never the base:
+// Mendix rejects `System.FileDocument` itself as a return type with CE0362,
+// while CE1540 permits FileDocument to be specialized (unlike HttpResponse,
+// which cannot be — so there is no matching field on ResultHandlingHttpResponse).
+type ResultHandlingFileDocument struct {
+	model.BaseElement
+	VariableName string `json:"variableName,omitempty"`
+	EntityRef    string `json:"entityRef,omitempty"` // qualified name, e.g. MyModule.MyFile
+}
+
+func (ResultHandlingFileDocument) isResultHandling() {}
+
 // ResultHandlingMapping uses an import mapping.
 type ResultHandlingMapping struct {
 	model.BaseElement
@@ -859,6 +1233,44 @@ type ResultHandlingMapping struct {
 	ResultVariable        string   `json:"resultVariable,omitempty"`
 	SingleObject          bool     `json:"singleObject,omitempty"` // true when mapping returns a single object (not a list)
 	ForceSingleOccurrence *bool    `json:"forceSingleOccurrence,omitempty"`
+
+	// RangeSingleObject is the RANGE's own First flag, independent of
+	// SingleObject (which decides the result VARIABLE's type). The two are
+	// separate axes in Mendix: the blank app's FeedbackModule ships an activity
+	// with Range=ConstantRange{SingleObject:false} — "All" — bound to an
+	// ObjectType variable, because the mapping itself returns one object.
+	// Conflating them makes an explicit All on such a mapping write a ListType
+	// variable, which mxbuild rejects with CE0243. nil = follow SingleObject,
+	// which is what every caller did before #881.
+	RangeSingleObject *bool `json:"rangeSingleObject,omitempty"`
+
+	// Custom range. When either is set the activity stores a
+	// Microflows$CustomRange instead of a ConstantRange — the "Custom" setting in
+	// Studio Pro's Range dropdown, which mxcli could not represent at all before
+	// #881 (it always wrote a ConstantRange, so a limit was unauthorable rather
+	// than merely undescribed).
+	LimitExpression  string `json:"limitExpression,omitempty"`
+	OffsetExpression string `json:"offsetExpression,omitempty"`
+
+	// ContentType is the ImportMappingCall's "Json" or "Xml", which follows the
+	// mapping's source: XML for an XML schema or a web service operation. A
+	// constant "Json" made mx check refuse a web-service mapping with "The
+	// selected import mapping cannot handle content type JSON"
+	// (mendixlabs/mxcli#1232). Empty writes "Json".
+	ContentType string `json:"contentType,omitempty"`
+
+	// ParameterVariable is the variable holding the mapping's input object,
+	// ImportMappingCall.ParameterVariableName; empty for a mapping without one.
+	// Commit is the call's Yes / YesWithoutEvents / No; empty writes
+	// YesWithoutEvents. MDL could say neither before ako/mxcli#1681.
+	ParameterVariable string `json:"parameterVariable,omitempty"`
+	Commit            string `json:"commit,omitempty"`
+
+	// ResultType is the stored result VariableType's $Type, "" when none is
+	// stored. Read only: it tells a stored activity Mendix cannot load (an
+	// object or list type naming no entity, mendixlabs/mxcli#1418) from one that
+	// stores no result at all.
+	ResultType string `json:"resultType,omitempty"`
 }
 
 func (ResultHandlingMapping) isResultHandling() {}
@@ -1124,9 +1536,35 @@ type NotifyWorkflowAction struct {
 	ErrorHandlingType  ErrorHandlingType `json:"errorHandlingType,omitempty"`
 	OutputVariableName string            `json:"outputVariableName,omitempty"`
 	WorkflowVariable   string            `json:"workflowVariable,omitempty"`
+	// Target is what the action notifies, Mendix 11.7+. nil when none is stored —
+	// which the build refuses (CE0166).
+	Target *NotifyTarget `json:"target,omitempty"`
+	// Activity is the target before Mendix 11.7: a wait-for-notification activity
+	// by qualified name (Module.Workflow.Name).
+	Activity string `json:"activity,omitempty"`
 }
 
 func (NotifyWorkflowAction) isMicroflowAction() {}
+
+// NotifyTarget is a notify action's NotifyTarget: the workflow element it reaches.
+type NotifyTarget struct {
+	// TypeName is the stored $Type, e.g. "Workflows$NotifyNotificationActivityTarget".
+	TypeName string `json:"typeName"`
+	// Name is the element's qualified name, Module.Workflow.ElementName.
+	Name string `json:"name"`
+}
+
+// NotifyBoundaryEventTargetType is the one target type that names its element
+// under BoundaryEvent rather than Activity.
+const NotifyBoundaryEventTargetType = "Workflows$NotifyNotificationBoundaryEventTarget"
+
+// Key returns the stored key that holds the element's name.
+func (t *NotifyTarget) Key() string {
+	if t.TypeName == NotifyBoundaryEventTargetType {
+		return "BoundaryEvent"
+	}
+	return "Activity"
+}
 
 // OpenWorkflowAction opens the workflow admin page.
 type OpenWorkflowAction struct {
@@ -1158,3 +1596,68 @@ type UnlockWorkflowAction struct {
 }
 
 func (UnlockWorkflowAction) isMicroflowAction() {}
+
+// SynchronizationType selects what a SYNCHRONIZE action sends to the server.
+//
+// Values are the ones the platform stores, taken from the Mendix Model SDK's
+// `SynchronizationType` (mendixmodelsdk, gen/microflows) — NOT from Studio Pro's
+// UI wording, which calls Specific "Selected object(s)" and would have led
+// straight to an invalid enum in the model.
+type SynchronizationType string
+
+const (
+	// SynchronizationTypeAll synchronizes the whole offline database. This is
+	// the platform default when the property is absent.
+	SynchronizationTypeAll SynchronizationType = "All"
+	// SynchronizationTypeUnsynchronized sends only objects with uncommitted
+	// offline changes. Introduced in Mendix 9.4.0.
+	SynchronizationTypeUnsynchronized SynchronizationType = "Unsynchronized"
+	// SynchronizationTypeSpecific synchronizes the objects and lists named in
+	// VariableNames.
+	SynchronizationTypeSpecific SynchronizationType = "Specific"
+)
+
+// SynchronizeAction synchronizes the offline database with the server. It is
+// nanoflow-only — Mendix rejects it in a microflow, which runs server-side.
+type SynchronizeAction struct {
+	model.BaseElement
+	ErrorHandlingType ErrorHandlingType   `json:"errorHandlingType,omitempty"`
+	SyncType          SynchronizationType `json:"syncType,omitempty"`
+	// VariableNames holds the object/list variables for SynchronizationTypeSpecific,
+	// stored as a BSON array of bare names (no `$`). Empty for the other modes.
+	VariableNames []string `json:"variableNames,omitempty"`
+}
+
+func (SynchronizeAction) isMicroflowAction() {}
+
+// UnsupportedAction is a read-only stand-in for a microflow action the reader
+// has no mapping for. It carries the stored `$Type` so DESCRIBE can name what it
+// could not render, instead of the anonymous "-- Empty action" that made a
+// missing mapping indistinguishable from an activity with no action at all
+// (upstream #863).
+//
+// It is deliberately inert on the write side: `microflowActionToGen` has no case
+// for it, so an UnsupportedAction never reaches BSON. That is the safe default —
+// the reader kept only the type name and the error-handling type, so writing it
+// back would produce an activity stripped of everything else.
+type UnsupportedAction struct {
+	model.BaseElement
+	// StorageType is the BSON `$Type`, e.g. "Microflows$SynchronizeAction".
+	StorageType       string            `json:"storageType,omitempty"`
+	ErrorHandlingType ErrorHandlingType `json:"errorHandlingType,omitempty"`
+}
+
+func (UnsupportedAction) isMicroflowAction() {}
+
+// RangeSingleObjectOf returns the ConstantRange.SingleObject value to store:
+// the explicit range flag when set, otherwise the result-variable flag, which is
+// what every caller relied on before the two axes were separated. (issue #881)
+func RangeSingleObjectOf(h *ResultHandlingMapping) bool {
+	if h == nil {
+		return false
+	}
+	if h.RangeSingleObject != nil {
+		return *h.RangeSingleObject
+	}
+	return h.SingleObject
+}

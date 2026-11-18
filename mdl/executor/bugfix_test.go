@@ -9,7 +9,11 @@ import (
 	"testing"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/backend/mock"
+	"github.com/mendixlabs/mxcli/mdl/linter"
 	"github.com/mendixlabs/mxcli/mdl/visitor"
+	"github.com/mendixlabs/mxcli/model"
+	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 )
 
 // TestValidateDuplicateVariableDeclareRetrieve verifies that DECLARE followed by
@@ -23,7 +27,7 @@ begin
   return $Count;
 end;`
 
-	errors := validateMicroflowFromMDL(t, input)
+	errors := duplicateNameErrorsFromMDL(t, input)
 
 	found := false
 	for _, e := range errors {
@@ -46,7 +50,7 @@ begin
   declare $X String = 'hello';
 end;`
 
-	errors := validateMicroflowFromMDL(t, input)
+	errors := duplicateNameErrorsFromMDL(t, input)
 
 	found := false
 	for _, e := range errors {
@@ -68,7 +72,7 @@ begin
   retrieve $Items from Test.SomeEntity;
 end;`
 
-	errors := validateMicroflowFromMDL(t, input)
+	errors := duplicateNameErrorsFromMDL(t, input)
 
 	for _, e := range errors {
 		if strings.Contains(e, "duplicate") {
@@ -86,7 +90,7 @@ begin
   $NewTodo = create Test.Todo();
 end;`
 
-	errors := validateMicroflowFromMDL(t, input)
+	errors := duplicateNameErrorsFromMDL(t, input)
 
 	found := false
 	for _, e := range errors {
@@ -98,6 +102,72 @@ end;`
 	if !found {
 		t.Errorf("Expected duplicate variable error for $NewTodo, got errors: %v", errors)
 	}
+}
+
+// TestValidateDuplicateMicroflowCallOutputVar covers finding #5 (second trigger):
+// a microflow-call output variable reused across a fallback chain is a fresh
+// declaration each time, so the second assignment is CE0111 — the natural
+// "try A, else try B" shape. Both the same-scope and the nested-in-if forms
+// must be caught (the fallback is almost always written inside an if).
+func TestValidateDuplicateMicroflowCallOutputVar(t *testing.T) {
+	t.Run("same scope", func(t *testing.T) {
+		input := `create microflow Test.MF_Fallback ()
+begin
+  $Summary = call microflow Test.Inner(Tag = 'description');
+  $Summary = call microflow Test.Inner(Tag = 'summary');
+end;`
+		errors := duplicateNameErrorsFromMDL(t, input)
+		if !hasDupError(errors, "Summary") {
+			t.Errorf("Expected duplicate variable error for $Summary, got: %v", errors)
+		}
+	})
+
+	t.Run("fallback inside if", func(t *testing.T) {
+		input := `create microflow Test.MF_FallbackIf ()
+begin
+  $Summary = call microflow Test.Inner(Tag = 'description');
+  if trim($Summary) = '' then
+    $Summary = call microflow Test.Inner(Tag = 'summary');
+  end if;
+end;`
+		errors := duplicateNameErrorsFromMDL(t, input)
+		if !hasDupError(errors, "Summary") {
+			t.Errorf("Expected duplicate variable error for $Summary (fallback in if), got: %v", errors)
+		}
+	})
+}
+
+// duplicateNameErrorsFromMDL returns the MDL063 messages for the script's
+// microflow, each prefixed "duplicate:". Duplicate names are MDL063's alone
+// since #953: the check-time body validator scoped them per branch and counted
+// void action calls, so it was wrong in both directions and no longer reports
+// them for a flow.
+func duplicateNameErrorsFromMDL(t *testing.T, input string) []string {
+	t.Helper()
+	prog, errs := visitor.Build(input)
+	if len(errs) > 0 {
+		t.Fatalf("Parse error: %v", errs[0])
+	}
+	stmt, ok := prog.Statements[0].(*ast.CreateMicroflowStmt)
+	if !ok {
+		t.Fatalf("Expected CreateMicroflowStmt, got %T", prog.Statements[0])
+	}
+	var out []string
+	for _, v := range ValidateMicroflow(stmt) {
+		if v.RuleID == "MDL063" {
+			out = append(out, "duplicate: "+v.Message)
+		}
+	}
+	return out
+}
+
+func hasDupError(errors []string, varName string) bool {
+	for _, e := range errors {
+		if strings.Contains(e, "duplicate") && strings.Contains(e, varName) {
+			return true
+		}
+	}
+	return false
 }
 
 // TestValidateEntityReservedAttributeName verifies that persistent entity attributes
@@ -130,6 +200,203 @@ func TestValidateEntityReservedAttributeName(t *testing.T) {
 	if !found {
 		t.Errorf("Expected reserved attribute error for CreatedDate, got: %v", violations)
 	}
+}
+
+// TestValidateEntityAutonumberNeedsSeed verifies MDL023: an autonumber attribute
+// without a seed fails the build (CE7247), so mxcli check flags it. Findings #6.
+func TestValidateEntityAutonumberNeedsSeed(t *testing.T) {
+	build := func(src string) []linter.Violation {
+		prog, errs := visitor.Build(src)
+		if len(errs) > 0 {
+			t.Fatalf("parse error: %v", errs[0])
+		}
+		return ValidateEntity(prog.Statements[0].(*ast.CreateEntityStmt))
+	}
+	hasMDL := func(vs []linter.Violation, id string) bool {
+		for _, v := range vs {
+			if v.RuleID == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !hasMDL(build(`create persistent entity M.G ( PuzzleNo: autonumber );`), "MDL023") {
+		t.Error("expected MDL023 for a seedless autonumber")
+	}
+	if hasMDL(build(`create persistent entity M.G ( PuzzleNo: autonumber default 1 );`), "MDL023") {
+		t.Error("did not expect MDL023 when autonumber has a seed")
+	}
+}
+
+// TestValidateEntityAutoMemberRename verifies MDL022: an AutoX pseudo-type
+// declared under a name other than its fixed system member warns that the name
+// is discarded on write. Findings #7.
+func TestValidateEntityAutoMemberRename(t *testing.T) {
+	build := func(src string) []linter.Violation {
+		prog, errs := visitor.Build(src)
+		if len(errs) > 0 {
+			t.Fatalf("parse error: %v", errs[0])
+		}
+		return ValidateEntity(prog.Statements[0].(*ast.CreateEntityStmt))
+	}
+	hasMDL := func(vs []linter.Violation, id string) bool {
+		for _, v := range vs {
+			if v.RuleID == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	if !hasMDL(build(`create persistent entity M.G ( StartedAt: autocreateddate );`), "MDL022") {
+		t.Error("expected MDL022 for a renamed autocreateddate")
+	}
+	// Canonical name (case-insensitive) does not warn.
+	if hasMDL(build(`create persistent entity M.G ( CreatedDate: autocreateddate );`), "MDL022") {
+		t.Error("did not expect MDL022 when the name matches the system member")
+	}
+}
+
+// TestValidateAlterEntityAddAttribute verifies that the same per-attribute
+// checks applied on CREATE (MDL022 AutoX rename, MDL023 autonumber seed, MDL021
+// reserved words) also run on the ALTER ENTITY ADD ATTRIBUTE path. Previously an
+// attribute added via ALTER escaped these checks entirely (findings #6, half-fix).
+func TestValidateAlterEntityAddAttribute(t *testing.T) {
+	build := func(src string) []linter.Violation {
+		prog, errs := visitor.Build(src)
+		if len(errs) > 0 {
+			t.Fatalf("parse error: %v", errs[0])
+		}
+		return ValidateAlterEntity(prog.Statements[0].(*ast.AlterEntityStmt))
+	}
+	hasMDL := func(vs []linter.Violation, id string) bool {
+		for _, v := range vs {
+			if v.RuleID == id {
+				return true
+			}
+		}
+		return false
+	}
+
+	// MDL023: seedless autonumber added via ALTER.
+	if !hasMDL(build(`alter entity M.G add attribute PuzzleNo: autonumber;`), "MDL023") {
+		t.Error("expected MDL023 for a seedless autonumber added via ALTER")
+	}
+	if hasMDL(build(`alter entity M.G add attribute PuzzleNo: autonumber default 1;`), "MDL023") {
+		t.Error("did not expect MDL023 when the added autonumber has a seed")
+	}
+	// MDL022: AutoX pseudo-type added under a non-canonical name.
+	if !hasMDL(build(`alter entity M.G add attribute StartedAt: autocreateddate;`), "MDL022") {
+		t.Error("expected MDL022 for a renamed autocreateddate added via ALTER")
+	}
+	if hasMDL(build(`alter entity M.G add attribute CreatedDate: autocreateddate;`), "MDL022") {
+		t.Error("did not expect MDL022 when the added AutoX name matches the system member")
+	}
+	// MDL021: reserved word added via ALTER (kind-independent).
+	if !hasMDL(build(`alter entity M.G add attribute Type: string;`), "MDL021") {
+		t.Error("expected MDL021 for a reserved word added via ALTER")
+	}
+	// A plain, valid attribute added via ALTER produces no violations.
+	if vs := build(`alter entity M.G add attribute Score: integer;`); len(vs) != 0 {
+		t.Errorf("expected no violations for a plain added attribute, got %v", vs)
+	}
+	// Non-ADD alter operations are ignored.
+	if vs := build(`alter entity M.G drop attribute Score;`); len(vs) != 0 {
+		t.Errorf("expected no violations for a DROP ATTRIBUTE op, got %v", vs)
+	}
+}
+
+// TestDroppedEntityMembers verifies the helper that lists members a CREATE OR
+// MODIFY replace would delete (findings #24).
+func TestDroppedEntityMembers(t *testing.T) {
+	existing := &domainmodel.Entity{
+		Name: "Game",
+		Attributes: []*domainmodel.Attribute{
+			{Name: "Puzzle"}, {Name: "Solution"}, {Name: "Difficulty"},
+		},
+		HasCreatedDate: true,
+		HasOwner:       true,
+	}
+	replacement := &domainmodel.Entity{
+		Name: "Game",
+		Attributes: []*domainmodel.Attribute{
+			{Name: "puzzle"}, // case-insensitive match — kept
+			{Name: "Score"},  // new — not a drop
+		},
+		HasOwner: true, // kept
+		// HasCreatedDate now false — dropped
+	}
+	dropped := droppedEntityMembers(existing, replacement)
+	got := strings.Join(dropped, ",")
+	// Solution and Difficulty are dropped; Puzzle survives (case-insensitive);
+	// createdDate audit field is dropped; owner survives.
+	for _, want := range []string{"Solution", "Difficulty", "createdDate (system field)"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected dropped members to include %q, got %q", want, got)
+		}
+	}
+	for _, unwanted := range []string{"Puzzle", "puzzle", "Score", "owner"} {
+		if strings.Contains(got, unwanted) {
+			t.Errorf("did not expect %q among dropped members, got %q", unwanted, got)
+		}
+	}
+}
+
+// TestCreateOrModifyEntity_WarnsOnDrop verifies that CREATE OR MODIFY ENTITY
+// still applies (non-blocking) but prints a data-loss warning listing the
+// attributes it removes (findings #24).
+func TestCreateOrModifyEntity_WarnsOnDrop(t *testing.T) {
+	mod := mkModule("Sudoku")
+	existing := &domainmodel.Entity{
+		BaseElement: model.BaseElement{ID: nextID("ent")},
+		ContainerID: nextID("dm"),
+		Name:        "Game",
+		Persistable: true,
+		Attributes: []*domainmodel.Attribute{
+			{Name: "Puzzle"}, {Name: "Solution"}, {Name: "Difficulty"},
+		},
+	}
+	dm := &domainmodel.DomainModel{
+		BaseElement: model.BaseElement{ID: nextID("dm")},
+		ContainerID: mod.ID,
+		Entities:    []*domainmodel.Entity{existing},
+	}
+	h := mkHierarchy(mod)
+	withContainer(h, dm.ID, mod.ID)
+	withContainer(h, existing.ContainerID, dm.ID)
+
+	updateCalled := false
+	mb := &mock.MockBackend{
+		IsConnectedFunc:      func() bool { return true },
+		ListModulesFunc:      func() ([]*model.Module, error) { return []*model.Module{mod}, nil },
+		ListDomainModelsFunc: func() ([]*domainmodel.DomainModel, error) { return []*domainmodel.DomainModel{dm}, nil },
+		GetDomainModelFunc:   func(id model.ID) (*domainmodel.DomainModel, error) { return dm, nil },
+		UpdateEntityFunc: func(dmID model.ID, e *domainmodel.Entity) error {
+			updateCalled = true
+			return nil
+		},
+	}
+
+	ctx, buf := newMockCtx(t, withBackend(mb), withHierarchy(h))
+	// Redeclare only one of the three existing attributes.
+	err := execCreateEntity(ctx, &ast.CreateEntityStmt{
+		Name:           ast.QualifiedName{Module: "Sudoku", Name: "Game"},
+		Kind:           ast.EntityPersistent,
+		CreateOrModify: true,
+		Attributes: []ast.Attribute{
+			{Name: "Puzzle", Type: ast.DataType{Kind: ast.TypeString}},
+		},
+	})
+	assertNoError(t, err)
+	if !updateCalled {
+		t.Fatal("UpdateEntity was not called — modify should still apply (non-blocking)")
+	}
+	out := buf.String()
+	assertContainsStr(t, out, "drops 2 existing member(s)")
+	assertContainsStr(t, out, "Solution")
+	assertContainsStr(t, out, "Difficulty")
+	assertContainsStr(t, out, "alter entity Sudoku.Game add attribute")
 }
 
 // TestValidateEntityNPEReservedWords verifies that non-persistent entities
@@ -394,11 +661,11 @@ func TestExpressionToXPath_XPathPathExpr(t *testing.T) {
 					{Expr: &ast.QualifiedNameExpr{QualifiedName: ast.QualifiedName{Module: "Sys", Name: "roles"}}},
 					{
 						Expr: &ast.QualifiedNameExpr{QualifiedName: ast.QualifiedName{Module: "Sys", Name: "UserRole"}},
-						Predicate: &ast.BinaryExpr{
+						Predicates: []ast.Expression{&ast.BinaryExpr{
 							Left:     &ast.IdentifierExpr{Name: "Active"},
 							Operator: "=",
 							Right:    &ast.LiteralExpr{Value: true, Kind: ast.LiteralBoolean},
-						},
+						}},
 					},
 				},
 			},
@@ -409,8 +676,8 @@ func TestExpressionToXPath_XPathPathExpr(t *testing.T) {
 			expr: &ast.XPathPathExpr{
 				Steps: []ast.XPathStep{
 					{
-						Expr:      &ast.QualifiedNameExpr{QualifiedName: ast.QualifiedName{Module: "System", Name: "roles"}},
-						Predicate: &ast.FunctionCallExpr{Name: "reversed"},
+						Expr:       &ast.QualifiedNameExpr{QualifiedName: ast.QualifiedName{Module: "System", Name: "roles"}},
+						Predicates: []ast.Expression{&ast.FunctionCallExpr{Name: "reversed"}},
 					},
 					{Expr: &ast.QualifiedNameExpr{QualifiedName: ast.QualifiedName{Module: "System", Name: "UserRole"}}},
 				},
@@ -661,5 +928,91 @@ func TestExprToStringNoSpaces(t *testing.T) {
 				t.Errorf("expressionToString() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestValidateEntityNPEValidationRules covers issue #832: Mendix refuses
+// validation rules on a non-persistable entity with
+//
+//	CE0070 "Validations rules are not allowed on entity 'X', because it is
+//	        not persistable."
+//
+// `not null` and `unique` ARE validation rules — Studio Pro models "required"
+// and "uniqueness" as rules on the entity, not as column constraints — so both
+// forms are rejected on an NPE. Verified against mxbuild 11.6.6: `not null`
+// with a message, `not null` bare, and `unique` each produce CE0070, while a
+// plain attribute does not. Before this rule `mxcli check` and `mxcli exec`
+// both accepted them and only a real build caught it.
+func TestValidateEntityNPEValidationRules(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		wantFor []string // attribute names expected to be flagged
+	}{
+		{
+			"not null with message",
+			`create non-persistent entity Test.NP ( "Name" : String(100) not null error 'req' );`,
+			[]string{"Name"},
+		},
+		{
+			// The message is optional; the rule exists either way, so bare
+			// `not null` is rejected by Mendix just the same.
+			"not null bare",
+			`create non-persistent entity Test.NP ( "Name" : String(100) not null );`,
+			[]string{"Name"},
+		},
+		{
+			"unique",
+			`create non-persistent entity Test.NP ( "Code" : String(50) unique error 'dup' );`,
+			[]string{"Code"},
+		},
+		{
+			"both constraints on separate attributes",
+			`create non-persistent entity Test.NP ( "Name" : String(100) not null, "Code" : String(50) unique );`,
+			[]string{"Name", "Code"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			prog, errs := visitor.Build(c.input)
+			if len(errs) > 0 {
+				t.Fatalf("parse error: %v", errs[0])
+			}
+			stmt := prog.Statements[0].(*ast.CreateEntityStmt)
+			violations := ValidateEntity(stmt)
+			for _, attrName := range c.wantFor {
+				found := false
+				for _, v := range violations {
+					if v.RuleID == "MDL054" && strings.Contains(v.Message, "'"+attrName+"'") {
+						found = true
+					}
+				}
+				if !found {
+					t.Errorf("expected MDL054 for attribute %q (CE0070), got: %v", attrName, violations)
+				}
+			}
+		})
+	}
+}
+
+// A PERSISTENT entity may carry exactly the same constraints — that is where
+// validation rules belong — so the rule must not fire there. Nor should it fire
+// on an NPE attribute that carries no constraint.
+func TestValidateEntityValidationRulesAllowedWhenPersistent(t *testing.T) {
+	cases := []string{
+		`create persistent entity Test.P ( "Name" : String(100) not null error 'req', "Code" : String(50) unique );`,
+		`create non-persistent entity Test.NP ( "Name" : String(100), "Qty" : Integer );`,
+	}
+	for _, input := range cases {
+		prog, errs := visitor.Build(input)
+		if len(errs) > 0 {
+			t.Fatalf("parse error: %v", errs[0])
+		}
+		stmt := prog.Statements[0].(*ast.CreateEntityStmt)
+		for _, v := range ValidateEntity(stmt) {
+			if v.RuleID == "MDL054" {
+				t.Errorf("unexpected MDL054 on %q: %s", input, v.Message)
+			}
+		}
 	}
 }

@@ -1,3 +1,4 @@
+mdl 1;
 -- ============================================================================
 -- Domain Model Examples - Comprehensive Entity & Enumeration Showcase
 -- ============================================================================
@@ -14,7 +15,7 @@
 --   - Enumerations (simple and with captions)
 --   - Persistent entities (basic to complex)
 --   - All attribute types (String, Integer, Decimal, Boolean, DateTime, etc.)
---   - Constraints (NOT NULL, UNIQUE, DEFAULT)
+--   - Constraints (NOT NULL, UNIQUE, DEFAULT, DateTime NOT LOCALIZED)
 --   - Indexes
 --   - Position annotations
 --   - JavaDoc documentation
@@ -43,33 +44,31 @@ create module DmTest;
  * Basic enumeration with identifier and caption.
  */
 create enumeration DmTest.OrderStatus (
-  /** Order received, awaiting processing */
+  -- Order received, awaiting processing
   PENDING 'Pending',
-  /** Order is being processed */
+  -- Order is being processed
   PROCESSING 'Processing',
-  /** Order has been shipped */
+  -- Order has been shipped
   SHIPPED 'Shipped',
-  /** Order delivered to customer */
+  -- Order delivered to customer
   DELIVERED 'Delivered',
-  /** Order was cancelled */
+  -- Order was cancelled
   CANCELLED 'Cancelled'
 );
-/
 
 /**
  * Priority levels for tasks.
  */
 create enumeration DmTest.Priority (
-  /** Low priority task */
+  -- Low priority task
   LOW 'Low',
-  /** Medium priority task */
+  -- Medium priority task
   MEDIUM 'Medium',
-  /** High priority task */
+  -- High priority task
   HIGH 'High',
-  /** Critical priority - immediate attention required */
+  -- Critical priority - immediate attention required
   critical 'Critical'
 );
-/
 
 -- ============================================================================
 -- Level 1.2: Enumeration with Captions
@@ -80,47 +79,45 @@ create enumeration DmTest.Priority (
  * Identifiers use internal codes, captions show user-friendly text.
  */
 create enumeration DmTest.PaymentMethod (
-  /** Credit card payment */
+  -- Credit card payment
   CC 'Credit Card',
-  /** Debit card payment */
+  -- Debit card payment
   DC 'Debit Card',
-  /** PayPal payment */
+  -- PayPal payment
   PP 'PayPal',
-  /** Bank transfer payment */
+  -- Bank transfer payment
   BT 'Bank Transfer',
-  /** Cash on delivery */
+  -- Cash on delivery
   COD 'Cash on Delivery'
 );
-/
 
 /**
  * Country codes with full names as captions.
  */
 create enumeration DmTest.Country (
-  /** United States */
+  -- United States
   US 'United States',
-  /** United Kingdom */
+  -- United Kingdom
   UK 'United Kingdom',
-  /** Germany */
+  -- Germany
   DE 'Germany',
-  /** France */
+  -- France
   FR 'France',
-  /** Netherlands */
+  -- Netherlands
   NL 'Netherlands',
-  /** Japan */
+  -- Japan
   JP 'Japan',
-  /** Australia */
+  -- Australia
   AU 'Australia'
 );
-/
 
 /**
  * User roles with descriptive captions.
  */
 create enumeration DmTest.UserRole (
-  /** Full system administrator */
+  -- Full system administrator
   ADMIN 'Administrator',
-  /** Department manager */
+  -- Department manager
   MANAGER 'Manager'
 );
 
@@ -128,18 +125,17 @@ create enumeration DmTest.UserRole (
  * User roles with descriptive captions.
  */
 create or modify enumeration DmTest.UserRole (
-  /** Full system administrator */
+  -- Full system administrator
   ADMIN 'Administrator',
-  /** Department manager */
+  -- Department manager
   MANAGER 'Manager',
-  /** Regular user */
+  -- Regular user
   "user" 'Standard User',
-  /** Guest with limited access */
+  -- Guest with limited access
   guest 'Guest',
-  /** Service account for API access */
+  -- Service account for API access
   service 'API Service Account'
 );
-/
 
 -- MARK: Altering Enumerations
 
@@ -154,7 +150,9 @@ create enumeration DmTest.ShipmentStage (
 
 alter enumeration DmTest.ShipmentStage add value Shipped caption 'Shipped to Customer';
 alter enumeration DmTest.ShipmentStage rename value Packed to Packaged;
-/
+-- Change an existing value's caption in place (name unchanged). Unlike drop +
+-- recreate, this works even while the enumeration is referenced by an attribute.
+alter enumeration DmTest.ShipmentStage modify value Shipped caption 'Delivered to Customer';
 
 -- ############################################################################
 -- PART 2: BASIC PERSISTENT ENTITIES
@@ -173,7 +171,6 @@ alter enumeration DmTest.ShipmentStage rename value Packed to Packaged;
 create persistent entity DmTest.SimpleTag (
   Name: string(50)
 );
-/
 
 /**
  * Simplest possible entity with just an identifier attribute.
@@ -182,7 +179,6 @@ create persistent entity DmTest.SimpleTag (
 create or modify persistent entity DmTest.SimpleTag (
   Name: string(50) not null
 );
-/
 
 /**
  * Entity with a few basic attributes.
@@ -190,13 +186,12 @@ create or modify persistent entity DmTest.SimpleTag (
 @position(100, 200)
 create persistent entity DmTest.Category (
   /** Category name */
-  Name: string(100) not null error 'Category name is required',
+  Name: string(100) not null error message 'Category name is required',
   /** Category description */
   description: string(500),
   /** Display order */
   SortOrder: integer default 0
 );
-/
 
 -- ============================================================================
 -- Level 2.2: Entity with All Basic Types
@@ -211,21 +206,21 @@ create persistent entity DmTest.Product (
   -- TODO: AutoNumber DEFAULT value not being set in project (implementation bug)
   ProductId: autonumber default 1,
   /** Product name (required) */
-  Name: string(200) not null error 'Product name is required',
+  Name: string(200) not null error message 'Product name is required',
   /** Unique product code */
-  Code: string(50) unique error 'Product code must be unique',
+  Code: string(50) unique error message 'Product code must be unique',
   /** Full product description */
   description: string(2000),
   /** Unit price with decimal precision */
-  Price: decimal not null error 'Price is required' default 0.00,
+  Price: decimal not null error message 'Price is required' default 0.00,
   /** Current stock quantity (Integer - 32-bit) */
   Stock: integer default 0,
   /** Large quantity for warehouses (Long - 64-bit) */
   TotalUnitsProduced: long default 0,
   /** Whether product is available for sale */
   IsActive: boolean default true,
-  /** Date product was released (Date only, no time) */
-  ReleaseDate: date,
+  /** Date product was released: a calendar date, so not localized (no time-zone shift) */
+  ReleaseDate: datetime not localized,
   /** Timestamp of creation (DateTime with time) */
   CreatedAt: datetime,
   /** Timestamp of last modification */
@@ -233,11 +228,10 @@ create persistent entity DmTest.Product (
   /** Product weight in kilograms */
   Weight: decimal,
   /** Stock keeping unit identifier */
-  SKU: string(20) unique error 'SKU must be unique',
+  SKU: string(20) unique error message 'SKU must be unique',
   /** Product image (Binary data) */
   ProductImage: binary
 );
-/
 
 -- ============================================================================
 -- Level 2.3: Entity with String Length Variations
@@ -249,7 +243,7 @@ create persistent entity DmTest.Product (
 @position(300, 200)
 create persistent entity DmTest.Document (
   /** Document title */
-  Title1: string(100) not null error 'Document title is required',
+  Title1: string(100) not null error message 'Document title is required',
   /** Document subtitle */
   Subtitle: string(200),
   /** Brief summary */
@@ -259,9 +253,8 @@ create persistent entity DmTest.Document (
   /** Document metadata */
   Metadata: string(2000),
   /** Short identifier code */
-  ShortCode: string(10) unique error 'Short code must be unique'
+  ShortCode: string(10) unique error message 'Short code must be unique'
 );
-/
 
 -- ############################################################################
 -- PART 3: ENTITIES WITH CONSTRAINTS
@@ -280,11 +273,11 @@ create persistent entity DmTest.Document (
 @position(500, 100)
 create persistent entity DmTest.Customer (
   /** Customer first name */
-  FirstName: string(100) not null error 'First name is required',
+  FirstName: string(100) not null error message 'First name is required',
   /** Customer last name */
-  LastName: string(100) not null error 'Last name is required',
+  LastName: string(100) not null error message 'Last name is required',
   /** Customer email address */
-  Email: string(200) not null error 'Email is required',
+  Email: string(200) not null error message 'Email is required',
   /** Phone number */
   Phone: string(50),
   /** Street address */
@@ -296,7 +289,6 @@ create persistent entity DmTest.Customer (
   /** Country (enumeration) */
   Country: enumeration(DmTest.Country)
 );
-/
 
 -- ============================================================================
 -- Level 3.2: UNIQUE Constraints
@@ -309,23 +301,22 @@ create persistent entity DmTest.Customer (
 @position(500, 200)
 create persistent entity DmTest.Employee (
   /** Unique employee number */
-  EmployeeNumber: string(20) not null error 'Employee number is required' unique error 'Employee number must be unique',
+  EmployeeNumber: string(20) not null error message 'Employee number is required' unique error message 'Employee number must be unique',
   /** Employee email address */
-  Email: string(200) not null error 'Email is required' unique error 'Email must be unique',
+  Email: string(200) not null error message 'Email is required' unique error message 'Email must be unique',
   /** Social security number */
-  SSN: string(20) unique error 'SSN must be unique',
+  SSN: string(20) unique error message 'SSN must be unique',
   /** First name */
-  FirstName: string(100) not null error 'First name is required',
+  FirstName: string(100) not null error message 'First name is required',
   /** Last name */
-  LastName: string(100) not null error 'Last name is required',
+  LastName: string(100) not null error message 'Last name is required',
   /** Department name */
   Department: string(100),
-  /** Hire date */
-  HireDate: datetime,
+  /** Hire date (Studio Pro "Localize" unticked) */
+  HireDate: datetime not localized,
   /** Whether employee is a manager */
   IsManager: boolean default false
 );
-/
 
 -- ============================================================================
 -- Level 3.3: DEFAULT Values
@@ -338,7 +329,7 @@ create persistent entity DmTest.Employee (
 @position(500, 300)
 create persistent entity DmTest.settings (
   /** Setting name */
-  Name: string(100) not null error 'Setting name is required',
+  Name: string(100) not null error message 'Setting name is required',
   /** String value */
   StringValue: string(500) default '',
   /** Integer value */
@@ -354,7 +345,6 @@ create persistent entity DmTest.settings (
   /** Multiplier factor */
   Multiplier: decimal default 1.0
 );
-/
 
 -- ============================================================================
 -- Level 3.4: Combined Constraints
@@ -373,13 +363,13 @@ create persistent entity DmTest.settings (
 @position(500, 400)
 create persistent entity DmTest.BankAccount (
   /** Unique account number */
-  AccountNumber: string(20) not null error 'Account number is required' unique error 'Account number must be unique',
+  AccountNumber: string(20) not null error message 'Account number is required' unique error message 'Account number must be unique',
   /** Account holder name */
-  AccountHolder: string(200) not null error 'Account holder name is required',
+  AccountHolder: string(200) not null error message 'Account holder name is required',
   /** Type of account */
-  AccountType: string(50) not null error 'Account type is required',
+  AccountType: string(50) not null error message 'Account type is required',
   /** Current balance */
-  Balance: decimal not null error 'Balance is required' default 0.00,
+  Balance: decimal not null error message 'Balance is required' default 0.00,
   /** Credit limit */
   CreditLimit: decimal default 0.00,
   /** Interest rate percentage */
@@ -387,13 +377,12 @@ create persistent entity DmTest.BankAccount (
   /** Whether account is active */
   IsActive: boolean default true,
   /** Date account was opened */
-  OpenedDate: datetime not null error 'Opened date is required',
+  OpenedDate: datetime not null error message 'Opened date is required',
   /** Date account was closed */
   ClosedDate: datetime,
   /** Date of last transaction */
   LastTransactionDate: datetime
 );
-/
 
 -- ############################################################################
 -- PART 4: ENTITIES WITH INDEXES
@@ -412,7 +401,7 @@ create persistent entity DmTest.BankAccount (
 @position(700, 100)
 create persistent entity DmTest.Subscriber (
   /** Subscriber email address */
-  Email: string(200) not null error 'Email is required' unique error 'Email must be unique',
+  Email: string(200) not null error message 'Email is required' unique error message 'Email must be unique',
   /** Subscriber name */
   Name: string(200),
   /** Subscription date */
@@ -421,7 +410,6 @@ create persistent entity DmTest.Subscriber (
   IsVerified: boolean default false
 )
 index (Email);
-/
 
 -- ============================================================================
 -- Level 4.2: Multiple Indexes
@@ -439,21 +427,21 @@ index (Email);
 @position(700, 200)
 create persistent entity DmTest.SalesOrder (
   /** Unique order number */
-  OrderNumber: string(50) not null error 'Order number is required' unique error 'Order number must be unique',
+  OrderNumber: string(50) not null error message 'Order number is required' unique error message 'Order number must be unique',
   /** Customer identifier */
-  CustomerId: string(50) not null error 'Customer ID is required',
+  CustomerId: string(50) not null error message 'Customer ID is required',
   /** Order date */
-  OrderDate: datetime not null error 'Order date is required',
+  OrderDate: datetime not null error message 'Order date is required',
   /** Ship date */
   ShipDate: datetime,
   /** Order status (enumeration) */
-  OrderStatus: enumeration(DmTest.OrderStatus) not null error 'Order status is required',
+  OrderStatus: enumeration(DmTest.OrderStatus) not null error message 'Order status is required',
   /** Payment method (enumeration) */
   PaymentMethod: enumeration(DmTest.PaymentMethod),
   /** Priority level (enumeration) */
-  Priority: enumeration(DmTest.Priority) not null error 'Priority is required',
+  Priority: enumeration(DmTest.Priority) not null error message 'Priority is required',
   /** Total amount */
-  TotalAmount: decimal not null error 'Total amount is required' default 0.00,
+  TotalAmount: decimal not null error message 'Total amount is required' default 0.00,
   /** Tax amount */
   TaxAmount: decimal default 0.00,
   /** Shipping cost */
@@ -465,7 +453,6 @@ index (OrderNumber),
 index (CustomerId asc),
 index (OrderDate desc),
 index (OrderStatus);
-/
 
 -- ============================================================================
 -- Level 4.3: Composite Index
@@ -479,13 +466,13 @@ index (OrderStatus);
 @position(700, 300)
 create persistent entity DmTest.AuditLog (
   /** Type of entity being audited */
-  EntityType: string(100) not null error 'Entity type is required',
+  EntityType: string(100) not null error message 'Entity type is required',
   /** ID of entity being audited */
-  EntityId: string(50) not null error 'Entity ID is required',
+  EntityId: string(50) not null error message 'Entity ID is required',
   /** Action performed */
-  Action1: string(50) not null error 'Action is required',
+  Action1: string(50) not null error message 'Action is required',
   /** Timestamp of action */
-  Timestamp: datetime not null error 'Timestamp is required',
+  Timestamp: datetime not null error message 'Timestamp is required',
   /** User who performed action */
   UserId: string(50),
   /** Previous value */
@@ -498,7 +485,6 @@ create persistent entity DmTest.AuditLog (
 index (EntityType, EntityId),
 index (Timestamp),
 index (UserId);
-/
 
 -- ############################################################################
 -- PART 5: JAVADOC DOCUMENTATION
@@ -519,13 +505,13 @@ index (UserId);
 @position(900, 100)
 create persistent entity DmTest.user (
   /** Unique username */
-  username: string(50) not null error 'Username is required' unique error 'Username must be unique',
+  username: string(50) not null error message 'Username is required' unique error message 'Username must be unique',
   /** User email address */
-  Email: string(200) not null error 'Email is required' unique error 'Email must be unique',
+  Email: string(200) not null error message 'Email is required' unique error message 'Email must be unique',
   /** Hashed password */
-  PasswordHash: string(500) not null error 'Password hash is required',
+  PasswordHash: string(500) not null error message 'Password hash is required',
   /** User role (enumeration) */
-  role: enumeration(DmTest.UserRole) not null error 'User role is required',
+  role: enumeration(DmTest.UserRole) not null error message 'User role is required',
   /** Whether user is active */
   IsActive: boolean default true,
   /** Account creation date */
@@ -533,7 +519,6 @@ create persistent entity DmTest.user (
   /** Last login timestamp */
   LastLoginAt: datetime
 );
-/
 
 -- ============================================================================
 -- Level 5.2: Detailed Documentation with Parameters
@@ -551,21 +536,21 @@ create persistent entity DmTest.user (
 @position(900, 200)
 create persistent entity DmTest.Invoice (
   /** Unique identifier generated by the system */
-  InvoiceNumber: string(50) not null error 'Invoice number is required' unique error 'Invoice number must be unique',
+  InvoiceNumber: string(50) not null error message 'Invoice number is required' unique error message 'Invoice number must be unique',
   /** Reference to the customer being billed */
-  CustomerId: string(50) not null error 'Customer ID is required',
+  CustomerId: string(50) not null error message 'Customer ID is required',
   /** Date the invoice was generated */
-  IssueDate: datetime not null error 'Issue date is required',
+  IssueDate: datetime not null error message 'Issue date is required',
   /** Payment due date */
-  DueDate: datetime not null error 'Due date is required',
+  DueDate: datetime not null error message 'Due date is required',
   /** Sum of line items before tax */
-  Subtotal: decimal not null error 'Subtotal is required' default 0.00,
+  Subtotal: decimal not null error message 'Subtotal is required' default 0.00,
   /** Calculated tax amount */
-  TaxAmount: decimal not null error 'Tax amount is required' default 0.00,
+  TaxAmount: decimal not null error message 'Tax amount is required' default 0.00,
   /** Final amount due (subtotal + tax) */
-  TotalAmount: decimal not null error 'Total amount is required' default 0.00,
+  TotalAmount: decimal not null error message 'Total amount is required' default 0.00,
   /** Current invoice status (Draft, Sent, Paid, Overdue, Cancelled) */
-  status: string(50) not null error 'Status is required' default 'Draft',
+  status: string(50) not null error message 'Status is required' default 'Draft',
   /** Date payment was received (null if unpaid) */
   PaidDate: datetime,
   /** Additional notes */
@@ -574,7 +559,6 @@ create persistent entity DmTest.Invoice (
 index (InvoiceNumber),
 index (CustomerId),
 index (status);
-/
 
 /**
  * Line item for an invoice.
@@ -585,19 +569,18 @@ index (status);
 @position(900, 300)
 create persistent entity DmTest.InvoiceLine (
   /** Line number within the invoice */
-  LineNumber: integer not null error 'Line number is required',
+  LineNumber: integer not null error message 'Line number is required',
   /** Description of the item */
-  description: string(500) not null error 'Description is required',
+  description: string(500) not null error message 'Description is required',
   /** Number of units */
-  Quantity: decimal not null error 'Quantity is required' default 1,
+  Quantity: decimal not null error message 'Quantity is required' default 1,
   /** Price per unit */
-  UnitPrice: decimal not null error 'Unit price is required',
+  UnitPrice: decimal not null error message 'Unit price is required',
   /** Total amount (Quantity * UnitPrice) */
-  Amount: decimal not null error 'Amount is required',
+  Amount: decimal not null error message 'Amount is required',
   /** Tax rate percentage */
   TaxRate: decimal default 0.00
 );
-/
 
 -- ############################################################################
 -- PART 6: ASSOCIATIONS
@@ -618,8 +601,7 @@ create association DmTest.Order_Customer
 from DmTest.SalesOrder to DmTest.Customer
 type reference
 owner default
-delete_behavior DELETE_BUT_KEEP_REFERENCES;
-/
+on delete set null;
 
 /**
  * Associates an invoice with a customer.
@@ -629,8 +611,7 @@ create association DmTest.Invoice_Customer
 from DmTest.Invoice to DmTest.Customer
 type reference
 owner default
-delete_behavior DELETE_BUT_KEEP_REFERENCES;
-/
+on delete set null;
 
 -- ============================================================================
 -- Level 6.2: Reference Association (One-to-Many via parent)
@@ -644,7 +625,6 @@ create association DmTest.Invoice_Lines
 from DmTest.InvoiceLine to DmTest.Invoice
 type reference
 owner both;
-/
 
 /**
  * Links employees to their department category.
@@ -653,7 +633,6 @@ create association DmTest.Employee_Department
 from DmTest.Employee to DmTest.Category
 type reference
 owner both;
-/
 
 /**
  * Self-referencing association for category hierarchy.
@@ -666,8 +645,7 @@ create association DmTest.Category_ParentCategory
 from DmTest.Category to DmTest.Category
 type reference
 owner default
-delete_behavior DELETE_BUT_KEEP_REFERENCES;
-/
+on delete set null;
 
 -- ============================================================================
 -- Level 6.3: ReferenceSet Association (Many-to-Many)
@@ -680,9 +658,9 @@ delete_behavior DELETE_BUT_KEEP_REFERENCES;
 @position(1100, 100)
 create persistent entity DmTest.Project1 (
   /** Project name */
-  Name: string(200) not null error 'Project name is required',
+  Name: string(200) not null error message 'Project name is required',
   /** Unique project code */
-  Code: string(50) unique error 'Project code must be unique',
+  Code: string(50) unique error message 'Project code must be unique',
   /** Project start date */
   StartDate: datetime,
   /** Project end date */
@@ -692,7 +670,6 @@ create persistent entity DmTest.Project1 (
   /** Project status */
   status: string(50) default 'Planning'
 );
-/
 
 /**
  * Many-to-many: Projects can have many employees,
@@ -702,7 +679,6 @@ create association DmTest.Project_Employees
 from DmTest.Project1 to DmTest.Employee
 type ReferenceSet
 owner both;
-/
 
 /**
  * Many-to-many: Products can have many tags,
@@ -712,7 +688,6 @@ create association DmTest.Product_Tags
 from DmTest.Product to DmTest.SimpleTag
 type ReferenceSet
 owner both;
-/
 
 -- ============================================================================
 -- Level 6.4: CREATE OR MODIFY ASSOCIATION (idempotent upsert)
@@ -728,17 +703,14 @@ create association DmTest.Project_Tags
 from DmTest.Project1 to DmTest.SimpleTag
 type ReferenceSet
 owner both;
-/
 
 -- Re-run safely with OR MODIFY to change delete behavior:
 create or modify association DmTest.Project_Tags
 from DmTest.Project1 to DmTest.SimpleTag
 type ReferenceSet
 owner default;
-/
 
 drop association DmTest.Project_Tags;
-/
 
 -- @version: 10.18+
 -- ############################################################################
@@ -769,7 +741,6 @@ create view entity DmTest.ActiveProducts (
     p.Stock as Stock
   from DmTest.Product as p
   where p.IsActive = true;
-/
 
 -- ============================================================================
 -- Level 7.2: View with Aggregation
@@ -793,7 +764,6 @@ create view entity DmTest.CustomerOrderStats (
     avg(o.TotalAmount) as AvgOrderValue
   from DmTest.SalesOrder as o
   GROUP by o.CustomerId;
-/
 
 -- ============================================================================
 -- Level 7.3: View with JOIN
@@ -823,7 +793,6 @@ create view entity DmTest.InvoiceDetails (
     i.status as status
   from DmTest.Invoice as i
   inner join i/DmTest.Invoice_Customer/DmTest.Customer as c;
-/
 
 -- ============================================================================
 -- Level 7.3b: JOIN with ON expression (no association) - NOT YET SUPPORTED
@@ -867,7 +836,6 @@ create view entity DmTest.OverdueInvoices (
   where i.status != 'Paid'
     and i.status != 'Cancelled'
     and i.DueDate < '[%CurrentDateTime%]';
-/
 
 -- ============================================================================
 -- Level 7.5: View with Multiple Aggregations
@@ -898,7 +866,6 @@ create view entity DmTest.MonthlySalesSummary (
   from DmTest.SalesOrder as o
   where o.OrderStatus != 'CANCELLED'
   GROUP by DATEPART(YEAR, o.OrderDate), DATEPART(MONTH, o.OrderDate);
-/
 
 -- ============================================================================
 -- Level 7.6: Microflow Retrieving from View Entity
@@ -927,7 +894,7 @@ begin
 
   retrieve $Stats from DmTest.CustomerOrderStats
     where CustomerId = $CustomerId
-    limit 1;
+    first;
 
   if $Stats != empty then
     set $TotalSpent = $Stats/TotalSpent;
@@ -935,7 +902,6 @@ begin
 
   return $TotalSpent;
 end;
-/
 
 -- @version: any
 -- ############################################################################
@@ -969,7 +935,6 @@ create non-persistent entity DmTest.SearchParameters (
   /** Whether to include inactive records */
   IncludeInactive: boolean default false
 );
-/
 
 -- ============================================================================
 -- Level 8.2: Non-Persistent for API Response
@@ -996,7 +961,6 @@ create non-persistent entity DmTest.ApiResponse (
   /** Unique request identifier */
   RequestId: string(50)
 );
-/
 
 -- ============================================================================
 -- Level 8.3: Non-Persistent for Reports
@@ -1029,7 +993,6 @@ create non-persistent entity DmTest.DashboardMetrics (
   /** Revenue from top product */
   TopProductRevenue: decimal
 );
-/
 
 -- ############################################################################
 -- PART 9: CREATE OR MODIFY ENTITY (Idempotent Updates)
@@ -1058,7 +1021,7 @@ create non-persistent entity DmTest.DashboardMetrics (
 @position(1700, 100)
 create or modify persistent entity DmTest.AppConfig (
   /** Configuration key */
-  ConfigKey: string(100) not null error 'Config key is required' unique error 'Config key must be unique',
+  ConfigKey: string(100) not null error message 'Config key is required' unique error message 'Config key must be unique',
   /** Configuration value */
   ConfigValue: string(2000),
   /** Description of setting */
@@ -1069,7 +1032,6 @@ create or modify persistent entity DmTest.AppConfig (
   ModifiedAt: datetime
 )
 index (ConfigKey);
-/
 
 /**
  * Configuration settings with CREATE OR MODIFY.
@@ -1082,9 +1044,9 @@ index (ConfigKey);
 @position(1900, 100)
 create or modify persistent entity DmTest.AppConfig (
   /** Configuration key */
-  ConfigKey: string(100) not null error 'Config key is required' unique error 'Config key must be unique',
+  ConfigKey: string(100) not null error message 'Config key is required' unique error message 'Config key must be unique',
   /** Configuration value */
-  ConfigValue: string(2500) not null error 'Value cannot be null',
+  ConfigValue: string(2500) not null error message 'Value cannot be null',
   /** Description of setting */
   description: string(600),
   /** Whether setting is active */
@@ -1096,7 +1058,6 @@ create or modify persistent entity DmTest.AppConfig (
 )
 index (ConfigKey)
 , index (ModifiedAt);
-/
 
 -- ============================================================================
 -- Level 9.2: CREATE OR MODIFY with @RenamedFrom (Attribute Renaming)
@@ -1129,11 +1090,11 @@ create or modify persistent entity DmTest.Contact (
 
   /** Full name - renamed from ContactName */
   @RenamedFrom('ContactName')
-  FullName: string(250) not null error 'Full name is required',
+  FullName: string(250) not null error message 'Full name is required',
 
   /** Primary email - renamed from ContactEmail */
   @RenamedFrom('ContactEmail')
-  PrimaryEmail: string(300) unique error 'Email must be unique',
+  PrimaryEmail: string(300) unique error message 'Email must be unique',
 
   /** Phone number */
   Phone: string(50),
@@ -1159,7 +1120,6 @@ create or modify persistent entity DmTest.Contact (
 index (FullName),
 index (PrimaryEmail),
 index (Company);
-/
 
 -- ============================================================================
 -- Level 9.3: CREATE OR MODIFY for Multiple Attribute Changes
@@ -1184,7 +1144,7 @@ create or modify persistent entity DmTest.task (
 
   /** Task title - renamed from TaskName */
   @RenamedFrom('TaskName')
-  TaskTitle: string(200) not null error 'Task title is required',
+  TaskTitle: string(200) not null error message 'Task title is required',
 
   /** Task summary - renamed from TaskDescription */
   @RenamedFrom('TaskDescription')
@@ -1194,7 +1154,7 @@ create or modify persistent entity DmTest.task (
   AssignedTo: string(100),
 
   /** Task priority using enumeration */
-  TaskPriority: enumeration(DmTest.Priority) not null error 'Priority is required',
+  TaskPriority: enumeration(DmTest.Priority) not null error message 'Priority is required',
 
   /** Task status */
   TaskStatus: enumeration(DmTest.OrderStatus) default DmTest.OrderStatus.PENDING,
@@ -1224,7 +1184,6 @@ index (TaskTitle),
 index (AssignedTo),
 index (DueDate),
 index (TaskStatus);
-/
 
 -- ============================================================================
 -- Level 9.4: CREATE OR MODIFY for Non-Persistent Entity
@@ -1274,7 +1233,6 @@ create or modify non-persistent entity DmTest.FilterParameters (
   /** Sort ascending - new field */
   SortAscending: boolean default false
 );
-/
 
 -- @version: 10.18+
 -- ============================================================================
@@ -1309,7 +1267,6 @@ create or modify view entity DmTest.TaskSummaryByAssignee (
   from DmTest.task as t
   where t.AssignedTo IS not null
   GROUP by t.AssignedTo;
-/
 
 /**
  * Active configuration view with CREATE OR MODIFY.
@@ -1330,7 +1287,6 @@ create or modify view entity DmTest.ActiveConfigs (
   where c.IsActive = true
     and 1=1
 ;
-/
 
 /**
  * Active configuration view with CREATE OR MODIFY.
@@ -1349,7 +1305,6 @@ create or modify view entity DmTest.ActiveConfigs (
     c.description as description
   from DmTest.AppConfig as c
   where c.IsActive = true;
-/
 
 -- @version: any
 -- ############################################################################
@@ -1383,7 +1338,7 @@ alter entity DmTest.Product
 
 -- Add attribute with constraints (NOT NULL, UNIQUE).
 alter entity DmTest.Employee
-  add attribute BadgeNumber: string(20) unique error 'Badge number must be unique';
+  add attribute BadgeNumber: string(20) unique error message 'Badge number must be unique';
 
 -- ============================================================================
 -- Level 10.2: RENAME ATTRIBUTE
@@ -1433,7 +1388,7 @@ alter entity DmTest.SimpleTag
 
 -- Set entity comment.
 alter entity DmTest.Category
-  set comment 'Used for product and department categorization.';
+  set documentation 'Used for product and department categorization.';
 
 -- ============================================================================
 -- Level 10.6: ADD INDEX / DROP INDEX
@@ -1458,7 +1413,7 @@ alter entity DmTest.BankAccount
   add attribute CurrencyCode: string(3) default 'EUR'
   add attribute IBAN: string(34)
   add index (IBAN)
-  set comment 'Extended with multi-currency support.';
+  set documentation 'Extended with multi-currency support.';
 
 -- ============================================================================
 -- Level 10.8: Quoted Identifiers for Reserved-Word Attribute Names
@@ -1478,7 +1433,7 @@ alter entity DmTest.VATRate
   rename attribute "range" to TaxRange;
 
 alter entity DmTest.VATRate
-  modify attribute `check` string(10);
+  modify attribute `check`: string(10);
 
 alter entity DmTest.VATRate
   add attribute "Order": integer;
@@ -1507,14 +1462,12 @@ begin
   log info 'Validating bank account';
   return true;
 end;
-/
 
 create microflow DmTest.ACT_InitBankAccountDefaults ($BankAccount: DmTest.BankAccount)
 begin
   log info 'Initializing defaults';
   return empty;
 end;
-/
 
 -- Add event handlers via ALTER ENTITY (pass entity object to microflow)
 alter entity DmTest.BankAccount
@@ -1578,7 +1531,6 @@ create view entity DmTest.TaskPerformanceAnalysis (
   from DmTest.task as t
   where t.TaskPriority in ('HIGH', 'CRITICAL')
     and t.AssignedTo IS not null;
-/
 
 /**
  * Sales orders with customer statistics using correlated subquery.
@@ -1608,7 +1560,6 @@ create view entity DmTest.SalesOrderStats (
      where o3.CustomerId = o.CustomerId) as CustomerTotalSpend
   from DmTest.SalesOrder as o
   where o.OrderDate IS not null;
-/
 
 /**
  * Products above average price using subquery comparison.
@@ -1630,7 +1581,6 @@ create view entity DmTest.AboveAverageProducts (
   from DmTest.Product as p
   where p.Price > (select avg(p3.Price) from DmTest.Product as p3)
     and p.IsActive = true;
-/
 
 /**
  * Comprehensive dashboard view with multiple subqueries.
@@ -1665,13 +1615,12 @@ create view entity DmTest.ComprehensiveDashboard (
     where t2.TaskPriority = 'HIGH'
   )
   GROUP by t.AssignedTo;
-/
 
-show entities;
-show entities in DmTest;
+list entities;
+list entities in DmTest;
 describe entity DmTest.ComprehensiveDashboard;
-show enumerations;
-show enumerations in DmTest;
+list enumerations;
+list enumerations in DmTest;
 
 create module DmTest2;
 move entity DmTest.Customer to DmTest2;
@@ -1679,8 +1628,8 @@ create module DmTest3;
 move enumeration DmTest.Country to DmTest3;
 move entity DmTest.ActiveConfigs to DmTest3;
 
-show entities in DmTest2;
-show enumerations in DmTest3;
+list entities in DmTest2;
+list enumerations in DmTest3;
 
 -- @version: any
 -- ############################################################################
@@ -1720,7 +1669,6 @@ create persistent entity DmTest.Attachment extends System.FileDocument (
   /** Whether this attachment is publicly accessible */
   IsPublic: boolean default false
 );
-/
 
 -- ============================================================================
 -- Level 12.2: EXTENDS System.Image
@@ -1741,7 +1689,6 @@ create persistent entity DmTest.ProductPhoto extends System.Image (
   /** Whether this is the primary product photo */
   IsPrimary: boolean default false
 );
-/
 
 -- ============================================================================
 -- Level 12.3: EXTENDS Application Entity
@@ -1753,7 +1700,7 @@ create persistent entity DmTest.ProductPhoto extends System.Image (
 @position(2300, 300)
 create persistent entity DmTest.Vehicle (
   /** License plate number */
-  LicensePlate: string(20) not null error 'License plate is required' unique error 'License plate must be unique',
+  LicensePlate: string(20) not null error message 'License plate is required' unique error message 'License plate must be unique',
   /** Vehicle make (manufacturer) */
   Make: string(100),
   /** Vehicle model name */
@@ -1765,7 +1712,6 @@ create persistent entity DmTest.Vehicle (
   /** Whether vehicle is currently active in the fleet */
   IsFleetActive: boolean default true
 );
-/
 
 /**
  * Truck entity that extends Vehicle with cargo-specific attributes.
@@ -1784,7 +1730,6 @@ create persistent entity DmTest.Truck extends DmTest.Vehicle (
   /** Whether truck has refrigeration unit */
   HasRefrigeration: boolean default false
 );
-/
 
 /**
  * Passenger car that extends Vehicle.
@@ -1800,7 +1745,6 @@ create persistent entity DmTest.PassengerCar extends DmTest.Vehicle (
   /** Trunk volume in liters */
   TrunkVolume: decimal
 );
-/
 
 -- ============================================================================
 -- Level 12.4: EXTENDS with No Additional Attributes
@@ -1814,7 +1758,6 @@ create persistent entity DmTest.PassengerCar extends DmTest.Vehicle (
  */
 @position(2300, 500)
 create persistent entity DmTest.InternalDocument extends System.FileDocument;
-/
 
 -- ============================================================================
 -- Level 12.5: GENERALIZATION Keyword (Legacy Syntax)
@@ -1829,7 +1772,6 @@ create persistent entity DmTest.ProfilePhoto generalization System.Image (
   /** Whether this photo has been approved by admin */
   IsApproved: boolean default false
 );
-/
 
 -- ============================================================================
 -- Level 12.6: CREATE OR MODIFY with EXTENDS
@@ -1852,7 +1794,6 @@ create or modify persistent entity DmTest.Attachment extends System.FileDocument
   /** Upload timestamp - new field added via CREATE OR MODIFY */
   UploadedAt: datetime
 );
-/
 
 -- ============================================================================
 -- Level 12.7: Association to Generalized Entity
@@ -1866,7 +1807,6 @@ create association DmTest.Product_Photos
 from DmTest.Product to DmTest.ProductPhoto
 type ReferenceSet
 owner both;
-/
 
 /**
  * Link invoices to their attachments.
@@ -1876,10 +1816,34 @@ create association DmTest.Invoice_Attachments
 from DmTest.Invoice to DmTest.Attachment
 type ReferenceSet
 owner both;
-/
+
+-- ############################################################################
+-- LEVEL 13: BULK ALTER — one statement for a whole module
+-- ############################################################################
+--
+-- ALTER ENTITIES replaces one ALTER ENTITY per entity. Only ADD ATTRIBUTE is
+-- offered: drop and rename aimed at a set are destructive by a typo.
+--
+-- IF NOT EXISTS is what makes it re-runnable, and this file is re-run on every
+-- doctype pass — the second run must skip rather than fail.
+
+-- Give every persistent entity in the module an audit trail.
+alter entities in DmTest
+  add attribute if not exists AuditCreated: AutoCreatedDate,
+  add attribute if not exists AuditChanged: AutoChangedDate
+  where persistent;
+
+-- The non-persistent half of the module, addressed on its own.
+alter entities in DmTest
+  add attribute if not exists ScratchNote: String(40)
+  where non-persistent;
+
+-- No filter: every entity in the module, view entities included.
+alter entities in DmTest
+  add attribute if not exists BulkTouched: Boolean;
 
 -- Verify generalized entities appear in listings
-show entities in DmTest;
+list entities in DmTest;
 describe entity DmTest.Attachment;
 describe entity DmTest.ProductPhoto;
 describe entity DmTest.Truck;

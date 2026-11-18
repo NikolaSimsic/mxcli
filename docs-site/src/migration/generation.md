@@ -32,6 +32,7 @@ mxcli -p app.mpr
 ## Example: Domain Model
 
 ```sql
+mdl 1;
 -- Enumerations first (referenced by entities)
 CREATE ENUMERATION Sales.OrderStatus (
   Draft 'Draft',
@@ -46,14 +47,13 @@ CREATE ENUMERATION Sales.OrderStatus (
 /** Customer master data */
 @Position(100, 100)
 CREATE PERSISTENT ENTITY CRM.Customer (
-  Name: String(200) NOT NULL ERROR 'Customer name is required',
-  Email: String(200) UNIQUE ERROR 'Email already exists',
+  Name: String(200) NOT NULL ERROR MESSAGE 'Customer name is required',
+  Email: String(200) UNIQUE ERROR MESSAGE 'Email already exists',
   Phone: String(50),
   IsActive: Boolean DEFAULT TRUE
 )
 INDEX (Name)
 INDEX (Email);
-/
 
 /** Sales order */
 @Position(300, 100)
@@ -65,13 +65,12 @@ CREATE PERSISTENT ENTITY Sales.Order (
 )
 INDEX (OrderNumber)
 INDEX (OrderDate DESC);
-/
 
 -- Associations
 CREATE ASSOCIATION Sales.Order_Customer
-  FROM CRM.Customer TO Sales.Order
+  FROM Sales.Order TO CRM.Customer
   TYPE Reference OWNER Default;
-/
+
 ```
 
 ## Example: Microflow
@@ -100,18 +99,17 @@ CREATE PAGE CRM.Customer_Overview (
   Title: 'Customers',
   Layout: Atlas_Core.Atlas_Default
 ) {
-  DATAGRID2 ON CRM.Customer (
-    COLUMN Name { Caption: 'Name' }
-    COLUMN Email { Caption: 'Email' }
-    COLUMN Phone { Caption: 'Phone' }
-    COLUMN IsActive { Caption: 'Active' }
-    SEARCH ON Name, Email
-    BUTTON 'New' CALL CRM.Customer_NewEdit
-    BUTTON 'Edit' CALL CRM.Customer_NewEdit
-    BUTTON 'Delete' CALL CONFIRM DELETE
-  )
+  DATAGRID dgCustomers (DataSource: DATABASE CRM.Customer, Selection: Single) {
+    COLUMN (Attribute: Name, Caption: 'Name') { TEXTFILTER fName }
+    COLUMN (Attribute: Email, Caption: 'Email') { TEXTFILTER fEmail }
+    COLUMN (Attribute: Phone, Caption: 'Phone')
+    COLUMN (Attribute: IsActive, Caption: 'Active')
+    CONTROLBAR {
+      ACTIONBUTTON btnNew (Caption: 'New', Action: SHOW PAGE CRM.Customer_NewEdit, ButtonStyle: Primary)
+    }
+  }
 };
-/
+
 ```
 
 ## Validation Between Steps
@@ -119,8 +117,8 @@ CREATE PAGE CRM.Customer_Overview (
 Validate after each script to catch errors early:
 
 ```bash
-# Syntax check (fast, no project needed)
-mxcli check domain-model.mdl
+# Syntax check (fast, no project used)
+mxcli check domain-model.mdl --no-project
 
 # Reference validation (checks entity/microflow names exist)
 mxcli check pages.mdl -p app.mpr --references

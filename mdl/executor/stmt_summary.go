@@ -35,6 +35,8 @@ func stmtSummary(stmt ast.Statement) string {
 		return fmt.Sprintf("create module %s", s.Name)
 	case *ast.DropModuleStmt:
 		return fmt.Sprintf("drop module %s", s.Name)
+	case *ast.AlterModuleSetStmt:
+		return fmt.Sprintf("alter module %s set", s.ModuleName)
 	case *ast.AlterModuleJarDepStmt:
 		return fmt.Sprintf("alter module %s jar dep (%d actions)", s.ModuleName, len(s.Actions))
 
@@ -73,6 +75,10 @@ func stmtSummary(stmt ast.Statement) string {
 		return fmt.Sprintf("drop page %s", s.Name)
 	case *ast.CreateSnippetStmtV3:
 		return fmt.Sprintf("create snippet %s", s.Name)
+	case *ast.CreateLayoutStmt:
+		return fmt.Sprintf("create layout %s", s.Name)
+	case *ast.DropLayoutStmt:
+		return fmt.Sprintf("drop layout %s", s.Name)
 	case *ast.DropSnippetStmt:
 		return fmt.Sprintf("drop snippet %s", s.Name)
 
@@ -81,6 +87,10 @@ func stmtSummary(stmt ast.Statement) string {
 		return fmt.Sprintf("create java action %s", s.Name)
 	case *ast.DropJavaActionStmt:
 		return fmt.Sprintf("drop java action %s", s.Name)
+	case *ast.CreateJavaScriptActionStmt:
+		return fmt.Sprintf("create javascript action %s", s.Name)
+	case *ast.DropJavaScriptActionStmt:
+		return fmt.Sprintf("drop javascript action %s", s.Name)
 
 	// Move
 	case *ast.MoveStmt:
@@ -107,16 +117,12 @@ func stmtSummary(stmt ast.Statement) string {
 		return fmt.Sprintf("grant view on page %s", s.Page)
 	case *ast.RevokePageAccessStmt:
 		return fmt.Sprintf("revoke view on page %s", s.Page)
-	case *ast.GrantWorkflowAccessStmt:
-		return fmt.Sprintf("grant execute on workflow %s", s.Workflow)
-	case *ast.RevokeWorkflowAccessStmt:
-		return fmt.Sprintf("revoke execute on workflow %s", s.Workflow)
 	case *ast.GrantEntityAccessStmt:
 		return fmt.Sprintf("grant on entity %s", s.Entity)
 	case *ast.RevokeEntityAccessStmt:
 		return fmt.Sprintf("revoke on entity %s", s.Entity)
 	case *ast.AlterProjectSecurityStmt:
-		return "alter project security"
+		return "alter app security"
 	case *ast.CreateDemoUserStmt:
 		return fmt.Sprintf("create demo user %s", s.UserName)
 	case *ast.DropDemoUserStmt:
@@ -124,9 +130,9 @@ func stmtSummary(stmt ast.Statement) string {
 	case *ast.CreateExternalEntityStmt:
 		return fmt.Sprintf("create external entity %s", s.Name)
 	case *ast.GrantODataServiceAccessStmt:
-		return fmt.Sprintf("grant access on odata service %s", s.Service)
+		return fmt.Sprintf("grant access on published odata service %s", s.Service)
 	case *ast.RevokeODataServiceAccessStmt:
-		return fmt.Sprintf("revoke access on odata service %s", s.Service)
+		return fmt.Sprintf("revoke access on published odata service %s", s.Service)
 	case *ast.GrantPublishedRestServiceAccessStmt:
 		return fmt.Sprintf("grant access on published rest service %s", s.Service)
 	case *ast.RevokePublishedRestServiceAccessStmt:
@@ -153,8 +159,12 @@ func stmtSummary(stmt ast.Statement) string {
 		return fmt.Sprintf("alter settings %s", s.Section)
 
 	// Navigation
-	case *ast.AlterNavigationStmt:
+	case *ast.CreateNavigationStmt:
 		return fmt.Sprintf("create navigation %s", s.ProfileName)
+	case *ast.AlterNavigationStmt:
+		return fmt.Sprintf("alter navigation %s", s.ProfileName)
+	case *ast.AlterMenuStmt:
+		return fmt.Sprintf("alter menu %s", s.Name.String())
 
 	// Query
 	case *ast.ShowStmt:
@@ -190,6 +200,9 @@ func stmtSummary(stmt ast.Statement) string {
 	case *ast.AlterStylingStmt:
 		return fmt.Sprintf("alter styling on %s %s widget %s", s.ContainerType, s.ContainerName, s.WidgetName)
 
+	case *ast.AlterFlowStmt:
+		return fmt.Sprintf("alter %s %s", s.Kind(), s.Name)
+
 	// ALTER PAGE / ALTER SNIPPET
 	case *ast.AlterPageStmt:
 		ct := s.ContainerType
@@ -200,7 +213,7 @@ func stmtSummary(stmt ast.Statement) string {
 
 	// Fragments
 	case *ast.DefineFragmentStmt:
-		return fmt.Sprintf("define fragment %s", s.Name)
+		return fmt.Sprintf("create fragment %s", s.Name)
 	case *ast.DescribeFragmentFromStmt:
 		return fmt.Sprintf("describe fragment from %s %s widget %s", s.ContainerType, s.ContainerName, s.WidgetName)
 

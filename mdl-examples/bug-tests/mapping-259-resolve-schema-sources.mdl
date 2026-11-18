@@ -1,0 +1,103 @@
+mdl 1;
+-- ============================================================================
+-- Bug ako/mxcli#259: a mapping's schema source was never resolved
+-- ============================================================================
+--
+-- Symptom (before fix):
+--   `create import mapping X with json structure Module.NoSuchThing` was
+--   accepted and written verbatim. mxbuild reports the dangling reference as
+--   CE1613 "… no longer exists" — but only at build time; `mxcli check` and even
+--   `check --references` passed.
+--
+-- Worse than it looks — the typo turned OFF member validation:
+--   The schema index is empty whenever the structure cannot be loaded FOR ANY
+--   REASON, and `resolvable()` reads an empty index as "there is nothing to
+--   validate against". So ONE typo in the source name switched off every member
+--   check in the mapping, and this went through with no complaint at all:
+--
+--     create import mapping M.IM with json structure M.NoSuchThing
+--     { create M.Loc { LocId = nonsense } };     -- both wrong, both accepted
+--
+--   That is why the fix refuses at the SOURCE rather than making `resolvable()`
+--   stricter: a NAMED but unresolvable source is an error, while NO source at
+--   all — an XML schema, a message definition, a schema-less test mapping —
+--   must keep working.
+--
+-- Also fixed: `null values` is an enum, not free text.
+--   ExportMappings$NullValueOption is {LeaveOutElement, SendAsNil}; mxcli wrote
+--   whatever identifier it was given, so `null values Banana` reached the stored
+--   document verbatim.
+--
+-- The XML half, since fixed:
+--   `with xml schema Module.NoSuchThing` was written through the same way. It
+--   now resolves against ListXmlSchemas on both engines. The silent-disabling
+--   half never applied there — mxcli cannot read an XSD's element tree, so an
+--   XML mapping had no member validation to lose — leaving the plain dangling
+--   reference, CE1613.
+--
+--   There is no fixture for it HERE and cannot be: MDL cannot create an XML
+--   schema, so a bug test has nothing to reference. The rule is pinned by unit
+--   tests instead (mdl/executor/mapping_source_resolution_test.go and
+--   sdk/mpr/reader_xmlschema_test.go).
+--
+--   How the document shape was established. First by planting a synthetic
+--   XmlSchemas$XmlSchema unit and letting mxbuild 11.13.0 identify it: the
+--   mapping's reference went from CE1613 "The selected XML schema
+--   'XGap.Probe_Xsd' no longer exists" to CE0292 "Please import an XSD file." at
+--   XML schema 'XGap.Probe_Xsd' — mxbuild naming, by module and name, the
+--   document it had just found. Since verified against THREE REAL Studio Pro
+--   documents (OneHarness: XML_ECO, XMLRequest_Diagram, XMLRequest_DiagramId),
+--   which mxcli lists with the right module and names.
+--
+--   CORRECTION, recorded because the wrong number shipped: this file first said
+--   no demo app contained an XML schema. It is 3 documents in 1 of 9 apps. The
+--   grep that produced the zero searched the EXTRACTED FILE TREE for the type
+--   string — which can only work for MPR v2, where units are files under
+--   mprcontents/. OneHarness is MPR **v1**: its units live in the SQLite
+--   Unit.Contents blob, where the string is not greppable from the file. The
+--   grep silently answered a different question than the one asked and returned
+--   0 for a reason unrelated to the answer.
+--
+--   The conclusion is unchanged, and is why the XML check FAILS OPEN on an empty
+--   list: 8 of 9 apps have none, so an empty list is the ordinary case, not
+--   evidence of a typo.
+--
+-- Watch for:
+--   An EMPTY project and a backend that CANNOT LIST look identical from here.
+--   Refusing is right for the first and wrong for the second, so the refusal
+--   only fires when the listing succeeds; a listing error takes the name at face
+--   value. Two pre-existing mock tests named a structure their mock did not
+--   provide and started failing — the right fix was to give the mock the
+--   structure, not to weaken the check, since a mapping whose named source does
+--   not exist is an inconsistent model to be asserting against.
+--
+-- Validation:
+--   mxbuild 11.13 reports 0 errors on the good mappings below; the bad forms are
+--   refused by `exec` AND by `check -p`, each naming what would have worked.
+--   `check -p` catching them is new: the issue's own report was that both check
+--   tiers passed, and the JSON half shipped refusing only at exec.
+-- ============================================================================
+
+create module BugTest259;
+
+create persistent entity BugTest259.Loc ( LocId: String(100) );
+
+create json structure BugTest259.JSON_Loc
+  sample $${"locationId": "x"}$$;
+
+-- The control: a source that resolves, and a member that exists.
+create or modify import mapping BugTest259.IMM_Loc
+  folder 'Mappings'
+  with json structure BugTest259.JSON_Loc
+{
+  create BugTest259.Loc { LocId = locationId }
+};
+
+-- The enum, spelled correctly. `null values Banana` is now refused.
+create or modify export mapping BugTest259.EXM_Loc
+  folder 'Mappings'
+  with json structure BugTest259.JSON_Loc
+  null values SendAsNil
+{
+  BugTest259.Loc { locationId = LocId }
+};

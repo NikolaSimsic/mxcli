@@ -32,11 +32,101 @@ func convertErrorHandlingType(eh *ast.ErrorHandlingClause) microflows.ErrorHandl
 // ehType returns the error handling type for an activity in this flow context.
 // Nanoflows default to "Abort" because they have no transactions; microflows
 // default to "Rollback". An explicit ON ERROR clause always overrides the default.
+//
+// Most builders want THIS, not explicitErrorHandling below, and the two are not
+// interchangeable — picking the wrong one is a silent CE6035. Which is right
+// depends entirely on what the call site did before:
+//
+//   - A builder that already supplied a default here (every create/change/log/
+//     page/message/validation activity) must keep using ehType. Returning empty
+//     discards the flow flavour, and the writer's literal "Rollback" is CE6035 on
+//     every un-annotated activity in a NANOFLOW, whose default is Abort. That is
+//     mendixlabs/mxcli#1078's regression: green unit suite, 11 errors under
+//     `make test-integration`.
+//   - Retrieve and Delete use explicitErrorHandling because their writers emitted
+//     a hardcoded "Rollback" that those two actions accept in every flow flavour,
+//     so empty is a no-op there.
+//
+// Same helper pair, opposite correct answer. Ask what the old expression returned
+// in EVERY context before replacing it, not just the one under test.
 func (fb *flowBuilder) ehType(eh *ast.ErrorHandlingClause) microflows.ErrorHandlingType {
 	if fb.isNanoflow && eh == nil {
 		return microflows.ErrorHandlingTypeAbort
 	}
 	return convertErrorHandlingType(eh)
+}
+
+// explicitErrorHandling returns the handling type for an action ONLY when the
+// author wrote an ON ERROR clause, and the empty string otherwise.
+//
+// The distinction is the whole safety of carrying this property at all. The
+// writers have always emitted a literal for these actions, and the value the
+// builder would otherwise supply is not always one Mendix accepts: a NANOFLOW's
+// no-clause default is Abort (ehType), and Abort is CE6035 on Log, Create,
+// Change, Commit, MicroflowCall and Aggregate — measured on 11.14.0 by setting
+// each in a stored document and building. Returning empty for "no clause" leaves
+// every un-annotated activity exactly as it was.
+func explicitErrorHandling(fb *flowBuilder, eh *ast.ErrorHandlingClause) microflows.ErrorHandlingType {
+	if eh == nil {
+		return ""
+	}
+	return fb.ehType(eh)
+}
+
+func isCustomErrorHandling(eh *ast.ErrorHandlingClause) bool {
+	return eh != nil && (eh.Type == ast.ErrorHandlingCustom || eh.Type == ast.ErrorHandlingCustomWithoutRollback)
+}
+
+// rejoinMergePosition is where the merge a fall-through handler of source
+// rejoins at goes: the @merge written on the source, or the computed fallback.
+func (fb *flowBuilder) rejoinMergePosition(source model.ID, computed model.Point) model.Point {
+	if p := fb.rejoinMergeAt[source]; p != nil {
+		return model.Point{X: p.X, Y: p.Y}
+	}
+	return computed
+}
+
+// mergeOnEdge places a merge inserted into the normal edge from originID to
+// destinationID: midway between the right edge of the one and the left edge of
+// the other, on the line of the node it enters.
+//
+// The fallback — the layout cursor less half a spacing — is only right while
+// the cursor still points at the successor, and by the time a rejoin is wired
+// the successor has been placed and the cursor moved past it. The merge then
+// landed ON an end event (same centre, the end inside the 40px merge) and
+// RIGHT of an activity, so the edge into it ran backwards (mendixlabs/mxcli#884,
+// ako/mxcli#1273). The fallback still covers an edge that does not run left to
+// right, such as one that wraps onto the next row.
+//
+// When the node entered is itself a merge — a branch's exit into the merge that
+// closes its IF or CASE — the new merge stays on the branch's row instead: on the
+// closing merge's line it would sit beside it, with the branch's and the
+// handler's edges climbing past each other to reach it (ako/mxcli#1459).
+func (fb *flowBuilder) mergeOnEdge(originID, destinationID model.ID, fallback model.Point) model.Point {
+	origin, dest := fb.objectByID(originID), fb.objectByID(destinationID)
+	if origin == nil || dest == nil {
+		return fallback
+	}
+	right := origin.GetPosition().X + objectSize(origin).Width/2
+	left := dest.GetPosition().X - objectSize(dest).Width/2
+	if left <= right {
+		return fallback
+	}
+	y := dest.GetPosition().Y
+	if _, closes := dest.(*microflows.ExclusiveMerge); closes {
+		y = origin.GetPosition().Y
+	}
+	return model.Point{X: (right + left) / 2, Y: y}
+}
+
+// objectByID returns this builder's object with the given ID, or nil.
+func (fb *flowBuilder) objectByID(id model.ID) microflows.MicroflowObject {
+	for i := len(fb.objects) - 1; i >= 0; i-- {
+		if o := fb.objects[i]; o != nil && o.GetID() == id {
+			return o
+		}
+	}
+	return nil
 }
 
 func isEmptyCustomErrorHandler(eh *ast.ErrorHandlingClause) bool {
@@ -50,6 +140,14 @@ func (fb *flowBuilder) finishCustomErrorHandler(activityID model.ID, activityX i
 	if eh == nil {
 		return
 	}
+	// The statement's own annotations are still pending while it is built, so a
+	// @merge on it — the rejoin merge's position (#750) — is read here.
+	if ann := fb.pendingAnnotations; ann != nil && ann.Merge != nil && isCustomErrorHandling(eh) {
+		if fb.rejoinMergeAt == nil {
+			fb.rejoinMergeAt = map[model.ID]*ast.Position{}
+		}
+		fb.rejoinMergeAt[activityID] = ann.Merge
+	}
 	if len(eh.Body) > 0 {
 		// Retry-loop pattern: error body ends with an IF whose non-terminating
 		// branch should loop back to the source activity (Studio Pro authors
@@ -61,6 +159,9 @@ func (fb *flowBuilder) finishCustomErrorHandler(activityID model.ID, activityX i
 			return
 		}
 		mergeID := fb.addErrorHandlerFlow(activityID, activityX, eh.Body)
+		if mergeID.id != "" {
+			fb.rejoinAfterRow(eh, activityID, activityX)
+		}
 		fb.handleErrorHandlerMergeWithSkip(mergeID, activityID, outputVar)
 		return
 	}
@@ -237,6 +338,93 @@ func (fb *flowBuilder) rewritePendingErrorHandlers(rewrite func(pendingErrorHand
 	fb.setActivePendingErrorHandler(active)
 }
 
+// pendingHandlers is every custom error-handler rejoin a builder still owes:
+// the active one and the queued ones, taken out of the builder together.
+type pendingHandlers struct {
+	active pendingErrorHandlerState
+	queue  []pendingErrorHandlerState
+}
+
+func (h pendingHandlers) empty() bool {
+	return h.active.activeIsEmpty() && len(h.queue) == 0
+}
+
+func (fb *flowBuilder) hasPendingErrorHandlers() bool {
+	return !fb.activePendingErrorHandler().activeIsEmpty() || len(fb.pendingErrorHandlers) > 0
+}
+
+// takePendingErrorHandlers removes every pending rejoin from the builder and
+// returns them.
+func (fb *flowBuilder) takePendingErrorHandlers() pendingHandlers {
+	h := pendingHandlers{active: fb.activePendingErrorHandler(), queue: fb.pendingErrorHandlers}
+	fb.setActivePendingErrorHandler(pendingErrorHandlerState{})
+	fb.pendingErrorHandlers = nil
+	return h
+}
+
+// adoptPendingErrorHandlers adds h to the builder's pending rejoins. h's active
+// handler stays the active one when the builder has none of its own: the
+// skip-var lookahead at the enclosing level reads the active handler's
+// variable, and a handler handed up from a branch is the one it has to see.
+func (fb *flowBuilder) adoptPendingErrorHandlers(h pendingHandlers) {
+	if h.empty() {
+		return
+	}
+	fb.pendingErrorHandlers = append(fb.pendingErrorHandlers, h.queue...)
+	if fb.activePendingErrorHandler().activeIsEmpty() {
+		fb.setActivePendingErrorHandler(h.active)
+	} else if !h.active.activeIsEmpty() {
+		fb.pendingErrorHandlers = append(fb.pendingErrorHandlers, h.active)
+	}
+}
+
+// enterBranch sets the enclosing path's pending rejoins aside while a branch
+// body (an IF or CASE arm, a loop body) is built, and returns them for
+// leaveBranch.
+//
+// A handler that falls through continues with the statement after the activity
+// that failed, so its rejoin is settled on the flow LEAVING that activity. The
+// rejoins used to live in one builder-wide slot that only the top-level body
+// loop settled: the handler of an activity inside an IF leaked out of it, and
+// the enclosing builder settled it on the next flow IT drew — the one into the
+// IF's own split, so a failing call re-entered the decision for ever — or on
+// none, which ended the flow at a new end event (ako/mxcli#1459). Scoping the
+// slot to the branch keeps the two apart in both directions: a branch's flows
+// settle only the branch's handlers, and never the enclosing path's.
+func (fb *flowBuilder) enterBranch() pendingHandlers {
+	return fb.takePendingErrorHandlers()
+}
+
+// leaveBranch restores the enclosing path's pending rejoins and hands it
+// whatever the branch could not settle itself — typically the handler of the
+// branch's last activity when the branch continues without a merge, where the
+// next flow the enclosing path draws is the one leaving that activity.
+func (fb *flowBuilder) leaveBranch(outer pendingHandlers) {
+	inner := fb.takePendingErrorHandlers()
+	fb.adoptPendingErrorHandlers(outer)
+	fb.adoptPendingErrorHandlers(inner)
+}
+
+// settleBranchFlow settles the pending rejoins of the branch being built on the
+// flow it just drew from originID to destinationID. stmt is the statement the
+// flow enters (nil for a merge) and rest the branch's statements after it, for
+// the skip-var rule: a handler skips the statements that read the failed
+// activity's output, which the failure never produced.
+//
+// branchEnds is true for a branch that ends in RETURN (or another terminator).
+// There a handler is settled only on the flow leaving its own activity: once it
+// has to skip a statement that reads the output, it does not come back into the
+// branch but continues where the IF does — the shared continuation a30881bbb
+// introduced for a branch whose success tail reads the output.
+func (fb *flowBuilder) settleBranchFlow(originID, destinationID model.ID, stmt ast.MicroflowStatement, rest []ast.MicroflowStatement, branchEnds bool) {
+	fb.rewritePendingErrorHandlers(func(state pendingErrorHandlerState) pendingErrorHandlerState {
+		if branchEnds && state.skipVar != "" && state.source != originID {
+			return state
+		}
+		return fb.addPendingErrorHandlerFlowForState(state, originID, destinationID, stmt, statementsReferenceVar(rest, state.skipVar))
+	})
+}
+
 func (fb *flowBuilder) addPendingErrorHandlerFlowForStatement(originID, destinationID model.ID, stmt ast.MicroflowStatement, futureReferencesSkipVar ...bool) {
 	futureReferences := len(futureReferencesSkipVar) > 0 && futureReferencesSkipVar[0]
 	fb.rewritePendingErrorHandlers(func(state pendingErrorHandlerState) pendingErrorHandlerState {
@@ -337,7 +525,7 @@ func (fb *flowBuilder) addEmptyErrorHandlerRejoinFlowFrom(normalOriginID, errorO
 	merge := &microflows.ExclusiveMerge{
 		BaseMicroflowObject: microflows.BaseMicroflowObject{
 			BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
-			Position:    model.Point{X: fb.posX - HorizontalSpacing/2, Y: fb.baseY},
+			Position:    fb.rejoinMergePosition(errorOriginID, fb.mergeOnEdge(normalOriginID, destinationID, model.Point{X: fb.posX - HorizontalSpacing/2, Y: fb.baseY})),
 			Size:        model.Size{Width: MergeSize, Height: MergeSize},
 		},
 	}
@@ -387,10 +575,16 @@ func (fb *flowBuilder) addErrorHandlerRejoinFlowForState(state pendingErrorHandl
 	existing := fb.flows[existingIdx]
 	fb.flows = append(fb.flows[:existingIdx], fb.flows[existingIdx+1:]...)
 
+	computed := fb.mergeOnEdge(originID, destinationID, model.Point{X: fb.posX - HorizontalSpacing/2, Y: fb.baseY})
+	if x, ok := fb.rejoinPastRowX[state.source]; ok && originID == state.source {
+		// The row is too long to rejoin before the next statement: the merge
+		// goes past it, where rejoinAfterRow made the main line wait.
+		computed.X = x
+	}
 	merge := &microflows.ExclusiveMerge{
 		BaseMicroflowObject: microflows.BaseMicroflowObject{
 			BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
-			Position:    model.Point{X: fb.posX - HorizontalSpacing/2, Y: fb.baseY},
+			Position:    fb.rejoinMergePosition(state.source, computed),
 			Size:        model.Size{Width: MergeSize, Height: MergeSize},
 		},
 	}
@@ -573,6 +767,13 @@ func errorHandlerStatementVarRefs(stmt ast.MicroflowStatement) []string {
 			}
 		}
 		refs = append(refs, exprVarRefs(s.Timeout)...)
+	case *ast.SendEmailStmt:
+		for _, e := range s.Expressions() {
+			refs = append(refs, exprVarRefs(e)...)
+		}
+		if s.Attachment != "" {
+			refs = append(refs, s.Attachment)
+		}
 	case *ast.SendRestRequestStmt:
 		for _, param := range s.Parameters {
 			refs = append(refs, sourceAttributeVarRefs(param.Expression)...)
@@ -596,8 +797,14 @@ func errorHandlerStatementVarRefs(stmt ast.MicroflowStatement) []string {
 		refs = append(refs, s.Variable)
 	case *ast.DeleteObjectStmt:
 		refs = append(refs, s.Variable)
+	case *ast.ExternalObjectStmt:
+		refs = append(refs, s.Variable)
 	case *ast.DownloadFileStmt:
 		refs = append(refs, s.FileDocument)
+	case *ast.SynchronizeStmt:
+		// Specific mode names existing object/list variables; All and
+		// Unsynchronized name none.
+		refs = append(refs, s.Variables...)
 	case *ast.ValidationFeedbackStmt:
 		if s.AttributePath != nil {
 			refs = append(refs, s.AttributePath.Variable)
@@ -615,6 +822,8 @@ func errorHandlerStatementVarRefs(stmt ast.MicroflowStatement) []string {
 		refs = append(refs, s.List)
 	case *ast.RemoveFromListStmt:
 		refs = append(refs, s.Item, s.List)
+	case *ast.ClearListStmt:
+		refs = append(refs, s.List)
 	}
 	return refs
 }
@@ -665,38 +874,85 @@ func (fb *flowBuilder) addErrorHandlerFlow(sourceActivityID model.ID, sourceX in
 	}
 
 	// Position error handler below the main flow
-	errorY := fb.posY + VerticalSpacing
+	errorY := fb.posY + ErrorHandlerPitch
 	errorX := sourceX
 
 	// Build error handler activities
-	errBuilder := &flowBuilder{
-		posX:         errorX,
-		posY:         errorY,
-		baseY:        errorY,
-		spacing:      HorizontalSpacing,
-		returnType:   fb.returnType,
-		varTypes:     fb.varTypes,
-		declaredVars: fb.declaredVars,
-		measurer:     fb.measurer,
-		backend:      fb.backend,
-		hierarchy:    fb.hierarchy,
-		restServices: fb.restServices,
-		isNanoflow:   fb.isNanoflow,
-	}
+	// A handler's activities are merged into the PARENT's object collection
+	// below, so a note declared outside the handler and referenced inside it
+	// (or the reverse) lands in one collection — sharing the note registry
+	// (nestedBuilder) is sound here in a way it is not across a loop boundary
+	// (#1077).
+	errBuilder := fb.nestedBuilder(errorX, errorY)
+	// The handler keeps the flow's return type, which its pending-handler
+	// routing and the undeclared-`set` advice read; a loop body never had it.
+	errBuilder.returnType = fb.returnType
+	// Same collection, so the same label table: `join recovered` inside a
+	// handler must find the `merge recovered` declared on the main path.
+	// This is the one rejoin MDL could not spell before, and the reason the
+	// registry is a shared pointer rather than per-builder state.
+	errBuilder.labelReg = fb.labels()
 
 	var lastErrID model.ID
 	var lastErrCase string
 	var lastErrAnchor *ast.FlowAnchors
+	// prevOwnAnchor is the @anchor of the handler statement before this one,
+	// whose `from:` is the side the edge between them leaves. The loop below
+	// built its edges with the default sides and never applied either end, so
+	// an @anchor inside a handler parsed, passed check and exec, and did
+	// nothing (mendixlabs/mxcli#991).
+	var prevOwnAnchor *ast.FlowAnchors
 	for _, stmt := range errorBody {
+		thisAnchor := stmtOwnAnchor(stmt)
 		actID := errBuilder.addStatement(stmt)
+		if errBuilder.pendingJoin != nil {
+			// A handler whose FIRST statement is a join has no activity of its
+			// own: the ERROR edge itself has to land on the merge, so it is
+			// created here rather than recorded as an ordinary join edge.
+			if lastErrID == "" {
+				label := errBuilder.pendingJoin.Label
+				errBuilder.pendingJoin = nil
+				m := errBuilder.mergeForLabel(label)
+				fb.flows = append(fb.flows, newErrorHandlerFlow(sourceActivityID, m.ID))
+				// Wired here rather than by resolveJoins, so it still counts as
+				// handled — otherwise the unwired-body-loop guard would report a
+				// join that was in fact wired.
+				errBuilder.labels().handled++
+				continue
+			}
+			errBuilder.takePendingJoin(lastErrID, lastErrCase, lastErrAnchor)
+			continue
+		}
 		if actID != "" {
 			errBuilder.applyPendingAnnotations(actID)
 			if lastErrID == "" {
-				// Connect source activity to first error handler activity
-				fb.flows = append(fb.flows, newErrorHandlerFlow(sourceActivityID, actID))
+				// Connect source activity to first error handler activity. The
+				// statement's `to:` is the side its incoming edge — this one —
+				// enters; the side the edge leaves the source has no spelling.
+				flow := newErrorHandlerFlow(sourceActivityID, actID)
+				applyUserAnchors(flow, nil, thisAnchor)
+				fb.flows = append(fb.flows, flow)
 			} else {
-				errBuilder.flows = append(errBuilder.flows, newHorizontalFlow(lastErrID, actID))
+				// A compound statement that left its exit pending — an `if`
+				// without `else` whose THEN returns has no merge — hands the
+				// next edge its case and @anchor, as every other body loop
+				// takes them. Drawn plain, the decision's FALSE edge was stored
+				// as NoCase: CE0079 at the decision, CE0773 at the flow
+				// (ako/mxcli#1455).
+				var flow *microflows.SequenceFlow
+				if lastErrCase != "" {
+					flow = newHorizontalFlowWithCase(lastErrID, actID, lastErrCase)
+				} else {
+					flow = newHorizontalFlow(lastErrID, actID)
+				}
+				originAnchor, destAnchor := prevOwnAnchor, thisAnchor
+				if prevOwnAnchor == nil && lastErrAnchor != nil {
+					originAnchor, destAnchor = pendingFlowAnchors(nil, lastErrAnchor, thisAnchor)
+				}
+				applyUserAnchors(flow, originAnchor, destAnchor)
+				errBuilder.flows = append(errBuilder.flows, flow)
 			}
+			prevOwnAnchor = thisAnchor
 			if errBuilder.nextConnectionPoint != "" {
 				lastErrID = errBuilder.nextConnectionPoint
 				lastErrCase = errBuilder.nextFlowCase
@@ -704,17 +960,60 @@ func (fb *flowBuilder) addErrorHandlerFlow(sourceActivityID model.ID, sourceX in
 				errBuilder.nextConnectionPoint = ""
 				errBuilder.nextFlowCase = ""
 				errBuilder.nextFlowAnchor = nil
+				// A compound statement steers its own exits.
+				prevOwnAnchor = nil
 			} else {
 				lastErrID = actID
 				lastErrCase = ""
-				lastErrAnchor = nil
+				// The edge that rejoins the main flow leaves this statement, so
+				// it takes the statement's `from:` — and only that: its `to:`
+				// belongs to the edge coming in.
+				lastErrAnchor = originOnly(thisAnchor)
 			}
 		}
 	}
 
-	// Append error handler objects and flows to the main builder
+	// Append error handler objects and flows to the main builder.
+	//
+	// annotationFlows and errors are part of that: without them a note written
+	// inside `on error begin … end error` arrived as an Annotation with no edge — a
+	// free-floating sticky note instead of one attached to the activity — and a
+	// refusal raised in the handler body never reached the caller (#1077).
 	fb.objects = append(fb.objects, errBuilder.objects...)
 	fb.flows = append(fb.flows, errBuilder.flows...)
+	fb.annotationFlows = append(fb.annotationFlows, errBuilder.annotationFlows...)
+	fb.errors = append(fb.errors, errBuilder.errors...)
+	// The handler's objects land in this collection, so its stated notes are
+	// this builder's to pin too.
+	for id := range errBuilder.statedNotes {
+		if fb.statedNotes == nil {
+			fb.statedNotes = map[model.ID]bool{}
+		}
+		fb.statedNotes[id] = true
+	}
+	// A @curve inside the handler is recorded on errBuilder, and applied by the
+	// builder that owns the flows once its graph is complete — this one, since
+	// the handler's flows (and the edge that rejoins the main flow) land here.
+	// Left on errBuilder it was never applied (mendixlabs/mxcli#991).
+	fb.adoptCurves(errBuilder)
+	if fb.annotationsByLabel == nil {
+		fb.annotationsByLabel = errBuilder.annotationsByLabel
+	}
+	// A `return` in the handler drew its end event into this collection too,
+	// so it is one of this builder's returns: the splice keeps it as a new end
+	// event of the flow rather than refusing it as an end the builder added
+	// (ako/mxcli#905). lastReturnEndID is left alone — it is the fallback
+	// target of the main path's own handlers.
+	for id := range errBuilder.returnEndIDs {
+		if fb.returnEndIDs == nil {
+			fb.returnEndIDs = map[model.ID]bool{}
+		}
+		fb.returnEndIDs[id] = true
+	}
+
+	// The row now occupies the lane under this activity's line, so the next
+	// statement that reaches into that lane waits for it (ako/mxcli#1768).
+	fb.reserveHandlerRow(sourceX, errorBody)
 
 	// If the error handler ends with RAISE ERROR or RETURN, it terminates there.
 	// Otherwise, return the last activity ID so caller can create a merge.
@@ -860,6 +1159,15 @@ func applyUserAnchors(flow *microflows.SequenceFlow, origin *ast.FlowAnchors, de
 	}
 }
 
+// originOnly is an anchor's `from:` alone, for an edge whose destination the
+// statement does not own.
+func originOnly(a *ast.FlowAnchors) *ast.FlowAnchors {
+	if a == nil || a.From == ast.AnchorSideUnset {
+		return nil
+	}
+	return &ast.FlowAnchors{From: a.From, To: ast.AnchorSideUnset}
+}
+
 func branchDestinationAnchor(branchAnchor, stmtAnchor *ast.FlowAnchors) *ast.FlowAnchors {
 	// The split branch annotation owns the incoming edge to the first branch
 	// activity. If it specifies `to`, it must win over the first statement's
@@ -907,6 +1215,10 @@ func isTerminalStmt(stmt ast.MicroflowStatement) bool {
 	case *ast.BreakStmt:
 		return true
 	case *ast.ContinueStmt:
+		return true
+	case *ast.JoinStmt:
+		// A join ends the path at a named merge, so a branch ending in one owes
+		// no flow to the enclosing IF's merge — exactly like a RETURN.
 		return true
 	case *ast.IfStmt:
 		if len(s.ElseBody) == 0 {
@@ -972,4 +1284,102 @@ func containsTerminalStmt(stmts []ast.MicroflowStatement) bool {
 		}
 	}
 	return false
+}
+
+// mergeOverConnectedEndEvents gives every end event that more than one path
+// reaches an exclusive merge to join them at.
+//
+// An end event accepts exactly ONE incoming sequence flow — joining two paths
+// is what a merge is for — so a second flow into one is CE0709 "Sequence flow
+// is not accepted by origin or destination". Only mxbuild catches it: the
+// document is otherwise well formed, so `mxcli check` passes and the project
+// still opens, which is how this survived a describe → exec round trip of a
+// whole project with everything else green.
+//
+// The shape that produced it is an empty `on error … begin end error` handler inside a
+// branch whose sibling also returns:
+//
+//	if … then
+//	  $r = call microflow M.Sub() on error without rollback begin end error;
+//	  return $r;          -- the normal path reaches the end event
+//	else
+//	  return 'no';        -- and so does this one
+//	end if;
+//
+// It runs as a post-pass rather than at the site that wires the error flow,
+// because the two colliding flows are created by unrelated builders in either
+// order: the error flow lands first and the branch's flow arrives afterwards,
+// so neither site can see the collision. Same reasoning as applyFlowCurves.
+//
+// Merging is what Studio Pro writes here, and it is also what keeps the
+// microflow's single return value — a second end event would need one of its
+// own, and MDL never said what it should be.
+//
+// Scoped to end events on purpose. Other node types also accept one inbound
+// flow, so the same collision is possible in principle, but an end event is the
+// only one measured to occur (1 microflow in 41 across the audit corpus) and
+// widening the rewrite to nodes with real inbound semantics — a loop, a merge's
+// own feeders — without a case to test it on would be a guess.
+func (fb *flowBuilder) mergeOverConnectedEndEvents() {
+	endEvents := make(map[model.ID]bool)
+	for _, obj := range fb.objects {
+		if ev, ok := obj.(*microflows.EndEvent); ok {
+			endEvents[ev.ID] = true
+		}
+	}
+	if len(endEvents) == 0 {
+		return
+	}
+
+	// First-seen order, so the merges are created deterministically rather than
+	// in map order — a shuffled object list is a spurious diff on every write.
+	var order []model.ID
+	inbound := make(map[model.ID][]int)
+	for i, flow := range fb.flows {
+		if flow == nil || !endEvents[flow.DestinationID] {
+			continue
+		}
+		if _, seen := inbound[flow.DestinationID]; !seen {
+			order = append(order, flow.DestinationID)
+		}
+		inbound[flow.DestinationID] = append(inbound[flow.DestinationID], i)
+	}
+
+	for _, endID := range order {
+		idxs := inbound[endID]
+		if len(idxs) < 2 {
+			continue
+		}
+		// On the edge of the path that arrives along the end event's own line, so
+		// the merge does not land on the end event (see mergeOnEdge).
+		pos := model.Point{X: fb.posX - HorizontalSpacing/2, Y: fb.baseY}
+		if end := fb.objectByID(endID); end != nil {
+			for _, i := range idxs {
+				if o := fb.objectByID(fb.flows[i].OriginID); o != nil && o.GetPosition().Y == end.GetPosition().Y {
+					pos = fb.mergeOnEdge(o.GetID(), endID, pos)
+					break
+				}
+			}
+		}
+		merge := &microflows.ExclusiveMerge{
+			BaseMicroflowObject: microflows.BaseMicroflowObject{
+				BaseElement: model.BaseElement{ID: model.ID(types.GenerateID())},
+				Position:    pos,
+				Size:        model.Size{Width: MergeSize, Height: MergeSize},
+			},
+		}
+		fb.objects = append(fb.objects, merge)
+
+		// The merge inherits how the first path entered the end event; the
+		// re-pointed flows lose it, because a connection index describes an
+		// edge's landing on a node and these now land on the merge.
+		destIndex := fb.flows[idxs[0]].DestinationConnectionIndex
+		for _, i := range idxs {
+			fb.flows[i].DestinationID = merge.ID
+			fb.flows[i].DestinationConnectionIndex = 0
+		}
+		mergeFlow := newHorizontalFlow(merge.ID, endID)
+		mergeFlow.DestinationConnectionIndex = destIndex
+		fb.flows = append(fb.flows, mergeFlow)
+	}
 }

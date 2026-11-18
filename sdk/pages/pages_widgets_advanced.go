@@ -3,9 +3,10 @@
 package pages
 
 import (
+	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // Navigation Widgets
@@ -13,6 +14,12 @@ import (
 // NavigationTree represents a navigation tree widget.
 type NavigationTree struct {
 	BaseWidget
+	// NavigationProfile names the profile the menu is drawn from. It is stored
+	// inside a Forms$NavigationSource under MenuSource, not on the tree itself.
+	NavigationProfile string `json:"navigationProfile,omitempty"`
+	// Menu names a Menus$MenuDocument instead, stored in a
+	// Forms$MenuDocumentSource. At most one of Menu and NavigationProfile is set.
+	Menu  string            `json:"menu,omitempty"`
 	Items []*NavigationItem `json:"items,omitempty"`
 }
 
@@ -25,9 +32,22 @@ type NavigationItem struct {
 	SubItems []*NavigationItem `json:"subItems,omitempty"`
 }
 
-// MenuBar represents a menu bar widget.
+// MenuBar represents a menu bar widget — the horizontal navigation a topbar
+// layout carries, where a NavigationTree is the vertical one a sidebar carries.
+//
+// Its stored shape is NavigationTree's: Appearance, MenuSource, Name, TabIndex
+// and nothing else (measured on Atlas_Core.Atlas_TopBar, and exactly what
+// generated/metamodel's PagesMenuBar declares). NavigationProfile is therefore
+// carried the same way — as the profile's name, which the codec wraps in a
+// Forms$NavigationSource.
 type MenuBar struct {
 	BaseWidget
+	NavigationProfile string `json:"navigationProfile,omitempty"`
+	// Menu names a menu document instead of a profile — see NavigationTree.
+	Menu string `json:"menu,omitempty"`
+
+	// MenuSource is the older polymorphic form, kept because the type is
+	// exported. Nothing reads or writes it.
 	MenuSource MenuSource `json:"menuSource,omitempty"`
 }
 
@@ -51,11 +71,52 @@ type CustomMenuSource struct {
 
 func (CustomMenuSource) isMenuSource() {}
 
-// SimpleMenuBar represents a simple menu bar.
+// SimpleMenuBar represents a simple menu bar — the widget Atlas's phone
+// layouts put in their bottom region (ako/mxcli#573).
+//
+// Measured on Atlas_Core.Phone_BottomBar (11.14.0): Appearance, MenuSource,
+// Name, Orientation, TabIndex, with MenuSource a Forms$MenuDocumentSource
+// naming Atlas_Core.Phone_Menu. Like every menu widget it can take a
+// navigation profile instead; at most one of Menu and NavigationProfile is set.
 type SimpleMenuBar struct {
 	BaseWidget
-	Orientation MenuOrientation `json:"orientation"`
-	MenuSource  MenuSource      `json:"menuSource,omitempty"`
+	Orientation       MenuOrientation `json:"orientation"`
+	Menu              string          `json:"menu,omitempty"`
+	NavigationProfile string          `json:"navigationProfile,omitempty"`
+
+	// MenuSource is the older polymorphic form, kept because the type is
+	// exported. Nothing reads or writes it.
+	MenuSource MenuSource `json:"menuSource,omitempty"`
+}
+
+// SidebarToggleButton is the button that opens and closes a responsive
+// layout's sidebar — Atlas's slide-in navigation on phones and tablets
+// (mendixlabs/mxcli#1220).
+//
+// Measured on Atlas_Core.Atlas_Default (11.13.0): Appearance, ButtonStyle,
+// CaptionTemplate, ConditionalVisibilitySettings, Icon, Name, RenderType,
+// TabIndex, Tooltip — an action button's keys without the action, which is
+// fixed: the button toggles the sidebar.
+type SidebarToggleButton struct {
+	BaseWidget
+	CaptionTemplate *ClientTemplate  `json:"captionTemplate,omitempty"`
+	Tooltip         *model.Text      `json:"tooltip,omitempty"`
+	Icon            *Icon            `json:"icon,omitempty"`
+	ButtonStyle     ButtonStyle      `json:"buttonStyle,omitempty"`
+	RenderMode      ButtonRenderMode `json:"renderMode,omitempty"`
+}
+
+// LayoutHeader is a phone or tablet layout's header bar (Forms$Header): two
+// widget lists, left and right. Atlas's Phone_ and Tablet_ layouts keep their
+// HeaderLeft / HeaderRight placeholders in it, and Phone_Sidebar /
+// Tablet_Sidebar their sidebar toggle.
+//
+// Measured on Atlas_Core (11.13.0): Appearance, LeftWidgets, Name,
+// RightWidgets, TabIndex, both lists marker 2.
+type LayoutHeader struct {
+	BaseWidget
+	LeftWidgets  []Widget `json:"leftWidgets,omitempty"`
+	RightWidgets []Widget `json:"rightWidgets,omitempty"`
 }
 
 // MenuOrientation represents menu orientation.
@@ -119,6 +180,17 @@ const (
 type SnippetParamMapping struct {
 	ParamName string // Snippet parameter name without leading $ (e.g. "Asset")
 	Argument  string // Variable being passed, includes leading $ (e.g. "$asset")
+	// IsSnippetParameter puts Argument in the SnippetParameter slot of the
+	// mapping's Forms$PageVariable instead of PageParameter: the call sits in a
+	// snippet and passes that snippet's own parameter (ako/mxcli#721 L3).
+	IsSnippetParameter bool
+	// IsLocalVariable puts Argument in the LocalVariable slot: the call passes a
+	// page `Variables:` entry, not a parameter (ako/mxcli#826).
+	IsLocalVariable bool
+	// IsWidget puts Argument in the Widget slot: the call passes a data
+	// view's object by naming the data view (ako/mxcli#1968). Written in
+	// PageParameter, it named a page parameter that does not exist — CE0115.
+	IsWidget bool
 }
 
 // SnippetCallWidget represents a snippet call widget.
@@ -169,18 +241,24 @@ type CustomWidget struct {
 	ObjectTypeID string `json:"-"`
 }
 
-// PropertyTypeIDEntry holds the IDs for a property type from a cloned widget.
-type PropertyTypeIDEntry struct {
-	PropertyTypeID string
-	ValueTypeID    string
-	DefaultValue   string // Default value from the template's ValueType
-	ValueType      string // Type of value (Boolean, Integer, String, DataSource, etc.)
-	Required       bool   // Whether this property is required
-	// For object list properties (IsList=true with ObjectType), these hold nested IDs
-	ObjectTypeID      string                         // ID of the nested ObjectType (for object lists like columns)
-	NestedPropertyIDs map[string]PropertyTypeIDEntry // Property IDs within the nested ObjectType
-	NestedKeyOrder    []string                       // Keys of NestedPropertyIDs in template PropertyTypes order; empty when no nested ObjectType
-}
+// PropertyTypeIDEntry and PropertyTranslation are re-exports of the canonical
+// types in mdl/types, NOT separate definitions.
+//
+// They used to be a second declaration of the same shape, with
+// convertPropTypeIDs (mdl/backend/modelsdk) copying field by field between the
+// two. That copy is where a template's DataSourceProperty — the widget's own
+// statement of which datasource a dependent property binds against — was
+// silently dropped: the loader reads it, the engine never saw it, and nothing
+// failed. A hand-maintained copy between two spellings of one type can only
+// lose fields, never gain them, so the two spellings are now one type.
+//
+// mdl/types has no internal dependencies, so aliasing it here adds no import
+// cycle. Same pattern as sdk/mpr's re-exports (CLAUDE.md: shared types live in
+// mdl/types; other packages re-export as aliases, never as duplicates).
+type (
+	PropertyTranslation = types.PropertyTranslation
+	PropertyTypeIDEntry = types.PropertyTypeIDEntry
+)
 
 // CustomWidgetType defines the pluggable widget type (CustomWidgets$CustomWidgetType).
 type CustomWidgetType struct {

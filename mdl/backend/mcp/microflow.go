@@ -4,6 +4,8 @@ package mcp
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
@@ -19,6 +21,11 @@ const microflowDocType = "Microflows$Microflow"
 // new activity is one case in mapMicroflowAction. Object and action types that
 // are not mapped yet are rejected with a clear error (the 130+ Microflows$*
 // types are an iterative follow-on). See docs/03-development/PED_MCP_CAPABILITIES.md.
+//
+// Against a skeleton constructor (Studio Pro 11.14) the create carries only the
+// canvas — positions, captions, flows, parameters, return type — and each
+// object's behaviour (action, return value, split condition, loop source) is set
+// by one ped_update_document right after; see adaptMicroflowSkeleton.
 func (b *Backend) CreateMicroflow(mf *microflows.Microflow) error {
 	moduleName, folderPath, err := b.resolveDocContainer(mf.ContainerID)
 	if err != nil {
@@ -29,6 +36,14 @@ func (b *Backend) CreateMicroflow(mf *microflows.Microflow) error {
 		return err
 	}
 	content["returnVariableName"] = mf.ReturnVariableName
+	var ops []pedOpEntry
+	if b.microflowConstructorTakesSkeleton() {
+		ops = adaptMicroflowSkeleton(content)
+	} else if containsNote(content) {
+		// The full constructor's flows carry no $Type, so a note's line could
+		// only be read as a SequenceFlow — an execution edge out of the note.
+		return fmt.Errorf("microflow %q has a note, which Studio Pro's MCP API takes only from the microflow constructor 11.14 introduced; this Studio Pro has the older one — remove the note or run without --mcp", mf.Name)
+	}
 	if err := b.ensureSchema(microflowDocType); err != nil {
 		return err
 	}
@@ -39,7 +54,194 @@ func (b *Backend) CreateMicroflow(mf *microflows.Microflow) error {
 		mf.ID = model.ID("mcp~mf~" + moduleName + "~" + mf.Name)
 	}
 	b.sessionMicroflows = append(b.sessionMicroflows, mf)
-	return b.pedCheckDocument(microflowDocType, moduleName+"."+mf.Name)
+	qn := moduleName + "." + mf.Name
+	if len(ops) > 0 {
+		if err := b.pedUpdateDoc(microflowDocType, qn, ops...); err != nil {
+			return fmt.Errorf("microflow %s was created, but setting its activities failed (the document is left in Studio Pro): %w", qn, err)
+		}
+	}
+	return b.pedCheckDocument(microflowDocType, qn)
+}
+
+// microflowConstructorTakesSkeleton reports whether the connected server's
+// Microflows$Microflow constructor is the skeleton shape. Studio Pro 11.14's is,
+// and rejects the older shape outright — measured live: `"/flows/0/$Type":"Expected
+// an element with $Type property."` and `"/returnType":"Expected one of [Void, …],
+// got {"type":"Void"}"`, so every microflow create over MCP failed.
+//
+// The same constructor also stopped taking anything but the canvas: its object
+// constructors declare only x/y (and a caption or loopType), and a create that
+// still sends relativeMiddlePoint, action or returnValue is ACCEPTED with those
+// silently dropped — measured: positions read back 0,0, `"action":null` ("No action
+// defined"), empty return value. So the flag selects the whole two-phase write, not
+// just the two rejected keys. Which release changed it is not established, and
+// serverInfo.version is frozen at 1.0.0, so the shape is read off the live
+// constructor schema (returnTypeEntity appears with it); the probe doubles as the
+// schema fetch PED asks for before a create.
+func (b *Backend) microflowConstructorTakesSkeleton() bool {
+	if b.microflowCtorSkeleton != nil {
+		return *b.microflowCtorSkeleton
+	}
+	takes := false
+	if b.client != nil {
+		res, err := b.client.CallTool("ped_get_schema", map[string]any{"elementTypes": []string{microflowDocType}})
+		if err == nil && res != nil && !res.IsError {
+			takes = strings.Contains(res.Text, "returnTypeEntity?: Reference<'DomainModels$Entity'")
+			if b.schemaFetched == nil {
+				b.schemaFetched = map[string]bool{}
+			}
+			b.schemaFetched[microflowDocType] = true
+		}
+	}
+	b.microflowCtorSkeleton = &takes
+	return takes
+}
+
+// adaptMicroflowSkeleton rewrites content built by buildFlowDocContent into the
+// skeleton constructor's shape, in place, and returns the ped_update_document
+// operations that set what the constructor no longer takes:
+//
+//   - leading parameter objects move to `parameters` (they still occupy the first
+//     stored object slots), so flow references $id(/objects/N) shift down by the
+//     parameter count while stored paths keep N;
+//   - relativeMiddlePoint becomes x/y;
+//   - action, returnValue, the split condition and the loop source become `set`
+//     operations on the stored document (/objectCollection/objects/N/…, nesting
+//     through a loop's objectCollection);
+//   - each sequence flow gets its $Type (a note's line already has one), the
+//     return type flattens to an enum plus
+//     returnTypeEntity/returnTypeEnumeration, and returnVariableName becomes an
+//     operation.
+func adaptMicroflowSkeleton(content map[string]any) []pedOpEntry {
+	var ops []pedOpEntry
+	set := func(path string, v any) {
+		ops = append(ops, pedOpEntry{Path: path, Operation: pedOperation{Type: "set", Value: v}})
+	}
+
+	objects, _ := content["objects"].([]any)
+	params := make([]any, 0)
+	for len(objects) > 0 {
+		po, _ := objects[0].(map[string]any)
+		if po["$Type"] != "Microflows$MicroflowParameterObject" {
+			break
+		}
+		skeletonPosition(po)
+		params = append(params, po)
+		objects = objects[1:]
+	}
+	for i, o := range objects {
+		if m, ok := o.(map[string]any); ok {
+			skeletonObject(m, fmt.Sprintf("/objectCollection/objects/%d", len(params)+i), set)
+		}
+	}
+	content["objects"] = objects
+	if len(params) > 0 {
+		content["parameters"] = params
+	}
+
+	flows, _ := content["flows"].([]any)
+	for _, f := range flows {
+		fm, ok := f.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, typed := fm["$Type"]; !typed {
+			fm["$Type"] = "Microflows$SequenceFlow"
+		}
+		for _, k := range []string{"originId", "destinationId", "origin", "destination"} {
+			if ref, ok := fm[k].(string); ok {
+				fm[k] = shiftObjectRef(ref, len(params))
+			}
+		}
+	}
+
+	if rt, ok := content["returnType"].(map[string]any); ok {
+		content["returnType"] = rt["type"]
+		if e, ok := rt["entity"]; ok {
+			content["returnTypeEntity"] = e
+		}
+		if e, ok := rt["enumeration"]; ok {
+			content["returnTypeEnumeration"] = e
+		}
+	}
+	if rvn, ok := content["returnVariableName"]; ok {
+		delete(content, "returnVariableName")
+		if s, _ := rvn.(string); s != "" {
+			set("/returnVariableName", s)
+		}
+	}
+	return ops
+}
+
+// skeletonObject strips one mapped canvas object (and its loop body) down to the
+// skeleton constructor's properties, emitting a set operation at docPath for each
+// behavioural property it removes.
+func skeletonObject(m map[string]any, docPath string, set func(string, any)) {
+	skeletonPosition(m)
+	if a, ok := m["action"]; ok {
+		delete(m, "action")
+		set(docPath+"/action", a)
+	}
+	if rv, ok := m["returnValue"]; ok {
+		delete(m, "returnValue")
+		set(docPath+"/returnValue", rv)
+	}
+	if c, ok := m["expressionSplitCondition"]; ok {
+		delete(m, "expressionSplitCondition")
+		set(docPath+"/splitCondition", map[string]any{"$Type": "Microflows$ExpressionSplitCondition", "expression": c})
+	}
+	if src, ok := m["iterableListSource"].(map[string]any); ok {
+		delete(m, "iterableListSource")
+		m["loopType"] = "ForEach"
+		set(docPath+"/loopSource", map[string]any{
+			"$Type":            "Microflows$IterableList",
+			"listVariableName": src["listVariableName"],
+			"variableName":     src["iteratorVariableName"],
+		})
+	}
+	if src, ok := m["whileLoopSource"].(map[string]any); ok {
+		delete(m, "whileLoopSource")
+		m["loopType"] = "While"
+		set(docPath+"/loopSource", map[string]any{
+			"$Type":           "Microflows$WhileLoopCondition",
+			"whileExpression": src["condition"],
+			"caption":         "",
+		})
+	}
+	if body, ok := m["objects"].([]any); ok {
+		for j, bo := range body {
+			if bm, ok := bo.(map[string]any); ok {
+				skeletonObject(bm, fmt.Sprintf("%s/objectCollection/objects/%d", docPath, j), set)
+			}
+		}
+	}
+}
+
+// skeletonPosition replaces relativeMiddlePoint with the constructor's x/y.
+func skeletonPosition(m map[string]any) {
+	if p, ok := m["relativeMiddlePoint"].(map[string]int); ok {
+		delete(m, "relativeMiddlePoint")
+		m["x"], m["y"] = p["x"], p["y"]
+	}
+}
+
+// shiftObjectRef lowers the top-level index of a $id(/objects/N…) reference by
+// shift — the parameter objects that moved out of `objects`.
+func shiftObjectRef(ref string, shift int) string {
+	const prefix = "$id(/objects/"
+	if shift == 0 || !strings.HasPrefix(ref, prefix) {
+		return ref
+	}
+	rest := ref[len(prefix):]
+	end := strings.IndexFunc(rest, func(r rune) bool { return r < '0' || r > '9' })
+	if end <= 0 {
+		return ref
+	}
+	n, err := strconv.Atoi(rest[:end])
+	if err != nil || n < shift {
+		return ref
+	}
+	return prefix + strconv.Itoa(n-shift) + rest[end:]
 }
 
 // buildFlowDocContent maps a microflow body — parameters as the leading canvas
@@ -61,7 +263,7 @@ func (b *Backend) buildFlowDocContent(kind, name string, params []*microflows.Mi
 			"$Type":               "Microflows$MicroflowParameterObject",
 			"name":                p.Name,
 			"type":                typeName,
-			"relativeMiddlePoint": map[string]int{"x": 200 + i*100, "y": 53},
+			"relativeMiddlePoint": map[string]int{"x": microflows.DerivedParameterPosition(i, params).X, "y": microflows.DerivedParameterPosition(i, params).Y},
 		}
 		if entity != "" {
 			po["entity"] = entity
@@ -98,10 +300,17 @@ func (b *Backend) buildFlowDocContent(kind, name string, params []*microflows.Mi
 			if !ok1 || !ok2 {
 				return nil, fmt.Errorf("%s %q: a sequence flow references an object that is not supported yet", kind, name)
 			}
+			if f.IsErrorHandler {
+				// PED's SequenceFlow has no property marking an error-handler
+				// flow, so this edge would be written as an ordinary one — a
+				// second normal exit from the activity (mendixlabs/mxcli#698).
+				return nil, fmt.Errorf("%s %q: an error handler flow cannot be authored over MCP (Studio Pro's PED API has no error-handler flow) — run without --mcp", kind, name)
+			}
 			pf := map[string]any{
 				"originId":      fmt.Sprintf("$id(%s)", op),
 				"destinationId": fmt.Sprintf("$id(%s)", dp),
 			}
+			setPEDSides(pf, f)
 			cv, err := mapCaseValue(f.CaseValue)
 			if err != nil {
 				return nil, fmt.Errorf("%s %q: %w", kind, name, err)
@@ -110,6 +319,16 @@ func (b *Backend) buildFlowDocContent(kind, name string, params []*microflows.Mi
 				pf["caseValue"] = cv
 			}
 			flows = append(flows, pf)
+		}
+		// A note's line shares the flows list, after the sequence flows, as the
+		// stored document has it.
+		for _, af := range oc.AnnotationFlows {
+			op, ok1 := idPath[af.OriginID]
+			dp, ok2 := idPath[af.DestinationID]
+			if !ok1 || !ok2 {
+				return nil, fmt.Errorf("%s %q: a note is attached to an object that is not supported yet", kind, name)
+			}
+			flows = append(flows, pedAnnotationFlow(af, fmt.Sprintf("$id(%s)", op), fmt.Sprintf("$id(%s)", dp)))
 		}
 	}
 
@@ -153,8 +372,8 @@ func (b *Backend) ListMicroflows() ([]*microflows.Microflow, error) {
 	return out, nil
 }
 
-// DeleteMicroflow drops a microflow via Concord's delete_document (PED has no
-// delete tool). Requires --mcp-concord; errors clearly otherwise.
+// DeleteMicroflow drops a microflow via deleteDocument: ped_delete_document
+// (Studio Pro 11.16+).
 func (b *Backend) DeleteMicroflow(id model.ID) error {
 	mf, err := b.GetMicroflow(id)
 	if err != nil {
@@ -164,7 +383,7 @@ func (b *Backend) DeleteMicroflow(id model.ID) error {
 	if err != nil {
 		return fmt.Errorf("resolve module for microflow %q: %w", mf.Name, err)
 	}
-	return b.concordDeleteDocument(modName, mf.Name)
+	return b.deleteDocument(microflowDocType, modName, mf.Name)
 }
 
 // GetMicroflow resolves by ID, preferring session-created microflows.
@@ -184,6 +403,27 @@ func mfKey(m *microflows.Microflow) string {
 // Nanoflow reads/writes live in nanoflow.go (they reuse buildFlowDocContent).
 func (b *Backend) IsRule(qualifiedName string) (bool, error) { return b.reader.IsRule(qualifiedName) }
 
+// Rule reads delegate to the local reader, like nanoflow reads: MDL cannot yet
+// author a rule over MCP, so there is nothing session-local to merge.
+func (b *Backend) ListRules() ([]*microflows.Rule, error) { return b.reader.ListRules() }
+
+func (b *Backend) GetRule(id model.ID) (*microflows.Rule, error) { return b.reader.GetRule(id) }
+
+// Rule authoring is not available over MCP — Studio Pro's Model API has no rule
+// verb, so there is nothing to delegate to.
+func (b *Backend) CreateRule(*microflows.Rule) error {
+	return errUnsupported("CreateRule")
+}
+func (b *Backend) UpdateRule(*microflows.Rule) error {
+	return errUnsupported("UpdateRule")
+}
+func (b *Backend) DeleteRule(model.ID) error {
+	return errUnsupported("DeleteRule")
+}
+func (b *Backend) MoveRule(*microflows.Rule) error {
+	return errUnsupported("MoveRule")
+}
+
 // pedMiddlePoint converts an executor object position to a PED relativeMiddlePoint.
 // The executor's layout engine already computes these coordinates (the same
 // value the MPR writer serializes as RelativeMiddlePoint), so reusing them makes
@@ -192,6 +432,55 @@ func (b *Backend) IsRule(qualifiedName string) (bool, error) { return b.reader.I
 // nested objects.
 func pedMiddlePoint(pt model.Point) map[string]int {
 	return map[string]int{"x": pt.X, "y": pt.Y}
+}
+
+var pedSides = []string{"Top", "Right", "Bottom", "Left"}
+
+// setPEDSides names a sequence flow's connection sides on its PED constructor.
+// Left out, Studio Pro draws every flow right -> left (measured on
+// 11.15.0-rc.4), whatever the builder or @anchor chose.
+func setPEDSides(v map[string]any, f *microflows.SequenceFlow) {
+	if f.OriginConnectionIndex >= 0 && f.OriginConnectionIndex < 4 {
+		v["originConnectionSide"] = pedSides[f.OriginConnectionIndex]
+	}
+	if f.DestinationConnectionIndex >= 0 && f.DestinationConnectionIndex < 4 {
+		v["destinationConnectionSide"] = pedSides[f.DestinationConnectionIndex]
+	}
+}
+
+// pedAnnotationFlow maps a note's line onto PED's Microflows$AnnotationFlow.
+// Unlike a SequenceFlow it is an element, not a constructor: its ends are
+// origin/destination (not originId/destinationId) and its sides are the
+// required connection indexes themselves.
+func pedAnnotationFlow(af *microflows.AnnotationFlow, origin, destination string) map[string]any {
+	sides := af.SidesOrDefault()
+	return map[string]any{
+		"$Type":                      "Microflows$AnnotationFlow",
+		"origin":                     origin,
+		"destination":                destination,
+		"originConnectionIndex":      sides.Origin,
+		"destinationConnectionIndex": sides.Destination,
+	}
+}
+
+// containsNote reports whether mapped content has a note anywhere on its
+// canvas, loop bodies included.
+func containsNote(content map[string]any) bool {
+	var walk func(objs []any) bool
+	walk = func(objs []any) bool {
+		for _, o := range objs {
+			m, _ := o.(map[string]any)
+			if m["$Type"] == "Microflows$Annotation" {
+				return true
+			}
+			if body, ok := m["objects"].([]any); ok && walk(body) {
+				return true
+			}
+		}
+		return false
+	}
+	objects, _ := content["objects"].([]any)
+	return walk(objects)
 }
 
 // mapObjectTree maps one executor microflow object onto a PED /objects entry,
@@ -219,6 +508,9 @@ func (b *Backend) mapObjectTree(o microflows.MicroflowObject, path string, idPat
 	case *microflows.ActionActivity:
 		action, err := mapMicroflowAction(obj.Action)
 		if err != nil {
+			return nil, err
+		}
+		if err := carryErrorHandlingType(obj.Action, action); err != nil {
 			return nil, err
 		}
 		return map[string]any{
@@ -294,6 +586,16 @@ func (b *Backend) mapObjectTree(o microflows.MicroflowObject, path string, idPat
 			}
 		}
 		m["objects"] = body
+		return m, nil
+	case *microflows.Annotation:
+		m := map[string]any{
+			"$Type":               "Microflows$Annotation",
+			"relativeMiddlePoint": pos,
+			"caption":             obj.Caption,
+		}
+		if obj.Size.Width > 0 && obj.Size.Height > 0 {
+			m["size"] = map[string]int{"width": obj.Size.Width, "height": obj.Size.Height}
+		}
 		return m, nil
 	default:
 		return nil, fmt.Errorf("microflow object type %T is not yet supported by the MCP backend", o)
@@ -610,6 +912,31 @@ func mapMicroflowAction(a microflows.MicroflowAction) (map[string]any, error) {
 		if act.LogNodeName != "" {
 			m["node"] = act.LogNodeName
 		}
+		// The Model SDK's name for "Include latest stack trace"; false is the
+		// default, so it is sent only when ticked (mendixlabs/mxcli#1543).
+		if act.IncludeLastStackTrace {
+			m["includeLatestStackTrace"] = true
+		}
+		return m, nil
+	case *microflows.NotifyWorkflowAction:
+		// ped_get_schema, Studio Pro 11.14: workflowVariable, outputVariableName and
+		// notifyTarget, whose reference is a qualified name under `activity` — or
+		// `boundaryEvent` for a boundary-event target.
+		m := map[string]any{
+			"$Type":              "Microflows$NotifyWorkflowAction",
+			"workflowVariable":   act.WorkflowVariable,
+			"outputVariableName": act.OutputVariableName,
+		}
+		if act.ErrorHandlingType != "" {
+			m["errorHandlingType"] = string(act.ErrorHandlingType)
+		}
+		if t := act.Target; t != nil {
+			key := "activity"
+			if t.Key() == "BoundaryEvent" {
+				key = "boundaryEvent"
+			}
+			m["notifyTarget"] = map[string]any{"$Type": t.TypeName, key: t.Name}
+		}
 		return m, nil
 	default:
 		return nil, fmt.Errorf("microflow action %T is not yet supported by the MCP backend", a)
@@ -789,9 +1116,9 @@ func memberChangeType(t microflows.MemberChangeType) string {
 // mfCommitType maps a CommitType onto the PED commit enum (Yes / YesWithoutEvents / No).
 func mfCommitType(c microflows.CommitType) string {
 	switch c {
-	case microflows.CommitTypeYes, microflows.CommitTypeYesWithEvents:
+	case microflows.CommitTypeYes:
 		return "Yes"
-	case microflows.CommitTypeNoEvent:
+	case microflows.CommitTypeYesWithoutEvents:
 		return "YesWithoutEvents"
 	default:
 		return "No"
@@ -878,4 +1205,31 @@ func mfEnumName(dt microflows.DataType) string {
 		return t.EnumerationQualifiedName
 	}
 	return ""
+}
+
+// carryErrorHandlingType writes an action's error-handling type onto its PED
+// map. mapMicroflowAction built each action without it, so `on error rollback`
+// or `on error continue` authored over --mcp landed with PED's default — the
+// clause silently gone (mendixlabs/mxcli#698). PED declares errorHandlingType on
+// every action element ('Rollback' | 'Custom' | 'CustomWithoutRollBack' |
+// 'Continue' | 'Abort', ped_get_schema on Studio Pro 11.14).
+//
+// The two custom forms are refused: they need an error-handler flow, which
+// PED's SequenceFlow cannot express.
+func carryErrorHandlingType(a microflows.MicroflowAction, m map[string]any) error {
+	eh := actionErrorHandlingType(a)
+	switch eh {
+	case "":
+		return nil
+	case microflows.ErrorHandlingTypeCustom, microflows.ErrorHandlingTypeCustomWithoutRollback:
+		return fmt.Errorf("a custom error handler (`on error … begin … end error`) cannot be authored over MCP: Studio Pro's PED API has no error-handler flow — run without --mcp")
+	}
+	m["errorHandlingType"] = string(eh)
+	return nil
+}
+
+// actionErrorHandlingType reads the ErrorHandlingType field every action that
+// has one carries; "" for one that has none.
+func actionErrorHandlingType(a microflows.MicroflowAction) microflows.ErrorHandlingType {
+	return microflows.ActionErrorHandlingType(a)
 }

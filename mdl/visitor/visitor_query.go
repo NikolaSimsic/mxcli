@@ -78,7 +78,12 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 			}
 		}
 		b.statements = append(b.statements, stmt)
-	} else if ctx.ENTITY() != nil {
+	} else if ctx.ENTITY() != nil && ctx.ACCESS() == nil {
+		// SHOW ENTITY Module.Entity. The ACCESS guard is load-bearing: this
+		// branch runs long before the ACCESS one below, so without it
+		// `SHOW ACCESS ON ENTITY Module.Entity` would answer with the entity's
+		// definition instead of its access rules — a wrong answer rather than an
+		// error, which is the harder kind to notice.
 		if qn := ctx.QualifiedName(); qn != nil {
 			name := buildQualifiedName(qn)
 			b.statements = append(b.statements, &ast.ShowStmt{
@@ -86,6 +91,16 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 				Name:       &name,
 			})
 		}
+	} else if ctx.ANNOTATIONS() != nil {
+		stmt := &ast.ShowStmt{ObjectType: ast.ShowAnnotations}
+		if ctx.IN() != nil {
+			if qn := ctx.QualifiedName(); qn != nil {
+				stmt.InModule = getQualifiedNameText(qn)
+			} else if id := ctx.IDENTIFIER(); id != nil {
+				stmt.InModule = id.GetText()
+			}
+		}
+		b.statements = append(b.statements, stmt)
 	} else if ctx.ASSOCIATIONS() != nil {
 		stmt := &ast.ShowStmt{ObjectType: ast.ShowAssociations}
 		if ctx.IN() != nil {
@@ -104,6 +119,16 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 				Name:       &name,
 			})
 		}
+	} else if ctx.FOLDERS() != nil {
+		stmt := &ast.ShowStmt{ObjectType: ast.ShowFolders}
+		if ctx.IN() != nil {
+			if qn := ctx.QualifiedName(); qn != nil {
+				stmt.InModule = getQualifiedNameText(qn)
+			} else if id := ctx.IDENTIFIER(); id != nil {
+				stmt.InModule = id.GetText()
+			}
+		}
+		b.statements = append(b.statements, stmt)
 	} else if ctx.ENUMERATIONS() != nil {
 		stmt := &ast.ShowStmt{ObjectType: ast.ShowEnumerations}
 		if ctx.IN() != nil {
@@ -154,6 +179,16 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 			}
 		}
 		b.statements = append(b.statements, stmt)
+	} else if ctx.RULES() != nil {
+		stmt := &ast.ShowStmt{ObjectType: ast.ShowRules}
+		if ctx.IN() != nil {
+			if qn := ctx.QualifiedName(); qn != nil {
+				stmt.InModule = getQualifiedNameText(qn)
+			} else if id := ctx.IDENTIFIER(); id != nil {
+				stmt.InModule = id.GetText()
+			}
+		}
+		b.statements = append(b.statements, stmt)
 	} else if ctx.WORKFLOWS() != nil {
 		stmt := &ast.ShowStmt{ObjectType: ast.ShowWorkflows}
 		if ctx.IN() != nil {
@@ -174,6 +209,34 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 			}
 		}
 		b.statements = append(b.statements, stmt)
+	} else if ctx.PAGE() != nil && ctx.ACCESS() == nil {
+		// `SHOW PAGE Module.Page` (singular) is an alias for DESCRIBE PAGE, the
+		// same way SHOW ENTITY / SHOW ASSOCIATION read as their describe. The
+		// grammar alternative existed with no visitor branch, so the statement
+		// parsed to nothing and the command exited 0 printing nothing — which
+		// reads as "this page is empty", not "this command does nothing".
+		//
+		// The ACCESS guard is the sibling of the one on the ENTITY branch above:
+		// this branch sits ~200 lines before the ACCESS one, so without it
+		// `SHOW ACCESS ON PAGE Module.Page` printed the page's whole definition
+		// instead of its allowed roles. Found by the #925 test sweep — the
+		// spelling parsed, which is why it was reported as working.
+		if qn := ctx.QualifiedName(); qn != nil {
+			b.statements = append(b.statements, &ast.DescribeStmt{
+				ObjectType: ast.DescribePage,
+				Name:       buildQualifiedName(qn),
+			})
+		}
+	} else if ctx.CONNECTIONS() != nil && ctx.DATABASE() == nil {
+		// SHOW CONNECTIONS lists the external SQL connections open in this
+		// session (sql.Manager). The grammar alternative had no visitor branch,
+		// so it parsed to nothing and printed nothing — indistinguishable from
+		// "no connections are open", which is a plausible and wrong answer.
+		//
+		// The DATABASE() guard is load-bearing: `SHOW DATABASE CONNECTIONS`
+		// also matches CONNECTIONS(), so without it this branch swallows the
+		// stored-document listing and answers it with live session state.
+		b.statements = append(b.statements, &ast.ShowStmt{ObjectType: ast.ShowConnections})
 	} else if ctx.SNIPPETS() != nil {
 		stmt := &ast.ShowStmt{ObjectType: ast.ShowSnippets}
 		if ctx.IN() != nil {
@@ -181,6 +244,46 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 				stmt.InModule = getQualifiedNameText(qn)
 			} else if id := ctx.IDENTIFIER(); id != nil {
 				stmt.InModule = id.GetText()
+			}
+		}
+		b.statements = append(b.statements, stmt)
+	} else if ctx.BUILDING() != nil && ctx.BLOCKS() != nil {
+		stmt := &ast.ShowStmt{ObjectType: ast.ShowBuildingBlocks}
+		if ctx.IN() != nil {
+			if qn := ctx.QualifiedName(); qn != nil {
+				stmt.InModule = getQualifiedNameText(qn)
+			} else if id := ctx.IDENTIFIER(); id != nil {
+				stmt.InModule = id.GetText()
+			}
+		}
+		b.statements = append(b.statements, stmt)
+	} else if ctx.TaskQueuesKw() != nil {
+		stmt := &ast.ShowQueuesStmt{}
+		if ctx.IN() != nil {
+			if qn := ctx.QualifiedName(); qn != nil {
+				stmt.Module = getQualifiedNameText(qn)
+			} else if id := ctx.IDENTIFIER(); id != nil {
+				stmt.Module = id.GetText()
+			}
+		}
+		b.statements = append(b.statements, stmt)
+	} else if ctx.SCHEDULED() != nil && ctx.EVENTS() != nil {
+		stmt := &ast.ShowScheduledEventsStmt{}
+		if ctx.IN() != nil {
+			if qn := ctx.QualifiedName(); qn != nil {
+				stmt.Module = getQualifiedNameText(qn)
+			} else if id := ctx.IDENTIFIER(); id != nil {
+				stmt.Module = id.GetText()
+			}
+		}
+		b.statements = append(b.statements, stmt)
+	} else if ctx.REGULAR() != nil && ctx.EXPRESSIONS() != nil {
+		stmt := &ast.ShowRegularExpressionsStmt{}
+		if ctx.IN() != nil {
+			if qn := ctx.QualifiedName(); qn != nil {
+				stmt.Module = getQualifiedNameText(qn)
+			} else if id := ctx.IDENTIFIER(); id != nil {
+				stmt.Module = id.GetText()
 			}
 		}
 		b.statements = append(b.statements, stmt)
@@ -214,7 +317,9 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 			}
 		}
 		b.statements = append(b.statements, stmt)
-	} else if ctx.VERSION() != nil {
+	} else if ctx.VERSION() != nil && ctx.FEATURES() == nil {
+		// `show features for version x.y` also carries VERSION; it belongs to
+		// the FEATURES branch below (ako/mxcli#910).
 		b.statements = append(b.statements, &ast.ShowStmt{ObjectType: ast.ShowVersion})
 	} else if ctx.CATALOG() != nil {
 		// SHOW CATALOG STATUS or SHOW CATALOG TABLES
@@ -327,7 +432,9 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 		// SHOW DEMO USERS
 		b.statements = append(b.statements, &ast.ShowStmt{ObjectType: ast.ShowDemoUsers})
 	} else if ctx.ACCESS() != nil {
-		// SHOW ACCESS ON [MICROFLOW|PAGE|WORKFLOW|NANOFLOW] Module.Entity
+		// SHOW ACCESS ON [ENTITY|MICROFLOW|PAGE|WORKFLOW|NANOFLOW] Module.Name.
+		// A bare name and an explicit ENTITY both fall through to ShowAccessOn,
+		// which reports entity access rules.
 		if qn := ctx.QualifiedName(); qn != nil {
 			name := buildQualifiedName(qn)
 			if ctx.MICROFLOW() != nil {
@@ -357,7 +464,7 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 				})
 			}
 		}
-	} else if ctx.ODATA() != nil && ctx.CLIENTS() != nil {
+	} else if ctx.ConsumedODataServicesKw() != nil {
 		// SHOW ODATA CLIENTS [IN module]
 		stmt := &ast.ShowStmt{ObjectType: ast.ShowODataClients}
 		if ctx.IN() != nil {
@@ -368,7 +475,7 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 			}
 		}
 		b.statements = append(b.statements, stmt)
-	} else if ctx.ODATA() != nil && ctx.SERVICES() != nil {
+	} else if ctx.PublishedODataServicesKw() != nil {
 		// SHOW ODATA SERVICES [IN module]
 		stmt := &ast.ShowStmt{ObjectType: ast.ShowODataServices}
 		if ctx.IN() != nil {
@@ -487,7 +594,26 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 			}
 		}
 		b.statements = append(b.statements, stmt)
-	} else if ctx.MODELS() != nil {
+	} else if ctx.GLYPHS() != nil {
+		// SHOW GLYPHS [LIKE 'pattern'] — the Mendix glyph font, not a project
+		// document, so there is no IN clause.
+		stmt := &ast.ShowStmt{ObjectType: ast.ShowGlyphs}
+		if sl := ctx.STRING_LITERAL(); sl != nil {
+			stmt.Like = unquoteStringLit(sl)
+		}
+		b.statements = append(b.statements, stmt)
+	} else if ctx.ICON() != nil && ctx.COLLECTION() != nil {
+		// SHOW ICON COLLECTION [IN module]
+		stmt := &ast.ShowStmt{ObjectType: ast.ShowIconCollections}
+		if ctx.IN() != nil {
+			if qn := ctx.QualifiedName(); qn != nil {
+				stmt.InModule = getQualifiedNameText(qn)
+			} else if id := ctx.IDENTIFIER(); id != nil {
+				stmt.InModule = id.GetText()
+			}
+		}
+		b.statements = append(b.statements, stmt)
+	} else if ctx.AiModelsKw() != nil {
 		// SHOW MODELS [IN module] (agent-editor Model documents)
 		stmt := &ast.ShowStmt{ObjectType: ast.ShowModels}
 		if ctx.IN() != nil {
@@ -531,6 +657,17 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 			}
 		}
 		b.statements = append(b.statements, stmt)
+	} else if ctx.PUBLISHED() != nil && ctx.MCP() != nil && ctx.SERVICES() != nil {
+		// LIST PUBLISHED MCP SERVICES [IN module]
+		stmt := &ast.ShowStmt{ObjectType: ast.ShowPublishedMCPServices}
+		if ctx.IN() != nil {
+			if qn := ctx.QualifiedName(); qn != nil {
+				stmt.InModule = getQualifiedNameText(qn)
+			} else if id := ctx.IDENTIFIER(); id != nil {
+				stmt.InModule = id.GetText()
+			}
+		}
+		b.statements = append(b.statements, stmt)
 	} else if ctx.PUBLISHED() != nil && ctx.REST() != nil && ctx.SERVICES() != nil {
 		// SHOW PUBLISHED REST SERVICES [IN module] - must come before REST CLIENTS check
 		stmt := &ast.ShowStmt{ObjectType: ast.ShowPublishedRestServices}
@@ -553,7 +690,7 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 			}
 		}
 		b.statements = append(b.statements, stmt)
-	} else if ctx.REST() != nil && ctx.CLIENTS() != nil {
+	} else if ctx.ConsumedRestServicesKw() != nil {
 		// SHOW REST CLIENTS [IN module]
 		stmt := &ast.ShowStmt{ObjectType: ast.ShowRestClients}
 		if ctx.IN() != nil {
@@ -564,6 +701,9 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 			}
 		}
 		b.statements = append(b.statements, stmt)
+	} else if ctx.WORKFLOW() != nil && ctx.GROUPS() != nil {
+		// SHOW WORKFLOW GROUPS
+		b.statements = append(b.statements, &ast.ShowStmt{ObjectType: ast.ShowWorkflowGroups})
 	} else if ctx.LANGUAGES() != nil {
 		// SHOW LANGUAGES
 		b.statements = append(b.statements, &ast.ShowStmt{ObjectType: ast.ShowLanguages})
@@ -571,15 +711,15 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 		// SHOW FEATURES [IN area] | SHOW FEATURES FOR VERSION x.y | SHOW FEATURES ADDED SINCE x.y
 		stmt := &ast.ShowFeaturesStmt{}
 		if ctx.ADDED() != nil && ctx.SINCE() != nil {
-			if nl := ctx.NUMBER_LITERAL(); nl != nil {
-				stmt.AddedSince = nl.GetText()
+			if fv := ctx.FeatureVersion(); fv != nil {
+				stmt.AddedSince = fv.GetText()
 			}
 		} else if ctx.FOR() != nil && ctx.VERSION() != nil {
-			if nl := ctx.NUMBER_LITERAL(); nl != nil {
-				stmt.ForVersion = nl.GetText()
+			if fv := ctx.FeatureVersion(); fv != nil {
+				stmt.ForVersion = fv.GetText()
 			}
 		} else if ctx.IN() != nil {
-			if id := ctx.IDENTIFIER(); id != nil {
+			if id := ctx.IdentifierOrKeyword(); id != nil {
 				stmt.InArea = id.GetText()
 			}
 		}
@@ -587,6 +727,28 @@ func (b *Builder) ExitShowStatement(ctx *parser.ShowStatementContext) {
 	} else if ctx.JSON() != nil && ctx.STRUCTURES() != nil {
 		// SHOW JSON STRUCTURES [IN module]
 		stmt := &ast.ShowStmt{ObjectType: ast.ShowJsonStructures}
+		if ctx.IN() != nil {
+			if qn := ctx.QualifiedName(); qn != nil {
+				stmt.InModule = getQualifiedNameText(qn)
+			} else if id := ctx.IDENTIFIER(); id != nil {
+				stmt.InModule = id.GetText()
+			}
+		}
+		b.statements = append(b.statements, stmt)
+	} else if ctx.MESSAGE() != nil && ctx.DEFINITIONS() != nil {
+		// SHOW MESSAGE DEFINITIONS [IN module] — the 11.15 documents (ako/mxcli#987)
+		stmt := &ast.ShowStmt{ObjectType: ast.ShowMessageDefinitions}
+		if ctx.IN() != nil {
+			if qn := ctx.QualifiedName(); qn != nil {
+				stmt.InModule = getQualifiedNameText(qn)
+			} else if id := ctx.IDENTIFIER(); id != nil {
+				stmt.InModule = id.GetText()
+			}
+		}
+		b.statements = append(b.statements, stmt)
+	} else if ctx.MESSAGE() != nil && ctx.DEFINITION() != nil && ctx.COLLECTION() != nil {
+		// SHOW MESSAGE DEFINITION COLLECTIONS [IN module]
+		stmt := &ast.ShowStmt{ObjectType: ast.ShowMessageDefinitionCollections}
 		if ctx.IN() != nil {
 			if qn := ctx.QualifiedName(); qn != nil {
 				stmt.InModule = getQualifiedNameText(qn)
@@ -663,6 +825,71 @@ func (b *Builder) ExitCatalogSelectQuery(ctx *parser.CatalogSelectQueryContext) 
 
 // ExitDescribeStatement handles DESCRIBE ENTITY/ASSOCIATION/ENUMERATION/MODULE
 func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
+	// DESCRIBE TRANSLATIONS [IN Module] FOR <lang>. Placed first: TRANSLATIONS is
+	// its own token, so nothing else can match, and reading it here keeps the
+	// rest of the chain unaware of a statement that names no document.
+	if ctx.TRANSLATIONS() != nil {
+		ids := ctx.AllIdentifierOrKeyword()
+		if len(ids) == 0 {
+			return
+		}
+		stmt := &ast.DescribeTranslationsStmt{Language: identifierOrKeywordText(ids[len(ids)-1])}
+		if len(ids) > 1 {
+			stmt.Module = identifierOrKeywordText(ids[0])
+		}
+		stmt.WithoutMarketplace = ctx.MARKETPLACE() != nil
+		b.statements = append(b.statements, stmt)
+		return
+	}
+
+	// R6: the single-thing reports that were `show` forms. Each builds the
+	// statement its `show` spelling builds, so the two are one statement and
+	// `show` is a pure alias (MDL-DEPR090).
+	if stmt := describeReport(ctx); stmt != nil {
+		b.statements = append(b.statements, stmt)
+		return
+	}
+
+	// DESCRIBE GLYPH 57350 | DESCRIBE GLYPH 'star'. Placed with the other
+	// no-document statements: a glyph is a character code in a font, so it has no
+	// qualified name for the chain below to build.
+	if ctx.GLYPH() != nil {
+		stmt := &ast.DescribeStmt{ObjectType: ast.DescribeGlyph}
+		if n := ctx.NUMBER_LITERAL(); n != nil {
+			stmt.Qualifier = n.GetText()
+		} else if sl := ctx.STRING_LITERAL(); sl != nil {
+			stmt.Qualifier = unquoteStringLit(sl)
+		}
+		if stmt.Qualifier != "" {
+			b.statements = append(b.statements, stmt)
+		}
+		return
+	}
+
+	// DESCRIBE QUEUE Module.Name
+	if ctx.TaskQueueKw() != nil {
+		if qn := ctx.QualifiedName(); qn != nil {
+			b.statements = append(b.statements, &ast.DescribeQueueStmt{Name: buildQualifiedName(qn)})
+		}
+		return
+	}
+
+	// DESCRIBE SCHEDULED EVENT Module.Name
+	if ctx.SCHEDULED() != nil && ctx.EVENT() != nil {
+		if qn := ctx.QualifiedName(); qn != nil {
+			b.statements = append(b.statements, &ast.DescribeScheduledEventStmt{Name: buildQualifiedName(qn)})
+		}
+		return
+	}
+
+	// DESCRIBE REGULAR EXPRESSION Module.Name
+	if ctx.REGULAR() != nil && ctx.EXPRESSION() != nil {
+		if qn := ctx.QualifiedName(); qn != nil {
+			b.statements = append(b.statements, &ast.DescribeRegularExpressionStmt{Name: buildQualifiedName(qn)})
+		}
+		return
+	}
+
 	// Handle DESCRIBE MODULE ROLE (uses qualifiedName)
 	if ctx.MODULE() != nil && ctx.ROLE() != nil {
 		if qn := ctx.QualifiedName(); qn != nil {
@@ -678,7 +905,7 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 	// Handle DESCRIBE DEMO USER 'name' (uses STRING_LITERAL)
 	if ctx.DEMO() != nil && ctx.USER() != nil {
 		if sl := ctx.STRING_LITERAL(); sl != nil {
-			userName := unquoteString(sl.GetText())
+			userName := unquoteStringLit(sl)
 			b.statements = append(b.statements, &ast.DescribeStmt{
 				ObjectType: ast.DescribeDemoUser,
 				Name:       ast.QualifiedName{Name: userName},
@@ -687,10 +914,16 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 		return
 	}
 
-	// Handle DESCRIBE USER ROLE 'Name' (uses STRING_LITERAL)
+	// Handle DESCRIBE USER ROLE 'Name' | Name (quoted or bare — DROP accepts both
+	// too, so the two commands are consistent; FINDINGS #5).
 	if ctx.USER() != nil && ctx.ROLE() != nil {
+		roleName := ""
 		if sl := ctx.STRING_LITERAL(); sl != nil {
-			roleName := unquoteString(sl.GetText())
+			roleName = unquoteStringLit(sl)
+		} else if iok := ctx.IdentifierOrKeyword(0); iok != nil {
+			roleName = identifierOrKeywordText(iok)
+		}
+		if roleName != "" {
 			b.statements = append(b.statements, &ast.DescribeStmt{
 				ObjectType: ast.DescribeUserRole,
 				Name:       ast.QualifiedName{Module: roleName, Name: roleName},
@@ -703,7 +936,7 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 	// module names that happen to match a keyword, like "Agents").
 	if ctx.MODULE() != nil {
 		var moduleName string
-		if iok := ctx.IdentifierOrKeyword(); iok != nil {
+		if iok := ctx.IdentifierOrKeyword(0); iok != nil {
 			moduleName = iok.GetText()
 		} else if id := ctx.IDENTIFIER(); id != nil {
 			// Fallback for older grammar versions.
@@ -718,7 +951,7 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 	}
 
 	// Handle DESCRIBE ODATA CLIENT/SERVICE and DESCRIBE EXTERNAL ENTITY
-	if ctx.ODATA() != nil && ctx.CLIENT() != nil {
+	if ctx.ConsumedODataServiceKw() != nil {
 		if qn := ctx.QualifiedName(); qn != nil {
 			name := buildQualifiedName(qn)
 			b.statements = append(b.statements, &ast.DescribeStmt{
@@ -728,7 +961,7 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 		}
 		return
 	}
-	if ctx.ODATA() != nil && ctx.SERVICE() != nil {
+	if ctx.PublishedODataServiceKw() != nil {
 		if qn := ctx.QualifiedName(); qn != nil {
 			name := buildQualifiedName(qn)
 			b.statements = append(b.statements, &ast.DescribeStmt{
@@ -773,11 +1006,18 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 		return
 	}
 
-	// Handle DESCRIBE SETTINGS
+	// Handle DESCRIBE SETTINGS [CONFIGURATION 'Name']
 	if ctx.SETTINGS() != nil {
-		b.statements = append(b.statements, &ast.DescribeStmt{
-			ObjectType: ast.DescribeSettings,
-		})
+		stmt := &ast.DescribeStmt{ObjectType: ast.DescribeSettings}
+		// `alter settings configuration 'X'` is the write form, so the read
+		// form has to accept the same shape — reaching for it and getting a
+		// parse error is the wrong lesson (mxcli-formula1 findings #8).
+		if ctx.CONFIGURATION() != nil {
+			if sl := ctx.STRING_LITERAL(); sl != nil {
+				stmt.Qualifier = unquoteStringLit(sl)
+			}
+		}
+		b.statements = append(b.statements, stmt)
 		return
 	}
 
@@ -791,7 +1031,7 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 			}
 			qn := buildQualifiedName(ctx.QualifiedName())
 			widgetName := ""
-			if iok := ctx.IdentifierOrKeyword(); iok != nil {
+			if iok := ctx.IdentifierOrKeyword(0); iok != nil {
 				widgetName = identifierOrKeywordText(iok)
 			}
 			b.statements = append(b.statements, &ast.DescribeFragmentFromStmt{
@@ -802,7 +1042,7 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 			return
 		}
 		// Simple: DESCRIBE FRAGMENT Name
-		if iok := ctx.IdentifierOrKeyword(); iok != nil {
+		if iok := ctx.IdentifierOrKeyword(0); iok != nil {
 			b.statements = append(b.statements, &ast.DescribeStmt{
 				ObjectType: ast.DescribeFragment,
 				Name:       ast.QualifiedName{Name: identifierOrKeywordText(iok)},
@@ -828,6 +1068,24 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 			}
 		}
 		b.statements = append(b.statements, stmt)
+		return
+	}
+
+	// DESCRIBE WIDGET <keyword|'widget id'> — a widget DEFINITION, not a
+	// document, so there is no qualified name. The STYLING branch above
+	// returns before this, but WIDGET also appears there (DESCRIBE STYLING …
+	// WIDGET name), so the guard stays explicit rather than resting on order.
+	if ctx.WIDGET() != nil && ctx.STYLING() == nil {
+		name := ""
+		if lit := ctx.STRING_LITERAL(); lit != nil {
+			name = unquoteStringLit(lit)
+		} else if id := ctx.IdentifierOrKeyword(0); id != nil {
+			name = id.GetText()
+		}
+		b.statements = append(b.statements, &ast.DescribeStmt{
+			ObjectType: ast.DescribeWidget,
+			Name:       ast.QualifiedName{Name: name},
+		})
 		return
 	}
 
@@ -870,7 +1128,7 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 		}
 		coordinate := ""
 		if sl := ctx.STRING_LITERAL(); sl != nil {
-			coordinate = unquoteString(sl.GetText())
+			coordinate = unquoteStringLit(sl)
 		}
 		b.statements = append(b.statements, &ast.DescribeStmt{
 			ObjectType: ast.DescribeJarDependency,
@@ -885,7 +1143,7 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 	if ctx.CONTRACT() != nil && ctx.OPERATION() != nil && ctx.FROM() != nil && ctx.OPENAPI() != nil {
 		if sl := ctx.STRING_LITERAL(); sl != nil {
 			b.statements = append(b.statements, &ast.DescribeContractFromOpenAPIStmt{
-				SpecPath: unquoteString(sl.GetText()),
+				SpecPath: unquoteStringLit(sl),
 			})
 		}
 		return
@@ -943,12 +1201,19 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 		})
 	} else if ctx.MICROFLOW() != nil {
 		b.statements = append(b.statements, &ast.DescribeStmt{
-			ObjectType: ast.DescribeMicroflow,
-			Name:       name,
+			ObjectType:  ast.DescribeMicroflow,
+			Name:        name,
+			Normalized:  ctx.NORMALIZED() != nil,
+			WithHandles: ctx.HANDLES() != nil,
 		})
 	} else if ctx.NANOFLOW() != nil {
 		b.statements = append(b.statements, &ast.DescribeStmt{
 			ObjectType: ast.DescribeNanoflow,
+			Name:       name,
+		})
+	} else if ctx.RULE() != nil {
+		b.statements = append(b.statements, &ast.DescribeStmt{
+			ObjectType: ast.DescribeRule,
 			Name:       name,
 		})
 	} else if ctx.WORKFLOW() != nil {
@@ -959,6 +1224,16 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 	} else if ctx.PAGE() != nil {
 		b.statements = append(b.statements, &ast.DescribeStmt{
 			ObjectType: ast.DescribePage,
+			Name:       name,
+		})
+	} else if ctx.BUILDING() != nil && ctx.BLOCK() != nil {
+		b.statements = append(b.statements, &ast.DescribeStmt{
+			ObjectType: ast.DescribeBuildingBlock,
+			Name:       name,
+		})
+	} else if ctx.MENU_KW() != nil {
+		b.statements = append(b.statements, &ast.DescribeStmt{
+			ObjectType: ast.DescribeMenu,
 			Name:       name,
 		})
 	} else if ctx.SNIPPET() != nil {
@@ -986,8 +1261,13 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 			ObjectType: ast.DescribeImageCollection,
 			Name:       name,
 		})
-	} else if ctx.MODEL() != nil {
-		// DESCRIBE MODEL Module.Name (agent-editor Model document)
+	} else if ctx.ICON() != nil && ctx.COLLECTION() != nil {
+		b.statements = append(b.statements, &ast.DescribeStmt{
+			ObjectType: ast.DescribeIconCollection,
+			Name:       name,
+		})
+	} else if ctx.AiModelKw() != nil {
+		// DESCRIBE AI MODEL Module.Name (agent-editor Model document)
 		b.statements = append(b.statements, &ast.DescribeStmt{
 			ObjectType: ast.DescribeModel,
 			Name:       name,
@@ -1004,13 +1284,18 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 			ObjectType: ast.DescribeKnowledgeBase,
 			Name:       name,
 		})
+	} else if ctx.PUBLISHED() != nil && ctx.MCP() != nil && ctx.SERVICE() != nil {
+		b.statements = append(b.statements, &ast.DescribeStmt{
+			ObjectType: ast.DescribePublishedMCPService,
+			Name:       name,
+		})
 	} else if ctx.CONSUMED() != nil && ctx.MCP() != nil && ctx.SERVICE() != nil {
 		// DESCRIBE CONSUMED MCP SERVICE Module.Name
 		b.statements = append(b.statements, &ast.DescribeStmt{
 			ObjectType: ast.DescribeConsumedMCPService,
 			Name:       name,
 		})
-	} else if ctx.REST() != nil && ctx.CLIENT() != nil {
+	} else if ctx.ConsumedRestServiceKw() != nil {
 		b.statements = append(b.statements, &ast.DescribeStmt{
 			ObjectType: ast.DescribeRestClient,
 			Name:       name,
@@ -1023,6 +1308,16 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 	} else if ctx.DATA() != nil && ctx.TRANSFORMER() != nil {
 		b.statements = append(b.statements, &ast.DescribeStmt{
 			ObjectType: ast.DescribeDataTransformer,
+			Name:       name,
+		})
+	} else if ctx.MESSAGE() != nil && ctx.DEFINITION() != nil && ctx.COLLECTION() != nil {
+		b.statements = append(b.statements, &ast.DescribeStmt{
+			ObjectType: ast.DescribeMessageDefinitionCollection,
+			Name:       name,
+		})
+	} else if ctx.MESSAGE() != nil && ctx.DEFINITION() != nil && ctx.CONTRACT() == nil {
+		b.statements = append(b.statements, &ast.DescribeStmt{
+			ObjectType: ast.DescribeMessageDefinition,
 			Name:       name,
 		})
 	} else if ctx.JSON() != nil && ctx.STRUCTURE() != nil {
@@ -1054,7 +1349,7 @@ func (b *Builder) ExitDescribeStatement(ctx *parser.DescribeStatementContext) {
 func (b *Builder) ExitSearchStatement(ctx *parser.SearchStatementContext) {
 	if ctx.STRING_LITERAL() != nil {
 		b.statements = append(b.statements, &ast.SearchStmt{
-			Query: unquoteString(ctx.STRING_LITERAL().GetText()),
+			Query: unquoteStringLit(ctx.STRING_LITERAL()),
 		})
 	}
 }
@@ -1067,7 +1362,7 @@ func (b *Builder) ExitSearchStatement(ctx *parser.SearchStatementContext) {
 func (b *Builder) ExitExecuteScriptStatement(ctx *parser.ExecuteScriptStatementContext) {
 	if ctx.STRING_LITERAL() != nil {
 		b.statements = append(b.statements, &ast.ExecuteScriptStmt{
-			Path: unquoteString(ctx.STRING_LITERAL().GetText()),
+			Path: unquoteStringLit(ctx.STRING_LITERAL()),
 		})
 	}
 }
@@ -1094,7 +1389,7 @@ func (b *Builder) ExitSessionSetStatement(ctx *parser.SessionSetStatementContext
 			value = valCtx.NUMBER_LITERAL().GetText()
 		}
 	case valCtx.STRING_LITERAL() != nil:
-		value = unquoteString(valCtx.STRING_LITERAL().GetText())
+		value = unquoteStringLit(valCtx.STRING_LITERAL())
 	case valCtx.IdentifierOrKeyword() != nil:
 		value = valCtx.IdentifierOrKeyword().GetText()
 	}
@@ -1102,14 +1397,18 @@ func (b *Builder) ExitSessionSetStatement(ctx *parser.SessionSetStatementContext
 }
 
 // ExitHelpStatement handles help/exit/quit commands
-// Grammar: helpStatement: IDENTIFIER (identifierOrKeyword)*
+// Grammar: helpStatement: IDENTIFIER (DOT? helpTopicWord)*
 func (b *Builder) ExitHelpStatement(ctx *parser.HelpStatementContext) {
 	if id := ctx.IDENTIFIER(); id != nil {
 		cmd := strings.ToLower(id.GetText())
 		switch cmd {
 		case "help", "?":
 			stmt := &ast.HelpStmt{}
-			for _, tok := range ctx.AllIdentifierOrKeyword() {
+			// One word per segment, however it was spelled. The DOT is a
+			// separator, not part of a word, and a word may itself be dotted
+			// when a whole path arrives as one token — syntax.Lookup splits on
+			// both, so the topic is passed on as the reader typed it.
+			for _, tok := range ctx.AllHelpTopicWord() {
 				stmt.Topic = append(stmt.Topic, strings.ToLower(tok.GetText()))
 			}
 			b.statements = append(b.statements, stmt)
@@ -1147,3 +1446,47 @@ func (b *Builder) ExitUpdateStatement(ctx *parser.UpdateStatementContext) {
 // ----------------------------------------------------------------------------
 // Helper Functions
 // ----------------------------------------------------------------------------
+
+// describeReport builds `describe app security`, `describe security matrix`,
+// `describe structure` and `describe context of`: the same statements as their
+// `show` spellings (see ExitShowStatement). Nil for every other describe.
+func describeReport(ctx *parser.DescribeStatementContext) ast.Statement {
+	inModule := func() string {
+		if ctx.IN() == nil {
+			return ""
+		}
+		if qn := ctx.QualifiedName(); qn != nil {
+			return getQualifiedNameText(qn)
+		}
+		if id := ctx.IDENTIFIER(); id != nil {
+			return id.GetText()
+		}
+		return ""
+	}
+	depth := func() int {
+		if ctx.DEPTH() != nil {
+			if n := ctx.NUMBER_LITERAL(); n != nil {
+				if d, err := strconv.Atoi(n.GetText()); err == nil {
+					return d
+				}
+			}
+		}
+		return 2
+	}
+	switch {
+	case ctx.APP() != nil && ctx.SECURITY() != nil:
+		return &ast.ShowStmt{ObjectType: ast.ShowProjectSecurity}
+	case ctx.SECURITY() != nil && ctx.MATRIX() != nil:
+		return &ast.ShowStmt{ObjectType: ast.ShowSecurityMatrix, InModule: inModule()}
+	case ctx.STRUCTURE() != nil && ctx.JSON() == nil:
+		return &ast.ShowStmt{ObjectType: ast.ShowStructure, Depth: depth(), All: ctx.ALL() != nil, InModule: inModule()}
+	case ctx.CONTEXT() != nil && ctx.OF() != nil:
+		qn := ctx.QualifiedName()
+		if qn == nil {
+			return nil
+		}
+		name := buildQualifiedName(qn)
+		return &ast.ShowStmt{ObjectType: ast.ShowContext, Name: &name, Depth: depth()}
+	}
+	return nil
+}

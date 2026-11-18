@@ -6,7 +6,8 @@ sources:
   - docs/03-development/PED_MCP_CAPABILITIES.md
   - mdl/backend/mcp/backend.go
   - mdl/backend/mcp/read_router.go
-  - mdl/backend/mcp/concord.go
+  - mdl/backend/mcp/delete.go
+  - mdl/backend/mcp/app.go
 ---
 
 > **Do not duplicate**: the tool matrix, transport setup, and capability gaps
@@ -20,15 +21,16 @@ A second implementation of the executor's backend interface (alongside the MPR
 backend) that does **not** write BSON to disk. Instead it routes model mutations to
 a **live, running Studio Pro** through that IDE's embedded MCP server — codenamed
 **PED** — while still reading structure from the local `.mpr` on disk. It is a
-*hybrid* backend: disk for reads, the live IDE for writes. A second optional MCP
-server, **Concord**, fills a few gaps PED lacks (notably document deletion).
+*hybrid* backend: disk for reads, the live IDE for writes. Deleting a document and
+running the app go through the same server: `ped_delete_document` and the
+`mendix_app` handler, both new in Studio Pro 11.16.
 
 ## How it fits
 
 The same MDL pipeline (grammar → AST → visitor → executor) runs unchanged; only the
 backend differs, which is exactly what the backend abstraction is for. Choosing the
 MCP backend means the executor's writes become `ped_*` tool calls against Studio
-Pro's in-memory model rather than `sdk/mpr` writer calls — so the edits appear live
+Pro's in-memory model rather than MPR writer calls — so the edits appear live
 in the open project instead of being serialised to the file.
 
 The hybrid split creates a **consistency problem the backend has to close itself**.

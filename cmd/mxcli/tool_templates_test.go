@@ -68,3 +68,104 @@ func TestGenerateDockerfile_Podman(t *testing.T) {
 		t.Error("docker runtime should not include podman configuration")
 	}
 }
+
+// TestGenerateDockerfile_PostgresServer guards the database prerequisite of
+// `mxcli run --local`: --ensure-db starts a local PostgreSQL service and creates
+// the role + database via a `sudo -u postgres` superuser, neither of which exists
+// when only postgresql-client is installed. The client alone is easy to mistake
+// for enough, so assert the server package specifically.
+func TestGenerateDockerfile_PostgresServer(t *testing.T) {
+	for _, runtime := range []string{"docker", "podman"} {
+		df := generateDockerfile("MyApp", "App.mpr", runtime)
+		if !strings.Contains(df, "postgresql \\") {
+			t.Errorf("%s Dockerfile must install the postgresql SERVER package, not just postgresql-client — 'run --local --ensure-db' cannot provision a database without it", runtime)
+		}
+		if !strings.Contains(df, "postgresql-client") {
+			t.Errorf("%s Dockerfile should keep postgresql-client (psql is used to probe and provision)", runtime)
+		}
+	}
+}
+
+// TestGenerateDockerfile_PlaywrightArm64 guards the arm64 Playwright provisioning
+// fix: browsers must be installed via @playwright/cli's bundled playwright-core
+// (not a transient "npx playwright"), into a world-readable shared cache, with a
+// stable headless-shell symlink that the generated cli.config.json pins.
+func TestGenerateDockerfile_PlaywrightArm64(t *testing.T) {
+	df := generateDockerfile("MyApp", "App.mpr", "docker")
+
+	if strings.Contains(df, "npx playwright install") {
+		t.Error("Dockerfile must not use 'npx playwright install' — it resolves a different playwright than the CLI's bundled core (wrong revision + wrong cache)")
+	}
+	if strings.Contains(df, "@playwright/cli@latest") {
+		t.Error("@playwright/cli must be pinned to a known-good version, not @latest (its CLI surface shifts between releases)")
+	}
+	if !strings.Contains(df, "@playwright/cli@0.1.") {
+		t.Error("Dockerfile should install a pinned @playwright/cli@0.1.x version")
+	}
+	for _, want := range []string{
+		"@playwright/cli/node_modules/playwright-core/cli.js", // install via bundled core
+		"chromium-headless-shell",                             // headless needs the shell build
+		"PLAYWRIGHT_BROWSERS_PATH",                            // shared, non-root-only cache
+		"/usr/local/bin/mx-headless-shell",                    // stable symlink for the config pin
+	} {
+		if !strings.Contains(df, want) {
+			t.Errorf("Dockerfile missing expected Playwright provisioning fragment %q", want)
+		}
+	}
+}
+
+// TestGeneratePlaywrightConfig_PinsHeadlessShell ensures the generated config is
+// valid JSON and pins executablePath to the stable symlink the Dockerfile
+// creates — without it, the alpha CLI falls back to the unavailable chrome
+// channel on arm64.
+func TestGeneratePlaywrightConfig_PinsHeadlessShell(t *testing.T) {
+	cfg := generatePlaywrightConfig()
+
+	var v struct {
+		Browser struct {
+			BrowserName   string `json:"browserName"`
+			LaunchOptions struct {
+				Headless       bool   `json:"headless"`
+				ExecutablePath string `json:"executablePath"`
+			} `json:"launchOptions"`
+		} `json:"browser"`
+	}
+	if err := json.Unmarshal([]byte(cfg), &v); err != nil {
+		t.Fatalf("playwright config is not valid JSON: %v\n%s", err, cfg)
+	}
+	if v.Browser.BrowserName != "chromium" {
+		t.Errorf("browserName = %q, want chromium", v.Browser.BrowserName)
+	}
+	if got := v.Browser.LaunchOptions.ExecutablePath; got != "/usr/local/bin/mx-headless-shell" {
+		t.Errorf("executablePath = %q, want the stable Dockerfile symlink /usr/local/bin/mx-headless-shell", got)
+	}
+}
+
+// On Podman-on-Windows the workspace bind mount does not honour chmod, so an
+// unguarded `chmod +x ./mxcli` failed the whole postCreateCommand after the
+// download had succeeded (mendixlabs/mxcli#742). The fast path's
+// `file ./mxcli | grep -q Linux` also needs `file` in the image, or it never
+// matches and every container start re-downloads the binary.
+func TestDevcontainerPostCreate_ToleratesChmodAndHasFile(t *testing.T) {
+	for _, runtime := range []string{"docker", "podman"} {
+		t.Run(runtime, func(t *testing.T) {
+			var v struct {
+				PostCreateCommand string `json:"postCreateCommand"`
+			}
+			if err := json.Unmarshal([]byte(generateDevcontainerJSON("MyApp", "App.mpr", runtime)), &v); err != nil {
+				t.Fatal(err)
+			}
+			cmd := v.PostCreateCommand
+			if !strings.Contains(cmd, "file ./mxcli | grep -q Linux") {
+				t.Fatalf("postCreateCommand no longer checks the binary with file; this test is out of date:\n%s", cmd)
+			}
+			if strings.Contains(strings.ReplaceAll(cmd, "chmod +x ./mxcli 2>/dev/null || true", ""), "chmod +x ./mxcli") {
+				t.Errorf("an unguarded chmod +x ./mxcli fails postCreateCommand on a mount that ignores modes:\n%s", cmd)
+			}
+			dockerfile := generateDockerfile("MyApp", "App.mpr", runtime)
+			if !strings.Contains(dockerfile, "       file \\\n") {
+				t.Errorf("the image lacks the file package that postCreateCommand's fast path runs:\n%s", dockerfile)
+			}
+		})
+	}
+}

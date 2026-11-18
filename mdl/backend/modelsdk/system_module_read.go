@@ -14,14 +14,31 @@ import (
 // User, FileDocument, …) can't be resolved — mirrors the legacy reader's
 // BuildSystemModule. Entity IDs are synthetic (System entities are referenced by
 // qualified name, never by ID, in serialized output).
-func buildSystemDomainModel() *domainmodel.DomainModel {
+//
+// It builds the MODELER view: meta also carries the entities that exist only in
+// the runtime's metamodel, and a model that names one of those is rejected by
+// mxbuild with CE1613 "no longer exists" — upstream #972, where every
+// specialization of System.Image inherited an access-rule member for
+// System.Thumbnail_Image. See meta.SystemEntityDef.RuntimeOnly.
+//
+// atLeast is the project version's IsAtLeast, nil when it is unknown: the
+// System module differs between versions (ako/mxcli#1810), and a check against
+// the wrong one accepts a name the project's build then refuses.
+func buildSystemDomainModel(atLeast func(major, minor int) bool) *domainmodel.DomainModel {
 	dm := &domainmodel.DomainModel{ContainerID: model.ID(meta.SystemModuleID)}
 	dm.ID = model.ID(meta.SystemDomainModelID)
-	for _, e := range meta.SystemEntities {
+	for _, e := range meta.ModelerSystemEntitiesIn(atLeast) {
 		ent := &domainmodel.Entity{
 			Name:              e.Name,
 			Persistable:       e.Persistable,
 			GeneralizationRef: e.Generalization,
+			// The stored system members, as Mendix keeps them: on the root's
+			// NoGeneralization only. A specialization reads its root's
+			// (systemMemberStoredOnChain in the executor).
+			HasOwner:       e.HasOwner,
+			HasChangedBy:   e.HasChangedBy,
+			HasCreatedDate: e.HasCreatedDate,
+			HasChangedDate: e.HasChangedDate,
 		}
 		ent.ID = model.ID("System." + e.Name)
 		for _, a := range e.Attributes {
@@ -38,6 +55,22 @@ func buildSystemDomainModel() *domainmodel.DomainModel {
 		}
 		dm.Entities = append(dm.Entities, ent)
 	}
+	// Platform associations (UserRoles, Session_User, Workflow_*, …). Without
+	// these, SHOW/LIST ASSOCIATIONS and DESCRIBE MODULE System omit every System
+	// association on the modelsdk engine (legacy already builds them via
+	// BuildSystemDomainModel). IDs are synthetic and match the entity ID scheme
+	// so the Parent/Child columns resolve to qualified names.
+	for _, a := range meta.ModelerSystemAssociationsIn(atLeast) {
+		assoc := &domainmodel.Association{
+			Name:     a.Name,
+			ParentID: model.ID("System." + a.Parent),
+			ChildID:  model.ID("System." + a.Child),
+			Type:     domainmodel.AssociationType(a.Type),
+			Owner:    domainmodel.AssociationOwner(a.Owner),
+		}
+		assoc.ID = model.ID("System." + a.Name)
+		dm.Associations = append(dm.Associations, assoc)
+	}
 	return dm
 }
 
@@ -53,7 +86,7 @@ func systemAttrType(a meta.SystemAttrDef) domainmodel.AttributeType {
 	case "Boolean":
 		return &domainmodel.BooleanAttributeType{}
 	case "DateTime":
-		return &domainmodel.DateTimeAttributeType{}
+		return &domainmodel.DateTimeAttributeType{LocalizeDate: true}
 	case "Enumeration":
 		return &domainmodel.EnumerationAttributeType{EnumerationRef: a.EnumQN}
 	case "AutoNumber":
@@ -65,4 +98,17 @@ func systemAttrType(a meta.SystemAttrDef) domainmodel.AttributeType {
 	default: // String and anything unmapped
 		return &domainmodel.StringAttributeType{Length: a.Length}
 	}
+}
+
+// systemVersionAtLeast is the project version's IsAtLeast, or nil when the
+// project version is not known.
+func (b *Backend) systemVersionAtLeast() func(major, minor int) bool {
+	if b == nil {
+		return nil
+	}
+	pv := b.ProjectVersion()
+	if pv == nil || pv.MajorVersion == 0 {
+		return nil
+	}
+	return pv.IsAtLeast
 }

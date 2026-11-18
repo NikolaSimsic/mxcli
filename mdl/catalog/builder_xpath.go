@@ -4,11 +4,11 @@ package catalog
 
 import (
 	"crypto/sha256"
-	"database/sql"
 	"fmt"
+	"github.com/mendixlabs/mxcli/modelsdk/bsoncompat"
 	"strings"
 
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/mendixlabs/mxcli/sdk/microflows"
 )
@@ -23,20 +23,24 @@ const (
 // buildXPathExpressions extracts all XPath constraint expressions from microflows,
 // domain model access rules, and page data sources into the xpath_expressions table.
 // Only runs in full mode.
-func (b *Builder) buildXPathExpressions() error {
-	if !b.fullMode {
-		return nil
-	}
-
-	stmt, err := b.tx.Prepare(`
+// xpathInsertSQL writes one xpath_expressions row; every extractor uses it.
+const xpathInsertSQL = `
 		INSERT INTO xpath_expressions_data (
 			Id, DocumentType, DocumentId, DocumentQualifiedName,
 			ComponentType, ComponentId, ComponentName,
 			XPathExpression, TargetEntity, ReferencedEntities,
 			IsParameterized, UsageType, ModuleName,
+			WidgetId, WidgetName,
 			ProjectId, SnapshotId
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`
+
+func (b *Builder) buildXPathExpressions() error {
+	if !b.fullMode {
+		return nil
+	}
+
+	stmt, err := b.tx.Prepare(xpathInsertSQL)
 	if err != nil {
 		return err
 	}
@@ -49,6 +53,9 @@ func (b *Builder) buildXPathExpressions() error {
 	mfs, err := b.cachedMicroflows()
 	if err == nil {
 		for _, mf := range mfs {
+			if !b.own(string(mf.ID)) {
+				continue
+			}
 			moduleID := b.hierarchy.findModuleID(mf.ContainerID)
 			moduleName := b.hierarchy.getModuleName(moduleID)
 			sourceQN := moduleName + "." + mf.Name
@@ -56,11 +63,15 @@ func (b *Builder) buildXPathExpressions() error {
 			count += b.extractMicroflowXPath(stmt, mf.ObjectCollection, "MICROFLOW", string(mf.ID), sourceQN, moduleName,
 				projectID, snapshotID)
 		}
+		b.disown()
 	}
 
 	nfs, err := b.cachedNanoflows()
 	if err == nil {
 		for _, nf := range nfs {
+			if !b.own(string(nf.ID)) {
+				continue
+			}
 			moduleID := b.hierarchy.findModuleID(nf.ContainerID)
 			moduleName := b.hierarchy.getModuleName(moduleID)
 			sourceQN := moduleName + "." + nf.Name
@@ -68,12 +79,16 @@ func (b *Builder) buildXPathExpressions() error {
 			count += b.extractMicroflowXPath(stmt, nf.ObjectCollection, "NANOFLOW", string(nf.ID), sourceQN, moduleName,
 				projectID, snapshotID)
 		}
+		b.disown()
 	}
 
 	// 2. Extract from entity access rules
 	dms, err := b.cachedDomainModels()
 	if err == nil {
 		for _, dm := range dms {
+			if !b.own(string(dm.ID)) {
+				continue
+			}
 			moduleID := b.hierarchy.findModuleID(dm.ContainerID)
 			moduleName := b.hierarchy.getModuleName(moduleID)
 
@@ -93,28 +108,33 @@ func (b *Builder) buildXPathExpressions() error {
 						"ACCESS_RULE", string(rule.ID), "",
 						rule.XPathConstraint, entityQN, refs,
 						isParam, XPathUsageSecurity, moduleName,
+						"", "",
 						projectID, snapshotID)
 					count++
 				}
 			}
 		}
+		b.disown()
 	}
 
 	// 3. Extract from page/snippet data sources by scanning raw BSON
 	// The page parser only reads metadata, not the widget tree, so we scan the
 	// raw BSON documents for XPathConstraint fields at any nesting depth.
 	for _, typePrefix := range []string{"Forms$Page", "Pages$Page", "Forms$Snippet", "Pages$Snippet"} {
-		rawPages, err := b.reader.ListRawUnitsByType(typePrefix)
+		rawPages, err := b.lister().ListRawUnitsByType(typePrefix)
 		if err != nil {
 			continue
 		}
 		for _, ru := range rawPages {
+			if !b.own(string(ru.ID)) {
+				continue
+			}
 			moduleID := b.hierarchy.findModuleID(ru.ContainerID)
 			moduleName := b.hierarchy.getModuleName(moduleID)
 
 			// Parse just the Name field from the BSON
 			var raw map[string]any
-			if err := bson.Unmarshal(ru.Contents, &raw); err != nil {
+			if err := bsoncompat.UnmarshalDocMap(ru.Contents, &raw); err != nil {
 				continue
 			}
 			name, _ := raw["Name"].(string)
@@ -129,6 +149,7 @@ func (b *Builder) buildXPathExpressions() error {
 			count += scanBSONForXPath(stmt, raw, docType, string(ru.ID), sourceQN, moduleName,
 				projectID, snapshotID)
 		}
+		b.disown()
 	}
 
 	b.report("XPath Expressions", count)
@@ -136,7 +157,7 @@ func (b *Builder) buildXPathExpressions() error {
 }
 
 // extractMicroflowXPath extracts XPath constraints from microflow/nanoflow actions.
-func (b *Builder) extractMicroflowXPath(stmt *sql.Stmt,
+func (b *Builder) extractMicroflowXPath(stmt *Stmt,
 	oc *microflows.MicroflowObjectCollection, docType, docID, docQN, moduleName,
 	projectID, snapshotID string) int {
 
@@ -179,6 +200,7 @@ func (b *Builder) extractMicroflowXPath(stmt *sql.Stmt,
 			"RETRIEVE_ACTION", componentID, componentName,
 			xpath, entityQN, refs,
 			isParam, XPathUsageRetrieve, moduleName,
+			"", "",
 			projectID, snapshotID)
 		count++
 	}
@@ -188,11 +210,33 @@ func (b *Builder) extractMicroflowXPath(stmt *sql.Stmt,
 // scanBSONForXPath recursively scans a BSON map for XPathConstraint fields
 // and inserts records into the xpath_expressions table.
 // This works on raw BSON data, avoiding the need for a full widget tree parser.
-func scanBSONForXPath(stmt *sql.Stmt, raw map[string]any,
+func scanBSONForXPath(stmt *Stmt, raw map[string]any,
 	docType, docID, docQN, moduleName,
 	projectID, snapshotID string) int {
+	return scanXPathUnder(stmt, raw, docType, docID, docQN, moduleName, projectID, snapshotID, "", "", true)
+}
+
+// isWidgetNode reports whether a node is a widget the widgets table indexes:
+// a named page or pluggable element below the document root.
+func isWidgetNode(raw map[string]any, root bool) bool {
+	if root {
+		return false
+	}
+	ty, _ := raw["$Type"].(string)
+	name, _ := raw["Name"].(string)
+	return name != "" && (strings.HasPrefix(ty, "Forms$") || strings.HasPrefix(ty, "Pages$") || ty == "CustomWidgets$CustomWidget")
+}
+
+// scanXPathUnder is scanBSONForXPath carrying the nearest enclosing widget, so
+// each row names the widget its data source belongs to (ako/mxcli#1879).
+func scanXPathUnder(stmt *Stmt, raw map[string]any,
+	docType, docID, docQN, moduleName,
+	projectID, snapshotID, widgetID, widgetName string, root bool) int {
 
 	count := 0
+	if isWidgetNode(raw, root) {
+		widgetID, widgetName = extractBsonID(raw["$ID"]), extractString(raw["Name"])
+	}
 
 	// Check if this node has an XPathConstraint
 	xpath := extractString(raw["XPathConstraint"])
@@ -201,7 +245,9 @@ func scanBSONForXPath(stmt *sql.Stmt, raw map[string]any,
 	}
 	if xpath != "" {
 		bsonType, _ := raw["$Type"].(string)
-		bsonID := extractBsonIDString(raw["$ID"])
+		// The catalog's GUID form, as every other table writes an id; %v of a
+		// bson.Binary was `{0 [57 221 …]}` (ako/mxcli#1879).
+		bsonID := extractBsonID(raw["$ID"])
 		entityQN := resolveEntityRefFromBSON(raw)
 
 		componentType := "WIDGET"
@@ -217,6 +263,7 @@ func scanBSONForXPath(stmt *sql.Stmt, raw map[string]any,
 			componentType, bsonID, bsonType,
 			xpath, entityQN, refs,
 			isParam, XPathUsageDatasource, moduleName,
+			widgetID, widgetName,
 			projectID, snapshotID)
 		count++
 	}
@@ -225,19 +272,19 @@ func scanBSONForXPath(stmt *sql.Stmt, raw map[string]any,
 	for _, v := range raw {
 		switch val := v.(type) {
 		case map[string]any:
-			count += scanBSONForXPath(stmt, val, docType, docID, docQN, moduleName,
-				projectID, snapshotID)
+			count += scanXPathUnder(stmt, val, docType, docID, docQN, moduleName,
+				projectID, snapshotID, widgetID, widgetName, false)
 		case bson.D:
 			m := make(map[string]any)
 			for _, elem := range val {
 				m[elem.Key] = elem.Value
 			}
-			count += scanBSONForXPath(stmt, m, docType, docID, docQN, moduleName,
-				projectID, snapshotID)
+			count += scanXPathUnder(stmt, m, docType, docID, docQN, moduleName,
+				projectID, snapshotID, widgetID, widgetName, false)
 		default:
 			scanBSONArray(v, func(child map[string]any) {
-				count += scanBSONForXPath(stmt, child, docType, docID, docQN, moduleName,
-					projectID, snapshotID)
+				count += scanXPathUnder(stmt, child, docType, docID, docQN, moduleName,
+					projectID, snapshotID, widgetID, widgetName, false)
 			})
 		}
 	}
@@ -279,39 +326,48 @@ func scanBSONArray(v any, fn func(map[string]any)) {
 
 // resolveEntityRefFromBSON extracts a qualified entity name from a BSON node
 // that has an EntityRef field (common in data source nodes).
+//
+// Studio Pro stores a DomainModels$DirectEntityRef with the name under
+// `Entity`, and a DomainModels$IndirectEntityRef (a data source over an
+// association path) as `Steps` ending on the entity the constraint applies to.
+// `QualifiedName` is kept for the synthetic shape older callers pass; no stored
+// EntityRef carries it, which is why every page XPath used to be recorded with
+// no target entity.
 func resolveEntityRefFromBSON(raw map[string]any) string {
-	// Try EntityRef (used by most data sources)
-	if entityRef, ok := raw["EntityRef"].(map[string]any); ok {
-		if name, ok := entityRef["QualifiedName"].(string); ok {
+	ref := bsonAsMap(raw["EntityRef"])
+	if ref == nil {
+		return ""
+	}
+	for _, key := range []string{"Entity", "QualifiedName"} {
+		if name, ok := ref[key].(string); ok && name != "" {
 			return name
 		}
 	}
-	// Try bson.D format
-	if entityRef, ok := raw["EntityRef"].(bson.D); ok {
-		for _, elem := range entityRef {
-			if elem.Key == "QualifiedName" {
-				if name, ok := elem.Value.(string); ok {
-					return name
-				}
-			}
+	last := ""
+	scanBSONArray(ref["Steps"], func(step map[string]any) {
+		if dest, ok := step["DestinationEntity"].(string); ok && dest != "" {
+			last = dest
 		}
-	}
-	return ""
+	})
+	return last
 }
 
-// extractBsonIDString extracts a BSON ID as a string from various formats.
-func extractBsonIDString(v any) string {
-	if v == nil {
-		return ""
+// bsonAsMap returns a decoded sub-document as a map, whichever shape the
+// decoder produced it in; nil when v is not a document.
+func bsonAsMap(v any) map[string]any {
+	switch d := v.(type) {
+	case map[string]any:
+		return d
+	case bson.M:
+		return d
+	case bson.D:
+		m := make(map[string]any, len(d))
+		for _, e := range d {
+			m[e.Key] = e.Value
+		}
+		return m
 	}
-	switch id := v.(type) {
-	case string:
-		return id
-	case []byte:
-		return fmt.Sprintf("%x", id)
-	default:
-		return fmt.Sprintf("%v", id)
-	}
+	return nil
 }
 
 // xpathID generates a deterministic ID from the document, component, and expression.

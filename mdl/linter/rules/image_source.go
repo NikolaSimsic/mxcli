@@ -4,10 +4,10 @@ package rules
 
 import (
 	"fmt"
+	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/mendixlabs/mxcli/mdl/linter"
 	"github.com/mendixlabs/mxcli/model"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 // ImageSourceRule checks for IMAGE widgets with no source configured.
@@ -23,6 +23,10 @@ func (r *ImageSourceRule) ID() string                       { return "MPR005" }
 func (r *ImageSourceRule) Name() string                     { return "UnconfiguredImage" }
 func (r *ImageSourceRule) Category() string                 { return "correctness" }
 func (r *ImageSourceRule) DefaultSeverity() linter.Severity { return linter.SeverityWarning }
+
+// RequiredCatalogMode: ctx.Widgets() reads widgets_data, which only a full
+// catalog build fills; under the default fast build the rule found nothing.
+func (r *ImageSourceRule) RequiredCatalogMode() linter.CatalogMode { return linter.CatalogFull }
 
 func (r *ImageSourceRule) Description() string {
 	return "Checks for IMAGE widgets with no source configured (crashes at runtime)"
@@ -47,7 +51,7 @@ func (r *ImageSourceRule) Check(ctx *linter.LintContext) []linter.Violation {
 	type containerInfo struct {
 		ID            string
 		QualifiedName string
-		Type          string // "PAGE" or "SNIPPET"
+		Type          string // "PAGE", "SNIPPET" or "LAYOUT"
 		ModuleName    string
 	}
 	containers := make(map[string]containerInfo)
@@ -83,10 +87,7 @@ func (r *ImageSourceRule) Check(ctx *linter.LintContext) []linter.Violation {
 				continue
 			}
 
-			docType := "page"
-			if c.Type == "SNIPPET" {
-				docType = "snippet"
-			}
+			docType := widgetDocType(c.Type)
 
 			violations = append(violations, linter.Violation{
 				RuleID:   r.ID(),
@@ -105,6 +106,20 @@ func (r *ImageSourceRule) Check(ctx *linter.LintContext) []linter.Violation {
 	}
 
 	return violations
+}
+
+// widgetDocType is the location document type of a widgets() row's container:
+// "page", "snippet" or "layout". A layout's widgets are catalogued since
+// ako/mxcli#1302; read as "page", a finding in one pointed at a page that does
+// not exist.
+func widgetDocType(containerType string) string {
+	switch containerType {
+	case "SNIPPET":
+		return "snippet"
+	case "LAYOUT":
+		return "layout"
+	}
+	return "page"
 }
 
 // docNameFromQualified extracts the document name from a qualified name like "Module.Name".
@@ -259,7 +274,7 @@ func extractStr(v any) string {
 }
 
 // getBsonArray extracts elements from a BSON array value.
-// Handles primitive.A and []any types, and strips the leading type indicator
+// Handles bson.A and []any types, and strips the leading type indicator
 // integer that Mendix BSON arrays use.
 func getBsonArray(v any) []any {
 	if v == nil {
@@ -269,7 +284,7 @@ func getBsonArray(v any) []any {
 	switch a := v.(type) {
 	case []any:
 		arr = a
-	case primitive.A:
+	case bson.A:
 		arr = []any(a)
 	default:
 		return nil

@@ -3,14 +3,93 @@
 package visitor
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
+	"github.com/antlr4-go/antlr/v4"
 	"github.com/mendixlabs/mxcli/mdl/ast"
 	"github.com/mendixlabs/mxcli/mdl/grammar/parser"
+	"github.com/mendixlabs/mxcli/mdl/types"
 )
 
+// routineHeader is the header a create microflow, nanoflow and rule statement
+// share.
+type routineHeader interface {
+	antlr.ParserRuleContext
+	IfNotExists() parser.IIfNotExistsContext
+	QualifiedName() parser.IQualifiedNameContext
+	LPAREN() antlr.TerminalNode
+	MicroflowParameterList() parser.IMicroflowParameterListContext
+	MicroflowReturnType() parser.IMicroflowReturnTypeContext
+	MicroflowOptions() parser.IMicroflowOptionsContext
+	BEGIN() antlr.TerminalNode
+}
+
+// refuseRoutineHeaderWithoutParens refuses a header written without its
+// parameter parentheses, `create microflow M.F returns Boolean` or `… M.F $l:
+// List of M.Item returns …` (mendixlabs/mxcli#1514). The grammar accepts the
+// bare form only so that this is the one error the mistake produces: left to
+// ANTLR, recovery inserted the `(`, read `returns` as a parameter name and
+// swallowed the body into its type, and every error it reported — `missing ':'
+// at 'Boolean'`, `extraneous input 'return'` three lines down — pointed past
+// the mistake. The error sits where the `(` belongs and shows the header as
+// written, with them added.
+func (b *Builder) refuseRoutineHeaderWithoutParens(ctx routineHeader, kind string) {
+	name := ctx.QualifiedName()
+	if ctx.LPAREN() != nil || name == nil || name.GetStop() == nil {
+		return
+	}
+	header := "create "
+	if c := findParentCreateStatement(ctx); c != nil && c.OR() != nil {
+		if c.MODIFY() != nil {
+			header += "or modify "
+		} else {
+			header += "or replace "
+		}
+	}
+	header += kind + " "
+	if ctx.IfNotExists() != nil {
+		header += "if not exists "
+	}
+	header += name.GetText() + " ("
+	params := ctx.MicroflowParameterList()
+	if params != nil {
+		header += extractExpressionText(params)
+	}
+	header += ")"
+	if ret := ctx.MicroflowReturnType(); ret != nil {
+		header += " " + extractExpressionText(ret)
+	}
+
+	// Point at what follows the name — the token the `(` should precede, and
+	// the one ANTLR's own error named.
+	at := name.GetStop()
+	line, col := at.GetLine(), at.GetColumn()+len(at.GetText())
+	var next antlr.Token
+	switch {
+	case params != nil:
+		next = params.GetStart()
+	case ctx.MicroflowReturnType() != nil:
+		next = ctx.MicroflowReturnType().GetStart()
+	case ctx.MicroflowOptions() != nil:
+		next = ctx.MicroflowOptions().GetStart()
+	case ctx.BEGIN() != nil:
+		next = ctx.BEGIN().GetSymbol()
+	}
+	if next != nil {
+		line, col = next.GetLine(), next.GetColumn()
+	}
+	topic := "microflow"
+	if kind != "microflow" {
+		topic += "." + kind // microflow.nanoflow, microflow.rule
+	}
+	b.addError(fmt.Errorf("line %d:%d a %s header needs its parameter list in parentheses, even when it is "+
+		"empty — they are not optional: write `%s`. See: mxcli syntax %s", line, col, kind, header, topic))
+}
+
 func (b *Builder) ExitCreateMicroflowStatement(ctx *parser.CreateMicroflowStatementContext) {
+	b.refuseRoutineHeaderWithoutParens(ctx, "microflow")
 	stmt := &ast.CreateMicroflowStmt{
 		Name: buildQualifiedName(ctx.QualifiedName()),
 	}
@@ -25,17 +104,18 @@ func (b *Builder) ExitCreateMicroflowStatement(ctx *parser.CreateMicroflowStatem
 		stmt.ReturnType = buildMicroflowReturnType(retType)
 	}
 
-	// Parse options (FOLDER, COMMENT)
+	// Parse options (FOLDER, EXPOSED AS)
 	if opts := ctx.MicroflowOptions(); opts != nil {
 		optsCtx := opts.(*parser.MicroflowOptionsContext)
 		for _, opt := range optsCtx.AllMicroflowOption() {
 			optCtx := opt.(*parser.MicroflowOptionContext)
-			if optCtx.COMMENT() != nil && optCtx.STRING_LITERAL() != nil {
-				stmt.Comment = unquoteString(optCtx.STRING_LITERAL().GetText())
-			}
 			if optCtx.FOLDER() != nil && optCtx.STRING_LITERAL() != nil {
-				stmt.Folder = unquoteString(optCtx.STRING_LITERAL().GetText())
+				stmt.Folder = unquoteStringLit(optCtx.STRING_LITERAL())
 			}
+			if exposed := optCtx.MicroflowExposedClause(); exposed != nil {
+				stmt.Expose = append(stmt.Expose, buildExposeActionClause(exposed))
+			}
+			applyMicroflowDocumentProperty(stmt, optCtx)
 		}
 	}
 
@@ -49,6 +129,7 @@ func (b *Builder) ExitCreateMicroflowStatement(ctx *parser.CreateMicroflowStatem
 	if createStmt != nil {
 		if createStmt.OR() != nil && (createStmt.MODIFY() != nil || createStmt.REPLACE() != nil) {
 			stmt.CreateOrModify = true
+			stmt.CreateOrReplace = createStmt.REPLACE() != nil
 		}
 		for _, ann := range createStmt.AllAnnotation() {
 			annCtx := ann.(*parser.AnnotationContext)
@@ -56,13 +137,15 @@ func (b *Builder) ExitCreateMicroflowStatement(ctx *parser.CreateMicroflowStatem
 				stmt.Excluded = true
 			}
 		}
+		stmt.ApplyEntityAccess = applyEntityAccessAnnotation(createStmt)
 	}
-	stmt.Documentation = findDocCommentText(ctx)
+	stmt.Documentation, stmt.DocumentationSet = findDocComment(ctx)
 
 	b.statements = append(b.statements, stmt)
 }
 
 func (b *Builder) ExitCreateNanoflowStatement(ctx *parser.CreateNanoflowStatementContext) {
+	b.refuseRoutineHeaderWithoutParens(ctx, "nanoflow")
 	stmt := &ast.CreateNanoflowStmt{
 		Name: buildQualifiedName(ctx.QualifiedName()),
 	}
@@ -77,16 +160,22 @@ func (b *Builder) ExitCreateNanoflowStatement(ctx *parser.CreateNanoflowStatemen
 		stmt.ReturnType = buildMicroflowReturnType(retType)
 	}
 
-	// Parse options (FOLDER, COMMENT)
+	// Parse options (FOLDER, EXPOSED AS)
 	if opts := ctx.MicroflowOptions(); opts != nil {
 		optsCtx := opts.(*parser.MicroflowOptionsContext)
 		for _, opt := range optsCtx.AllMicroflowOption() {
 			optCtx := opt.(*parser.MicroflowOptionContext)
-			if optCtx.COMMENT() != nil && optCtx.STRING_LITERAL() != nil {
-				stmt.Comment = unquoteString(optCtx.STRING_LITERAL().GetText())
-			}
 			if optCtx.FOLDER() != nil && optCtx.STRING_LITERAL() != nil {
-				stmt.Folder = unquoteString(optCtx.STRING_LITERAL().GetText())
+				stmt.Folder = unquoteStringLit(optCtx.STRING_LITERAL())
+			}
+			if exposed := optCtx.MicroflowExposedClause(); exposed != nil {
+				stmt.Expose = append(stmt.Expose, buildExposeActionClause(exposed))
+			}
+			// A nanoflow stores an export level like a microflow. The clause
+			// parsed here and was dropped, so `export level api` wrote Hidden
+			// (mendixlabs/mxcli#1498).
+			if el := optCtx.MicroflowExportLevelClause(); el != nil {
+				stmt.ExportLevel = exportLevelOf(el.(*parser.MicroflowExportLevelClauseContext))
 			}
 		}
 	}
@@ -101,6 +190,7 @@ func (b *Builder) ExitCreateNanoflowStatement(ctx *parser.CreateNanoflowStatemen
 	if createStmt != nil {
 		if createStmt.OR() != nil && (createStmt.MODIFY() != nil || createStmt.REPLACE() != nil) {
 			stmt.CreateOrModify = true
+			stmt.CreateOrReplace = createStmt.REPLACE() != nil
 		}
 		for _, ann := range createStmt.AllAnnotation() {
 			annCtx := ann.(*parser.AnnotationContext)
@@ -108,8 +198,58 @@ func (b *Builder) ExitCreateNanoflowStatement(ctx *parser.CreateNanoflowStatemen
 				stmt.Excluded = true
 			}
 		}
+		// No @applyentityaccess on a nanoflow: it runs in the client and
+		// Nanoflows$Nanoflow stores no such property, so the annotation would
+		// parse and do nothing.
 	}
-	stmt.Documentation = findDocCommentText(ctx)
+	stmt.Documentation, stmt.DocumentationSet = findDocComment(ctx)
+
+	b.statements = append(b.statements, stmt)
+}
+
+// ExitCreateRuleStatement mirrors ExitCreateNanoflowStatement — a rule shares the
+// microflow header and body grammar, so the only difference is the AST node.
+func (b *Builder) ExitCreateRuleStatement(ctx *parser.CreateRuleStatementContext) {
+	b.refuseRoutineHeaderWithoutParens(ctx, "rule")
+	stmt := &ast.CreateRuleStmt{
+		Name: buildQualifiedName(ctx.QualifiedName()),
+	}
+
+	if paramList := ctx.MicroflowParameterList(); paramList != nil {
+		stmt.Parameters = buildMicroflowParameters(paramList)
+	}
+	if retType := ctx.MicroflowReturnType(); retType != nil {
+		stmt.ReturnType = buildMicroflowReturnType(retType)
+	}
+	if opts := ctx.MicroflowOptions(); opts != nil {
+		optsCtx := opts.(*parser.MicroflowOptionsContext)
+		for _, opt := range optsCtx.AllMicroflowOption() {
+			optCtx := opt.(*parser.MicroflowOptionContext)
+			if optCtx.FOLDER() != nil && optCtx.STRING_LITERAL() != nil {
+				stmt.Folder = unquoteStringLit(optCtx.STRING_LITERAL())
+			}
+			if exposed := optCtx.MicroflowExposedClause(); exposed != nil {
+				stmt.Expose = append(stmt.Expose, buildExposeActionClause(exposed))
+			}
+		}
+	}
+	if body := ctx.MicroflowBody(); body != nil {
+		stmt.Body = buildMicroflowBody(body)
+	}
+
+	if createStmt := findParentCreateStatement(ctx); createStmt != nil {
+		if createStmt.OR() != nil && (createStmt.MODIFY() != nil || createStmt.REPLACE() != nil) {
+			stmt.CreateOrModify = true
+		}
+		for _, ann := range createStmt.AllAnnotation() {
+			annCtx := ann.(*parser.AnnotationContext)
+			if strings.EqualFold(annCtx.AnnotationName().GetText(), "excluded") {
+				stmt.Excluded = true
+			}
+		}
+		stmt.ApplyEntityAccess = applyEntityAccessAnnotation(createStmt)
+	}
+	stmt.Documentation, stmt.DocumentationSet = findDocComment(ctx)
 
 	b.statements = append(b.statements, stmt)
 }
@@ -175,7 +315,9 @@ func buildMicroflowDataType(ctx parser.IDataTypeContext) ast.DataType {
 		return ast.DataType{Kind: ast.TypeDateTime}
 	}
 	if strings.HasPrefix(text, "DATE") {
-		return ast.DataType{Kind: ast.TypeDate}
+		// `date` (MDL-DEPR160): Mendix has no date-only type, and a `date`
+		// was always stored as a DateTime.
+		return ast.DataType{Kind: ast.TypeDateTime}
 	}
 	if strings.HasPrefix(text, "BINARY") {
 		return ast.DataType{Kind: ast.TypeBinary}
@@ -231,7 +373,9 @@ func buildNonListDataType(ctx parser.INonListDataTypeContext) ast.DataType {
 		return ast.DataType{Kind: ast.TypeDateTime}
 	}
 	if strings.HasPrefix(text, "DATE") {
-		return ast.DataType{Kind: ast.TypeDate}
+		// `date` (MDL-DEPR160): Mendix has no date-only type, and a `date`
+		// was always stored as a DateTime.
+		return ast.DataType{Kind: ast.TypeDateTime}
 	}
 	if strings.HasPrefix(text, "BINARY") {
 		return ast.DataType{Kind: ast.TypeBinary}
@@ -265,10 +409,44 @@ func buildMicroflowParameters(ctx parser.IMicroflowParameterListContext) []ast.M
 			param.Type = buildMicroflowDataType(dt)
 		}
 
+		applyParameterAnnotations(&param, p.AllAnnotation())
+
 		params = append(params, param)
 	}
 
 	return params
+}
+
+// applyParameterAnnotations reads the annotations written on a parameter.
+//
+// Only @position(x, y) means anything on a parameter — it is a stored node with
+// its own coordinates, and nothing else about it is a canvas property. Every
+// other name is recorded rather than ignored, so MDL059 can refuse it; an
+// annotation that parses and does nothing is the failure mode #884 was about,
+// and a typo of `@position` is exactly the case that has to be caught.
+func applyParameterAnnotations(param *ast.MicroflowParam, annotations []parser.IAnnotationContext) {
+	for _, annCtx := range annotations {
+		ann := annCtx.(*parser.AnnotationContext)
+		name := strings.ToLower(ann.AnnotationName().GetText())
+		if name != "position" {
+			param.UnknownAnnotations = append(param.UnknownAnnotations, name)
+			continue
+		}
+		params := ann.AnnotationParams()
+		if params == nil {
+			param.UnknownAnnotations = append(param.UnknownAnnotations, name)
+			continue
+		}
+		all := params.(*parser.AnnotationParamsContext).AllAnnotationParam()
+		if len(all) < 2 {
+			param.UnknownAnnotations = append(param.UnknownAnnotations, name)
+			continue
+		}
+		param.Position = &ast.Position{
+			X: parseAnnotationParamInt(all[0]),
+			Y: parseAnnotationParamInt(all[1]),
+		}
+	}
 }
 
 // buildMicroflowReturnType converts return type context to MicroflowReturnType.
@@ -291,4 +469,138 @@ func buildMicroflowReturnType(ctx parser.IMicroflowReturnTypeContext) *ast.Micro
 	}
 
 	return ret
+}
+
+// buildExposeActionClause reads one EXPOSED AS <kind> ACTION clause.
+//
+// A microflow has two toolbox entries, stored under different keys, so the kind
+// is part of the clause rather than implied. NOT EXPOSED is the removal form:
+// an absent clause preserves what is stored, because the entry also holds icon
+// and image bitmaps MDL cannot name.
+func buildExposeActionClause(ctx parser.IMicroflowExposedClauseContext) ast.ExposeActionClause {
+	out := ast.ExposeActionClause{Workflow: ctx.WORKFLOW() != nil}
+	if ctx.NOT() != nil {
+		out.Remove = true
+		return out
+	}
+	if strs := ctx.AllSTRING_LITERAL(); len(strs) >= 2 {
+		out.Caption = unquoteStringLit(strs[0])
+		out.Category = unquoteStringLit(strs[1])
+	}
+	out.Bitmaps = buildExposeBitmaps(ctx.AllExposeBitmapClause())
+	return out
+}
+
+// buildExposeBitmaps reads the ICON/IMAGE clauses hanging off an exposed clause.
+//
+// DROP ICON clears one; an omitted clause leaves what is stored alone, which is
+// why clearing has to be written out.
+func buildExposeBitmaps(clauses []parser.IExposeBitmapClauseContext) []ast.ExposeBitmap {
+	var out []ast.ExposeBitmap
+	for _, c := range clauses {
+		b := ast.ExposeBitmap{
+			Image: c.IMAGE() != nil,
+			Dark:  c.DARK() != nil,
+			Clear: c.DROP() != nil,
+		}
+		if lit := c.STRING_LITERAL(); lit != nil {
+			b.Path = unquoteStringLit(lit)
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
+// applyEntityAccessAnnotation reads `@applyentityaccess` off a document's
+// annotations, or nil when it is absent.
+//
+// nil is not false: an absent annotation PRESERVES the stored setting, the way
+// @excluded and the doc comment do, because the setting is model state rather
+// than script state. Collapsing the two is the bug this exists to fix — a
+// rewrite that did not mention it turned "apply entity access" off.
+//
+// The bare form means true; `@applyentityaccess(false)` clears it. No grammar
+// change is needed for either: annotationValue already accepts a literal.
+func applyEntityAccessAnnotation(createStmt parser.ICreateStatementContext) *bool {
+	if createStmt == nil {
+		return nil
+	}
+	for _, ann := range createStmt.AllAnnotation() {
+		annCtx := ann.(*parser.AnnotationContext)
+		if !strings.EqualFold(annCtx.AnnotationName().GetText(), "applyentityaccess") {
+			continue
+		}
+		value := true
+		if params := annCtx.AnnotationParams(); params != nil {
+			if strings.EqualFold(strings.TrimSpace(params.GetText()), "false") {
+				value = false
+			}
+		}
+		return &value
+	}
+	return nil
+}
+
+// exportLevelOf maps an EXPORT LEVEL clause's keyword to the member's stored
+// spelling — never the user's casing, which is not what MicroflowsExportLevel
+// declares.
+func exportLevelOf(elCtx *parser.MicroflowExportLevelClauseContext) *string {
+	level := types.ExportLevelHidden
+	if elCtx.API() != nil {
+		level = types.ExportLevelAPI
+	}
+	return &level
+}
+
+// applyMicroflowDocumentProperty reads the URL / EXPORT LEVEL / concurrency
+// header clauses onto the statement.
+//
+// Every field it sets is a POINTER, and that is the whole design: an absent
+// clause must stay distinguishable from a stated one, because absent preserves
+// what is stored and stated overrides it (mendixlabs/mxcli#1120). A plain value
+// would make every rewrite that did not mention the clause reset the property —
+// exactly the bug that made these worth authoring in the first place.
+func applyMicroflowDocumentProperty(stmt *ast.CreateMicroflowStmt, optCtx *parser.MicroflowOptionContext) {
+	if u := optCtx.MicroflowUrlClause(); u != nil {
+		uc := u.(*parser.MicroflowUrlClauseContext)
+		switch {
+		case uc.DROP() != nil:
+			// DROP URL clears both halves: a search-parameter list without a URL
+			// is configuration for a deep link that no longer exists.
+			empty, none := "", []string{}
+			stmt.URL, stmt.URLSearchParameters = &empty, &none
+		case uc.SEARCH() != nil:
+			names := []string{}
+			if sp := uc.MicroflowUrlSearchParams(); sp != nil {
+				spCtx := sp.(*parser.MicroflowUrlSearchParamsContext)
+				for _, v := range spCtx.AllVARIABLE() {
+					names = append(names, strings.TrimPrefix(v.GetText(), "$"))
+				}
+			}
+			stmt.URLSearchParameters = &names
+		case uc.STRING_LITERAL() != nil:
+			url := unquoteStringLit(uc.STRING_LITERAL())
+			stmt.URL = &url
+		}
+	}
+
+	if el := optCtx.MicroflowExportLevelClause(); el != nil {
+		stmt.ExportLevel = exportLevelOf(el.(*parser.MicroflowExportLevelClauseContext))
+	}
+
+	if c := optCtx.MicroflowConcurrencyClause(); c != nil {
+		cCtx := c.(*parser.MicroflowConcurrencyClauseContext)
+		clause := &ast.ConcurrencyClause{Allow: cCtx.ALLOW() != nil}
+		if e := cCtx.MicroflowConcurrencyError(); e != nil {
+			eCtx := e.(*parser.MicroflowConcurrencyErrorContext)
+			if eCtx.ERROR_MESSAGE() != nil && eCtx.STRING_LITERAL() != nil {
+				clause.ErrorMessage = unquoteStringLit(eCtx.STRING_LITERAL())
+				clause.ErrorMessageSet = true
+			}
+			if qn := eCtx.QualifiedName(); qn != nil {
+				clause.ErrorMicroflow = buildQualifiedName(qn).String()
+			}
+		}
+		stmt.Concurrency = clause
+	}
 }

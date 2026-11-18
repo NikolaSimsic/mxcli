@@ -1,0 +1,95 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package modelsdkbackend
+
+import (
+	"testing"
+
+	"github.com/mendixlabs/mxcli/sdk/microflows"
+	"go.mongodb.org/mongo-driver/v2/bson"
+)
+
+// TestActionFromGen_WebServiceCall_Raw guards the legacy SOAP CALL WEB SERVICE
+// action. When the action carries a field the structured describe form can't
+// represent (e.g. HttpConfiguration), it must surface RawBSON so the renderer
+// emits `call web service raw '<base64>'` rather than "-- Empty action".
+func TestActionFromGen_WebServiceCall_Raw(t *testing.T) {
+	act := decodeAction(t, bson.D{
+		{Key: "$ID", Value: "ws-1"},
+		{Key: "$Type", Value: "Microflows$CallWebServiceAction"},
+		{Key: "ErrorHandlingType", Value: "CustomWithoutRollBack"},
+		{Key: "ImportedService", Value: "Launchpad.LamaCloudIntegrationV2"},
+		{Key: "OperationName", Value: "PushAppDeployment"},
+		// An unsupported field forces the raw fallback.
+		{Key: "HttpConfiguration", Value: bson.D{{Key: "$Type", Value: "Microflows$HttpConfiguration"}}},
+	})
+	ws, ok := act.(*microflows.WebServiceCallAction)
+	if !ok {
+		t.Fatalf("actionFromGen → %T, want *microflows.WebServiceCallAction", act)
+	}
+	if string(ws.ServiceID) != "Launchpad.LamaCloudIntegrationV2" || ws.OperationName != "PushAppDeployment" {
+		t.Errorf("structured fields = {%q, %q}", ws.ServiceID, ws.OperationName)
+	}
+	if len(ws.RawBSON) == 0 {
+		t.Error("RawBSON empty, want set (HttpConfiguration is an unsupported field → raw fallback)")
+	}
+}
+
+// TestActionFromGen_WebServiceCall_NoRaw confirms an action carrying exactly
+// what the structured writer emits does NOT set RawBSON, so the renderer uses
+// the readable `call web service …` form.
+func TestActionFromGen_WebServiceCall_NoRaw(t *testing.T) {
+	raw, err := bson.Marshal(referenceSoapActionMap())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc bson.D
+	if err := bson.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	ws := decodeAction(t, doc).(*microflows.WebServiceCallAction)
+	if len(ws.RawBSON) != 0 {
+		t.Errorf("RawBSON set, want empty (the writer's own form → structured form)")
+	}
+}
+
+// TestActionFromGen_WebServiceCall_MissingKeysRaw: an action without the keys
+// the structured writer adds keeps RawBSON, since writing its structured form
+// back would add them — ErrorHandlingType among them, which reads back as
+// Rollback when absent (ako/mxcli#861).
+func TestActionFromGen_WebServiceCall_MissingKeysRaw(t *testing.T) {
+	act := decodeAction(t, bson.D{
+		{Key: "$ID", Value: "ws-2"},
+		{Key: "$Type", Value: "Microflows$CallWebServiceAction"},
+		{Key: "ImportedService", Value: "Mod.Service"},
+		{Key: "OperationName", Value: "Op"},
+	})
+	if ws := act.(*microflows.WebServiceCallAction); len(ws.RawBSON) == 0 {
+		t.Errorf("RawBSON empty, want set (the structured form would write a different document)")
+	}
+}
+
+// The "Use a timeout" toggle is read into the struct for the catalog
+// (mendixlabs/mxcli#1267). A stored false keeps the raw fallback, so reading it
+// changes no write — asserted here too, since that is what makes the field safe.
+func TestActionFromGen_WebServiceCall_UseRequestTimeOut(t *testing.T) {
+	for _, use := range []bool{true, false} {
+		m := referenceSoapActionMap()
+		m["UseRequestTimeOut"] = use
+		raw, err := bson.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc bson.D
+		if err := bson.Unmarshal(raw, &doc); err != nil {
+			t.Fatal(err)
+		}
+		ws := decodeAction(t, doc).(*microflows.WebServiceCallAction)
+		if ws.UseRequestTimeOut != use {
+			t.Errorf("stored UseRequestTimeOut=%v read as %v", use, ws.UseRequestTimeOut)
+		}
+		if !use && len(ws.RawBSON) == 0 {
+			t.Error("a call with the timeout off lost its raw fallback")
+		}
+	}
+}

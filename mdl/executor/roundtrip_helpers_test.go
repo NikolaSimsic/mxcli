@@ -26,7 +26,7 @@ import (
 	"github.com/mendixlabs/mxcli/cmd/mxcli/docker"
 	"github.com/mendixlabs/mxcli/mdl/ast"
 	"github.com/mendixlabs/mxcli/mdl/backend"
-	mprbackend "github.com/mendixlabs/mxcli/mdl/backend/mpr"
+	modelsdkbackend "github.com/mendixlabs/mxcli/mdl/backend/modelsdk"
 	"github.com/mendixlabs/mxcli/mdl/visitor"
 	"github.com/pmezard/go-difflib/difflib"
 )
@@ -50,6 +50,22 @@ var sharedSourceMPR string
 // TestMain creates or locates the source project once, then runs all tests.
 // This avoids running `mx create-project` per test (~29s each).
 func TestMain(m *testing.M) {
+	// 0. Settle the engine matrix before anything runs. An unrecognised name is
+	// fatal, because the alternative is a gate that selects no engine, runs
+	// nothing, and reports success — and a failing package's output IS shown, so
+	// this message lands. The narrowing notice below only reaches a -v run, since
+	// `go test` discards a passing package's output; the CI step name carries it
+	// for everyone else.
+	if len(unknownGateEngines) > 0 {
+		fmt.Fprintf(os.Stderr, "FAIL: %s names unknown engine(s): %s (known: %s)\n",
+			gateEnginesEnv, strings.Join(unknownGateEngines, ", "), gateEngineNames(allGateEngines))
+		os.Exit(1)
+	}
+	if len(gateEngines) != len(allGateEngines) {
+		fmt.Fprintf(os.Stderr, "TestMain: engine matrix narrowed by %s to %s (full matrix: %s)\n",
+			gateEnginesEnv, gateEngineNames(gateEngines), gateEngineNames(allGateEngines))
+	}
+
 	// 1. Try the committed source project
 	srcDir, err := filepath.Abs(sourceProject)
 	if err == nil {
@@ -279,14 +295,26 @@ func copyDir(src, dst string) error {
 }
 
 // setupTestEnv creates a new test environment with a fresh copy of the source project.
+//
+// This defaulted to the LEGACY engine, so most of this package's integration
+// tests ran on the engine that has since been deleted rather than on the one
+// users get. Deleting it (docs/plans/2026-09-14-retire-legacy-engine.md) moved
+// them all onto the codec engine, which is the coverage that was intended.
 func setupTestEnv(t *testing.T) *testEnv {
+	return setupTestEnvWithBackend(t, func() backend.FullBackend { return modelsdkbackend.New() })
+}
+
+// setupTestEnvWithBackend is setupTestEnv parametrized by the backend factory,
+// so a test can name the engine it wants (see TestMxCheck_DoctypeScripts, which
+// loops over the matrix).
+func setupTestEnvWithBackend(t *testing.T, factory func() backend.FullBackend) *testEnv {
 	t.Helper()
 
 	projectPath := copyTestProject(t)
 
 	output := &bytes.Buffer{}
 	exec := New(output)
-	exec.SetBackendFactory(func() backend.FullBackend { return mprbackend.New() })
+	exec.SetBackendFactory(factory)
 
 	// Connect to project
 	connectStmt := &ast.ConnectStmt{

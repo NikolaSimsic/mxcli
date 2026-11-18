@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"strings"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
+
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
+	"github.com/mendixlabs/mxcli/sdk/javaactions"
 )
 
 func (b *Builder) buildModules() error {
@@ -15,11 +18,34 @@ func (b *Builder) buildModules() error {
 		return err
 	}
 
+	// The domain model's documentation, by module. A module has no
+	// documentation of its own; its domain model does, and nothing read it.
+	// A failed domain-model read costs the column, not the module list.
+	// The modules are rebuilt every time, and an incremental build decodes
+	// only the domain models it rebuilds: it reads every domain model's
+	// stored Documentation instead.
+	dmDocs := map[string]string{}
+	if b.scope == nil {
+		if dms, err := b.cachedDomainModels(); err == nil {
+			for _, dm := range dms {
+				if dm.Documentation != "" {
+					dmDocs[string(b.hierarchy.findModuleID(dm.ContainerID))] = dm.Documentation
+				}
+			}
+		}
+	} else if units, err := b.reader.ListRawUnitsByType("DomainModels$DomainModel"); err == nil {
+		for _, u := range units {
+			if doc, ok := bson.Raw(u.Contents).Lookup("Documentation").StringValueOK(); ok && doc != "" {
+				dmDocs[string(b.hierarchy.findModuleID(u.ContainerID))] = doc
+			}
+		}
+	}
+
 	stmt, err := b.tx.Prepare(`
 		INSERT INTO modules_data (Id, Name, QualifiedName, ModuleName, Folder, Description,
-			Source, AppStoreVersion, AppStoreGuid,
+			Source, AppStoreVersion, AppStoreGuid, DomainModelDocumentation,
 			ProjectId, SnapshotId)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -37,6 +63,14 @@ func (b *Builder) buildModules() error {
 				source = "Marketplace"
 			}
 		}
+		if m.PackageFile != "" {
+			// ako/mxcli#1780: held as modules/<Name>.mxmodule. A non-empty
+			// Source is also what keeps lint off a module the user cannot edit.
+			if source != "" {
+				source += ", "
+			}
+			source += "Packaged"
+		}
 		_, err := stmt.Exec(
 			string(m.ID),
 			m.Name,
@@ -47,6 +81,7 @@ func (b *Builder) buildModules() error {
 			source,
 			m.AppStoreVersion,
 			m.AppStoreGuid,
+			dmDocs[string(m.ID)],
 			projectID, snapshotID,
 		)
 		if err != nil {
@@ -69,9 +104,10 @@ func (b *Builder) buildEntities() error {
 		INSERT INTO entities_data (Id, Name, QualifiedName, ModuleName, Folder, EntityType,
 			Description, Generalization, AttributeCount, AssociationCount,
 			AccessRuleCount, ValidationRuleCount, HasEventHandlers,
+			HasCreatedDate, HasChangedDate, HasOwner, HasChangedBy,
 			IsExternal, ExternalService,
 			ProjectId, SnapshotId)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -80,9 +116,9 @@ func (b *Builder) buildEntities() error {
 
 	attrStmt, err := b.tx.Prepare(`
 		INSERT INTO attributes_data (Id, Name, EntityId, EntityQualifiedName, ModuleName,
-			DataType, Length, IsUnique, IsRequired, DefaultValue, IsCalculated, Description,
-			ProjectId, SnapshotId)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			DataType, EnumerationQualifiedName, Length, IsUnique, IsRequired, DefaultValue,
+			IsCalculated, Description, ProjectId, SnapshotId)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -94,6 +130,9 @@ func (b *Builder) buildEntities() error {
 	entityCount := 0
 	attrCount := 0
 	for _, dm := range domainModels {
+		if !b.own(string(dm.ID)) {
+			continue
+		}
 		// Get module name using hierarchy
 		moduleID := b.hierarchy.findModuleID(dm.ContainerID)
 		moduleName := b.hierarchy.getModuleName(moduleID)
@@ -139,6 +178,10 @@ func (b *Builder) buildEntities() error {
 				len(entity.AccessRules),
 				len(entity.ValidationRules),
 				hasEventHandlers,
+				boolToInt(entity.HasCreatedDate),
+				boolToInt(entity.HasChangedDate),
+				boolToInt(entity.HasOwner),
+				boolToInt(entity.HasChangedBy),
 				isExternal,
 				externalService,
 				projectID, snapshotID,
@@ -175,12 +218,20 @@ func (b *Builder) buildEntities() error {
 			// Insert attributes
 			for _, attr := range entity.Attributes {
 				dataType := ""
+				enumQN := ""
 				length := 0
 				if attr.Type != nil {
 					dataType = attr.Type.GetTypeName()
 					// Try to get length for string types
 					if st, ok := attr.Type.(*domainmodel.StringAttributeType); ok {
 						length = st.Length
+					}
+					// GetTypeName is the bare kind, so an enumeration attribute
+					// reports only "Enumeration". Which enumeration is a separate
+					// column; without it nothing downstream can check a value
+					// against the cases.
+					if et, ok := attr.Type.(*domainmodel.EnumerationAttributeType); ok {
+						enumQN = et.EnumerationRef
 					}
 				}
 
@@ -210,6 +261,7 @@ func (b *Builder) buildEntities() error {
 					qualifiedName,
 					moduleName,
 					dataType,
+					enumQN,
 					length,
 					isUnique,
 					isRequired,
@@ -225,6 +277,7 @@ func (b *Builder) buildEntities() error {
 			}
 		}
 	}
+	b.disown()
 
 	b.report("Entities", entityCount)
 	b.report("Attributes", attrCount)
@@ -258,21 +311,42 @@ func (b *Builder) buildEnumerations() error {
 	}
 	defer stmt.Close()
 
+	valueStmt, err := b.tx.Prepare(`
+		INSERT INTO enumeration_values_data (Id, EnumerationId, EnumerationQualifiedName,
+			ModuleName, Name, Caption, Ordinal, ProjectId, SnapshotId)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return err
+	}
+	defer valueStmt.Close()
+
 	projectID, snapshotID := b.snapshotMeta()
+	valueCount := 0
+	lang := b.defaultLanguage()
 
 	for _, enum := range enums {
+		if !b.own(string(enum.ID)) {
+			continue
+		}
 		// Get module name using hierarchy
 		moduleID := b.hierarchy.findModuleID(enum.ContainerID)
 		moduleName := b.hierarchy.getModuleName(moduleID)
 
 		qualifiedName := moduleName + "." + enum.Name
 
+		// Resolve the real folder path from the enum's container (matches pages /
+		// simple docs). Hardcoding this to the module name made a MOVE ENUMERATION
+		// … TO FOLDER look like a silent no-op in the catalog even though the move
+		// persisted (Bug 12b).
+		folderPath := b.hierarchy.buildFolderPath(enum.ContainerID)
+
 		_, err := stmt.Exec(
 			string(enum.ID),
 			enum.Name,
 			qualifiedName,
 			moduleName,
-			moduleName, // Folder as module name for now
+			folderPath,
 			enum.Documentation,
 			len(enum.Values),
 			projectID, snapshotID,
@@ -280,14 +354,78 @@ func (b *Builder) buildEnumerations() error {
 		if err != nil {
 			return err
 		}
+
+		for i, v := range enum.Values {
+			// A value's Id is not always populated on read, and the pair
+			// (enumeration, name) is what identifies it anyway — a synthetic key
+			// keeps the row insertable either way.
+			id := string(v.ID)
+			if id == "" {
+				id = string(enum.ID) + "/" + v.Name
+			}
+			// The project's own language first: a hardcoded "en_US" put the
+			// English caption in the column of a Dutch project that has both, so
+			// CATALOG.ENUMERATION_VALUES and DESCRIBE disagreed about the same
+			// value (mendixlabs/mxcli#1113). Any translation still beats none —
+			// nothing downstream keys off this, the checker matches on Name —
+			// and the last resort is sorted, since a row that varies run to run
+			// is indistinguishable from a model change.
+			caption := ""
+			if v.Caption != nil {
+				caption = pickTranslation(v.Caption.Translations, lang)
+			}
+			if _, err := valueStmt.Exec(
+				id,
+				string(enum.ID),
+				qualifiedName,
+				moduleName,
+				v.Name,
+				caption,
+				i,
+				projectID, snapshotID,
+			); err != nil {
+				return err
+			}
+			valueCount++
+		}
 	}
+	b.disown()
 
 	b.report("Enumerations", len(enums))
+	b.report("Enumeration values", valueCount)
 	return nil
 }
 
+// catalogCodeActionType encodes a Java action return or parameter type for the
+// catalog. A type-parameter reference is prefixed rather than written as its
+// bare name: Studio Pro accepts any name for a type parameter, including a
+// primitive's, and a bare `String` made an action returning its type parameter
+// called String indistinguishable from one returning the primitive
+// (mendixlabs/mxcli#1183). The prefix follows the `Kind:Name` shape
+// microflows_data.ReturnType already uses; no primitive contains a colon.
+//
+//	TypeParameter:T          — an object of the entity bound to T
+//	List of TypeParameter:T  — a list of them
+//	EntityTypeParameter:T    — the entity-type selector that binds T
+//
+// DESCRIBE keeps the bare name, which is its MDL syntax; this is the catalog's
+// encoding only.
+func catalogCodeActionType(t interface{ TypeString() string }) string {
+	switch tp := t.(type) {
+	case *javaactions.TypeParameter:
+		return "TypeParameter:" + tp.TypeParameter
+	case *javaactions.EntityTypeParameterType:
+		return "EntityTypeParameter:" + tp.TypeParameterName
+	case *javaactions.ListType:
+		if tp.TypeParameter != "" {
+			return "List of TypeParameter:" + tp.TypeParameter
+		}
+	}
+	return t.TypeString()
+}
+
 func (b *Builder) buildJavaActions() error {
-	actions, err := b.reader.ListJavaActionsFull()
+	actions, err := b.lister().ListJavaActionsFull()
 	if err != nil {
 		return err
 	}
@@ -303,9 +441,24 @@ func (b *Builder) buildJavaActions() error {
 	}
 	defer stmt.Close()
 
+	paramStmt, err := b.tx.Prepare(`
+		INSERT INTO java_action_parameters_data (Id, JavaActionId, JavaActionName,
+			QualifiedName, ModuleName, Name, Description, ParameterType, IsRequired,
+			Ordinal, ProjectId, SnapshotId)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`)
+	if err != nil {
+		return err
+	}
+	defer paramStmt.Close()
+
 	projectID, snapshotID := b.snapshotMeta()
+	paramCount := 0
 
 	for _, ja := range actions {
+		if !b.own(string(ja.ID)) {
+			continue
+		}
 		moduleID := b.hierarchy.findModuleID(ja.ContainerID)
 		moduleName := b.hierarchy.getModuleName(moduleID)
 		qualifiedName := moduleName + "." + ja.Name
@@ -313,7 +466,7 @@ func (b *Builder) buildJavaActions() error {
 
 		returnType := ""
 		if ja.ReturnType != nil {
-			returnType = ja.ReturnType.TypeString()
+			returnType = catalogCodeActionType(ja.ReturnType)
 		}
 
 		_, err := stmt.Exec(
@@ -331,14 +484,44 @@ func (b *Builder) buildJavaActions() error {
 		if err != nil {
 			return err
 		}
+
+		for i, p := range ja.Parameters {
+			if p == nil {
+				continue
+			}
+			paramType := ""
+			if p.ParameterType != nil {
+				paramType = catalogCodeActionType(p.ParameterType)
+			}
+			if _, err := paramStmt.Exec(
+				string(p.ID),
+				string(ja.ID),
+				ja.Name,
+				qualifiedName+"."+p.Name,
+				moduleName,
+				p.Name,
+				p.Description,
+				paramType,
+				boolToInt(p.IsRequired),
+				i,
+				projectID, snapshotID,
+			); err != nil {
+				return err
+			}
+			paramCount++
+		}
 	}
+	b.disown()
 
 	b.report("Java Actions", len(actions))
+	if paramCount > 0 {
+		b.report("Java Action Parameters", paramCount)
+	}
 	return nil
 }
 
 func (b *Builder) buildODataClients() error {
-	services, err := b.reader.ListConsumedODataServices()
+	services, err := b.lister().ListConsumedODataServices()
 	if err != nil {
 		return err
 	}
@@ -357,10 +540,18 @@ func (b *Builder) buildODataClients() error {
 	projectID, snapshotID := b.snapshotMeta()
 
 	for _, svc := range services {
+		if !b.own(string(svc.ID)) {
+			continue
+		}
 		moduleID := b.hierarchy.findModuleID(svc.ContainerID)
 		moduleName := b.hierarchy.getModuleName(moduleID)
 
 		qualifiedName := moduleName + "." + svc.Name
+
+		// The runtime calls these on every request the service makes, so the
+		// service is their caller.
+		b.addServiceMicroflowRefs(RefObjectConsumedODataService, svc.ID, qualifiedName, moduleName,
+			RefKindCall, svc.ConfigurationMicroflow, svc.HeadersMicroflow, svc.ErrorHandlingMicroflow)
 
 		validated := 0
 		if svc.Validated {
@@ -382,13 +573,14 @@ func (b *Builder) buildODataClients() error {
 			return err
 		}
 	}
+	b.disown()
 
 	b.report("OData Clients", len(services))
 	return nil
 }
 
 func (b *Builder) buildODataServices() error {
-	services, err := b.reader.ListPublishedODataServices()
+	services, err := b.lister().ListPublishedODataServices()
 	if err != nil {
 		return err
 	}
@@ -407,11 +599,21 @@ func (b *Builder) buildODataServices() error {
 	projectID, snapshotID := b.snapshotMeta()
 
 	for _, svc := range services {
+		if !b.own(string(svc.ID)) {
+			continue
+		}
 		moduleID := b.hierarchy.findModuleID(svc.ContainerID)
 		moduleName := b.hierarchy.getModuleName(moduleID)
 
 		qualifiedName := moduleName + "." + svc.Name
 		authTypes := strings.Join(svc.AuthenticationTypes, ", ")
+
+		// Every microflow the service runs is an entry point: a client's
+		// request reaches it, nothing in the model calls it. Without the edge a
+		// resource's read microflow and the service's authentication microflow
+		// read as dead to `refs`, `impact` and QUAL004 (ako/mxcli#1639).
+		b.addServiceMicroflowRefs(RefObjectPublishedODataService, svc.ID, qualifiedName, moduleName,
+			RefKindPublish, publishedODataMicroflows(svc)...)
 
 		_, err := stmt.Exec(
 			string(svc.ID),
@@ -429,6 +631,7 @@ func (b *Builder) buildODataServices() error {
 			return err
 		}
 	}
+	b.disown()
 
 	b.report("OData Services", len(services))
 	return nil
@@ -455,6 +658,9 @@ func (b *Builder) buildBusinessEventServices() error {
 	projectID, snapshotID := b.snapshotMeta()
 
 	for _, svc := range services {
+		if !b.own(string(svc.ID)) {
+			continue
+		}
 		moduleID := b.hierarchy.findModuleID(svc.ContainerID)
 		moduleName := b.hierarchy.getModuleName(moduleID)
 		qualifiedName := moduleName + "." + svc.Name
@@ -466,6 +672,7 @@ func (b *Builder) buildBusinessEventServices() error {
 				msgCount += len(ch.Messages)
 			}
 		}
+		handlers := make([]string, 0, len(svc.OperationImplementations))
 		for _, op := range svc.OperationImplementations {
 			switch op.Operation {
 			case "publish":
@@ -473,7 +680,13 @@ func (b *Builder) buildBusinessEventServices() error {
 			case "subscribe":
 				subscribeCount++
 			}
+			handlers = append(handlers, op.Microflow)
 		}
+		// An operation's microflow is the handler the platform runs when the
+		// event arrives — an event handler, like an entity's, and reached the
+		// same way: nothing in the model calls it.
+		b.addServiceMicroflowRefs(RefObjectBusinessEventService, svc.ID, qualifiedName, moduleName,
+			RefKindEvent, handlers...)
 
 		serviceName := ""
 		eventNamePrefix := ""
@@ -499,6 +712,7 @@ func (b *Builder) buildBusinessEventServices() error {
 			return err
 		}
 	}
+	b.disown()
 
 	b.report("Business Event Services", len(services))
 	return nil
@@ -527,6 +741,9 @@ func (b *Builder) buildBusinessEvents() error {
 
 	count := 0
 	for _, svc := range services {
+		if !b.own(string(svc.ID)) {
+			continue
+		}
 		moduleID := b.hierarchy.findModuleID(svc.ContainerID)
 		moduleName := b.hierarchy.getModuleName(moduleID)
 		svcQN := moduleName + "." + svc.Name
@@ -599,6 +816,7 @@ func (b *Builder) buildBusinessEvents() error {
 			}
 		}
 	}
+	b.disown()
 
 	b.report("Business Events", count)
 	return nil
@@ -624,6 +842,9 @@ func (b *Builder) buildDatabaseConnections() error {
 	projectID, snapshotID := b.snapshotMeta()
 
 	for _, conn := range connections {
+		if !b.own(string(conn.ID)) {
+			continue
+		}
 		moduleID := b.hierarchy.findModuleID(conn.ContainerID)
 		moduleName := b.hierarchy.getModuleName(moduleID)
 		qualifiedName := moduleName + "." + conn.Name
@@ -643,6 +864,7 @@ func (b *Builder) buildDatabaseConnections() error {
 			return err
 		}
 	}
+	b.disown()
 
 	b.report("Database Connections", len(connections))
 	return nil
@@ -668,6 +890,9 @@ func (b *Builder) buildJarDependencies() error {
 
 	count := 0
 	for _, ms := range allSettings {
+		if !b.own(string(ms.ID)) {
+			continue
+		}
 		moduleName := b.hierarchy.getModuleName(ms.ContainerID)
 		for _, dep := range ms.JarDependencies {
 			coordinate := dep.GroupID + ":" + dep.ArtifactID
@@ -691,13 +916,14 @@ func (b *Builder) buildJarDependencies() error {
 			count++
 		}
 	}
+	b.disown()
 
 	b.report("JAR Dependencies", count)
 	return nil
 }
 
 func (b *Builder) buildJsonStructures() error {
-	structures, err := b.reader.ListJsonStructures()
+	structures, err := b.lister().ListJsonStructures()
 	if err != nil {
 		return err
 	}
@@ -716,6 +942,9 @@ func (b *Builder) buildJsonStructures() error {
 	projectID, snapshotID := b.snapshotMeta()
 
 	for _, js := range structures {
+		if !b.own(string(js.ID)) {
+			continue
+		}
 		moduleID := b.hierarchy.findModuleID(js.ContainerID)
 		moduleName := b.hierarchy.getModuleName(moduleID)
 		qualifiedName := moduleName + "." + js.Name
@@ -746,22 +975,23 @@ func (b *Builder) buildJsonStructures() error {
 			return err
 		}
 	}
+	b.disown()
 
 	b.report("JSON Structures", len(structures))
 	return nil
 }
 
 func (b *Builder) buildImportMappings() error {
-	mappings, err := b.reader.ListImportMappings()
+	mappings, err := b.lister().ListImportMappings()
 	if err != nil {
 		return err
 	}
 
 	stmt, err := b.tx.Prepare(`
-		INSERT INTO import_mappings_data (Name, QualifiedName, ModuleName,
-			SchemaSource, ElementCount, Documentation, Folder,
+		INSERT INTO import_mappings_data (Id, Name, QualifiedName, ModuleName,
+			SchemaSource, ElementCount, Documentation, Folder, Excluded,
 			ProjectId, SnapshotId)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -771,6 +1001,9 @@ func (b *Builder) buildImportMappings() error {
 	projectID, snapshotID := b.snapshotMeta()
 
 	for _, im := range mappings {
+		if !b.own(string(im.ID)) {
+			continue
+		}
 		moduleID := b.hierarchy.findModuleID(im.ContainerID)
 		moduleName := b.hierarchy.getModuleName(moduleID)
 		qualifiedName := moduleName + "." + im.Name
@@ -781,10 +1014,11 @@ func (b *Builder) buildImportMappings() error {
 			src = im.XmlSchema
 		}
 		if src == "" {
-			src = im.MessageDefinition
+			src = im.MessageDefinitionSource()
 		}
 
 		_, err := stmt.Exec(
+			string(im.ID),
 			im.Name,
 			qualifiedName,
 			moduleName,
@@ -792,28 +1026,30 @@ func (b *Builder) buildImportMappings() error {
 			len(im.Elements),
 			im.Documentation,
 			folderPath,
+			im.Excluded,
 			projectID, snapshotID,
 		)
 		if err != nil {
 			return err
 		}
 	}
+	b.disown()
 
 	b.report("Import Mappings", len(mappings))
 	return nil
 }
 
 func (b *Builder) buildExportMappings() error {
-	mappings, err := b.reader.ListExportMappings()
+	mappings, err := b.lister().ListExportMappings()
 	if err != nil {
 		return err
 	}
 
 	stmt, err := b.tx.Prepare(`
-		INSERT INTO export_mappings_data (Name, QualifiedName, ModuleName,
-			SchemaSource, NullValueOption, ElementCount, Documentation, Folder,
+		INSERT INTO export_mappings_data (Id, Name, QualifiedName, ModuleName,
+			SchemaSource, NullValueOption, ElementCount, Documentation, Folder, Excluded,
 			ProjectId, SnapshotId)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -823,6 +1059,9 @@ func (b *Builder) buildExportMappings() error {
 	projectID, snapshotID := b.snapshotMeta()
 
 	for _, em := range mappings {
+		if !b.own(string(em.ID)) {
+			continue
+		}
 		moduleID := b.hierarchy.findModuleID(em.ContainerID)
 		moduleName := b.hierarchy.getModuleName(moduleID)
 		qualifiedName := moduleName + "." + em.Name
@@ -833,10 +1072,11 @@ func (b *Builder) buildExportMappings() error {
 			src = em.XmlSchema
 		}
 		if src == "" {
-			src = em.MessageDefinition
+			src = em.MessageDefinitionSource()
 		}
 
 		_, err := stmt.Exec(
+			string(em.ID),
 			em.Name,
 			qualifiedName,
 			moduleName,
@@ -845,12 +1085,14 @@ func (b *Builder) buildExportMappings() error {
 			len(em.Elements),
 			em.Documentation,
 			folderPath,
+			em.Excluded,
 			projectID, snapshotID,
 		)
 		if err != nil {
 			return err
 		}
 	}
+	b.disown()
 
 	b.report("Export Mappings", len(mappings))
 	return nil

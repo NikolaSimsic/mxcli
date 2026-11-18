@@ -149,8 +149,10 @@ func TestMapUserTaskWithBoundaryEvent(t *testing.T) {
 	if len(be) != 1 {
 		t.Fatalf("boundaryEvents: %+v", m["boundaryEvents"])
 	}
+	// The delay is not a constructor property (ped_get_schema, Studio Pro 11.14);
+	// applyTimerBoundaryEvents sets it once the event is stored.
 	e0, _ := be[0].(map[string]any)
-	if e0["$Type"] != "Workflows$InterruptingTimerBoundaryEvent" || e0["firstExecutionTime"] != "addHours([%CurrentDateTime%], 2)" {
+	if _, has := e0["firstExecutionTime"]; e0["$Type"] != "Workflows$InterruptingTimerBoundaryEvent" || has {
 		t.Fatalf("boundary event: %+v", e0)
 	}
 }
@@ -328,10 +330,15 @@ func wfMutatorFake(t *testing.T) (*fakePED, *mcpWorkflowMutator) {
 			{"$Type":"Workflows$BooleanConditionOutcome","value":false}]`,
 		"/flow/activities/2/outcomes": `[{"$Type":"Workflows$ParallelSplitOutcome"},
 			{"$Type":"Workflows$ParallelSplitOutcome"},{"$Type":"Workflows$ParallelSplitOutcome"}]`,
-		"/flow/activities/0/userTargeting":  `{"$Type":"Workflows$XPathUserTargeting"}`,
-		"/flow/activities/0/boundaryEvents": `[{"$Type":"Workflows$InterruptingTimerBoundaryEvent"}]`,
+		"/flow/activities/0/userTargeting": `{"$Type":"Workflows$XPathUserTargeting"}`,
 	}
+	store := newBoundaryEventStore(map[string][]map[string]any{
+		"/flow/activities/0/boundaryEvents": {{"$Type": "Workflows$InterruptingTimerBoundaryEvent", "persistentId": "stored-0"}},
+	})
 	f := newFakePED(t, func(name string, args map[string]any) (string, bool) {
+		if text, ok := store.handle(name, args); ok {
+			return text, false
+		}
 		if name == "ped_check_errors" {
 			return "No errors found.", false
 		}
@@ -348,6 +355,73 @@ func wfMutatorFake(t *testing.T) (*fakePED, *mcpWorkflowMutator) {
 	})
 	b := &Backend{client: f.connectClient(t)}
 	return f, &mcpWorkflowMutator{backend: b, moduleName: "M", workflowName: "WF"}
+}
+
+// jumpShadowFake scripts a flow holding an activity and a jump back to it. The
+// jump carries the shape buildJumpTo writes when the MDL gives no caption:
+// name "JumpTo", caption = the target's name.
+func jumpShadowFake(t *testing.T) (*fakePED, *mcpWorkflowMutator) {
+	t.Helper()
+	acts := `[{"$Type":"Workflows$SingleUserTaskActivity","name":"bugSplitJump","caption":"Split the jump"},
+		{"$Type":"Workflows$CallMicroflowTask","name":"Other","caption":"Twin"},
+		{"$Type":"Workflows$CallMicroflowTask","name":"Other2","caption":"Twin"},
+		{"$Type":"Workflows$JumpToActivity","name":"JumpTo","caption":"bugSplitJump","targetActivity":"bugSplitJump"}]`
+	// InsertBoundaryEvent finds the event it added by the persistentId that
+	// appeared, so the boundaryEvents lists must remember what was added.
+	store := newBoundaryEventStore(nil)
+	f := newFakePED(t, func(name string, args map[string]any) (string, bool) {
+		if text, ok := store.handle(name, args); ok {
+			return text, false
+		}
+		if name == "ped_check_errors" {
+			return "No errors found.", false
+		}
+		if name != "ped_read_document" {
+			return "SUCCESS", false
+		}
+		paths, _ := args["paths"].([]any)
+		p, _ := paths[0].(string)
+		v := "null"
+		if p == "/flow/activities" {
+			v = acts
+		}
+		return fmt.Sprintf(`{"results":[{"path":%q,"result":%s}]}`, p, v), false
+	})
+	b := &Backend{client: f.connectClient(t)}
+	return f, &mcpWorkflowMutator{backend: b, moduleName: "M", workflowName: "WF"}
+}
+
+// Measured live on Studio Pro 11.14: `insert boundary event on bugSplitJump`
+// failed with `ambiguous activity "bugSplitJump" (2 matches)` because the jump's
+// caption matched the reference as well as the target's name.
+func TestWFResolve_NameBeatsJumpCaption(t *testing.T) {
+	f, m := jumpShadowFake(t)
+	if err := m.InsertBoundaryEvent("bugSplitJump", 0, "NonInterruptingTimer", "addHours([%CurrentDateTime%], 1)", "", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if ops := wfUpdateOps(t, f); !strings.Contains(ops, `"path":"/flow/activities/0/boundaryEvents"`) {
+		t.Errorf("boundary event not added to the named activity: %s", ops)
+	}
+
+	// Captions still resolve when no name matches ...
+	_, m2 := jumpShadowFake(t)
+	loc, err := m2.resolve("Split the jump", 0)
+	if err != nil || loc.index != 0 {
+		t.Errorf("caption fallback: index %d, err %v", loc.index, err)
+	}
+	// @N still counts every match in document order, so a script that reached
+	// the jump as bugSplitJump@2 keeps working (24-workflow-examples.mdl relies
+	// on this with ACT_Process@2).
+	if loc, err := m2.resolve("bugSplitJump", 2); err != nil || loc.index != 3 {
+		t.Errorf("bugSplitJump@2: index %d, err %v", loc.index, err)
+	}
+	// ... and two caption-only matches are still ambiguous, addressable by @N.
+	if _, err := m2.resolve("Twin", 0); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Errorf("two caption matches should be ambiguous, got %v", err)
+	}
+	if loc, err := m2.resolve("Twin", 2); err != nil || loc.index != 2 {
+		t.Errorf("Twin@2: index %d, err %v", loc.index, err)
+	}
 }
 
 func wfUpdateOps(t *testing.T, f *fakePED) string {
@@ -418,14 +492,8 @@ func TestWFDropPath(t *testing.T) {
 	if ops := wfUpdateOps(t, f); !strings.Contains(ops, `"path":"/flow/activities/2/outcomes"`) || !strings.Contains(ops, `"index":1`) {
 		t.Errorf("drop path 'Path 2' wrong: %s", ops)
 	}
-	// Empty caption drops the last path (index 2 of 3).
-	f2, m2 := wfMutatorFake(t)
-	if err := m2.DropPath("Parallel split", 0, ""); err != nil {
-		t.Fatal(err)
-	}
-	if ops := wfUpdateOps(t, f2); !strings.Contains(ops, `"index":2`) {
-		t.Errorf("drop last path wrong: %s", ops)
-	}
+	// An empty caption used to drop the last path; it names none, so it is
+	// refused now (TestWFDropPath_EmptyCaptionIsRefused).
 }
 
 func TestWFInsertBranch(t *testing.T) {
@@ -458,22 +526,25 @@ func TestWFDropBranch(t *testing.T) {
 
 func TestWFBoundaryEvent(t *testing.T) {
 	f, m := wfMutatorFake(t)
-	if err := m.InsertBoundaryEvent("ReviewOrder", 0, "NonInterruptingTimer", "addHours([%CurrentDateTime%], 1)", nil); err != nil {
+	if err := m.InsertBoundaryEvent("ReviewOrder", 0, "NonInterruptingTimer", "addHours([%CurrentDateTime%], 1)", "", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	ops := wfUpdateOps(t, f)
 	for _, want := range []string{
 		`"path":"/flow/activities/0/boundaryEvents"`, `"type":"add"`,
 		`"$Type":"Workflows$NonInterruptingTimerBoundaryEvent"`,
-		`"firstExecutionTime":"addHours([%CurrentDateTime%], 1)"`,
 	} {
 		if !strings.Contains(ops, want) {
 			t.Errorf("insert boundary event missing %s: %s", want, ops)
 		}
 	}
+	// Its delay is set where it landed (the fake prepends), in a second update.
+	if got := recordedOps(t, f); len(got) != 4 || got[3] != `set /flow/activities/0/boundaryEvents/0/firstExecutionTime "addHours([%CurrentDateTime%], 1)"` {
+		t.Errorf("delay not set on the inserted event: %v", got)
+	}
 	// DROP removes index 0.
 	f2, m2 := wfMutatorFake(t)
-	if err := m2.DropBoundaryEvent("ReviewOrder", 0); err != nil {
+	if err := m2.DropBoundaryEvent("ReviewOrder", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if ops := wfUpdateOps(t, f2); !strings.Contains(ops, `"path":"/flow/activities/0/boundaryEvents"`) || !strings.Contains(ops, `"index":0`) {
@@ -504,11 +575,15 @@ func TestWFSetActivityProperty(t *testing.T) {
 }
 
 func TestUpdateWorkflow_ReplacesFlowAndProperties(t *testing.T) {
-	f := newFakePED(t, func(name string, _ map[string]any) (string, bool) {
+	f := newFakePED(t, func(name string, args map[string]any) (string, bool) {
 		switch name {
 		case "ped_check_errors":
 			return "No errors found.", false
 		case "ped_read_document":
+			// The stored workflow has no event handlers and no event sub-processes.
+			if paths, _ := args["paths"].([]any); len(paths) == 1 && (paths[0] == "/onWorkflowEvent" || paths[0] == "/eventSubProcesses") {
+				return `{"results":[{"path":"` + paths[0].(string) + `","result":[]}]}`, false
+			}
 			// The existing flow has 3 activities (Start, X, End).
 			return `{"results":[{"path":"/flow/activities","result":[
 				{"$Type":"Workflows$StartWorkflowActivity"},
@@ -538,18 +613,23 @@ func TestUpdateWorkflow_ReplacesFlowAndProperties(t *testing.T) {
 	if err := b.UpdateWorkflow(wf); err != nil {
 		t.Fatalf("UpdateWorkflow: %v", err)
 	}
-	call, ok := f.callByName("ped_update_document")
-	if !ok {
+	// Adds and removes go in separate updates (see UpdateWorkflow).
+	var ops []any
+	for _, c := range f.calls {
+		if c.Name == "ped_update_document" {
+			ops = append(ops, c.Args["operations"].([]any)...)
+		}
+	}
+	if len(ops) == 0 {
 		t.Fatal("no ped_update_document sent")
 	}
-	ops, _ := call.Args["operations"].([]any)
 	var adds, removes int
 	for _, o := range ops {
 		op, _ := o.(map[string]any)["operation"].(map[string]any)
 		switch op["type"] {
 		case "add":
 			adds++
-			// Middles are inserted just after Start (index 1), in reverse order.
+			// Middles are inserted just after Start (index 1), in statement order.
 			if idx, _ := op["index"].(float64); idx != 1 {
 				t.Errorf("flow-replace add must target index 1, got %v", op["index"])
 			}
@@ -607,15 +687,21 @@ func TestWFNestedActivityResolution(t *testing.T) {
 	m := &mcpWorkflowMutator{backend: &Backend{client: f.connectClient(t)}, moduleName: "M", workflowName: "WF"}
 
 	// Resolve lands in the nested flow.
-	arrayPath, index, actPath, err := m.resolve("NestedCall", 0)
+	loc, err := m.resolve("NestedCall", 0)
 	if err != nil {
 		t.Fatalf("resolve nested: %v", err)
 	}
-	if arrayPath != "/flow/activities/1/outcomes/0/flow/activities" || index != 0 {
-		t.Fatalf("nested resolve = %q[%d], want /flow/activities/1/outcomes/0/flow/activities[0]", arrayPath, index)
+	if loc.arrayPath != "/flow/activities/1/outcomes/0/flow/activities" || loc.index != 0 {
+		t.Fatalf("nested resolve = %q[%d], want /flow/activities/1/outcomes/0/flow/activities[0]", loc.arrayPath, loc.index)
 	}
-	if actPath != "/flow/activities/1/outcomes/0/flow/activities/0" {
-		t.Fatalf("actPath = %q", actPath)
+	if loc.actPath != "/flow/activities/1/outcomes/0/flow/activities/0" {
+		t.Fatalf("actPath = %q", loc.actPath)
+	}
+	// The same walk collects every activity name, nested ones included.
+	for _, want := range []string{"Start", "Review", "NestedCall", "End"} {
+		if !loc.taken[want] {
+			t.Errorf("resolve did not record activity name %q: %v", want, loc.taken)
+		}
 	}
 
 	// DropActivity on the nested ref removes from the nested array.
@@ -626,5 +712,49 @@ func TestWFNestedActivityResolution(t *testing.T) {
 	raw, _ := json.Marshal(call.Args["operations"])
 	if !strings.Contains(string(raw), `"path":"/flow/activities/1/outcomes/0/flow/activities"`) || !strings.Contains(string(raw), `"index":0`) {
 		t.Errorf("nested drop op wrong: %s", raw)
+	}
+}
+
+// ako/mxcli#1714: how PED takes a template's parameter list is unmeasured, so
+// a text with parameters is refused over MCP rather than written without them.
+func TestMCPWorkflow_RefusesTemplateParameters(t *testing.T) {
+	task := &workflows.UserTask{Page: "M.P", TaskName: "Review {1}", TaskNameParams: []string{"$WorkflowContext/Title"}}
+	task.Name, task.Caption = "Review", "Review"
+	if _, err := mapWorkflowActivity(task); err == nil || !strings.Contains(err.Error(), "template parameters") {
+		t.Errorf("create with task name parameters: got %v, want a refusal", err)
+	}
+	wf := &workflows.Workflow{Name: "W", WorkflowName: "W {1}", WorkflowNameParams: []string{"$WorkflowContext/Title"}}
+	if _, err := (&Backend{}).mapWorkflowContent(wf, true); err == nil || !strings.Contains(err.Error(), "template parameters") {
+		t.Errorf("create with display parameters: got %v, want a refusal", err)
+	}
+	m := &mcpWorkflowMutator{backend: &Backend{}, moduleName: "M", workflowName: "WF"}
+	if err := m.SetTemplateParameters("", 0, "display", []string{"$WorkflowContext/Title"}); err == nil {
+		t.Error("alter with display parameters must be refused")
+	}
+	// CONTROL: no parameters is what MCP wrote before.
+	if err := m.SetTemplateParameters("", 0, "display", nil); err != nil {
+		t.Errorf("alter without parameters: %v", err)
+	}
+	plain := &workflows.UserTask{Page: "M.P"}
+	plain.Name, plain.Caption = "Plain", "Plain"
+	if _, err := mapWorkflowActivity(plain); err != nil {
+		t.Errorf("a task without parameters: %v", err)
+	}
+}
+
+// ako/mxcli#1716: PED's timer constructors drop what they do not take, so a
+// recurrence is refused over MCP rather than written as a one-shot timer.
+func TestMCPWorkflow_RefusesRecurrence(t *testing.T) {
+	r := &workflows.Recurrence{IntervalType: "Day", Interval: 1, MaxExecutions: 3}
+	if _, err := boundaryEventElement(&workflows.BoundaryEvent{EventType: "NonInterruptingTimer", Recurrence: r}); err == nil {
+		t.Error("a repeating boundary event must be refused over MCP")
+	}
+	start := &workflows.EventSubProcessStartActivity{Timer: true, Recurrence: r}
+	start.Name = "S"
+	if _, err := mapWorkflowActivity(start); err == nil {
+		t.Error("a repeating event sub-process start must be refused over MCP")
+	}
+	if _, err := boundaryEventElement(&workflows.BoundaryEvent{EventType: "NonInterruptingTimer"}); err != nil {
+		t.Errorf("control, no recurrence: %v", err)
 	}
 }

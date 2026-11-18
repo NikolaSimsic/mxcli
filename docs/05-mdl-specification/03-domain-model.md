@@ -100,6 +100,7 @@ create view entity Reports.CustomerStats (
 | Required | `not null` | Value cannot be empty |
 | Unique | `unique` | Value must be unique |
 | Default | `default value` | Default value on create |
+| Localize (DateTime only) | `not localized` / `localized` | `DomainModels$DateTimeAttributeType.LocalizeDate`. Unstated: true on a new attribute, the stored value on a rewrite. `describe` prints only `not localized` |
 
 ### Attribute Ordering
 
@@ -227,11 +228,18 @@ Associations define relationships between entities.
 
 ### Association Syntax
 
+**Direction (important):** an association goes **`from` the entity that owns the
+foreign key `to` the entity it references**. In a many-to-one, that means
+`from <the "many" entity> to <the "one" entity>` — e.g. each `Order` knows its
+`Customer`, so `from Order to Customer`. This is the opposite of what many people
+expect; getting it backwards passes `mxcli check` but fails the Mendix build with
+`CE0854 "not reachable from entity"`.
+
 ```sql
 [/** <documentation> */]
 create association <module>.<AssociationName>
-  from <ParentEntity>
-  to <ChildEntity>
+  from <ForeignKeyOwnerEntity>   -- owns the reference (the "many" side)
+  to <ReferencedEntity>          -- is referenced (the "one" side)
   type <reference|ReferenceSet>
   [owner <default|both|Parent|Child>]
   [delete_behavior <behavior>]
@@ -243,8 +251,8 @@ create association <module>.<AssociationName>
 | Property | MDL Clause | Description |
 |----------|------------|-------------|
 | Name | `Module.Name` | Association identifier |
-| Parent | `from entity` | Parent (owner/many) side of relationship |
-| Child | `to entity` | Child (referenced/one) side of relationship |
+| From | `from entity` | The entity that **owns the foreign key** — the "many" side of a many-to-one |
+| To | `to entity` | The **referenced** entity — the "one" side |
 | Type | `type reference/ReferenceSet` | Cardinality type |
 | Owner | `owner` | Which side can modify |
 | Delete Behavior | `delete_behavior` | What happens on delete |
@@ -262,16 +270,19 @@ create association <module>.<AssociationName>
 
 | Behavior | MDL Keyword | Description |
 |----------|-------------|-------------|
-| Delete but keep references | `DELETE_BUT_KEEP_REFERENCES` | Delete object, nullify references |
-| Delete cascade | `DELETE_CASCADE` | Delete associated objects too |
+| Keep references | `DELETE_BUT_KEEP_REFERENCES` | Delete object, nullify references |
+| Delete referenced too | `CASCADE` | Delete the associated objects too (there is **no** `DELETE_CASCADE`) |
+| Only if unreferenced | `DELETE_IF_NO_REFERENCES` | Delete only when nothing references it |
+| Delete both | `DELETE_AND_REFERENCES` | Delete this object and the ones it references |
+| Prevent | `PREVENT` | Block the delete while a reference exists |
 
 ### Examples
 
 ```sql
-/** Order belongs to Customer (many-to-one) */
+/** Order belongs to Customer (many-to-one): Order owns the FK → from Order to Customer */
 create association Sales.Order_Customer
-  from Sales.Customer
-  to Sales.Order
+  from Sales.Order
+  to Sales.Customer
   type reference
   owner default
   delete_behavior DELETE_BUT_KEEP_REFERENCES;
@@ -285,12 +296,12 @@ create association Sales.Order_Product
   owner both;
 /
 
-/** Invoice must be deleted with Order */
+/** Invoice must be deleted with its Order */
 create association Sales.Order_Invoice
   from Sales.Order
   to Sales.Invoice
   type reference
-  delete_behavior DELETE_CASCADE;
+  delete_behavior CASCADE;
 /
 ```
 
@@ -354,7 +365,7 @@ Access rules control entity-level security. They are managed via `grant` and `re
 
 ```sql
 -- Grant entity access to a module role
-grant <module>.<role> on <module>.<entity> (<rights>) [where '<xpath>'];
+grant <rights> on entity <module>.<entity> to <module>.<role> [, ...] [where [<xpath>]];
 
 -- Revoke entity access
 revoke <module>.<role> on <module>.<entity>;
@@ -376,19 +387,19 @@ Where `<rights>` is a comma-separated list of:
 
 ```sql
 -- Full access
-grant Sales.Admin on Sales.Customer (create, delete, read *, write *);
+grant create, delete, read *, write * on entity Sales.Customer to Sales.Admin;
 
 -- Read-only
-grant Sales.Viewer on Sales.Customer (read *);
+grant read * on entity Sales.Customer to Sales.Viewer;
 
 -- Selective member access
-grant Sales.User on Sales.Customer (read (Name, Email), write (Email));
+grant read (Name, Email), write (Email) on entity Sales.Customer to Sales.User;
 
 -- With XPath constraint
-grant Sales.User on Sales.Order (read *, write *) where '[Status = ''Open'']';
+grant read *, write * on entity Sales.Order to Sales.User where [Status = 'Open'];
 
 -- Revoke
-revoke Sales.User on Sales.Order;
+revoke all on entity Sales.Order from Sales.User;
 ```
 
 ### Access Rule Properties
@@ -480,10 +491,10 @@ index (OrderNumber)
 index (OrderDate desc);
 /
 
--- Create association
+-- Create association (Order owns the FK to Customer → from Order to Customer)
 create association Sales.Order_Customer
-  from Sales.Customer
-  to Sales.Order
+  from Sales.Order
+  to Sales.Customer
   type reference
   owner default
   delete_behavior DELETE_BUT_KEEP_REFERENCES;

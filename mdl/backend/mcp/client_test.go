@@ -17,6 +17,14 @@ type fakePED struct {
 	srv     *httptest.Server
 	calls   []recordedCall
 	respond func(name string, args map[string]any) (text string, isError bool)
+	// rpcErr, when set and returning ok=true, makes the tools/call answer with a
+	// JSON-RPC error object (e.g. Studio Pro's -32000 "Request timed out")
+	// instead of a tool result.
+	rpcErr func(name string, args map[string]any) (code int, msg string, ok bool)
+	// tools, when set, is the surface reported by tools/list: tool name → the
+	// input-schema property names it advertises. Drives SupportsToolArg, which
+	// gates per-release arguments such as pg_read_page's 11.13 `depth`.
+	tools map[string][]string
 }
 
 type recordedCall struct {
@@ -51,6 +59,22 @@ func newFakePED(t *testing.T, respond func(name string, args map[string]any) (st
 				"protocolVersion": "2025-06-18",
 				"serverInfo":      map[string]any{"name": "fake-studio-pro", "version": "1.0.0"},
 			}
+		case "tools/list":
+			list := make([]map[string]any, 0, len(f.tools))
+			for name, props := range f.tools {
+				properties := map[string]any{}
+				for _, p := range props {
+					properties[p] = map[string]any{"type": "string"}
+				}
+				list = append(list, map[string]any{
+					"name": name,
+					"inputSchema": map[string]any{
+						"type": "object", "additionalProperties": false,
+						"properties": properties,
+					},
+				})
+			}
+			result = map[string]any{"tools": list}
 		case "tools/call":
 			var p struct {
 				Name      string         `json:"name"`
@@ -58,6 +82,15 @@ func newFakePED(t *testing.T, respond func(name string, args map[string]any) (st
 			}
 			_ = json.Unmarshal(req.Params, &p)
 			f.calls = append(f.calls, recordedCall{Name: p.Name, Args: p.Arguments})
+			if f.rpcErr != nil {
+				if code, msg, ok := f.rpcErr(p.Name, p.Arguments); ok {
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"jsonrpc": "2.0", "id": req.ID,
+						"error": map[string]any{"code": code, "message": msg},
+					})
+					return
+				}
+			}
 			text, isErr := "OK", false
 			if f.respond != nil {
 				text, isErr = f.respond(p.Name, p.Arguments)

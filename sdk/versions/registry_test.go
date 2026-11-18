@@ -73,14 +73,16 @@ func TestIsAvailable(t *testing.T) {
 		version    SemVer
 		want       bool
 	}{
-		// View entities require 10.18+
-		{"domain_model", "view_entities", SemVer{10, 18, 0}, true},
-		{"domain_model", "view_entities", SemVer{10, 17, 0}, false},
+		// View entities require 10.21+: the source document mxcli writes is
+		// a 10.21 type (ako/mxcli#1811), though Mendix had them from 10.18.
+		{"domain_model", "view_entities", SemVer{10, 21, 0}, true},
+		{"domain_model", "view_entities", SemVer{10, 20, 0}, false},
 		{"domain_model", "view_entities", SemVer{11, 0, 0}, true},
 		// Basic entities available in 9.x+
 		{"domain_model", "entities", SemVer{9, 0, 0}, true},
-		// Page parameters require 11.0+
-		{"pages", "page_parameters", SemVer{10, 24, 0}, false},
+		// Page parameters require 9.4+ (see page_parameter_floor_test.go)
+		{"pages", "page_parameters", SemVer{9, 3, 0}, false},
+		{"pages", "page_parameters", SemVer{10, 24, 0}, true},
 		{"pages", "page_parameters", SemVer{11, 0, 0}, true},
 		// Unknown feature
 		{"domain_model", "teleportation", SemVer{11, 0, 0}, false},
@@ -119,11 +121,11 @@ func TestFeaturesForVersion(t *testing.T) {
 		t.Error("view_entities not found in features list")
 	}
 
-	// Check that page_parameters is NOT available at 10.24
+	// Check that design_properties_v3 is NOT available at 10.24 (Atlas v3 is 11.0+)
 	for _, f := range features {
-		if f.Area == "pages" && f.Name == "page_parameters" {
+		if f.Area == "pages" && f.Name == "design_properties_v3" {
 			if f.Available {
-				t.Error("page_parameters should NOT be available at 10.24")
+				t.Error("design_properties_v3 should NOT be available at 10.24")
 			}
 		}
 	}
@@ -140,16 +142,16 @@ func TestFeaturesAddedSince(t *testing.T) {
 		t.Fatal("expected features added since 10.24.0, got none")
 	}
 
-	// page_parameters (11.0+) should be in the list
+	// design_properties_v3 (11.0+) should be in the list
 	found := false
 	for _, f := range added {
-		if f.Name == "page_parameters" {
+		if f.Name == "design_properties_v3" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Error("page_parameters should appear in features added since 10.24")
+		t.Error("design_properties_v3 should appear in features added since 10.24")
 	}
 
 	// entities (10.0+) should NOT be in the list
@@ -238,5 +240,161 @@ func TestDisplayName(t *testing.T) {
 	e := FeatureEntry{Name: "view_entities"}
 	if got := e.DisplayName(); got != "view entities" {
 		t.Errorf("DisplayName() = %q, want %q", got, "view entities")
+	}
+}
+
+// TestAgentDocumentsAreGated is the guard for the version gap reported in
+// mxcli-formula1 FINDINGS §53: `show features` listed nothing for agents or MCP,
+// so there was no checkFeature() gate and an older project got no actionable
+// error.
+//
+// This matters more than a normal version gate because nothing downstream
+// catches it. Agent Editor documents are stored as custom blobs, mxbuild does
+// not validate them (it contains no agent-editor strings at all), so an agent
+// authored against a pre-11.9 project builds green and simply cannot be opened.
+func TestAgentDocumentsAreGated(t *testing.T) {
+	reg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	docs := []string{"agent_model", "agent_knowledge_base", "agent_consumed_mcp_service", "agent"}
+	for _, name := range docs {
+		t.Run(name, func(t *testing.T) {
+			// Available on a project new enough for the agent editor...
+			if !reg.IsAvailable("agent_documents", name, SemVer{Major: 11, Minor: 9, Patch: 0}) {
+				t.Errorf("%s should be available on 11.9.0", name)
+			}
+			// ...and refused below it, which is the half that was missing.
+			if reg.IsAvailable("agent_documents", name, SemVer{Major: 11, Minor: 8, Patch: 0}) {
+				t.Errorf("%s must not be reported available on 11.8.0", name)
+			}
+			if reg.IsAvailable("agent_documents", name, SemVer{Major: 10, Minor: 24, Patch: 0}) {
+				t.Errorf("%s must not be reported available on 10.24.0", name)
+			}
+		})
+	}
+}
+
+// TestWorkflowGroupsFloorIs11_2 pins the workflow-group gate to the metamodel,
+// not to the release notes.
+//
+// mendixlabs/mxcli#272 states "Workflow Groups are GA from Mendix 11.6". The
+// arbiter for whether the document loads is the Model SDK's own
+// StructureVersionInfo, and there both Settings$WorkflowGroup and
+// WorkflowsProjectSettingsPart.groups read `introduced: "11.2.0"`
+// (mendixmodelsdk 4.115.0, package/src/gen/settings.js). Gating on 11.6 would
+// refuse four minors of projects that store the property perfectly well.
+func TestWorkflowGroupsFloorIs11_2(t *testing.T) {
+	reg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cases := []struct {
+		v    SemVer
+		want bool
+	}{
+		{SemVer{Major: 10, Minor: 24, Patch: 0}, false},
+		{SemVer{Major: 11, Minor: 1, Patch: 0}, false},
+		{SemVer{Major: 11, Minor: 2, Patch: 0}, true},
+		{SemVer{Major: 11, Minor: 13, Patch: 0}, true},
+	}
+	for _, tc := range cases {
+		if got := reg.IsAvailable("workflows", "groups", tc.v); got != tc.want {
+			t.Errorf("IsAvailable(workflows, groups, %v) = %v, want %v", tc.v, got, tc.want)
+		}
+	}
+}
+
+// TestStringAggIsOnTwoReleaseLines: Mendix added STRING_AGG to OQL in 11.2.0
+// and, separately, in 10.24.22 on the 10.24 line (ako/mxcli#1650). Two entries
+// with a max_version on the first; every view of the registry has to agree on
+// what that means — IsAvailable alone did, while `show features` took the
+// lowest floor and reported the feature missing on every 11.x.
+func TestStringAggIsOnTwoReleaseLines(t *testing.T) {
+	reg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cases := []struct {
+		v         SemVer
+		available bool
+		since     string // the floor shown for v
+	}{
+		{SemVer{10, 24, 21}, false, "10.24.22"},
+		{SemVer{10, 24, 22}, true, "10.24.22"},
+		{SemVer{11, 0, 0}, false, "11.2.0"},
+		{SemVer{11, 1, 0}, false, "11.2.0"},
+		{SemVer{11, 2, 0}, true, "11.2.0"},
+		{SemVer{11, 6, 6}, true, "11.2.0"},
+	}
+	for _, c := range cases {
+		if got := reg.IsAvailable("oql_functions", "string_agg", c.v); got != c.available {
+			t.Errorf("IsAvailable(%s) = %v, want %v", c.v, got, c.available)
+		}
+		for _, list := range [][]FeatureStatus{reg.FeaturesForVersion(c.v), reg.FeaturesInArea("oql_functions", c.v)} {
+			found := false
+			for _, f := range list {
+				if f.Area != "oql_functions" || f.Name != "string_agg" {
+					continue
+				}
+				found = true
+				if f.Available != c.available || f.MinVersion.String() != c.since {
+					t.Errorf("at %s: listed available=%v since %s, want %v since %s",
+						c.v, f.Available, f.MinVersion, c.available, c.since)
+				}
+			}
+			if !found {
+				t.Errorf("at %s: string_agg not listed", c.v)
+			}
+		}
+	}
+
+	// Upgrading from 11.0 adds it at 11.2.0; from 10.24.22 there is nothing to add.
+	added := func(since SemVer) string {
+		for _, f := range reg.FeaturesAddedSince(since) {
+			if f.Area == "oql_functions" && f.Name == "string_agg" {
+				return f.MinVersion.String()
+			}
+		}
+		return ""
+	}
+	if got := added(SemVer{11, 0, 0}); got != "11.2.0" {
+		t.Errorf("added since 11.0.0 = %q, want 11.2.0", got)
+	}
+	if got := added(SemVer{10, 24, 22}); got != "" {
+		t.Errorf("added since 10.24.22 = %q, want nothing: it is there already", got)
+	}
+	if got := added(SemVer{10, 24, 0}); got != "10.24.22" {
+		t.Errorf("added since 10.24.0 = %q, want 10.24.22", got)
+	}
+}
+
+// ako/mxcli#2140: mendix-10.yaml and mendix-11.yaml both list
+// message_definition_collection from 10.0.0, and only the 11 file closes it at
+// 11.14.99 (Mendix 11.15 removed the collection). dedup kept the first of the
+// two — the one without the ceiling — so the registry said a collection is
+// available on 11.16, and `mxcli syntax message-definition` printed "10.0.0+".
+func TestMessageDefinitionCollectionEndsAt1114(t *testing.T) {
+	reg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, c := range []struct {
+		v         SemVer
+		available bool
+	}{
+		{SemVer{10, 24, 0}, true},
+		{SemVer{11, 14, 0}, true},
+		{SemVer{11, 15, 0}, false},
+		{SemVer{11, 16, 0}, false},
+	} {
+		if got := reg.IsAvailable("integration", "message_definition_collection", c.v); got != c.available {
+			t.Errorf("IsAvailable(%s) = %v, want %v", c.v, got, c.available)
+		}
+	}
+	e, ok := reg.Lookup("integration", "message_definition_collection")
+	if !ok || e.MaxVersion == nil || e.MaxVersion.String() != "11.14.99" {
+		t.Errorf("Lookup = %+v, want the 11.14.99 ceiling", e)
 	}
 }

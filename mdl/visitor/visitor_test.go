@@ -14,8 +14,8 @@ func TestMicroflowParsing(t *testing.T) {
 	input := `CREATE MICROFLOW MyModule.HelloWorld ()
 RETURNS String
 BEGIN
-  DECLARE $greeting String = 'Hello, World!'
-  RETURN $greeting
+  DECLARE $greeting String = 'Hello, World!';
+  RETURN $greeting;
 END;`
 
 	prog, errs := Build(input)
@@ -844,8 +844,10 @@ END;`
 	if !commitStmt.RefreshInClient {
 		t.Error("Expected RefreshInClient to be true")
 	}
-	if commitStmt.WithEvents {
-		t.Error("Expected WithEvents to be false")
+	// Absent means events ON — Mendix's default (#895) — so the flag the AST
+	// carries is WithoutEvents, and it stays clear here.
+	if commitStmt.WithoutEvents {
+		t.Error("Expected WithoutEvents to be false")
 	}
 }
 
@@ -886,8 +888,55 @@ END;`
 	if !commitStmt.RefreshInClient {
 		t.Error("Expected RefreshInClient to be true")
 	}
-	if !commitStmt.WithEvents {
-		t.Error("Expected WithEvents to be true")
+	if commitStmt.WithoutEvents {
+		t.Error("Expected WithoutEvents to be false")
+	}
+	// WITH EVENTS says the same thing as writing nothing, but MDL067 needs to
+	// tell the two apart, so the redundant spelling is recorded.
+	if !commitStmt.ExplicitWithEvents {
+		t.Error("Expected ExplicitWithEvents to be true")
+	}
+}
+
+// TestCommitWithoutEvents verifies COMMIT WITHOUT EVENTS parses — the spelling
+// that did not exist before #895, and the only one that turns the handlers off.
+func TestCommitWithoutEvents(t *testing.T) {
+	input := `CREATE MICROFLOW Test.TestCommit ($Order: Test.Order)
+RETURNS Boolean AS $Success
+BEGIN
+  COMMIT $Order WITHOUT EVENTS;
+  RETURN true;
+END;`
+
+	prog, errs := Build(input)
+	if len(errs) > 0 {
+		for _, err := range errs {
+			t.Errorf("Parse error: %v", err)
+		}
+		return
+	}
+
+	stmt := prog.Statements[0].(*ast.CreateMicroflowStmt)
+
+	var commitStmt *ast.MfCommitStmt
+	for _, s := range stmt.Body {
+		if cs, ok := s.(*ast.MfCommitStmt); ok {
+			commitStmt = cs
+			break
+		}
+	}
+
+	if commitStmt == nil {
+		t.Fatal("Expected to find COMMIT statement")
+	}
+	if !commitStmt.WithoutEvents {
+		t.Error("Expected WithoutEvents to be true")
+	}
+	if commitStmt.ExplicitWithEvents {
+		t.Error("Expected ExplicitWithEvents to be false")
+	}
+	if commitStmt.RefreshInClient {
+		t.Error("Expected RefreshInClient to be false")
 	}
 }
 
@@ -992,8 +1041,11 @@ END;`
 		t.Fatal("Expected to find RETRIEVE statement")
 	}
 
-	if retrieveStmt.Limit != "1" {
-		t.Errorf("Expected Limit '1', got %q", retrieveStmt.Limit)
+	// Without the `mdl 1;` header `limit 1` keeps its alpha meaning, the object
+	// range (ako/mxcli#734); retrieve_first_test.go covers both versions.
+	if !retrieveStmt.First || retrieveStmt.Limit != "" {
+		t.Errorf("Expected the object range (First) for an mdl 0 `limit 1`, got First=%v Limit=%q",
+			retrieveStmt.First, retrieveStmt.Limit)
 	}
 
 	t.Log("RETRIEVE with LIMIT parsed correctly")
@@ -1054,6 +1106,67 @@ END;`
 	}
 
 	t.Log("DECLARE without AS keyword parsed correctly")
+}
+
+// TestAlterEntityAttributeIfExistsGuards verifies ADD ATTRIBUTE IF NOT EXISTS
+// and DROP ATTRIBUTE IF EXISTS set the idempotency flags on the AST. Findings #10.
+func TestAlterEntityAttributeIfExistsGuards(t *testing.T) {
+	prog, errs := Build(`ALTER ENTITY M.E ADD ATTRIBUTE IF NOT EXISTS Score: Integer;
+ALTER ENTITY M.E DROP ATTRIBUTE IF EXISTS OldCol;
+ALTER ENTITY M.E ADD ATTRIBUTE Plain: Integer;
+ALTER ENTITY M.E DROP ATTRIBUTE PlainCol;`)
+	if len(errs) > 0 {
+		t.Fatalf("parse error: %v", errs[0])
+	}
+	if len(prog.Statements) != 4 {
+		t.Fatalf("expected 4 statements, got %d", len(prog.Statements))
+	}
+	add := prog.Statements[0].(*ast.AlterEntityStmt)
+	if !add.IfNotExists {
+		t.Error("expected IfNotExists on ADD ATTRIBUTE IF NOT EXISTS")
+	}
+	drop := prog.Statements[1].(*ast.AlterEntityStmt)
+	if !drop.IfExists {
+		t.Error("expected IfExists on DROP ATTRIBUTE IF EXISTS")
+	}
+	// Plain forms must NOT set the guards.
+	if prog.Statements[2].(*ast.AlterEntityStmt).IfNotExists {
+		t.Error("plain ADD ATTRIBUTE should not set IfNotExists")
+	}
+	if prog.Statements[3].(*ast.AlterEntityStmt).IfExists {
+		t.Error("plain DROP ATTRIBUTE should not set IfExists")
+	}
+}
+
+// TestAlterEntityAddAttributeDocComment guards traceops #27: a `/** … */` doc
+// comment written BETWEEN `add attribute` clauses (before the ADD keyword) must
+// parse and document the FOLLOWING attribute — `--` line comments are discarded,
+// so they are not an equivalent workaround.
+func TestAlterEntityAddAttributeDocComment(t *testing.T) {
+	prog, errs := Build(`alter entity M.E
+  add attribute Zz1: string(10)
+  /** doc for the second column */
+  add attribute Zz2: string(10);`)
+	if len(errs) > 0 {
+		t.Fatalf("parse error: %v", errs[0])
+	}
+	if len(prog.Statements) != 2 {
+		t.Fatalf("expected 2 statements (one per add attribute), got %d", len(prog.Statements))
+	}
+	zz1 := prog.Statements[0].(*ast.AlterEntityStmt)
+	if zz1.Attribute == nil || zz1.Attribute.Name != "Zz1" {
+		t.Fatalf("statement 0 is not ADD Zz1: %+v", zz1)
+	}
+	if zz1.Attribute.Documentation != "" {
+		t.Errorf("Zz1 should have no doc, got %q", zz1.Attribute.Documentation)
+	}
+	zz2 := prog.Statements[1].(*ast.AlterEntityStmt)
+	if zz2.Attribute == nil || zz2.Attribute.Name != "Zz2" {
+		t.Fatalf("statement 1 is not ADD Zz2: %+v", zz2)
+	}
+	if zz2.Attribute.Documentation != "doc for the second column" {
+		t.Errorf("Zz2 documentation = %q, want %q", zz2.Attribute.Documentation, "doc for the second column")
+	}
 }
 
 // TestAlterEntityAddAttribute verifies ALTER ENTITY ADD ATTRIBUTE produces correct AST.
@@ -1224,12 +1337,39 @@ func TestEnhanceErrorMessage_Apostrophe(t *testing.T) {
 			msg:      "no viable alternative at input 'CREATE PERSISTENT'",
 			wantHint: false,
 		},
+		// findings #4: real short lowercase MDL keywords/identifiers are NOT
+		// contraction leftovers and must not draw the apostrophe hint.
+		{
+			name:     "keyword on is not apostrophe",
+			msg:      "mismatched input 'on' expecting {';', ','}",
+			wantHint: false,
+		},
+		{
+			name:     "keyword in is not apostrophe",
+			msg:      "extraneous input 'in' expecting {';', ','}",
+			wantHint: false,
+		},
+		{
+			name:     "keyword as is not apostrophe",
+			msg:      "mismatched input 'as' expecting {';', ','}",
+			wantHint: false,
+		},
+		{
+			name:     "keyword to is not apostrophe",
+			msg:      "missing ';' at 'to'",
+			wantHint: false,
+		},
+		{
+			name:     "keyword by is not apostrophe",
+			msg:      "mismatched input 'by' expecting {';', ','}",
+			wantHint: false,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := enhanceErrorMessage(tt.msg)
-			hasHint := result != tt.msg
+			result := enhanceErrorMessage(tt.msg, "")
+			hasHint := strings.Contains(result, "apostrophe")
 			if hasHint != tt.wantHint {
 				if tt.wantHint {
 					t.Errorf("expected apostrophe hint but got none.\n  input:  %s\n  output: %s", tt.msg, result)
@@ -1243,6 +1383,32 @@ func TestEnhanceErrorMessage_Apostrophe(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestEnhanceErrorMessage_MultilineString covers finding #6: a string literal
+// that runs off the end of its line must get the "cannot span multiple lines"
+// hint, NOT the "double your apostrophes" advice (which would make it worse). The
+// distinguishing signal is a newline inside the token-recognition-error payload.
+func TestEnhanceErrorMessage_MultilineString(t *testing.T) {
+	// A literal spanning two lines: the offending text carries a newline.
+	multiline := "line 8:66 token recognition error at: ''\n'"
+	out := enhanceErrorMessage(multiline, "")
+	if !strings.Contains(out, "cannot span multiple lines") {
+		t.Errorf("expected multiline-string hint, got: %s", out)
+	}
+	if strings.Contains(out, "unescaped apostrophe") {
+		t.Errorf("multiline-string error must not show the apostrophe hint, got: %s", out)
+	}
+
+	// A single-line unbalanced quote (no newline) keeps the apostrophe hint.
+	singleLine := "line 3:12 token recognition error at: ''"
+	out = enhanceErrorMessage(singleLine, "")
+	if strings.Contains(out, "cannot span multiple lines") {
+		t.Errorf("single-line error must not show the multiline hint, got: %s", out)
+	}
+	if !strings.Contains(out, "apostrophe") {
+		t.Errorf("expected apostrophe hint for single-line unbalanced quote, got: %s", out)
 	}
 }
 
@@ -1306,12 +1472,53 @@ func TestEnhanceErrorMessage_QuotedGrantAttribute(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := enhanceErrorMessage(tt.msg)
+			result := enhanceErrorMessage(tt.msg, "")
 			hasHint := strings.Contains(result, "Attribute-level GRANT")
 			if hasHint != tt.wantHint {
 				t.Errorf("expected hint=%v\n  input:  %s\n  output: %s", tt.wantHint, tt.msg, result)
 			}
 		})
+	}
+}
+
+func TestEnhanceErrorMessage_EnumEquals(t *testing.T) {
+	tests := []struct {
+		name     string
+		msg      string
+		wantHint bool
+	}{
+		{"enum value equals", `mismatched input '=' expecting ')'`, true},
+		{"attribute default equals (different msg)", `no viable alternative at input 'string'`, false},
+		{"unrelated mismatched", `mismatched input 'foo' expecting ';'`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := enhanceErrorMessage(tt.msg, "")
+			hasHint := strings.Contains(result, "Enumeration values do not use '='")
+			if hasHint != tt.wantHint {
+				t.Errorf("expected hint=%v\n  input:  %s\n  output: %s", tt.wantHint, tt.msg, result)
+			}
+		})
+	}
+}
+
+// TestParseError_EnumEqualsHint confirms the hint reaches the surface for the
+// full statement, and that a quoted value name is NOT the problem — the `=` is.
+func TestParseError_EnumEqualsHint(t *testing.T) {
+	_, errs := Build(`CREATE ENUMERATION Mod."ENUM_X" ( "Grade1" = 'Grade 1' );`)
+	if len(errs) == 0 {
+		t.Fatal("expected a parse error for the enum '=' form")
+	}
+	joined := ""
+	for _, e := range errs {
+		joined += e.Error() + "\n"
+	}
+	if !strings.Contains(joined, "Enumeration values do not use '='") {
+		t.Errorf("expected enum-equals hint, got: %s", joined)
+	}
+	// The quoted value name + space caption must parse cleanly (no error).
+	if _, ok := Build(`CREATE ENUMERATION Mod."ENUM_X" ( "Grade1" 'Grade 1' );`); len(ok) != 0 {
+		t.Errorf("quoted enum value name + caption should parse, got errors: %v", ok)
 	}
 }
 
@@ -1332,6 +1539,33 @@ func TestParseError_QuotedGrantAttribute(t *testing.T) {
 		t.Errorf("expected GRANT-attribute hint in error messages, got:\n")
 		for _, err := range errs {
 			t.Errorf("  %v", err)
+		}
+	}
+}
+
+// TestParseError_MisplacedExtends verifies that an EXTENDS clause placed after
+// the attribute parentheses produces an actionable hint about ordering (#4).
+func TestParseError_MisplacedExtends(t *testing.T) {
+	for _, input := range []string{
+		`create entity Mod.Child (Name: String) extends Mod.Parent;`,
+		`create persistent entity Mod.Child (Name: String) generalization Mod.Parent;`,
+	} {
+		_, errs := Build(input)
+		if len(errs) == 0 {
+			t.Fatalf("expected parse errors for misplaced EXTENDS in %q", input)
+		}
+		found := false
+		for _, err := range errs {
+			if strings.Contains(err.Error(), "must come BEFORE the attribute") {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected misplaced-EXTENDS hint for %q, got:", input)
+			for _, err := range errs {
+				t.Errorf("  %v", err)
+			}
 		}
 	}
 }
@@ -1731,11 +1965,11 @@ END;`
 	if logStmt.Annotations == nil {
 		t.Fatal("expected annotations")
 	}
-	if got := logStmt.Annotations.FreeAnnotations; len(got) != 1 || got[0] != "free note" {
+	if got := logStmt.Annotations.FreeNotes; len(got) != 1 || got[0].Text != "free note" {
 		t.Fatalf("free annotations = %#v, want [free note]", got)
 	}
-	if logStmt.Annotations.AnnotationText != "" {
-		t.Fatalf("attached annotation = %q, want empty", logStmt.Annotations.AnnotationText)
+	if len(logStmt.Annotations.Notes) != 0 {
+		t.Fatalf("attached annotations = %#v, want empty", logStmt.Annotations.Notes)
 	}
 }
 
@@ -1765,11 +1999,12 @@ END;`
 		t.Fatal("expected annotations")
 	}
 	want := []string{"first free note", "second free note", "third free note"}
-	if got := logStmt.Annotations.FreeAnnotations; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+	got := logStmt.Annotations.FreeNotes
+	if len(got) != len(want) || got[0].Text != want[0] || got[1].Text != want[1] || got[2].Text != want[2] {
 		t.Fatalf("free annotations = %#v, want %#v", got, want)
 	}
-	if logStmt.Annotations.AnnotationText != "" {
-		t.Fatalf("attached annotation = %q, want empty", logStmt.Annotations.AnnotationText)
+	if len(logStmt.Annotations.Notes) != 0 {
+		t.Fatalf("attached annotations = %#v, want empty", logStmt.Annotations.Notes)
 	}
 }
 
@@ -1796,11 +2031,11 @@ END;`
 	if logStmt.Annotations == nil {
 		t.Fatal("expected annotations")
 	}
-	if logStmt.Annotations.AnnotationText != "attached note" {
-		t.Fatalf("attached annotation = %q, want attached note", logStmt.Annotations.AnnotationText)
+	if got := logStmt.Annotations.Notes; len(got) != 1 || got[0].Text != "attached note" {
+		t.Fatalf("attached annotations = %#v, want [attached note]", got)
 	}
-	if len(logStmt.Annotations.FreeAnnotations) != 0 {
-		t.Fatalf("free annotations = %#v, want empty", logStmt.Annotations.FreeAnnotations)
+	if len(logStmt.Annotations.FreeNotes) != 0 {
+		t.Fatalf("free annotations = %#v, want empty", logStmt.Annotations.FreeNotes)
 	}
 }
 
@@ -2128,20 +2363,64 @@ END;`
 }
 
 func TestShouldPreserveExpressionSourceIgnoresStringLiteralPunctuation(t *testing.T) {
-	if shouldPreserveExpressionSource("'Processed {1} items!'") {
+	if shouldPreserveExpressionSource("'Processed {1} items!'", false) {
 		t.Fatal("plain string literal punctuation should not force SourceExpr preservation")
 	}
-	if shouldPreserveExpressionSource("'Owner''s item: {1}'") {
+	if shouldPreserveExpressionSource("'Owner''s item: {1}'", false) {
 		t.Fatal("escaped quotes and colon inside a string literal should not force SourceExpr preservation")
 	}
-	if !shouldPreserveExpressionSource("$Token!=empty") {
+	if !shouldPreserveExpressionSource("$Token!=empty", false) {
 		t.Fatal("compact operators outside string literals should preserve source")
 	}
-	if !shouldPreserveExpressionSource("substring($Text,0,find($Text, '.'))") {
+	if !shouldPreserveExpressionSource("substring($Text,0,find($Text, '.'))", false) {
 		t.Fatal("compact comma-separated arguments should preserve source")
 	}
-	if !shouldPreserveExpressionSource("not($Object/Flag)") {
+	if !shouldPreserveExpressionSource("not($Object/Flag)", false) {
 		t.Fatal("compact not() expressions should preserve source")
+	}
+}
+
+// TestShouldPreserveExpressionSource_Decimals guards ledger findings #18–19: the
+// AST re-serializer truncates a zero-fraction decimal (`2.0`→`2`) and emits small
+// values in scientific notation (`0.000001`→`1e-06`), so a decimal literal must
+// preserve the raw source. A `/` (member-access separator, NOT division) must NOT
+// trigger preservation — that would source-freeze every association path.
+func TestShouldPreserveExpressionSource_Decimals(t *testing.T) {
+	mustPreserve := []string{
+		"$Dec div 2.0",              // #18: 2.0 → 2 on re-serialize
+		"$Dec * $I * $I * 0.000001", // #19: 0.000001 → 1e-06
+		"2.0",                       // standalone decimal literal
+		"100.0",                     // zero-fraction decimal
+		"round($Dec * $I * 0.001)",  // small decimal in an arg
+		"$Dec / $Dec2",              // #17: `/ $` division misuse (kept so MDL045 sees it)
+		"$Dec/$Dec2",                // #17: no-space division misuse
+	}
+	for _, s := range mustPreserve {
+		if !shouldPreserveExpressionSource(s, false) {
+			t.Errorf("expected source preservation for %q (decimal would be corrupted)", s)
+		}
+	}
+	// A `/` is the member-access separator in MDL, not division: an association
+	// path must NOT be source-frozen on account of its slashes (that regressed
+	// TestAssociationNavParsing). A qualified name's dot (letters) and a slash
+	// inside a string literal must also not force preservation.
+	mustNotPreserve := []string{
+		"$Order/Module.Assoc/Name", // association navigation path
+		"$currentObject/Amount",    // plain member access
+		"Ledger.Category",          // qualified name dot (non-numeric)
+		"'a/b path'",               // slash inside a string literal
+		// ledger #48: a qualified-name segment ending in a digit must NOT be read
+		// as a decimal (that froze the source and skipped association-entity
+		// resolution → CE0117). Modules/entities ending in a digit are common.
+		"$T/L48.Transaction_Account/Name", // module name ends in a digit
+		"$obj/App2.Entity/Attr",           // module 'App2'
+		"$c/Mod.Account2/Name",            // entity name ends in a digit
+		"L48.Transaction",                 // bare qualified name, digit module
+	}
+	for _, s := range mustNotPreserve {
+		if shouldPreserveExpressionSource(s, false) {
+			t.Errorf("did not expect source preservation for %q", s)
+		}
 	}
 }
 
@@ -2211,5 +2490,208 @@ func TestCreateOrReplaceEnumeration_FlagsCreateOrModify(t *testing.T) {
 	}
 	if !stmt.CreateOrModify {
 		t.Error("CREATE OR REPLACE should set CreateOrModify=true so the executor takes the update path")
+	}
+}
+
+// TestEnhanceErrorMessage_CollapsesTokenDump verifies the noisy statement-start
+// `expecting {30 tokens}` set is rewritten to a readable phrase (findings: error
+// messages should convey the fix, not dump internal token names).
+func TestEnhanceErrorMessage_CollapsesTokenDump(t *testing.T) {
+	raw := "extraneous input '(' expecting {<EOF>, DOC_COMMENT, CREATE, ALTER, DROP, SHOW, DESCRIBE, IDENTIFIER}"
+	out := enhanceErrorMessage(raw, "")
+	if strings.Contains(out, "DOC_COMMENT") || strings.Contains(out, "IDENTIFIER") {
+		t.Errorf("token dump not collapsed:\n%s", out)
+	}
+	if !strings.Contains(out, "start of a statement") {
+		t.Errorf("expected the statement-start phrase, got:\n%s", out)
+	}
+}
+
+// TestEnhanceErrorMessage_SmallExpectingSetUntouched keeps the useful single/small
+// expected-token messages intact.
+func TestEnhanceErrorMessage_SmallExpectingSetUntouched(t *testing.T) {
+	raw := "mismatched input '=' expecting ':'"
+	out := enhanceErrorMessage(raw, "")
+	if !strings.Contains(out, "expecting ':'") {
+		t.Errorf("small expecting set should be preserved, got:\n%s", out)
+	}
+}
+
+// TestEnhanceErrorMessage_BareNotHint fires the not(expr) hint from the source
+// line (sudoku findings #3), and not otherwise.
+func TestEnhanceErrorMessage_BareNotHint(t *testing.T) {
+	const notHint = "negated expression"
+	out := enhanceErrorMessage("mismatched input '$x' expecting THEN", "  if not $Cell/IsInvalid then")
+	if !strings.Contains(out, notHint) || !strings.Contains(out, "not($Cell") {
+		t.Errorf("expected the bare-not hint, got:\n%s", out)
+	}
+	// A properly parenthesized not must not trigger it.
+	if strings.Contains(enhanceErrorMessage("mismatched input 'foo' expecting ';'", "  if not($Cell/Flag) then"), notHint) {
+		t.Error("not(expr) should not trigger the bare-not hint")
+	}
+}
+
+// TestBuild_BareNotEndToEnd confirms the hint reaches the surface through Build.
+func TestBuild_BareNotEndToEnd(t *testing.T) {
+	_, errs := Build("create microflow M.T() begin if not $x then log info 'a'; end if; return true; end")
+	joined := ""
+	for _, e := range errs {
+		joined += e.Error() + "\n"
+	}
+	if !strings.Contains(joined, "not(") {
+		t.Errorf("expected a not(expr) hint in Build errors, got:\n%s", joined)
+	}
+}
+
+// TestEntityIndexOnKeyword verifies the SQL-like `INDEX name ON (cols)` form
+// parses (findings #4) and is equivalent to the bare `INDEX name (cols)` form —
+// the optional ON is not mistaken for a column, and column order is preserved.
+func TestEntityIndexOnKeyword(t *testing.T) {
+	for _, src := range []string{
+		`create persistent entity M.Cell (Row: integer, Col: integer) index idx_pos on (Row, Col);`,
+		`create persistent entity M.Cell (Row: integer, Col: integer) index idx_pos (Row, Col);`,
+	} {
+		prog, errs := Build(src)
+		if len(errs) > 0 {
+			t.Fatalf("parse error for %q: %v", src, errs[0])
+		}
+		ent, ok := prog.Statements[0].(*ast.CreateEntityStmt)
+		if !ok {
+			t.Fatalf("expected CreateEntityStmt, got %T", prog.Statements[0])
+		}
+		if len(ent.Indexes) != 1 {
+			t.Fatalf("%q: expected 1 index, got %d", src, len(ent.Indexes))
+		}
+		cols := ent.Indexes[0].Columns
+		if len(cols) != 2 || cols[0].Name != "Row" || cols[1].Name != "Col" {
+			t.Errorf("%q: expected columns [Row Col], got %+v", src, cols)
+		}
+	}
+}
+
+// TestAlterEntityAddIndexOnKeyword verifies ALTER ENTITY ADD INDEX also accepts ON.
+func TestAlterEntityAddIndexOnKeyword(t *testing.T) {
+	prog, errs := Build(`alter entity M.Cell add index idx_col on (Col);`)
+	if len(errs) > 0 {
+		t.Fatalf("parse error: %v", errs[0])
+	}
+	alt, ok := prog.Statements[0].(*ast.AlterEntityStmt)
+	if !ok {
+		t.Fatalf("expected AlterEntityStmt, got %T", prog.Statements[0])
+	}
+	if alt.Operation != ast.AlterEntityAddIndex || alt.Index == nil {
+		t.Fatalf("expected AddIndex with an Index, got op=%d index=%v", alt.Operation, alt.Index)
+	}
+	if len(alt.Index.Columns) != 1 || alt.Index.Columns[0].Name != "Col" {
+		t.Errorf("expected column [Col], got %+v", alt.Index.Columns)
+	}
+}
+
+// TestEnhanceErrorMessage_XPathArithmetic verifies the XPath-arithmetic hint
+// fires for an arithmetic operator inside a bracketed constraint (findings #8)
+// and not for arithmetic in a normal expression.
+func TestEnhanceErrorMessage_XPathArithmetic(t *testing.T) {
+	xhint := "cannot compute values"
+	// Inside a constraint: `expecting ']'` + arithmetic op → hint.
+	for _, op := range []string{"+", "*", "div", "mod"} {
+		msg := "mismatched input '" + op + "' expecting ']'"
+		if got := enhanceErrorMessage(msg, ""); !strings.Contains(got, xhint) {
+			t.Errorf("op %q: expected XPath-arithmetic hint, got:\n%s", op, got)
+		}
+	}
+	// A normal expression arithmetic error (not `expecting ']'`) must not fire.
+	if got := enhanceErrorMessage("mismatched input '+' expecting ';'", ""); strings.Contains(got, xhint) {
+		t.Errorf("did not expect XPath hint for a non-constraint arithmetic error:\n%s", got)
+	}
+}
+
+// TestKeywordWidgetName guards traceops #12: an MDL keyword (body, content,
+// search, as) used unquoted as a widget name must parse and keep the name,
+// instead of being rejected ("mismatched input 'body'") or silently dropped.
+func TestKeywordWidgetName(t *testing.T) {
+	prog, errs := Build(`create page M.P ( Title: 'P', Layout: Atlas_Core.Atlas_Default ) {
+  container body {
+    dynamictext content (Content: 'x')
+  }
+}`)
+	if len(errs) > 0 {
+		t.Fatalf("parse error: %v", errs[0])
+	}
+	page := prog.Statements[0].(*ast.CreatePageStmtV3)
+	if len(page.Widgets) != 1 || page.Widgets[0].Name != "body" {
+		t.Fatalf("outer widget name = %q, want body", widgetName(page.Widgets))
+	}
+	inner := page.Widgets[0].Children
+	if len(inner) != 1 || inner[0].Name != "content" {
+		t.Errorf("inner widget name = %q, want content", widgetName(inner))
+	}
+}
+
+// TestParamFormatBlock guards ledger #75: a dynamic-text content parameter may
+// carry a per-parameter FORMAT block, parsed into ParamAssignmentV3.Format.Props.
+func TestParamFormatBlock(t *testing.T) {
+	prog, errs := Build(`create page M.P ( Title: 'P', Layout: Atlas_Core.Atlas_Default ) {
+  container body {
+    dynamictext amt (Content: '{1}', ContentParams: [{1} = Amount format (decimalPrecision: 4, groupDigits: true)])
+  }
+}`)
+	if len(errs) > 0 {
+		t.Fatalf("parse error: %v", errs[0])
+	}
+	page := prog.Statements[0].(*ast.CreatePageStmtV3)
+	dt := page.Widgets[0].Children[0]
+	params := dt.GetContentParams()
+	if len(params) != 1 || params[0].Format == nil {
+		t.Fatalf("expected 1 param with a format block, got %+v", params)
+	}
+	if v, ok := params[0].Format.Get("decimalprecision"); !ok || v != "4" {
+		t.Errorf("decimalPrecision = %q,%v want 4", v, ok)
+	}
+	if v, ok := params[0].Format.Get("groupdigits"); !ok || v != "true" {
+		t.Errorf("groupDigits = %q,%v want true", v, ok)
+	}
+}
+
+func widgetName(ws []*ast.WidgetV3) string {
+	if len(ws) == 0 {
+		return "<none>"
+	}
+	return ws[0].Name
+}
+
+// TestMultiLineStringLiteral guards traceops #11: a single-quoted string literal
+// may span lines. Before this the newline terminated the token ("missing END").
+func TestMultiLineStringLiteral(t *testing.T) {
+	prog, errs := Build("create microflow M.T () returns String as $out\nbegin\n  declare $S String = 'line one\nline two';\n  return $S;\nend;")
+	if len(errs) > 0 {
+		t.Fatalf("parse error: %v", errs[0])
+	}
+	if len(prog.Statements) != 1 {
+		t.Fatalf("expected 1 statement, got %d", len(prog.Statements))
+	}
+}
+
+// TestAlterEntityMissingAttributeKeywordHint guards traceops #16: the parse
+// error for `alter entity … add <name>: <type>` (missing the `attribute`
+// keyword) carries an actionable hint, and a real clause (`add index …`) does not.
+func TestAlterEntityMissingAttributeKeywordHint(t *testing.T) {
+	_, errs := Build(`alter entity M.E add Name: string(20);`)
+	if len(errs) == 0 {
+		t.Fatal("expected a parse error for the missing `attribute` keyword")
+	}
+	var joined string
+	for _, e := range errs {
+		joined += e.Error() + "\n"
+	}
+	if !strings.Contains(joined, "needs the `attribute` keyword") {
+		t.Errorf("error missing the attribute-keyword hint:\n%s", joined)
+	}
+
+	// A valid `add index` clause must NOT be mis-hinted.
+	_, errs2 := Build(`alter entity M.E add index idx (Name);`)
+	for _, e := range errs2 {
+		if strings.Contains(e.Error(), "needs the `attribute` keyword") {
+			t.Errorf("add index wrongly hinted: %v", e)
+		}
 	}
 }

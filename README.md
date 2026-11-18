@@ -6,7 +6,11 @@
 
 A command-line tool that enables AI coding assistants ([Claude Code](https://claude.ai/claude-code), GitHub Copilot, OpenCode, Cursor, Continue.dev, Windsurf, Aider, and others) to read, understand, and modify Mendix application projects.
 
-**[Read the documentation](https://mendixlabs.github.io/mxcli/)** | **[Try it in the Playground](https://codespaces.new/mendixlabs/mxcli-playground)** -- no install needed, runs in your browser
+**[Read the documentation](https://www.mxcli.org/)** | **[Use the bootstrap prompt](https://www.mxcli.org/tools/bootstrap-prompt.html)** -- the fastest way to spin up a Mendix project: paste it into a Claude Code cloud session on an empty repo, no local install needed
+
+[![The mxcli language poster -- click to open the interactive version](docs-site/src/poster/mxcli-poster-small.png)](https://www.mxcli.org/poster/mxcli-language-poster.html)
+
+*Click the poster to open the [interactive version](https://www.mxcli.org/poster/mxcli-language-poster.html).*
 
 ## Why mxcli?
 
@@ -19,6 +23,22 @@ Mendix projects are stored in binary `.mpr` files that AI agents can't read dire
 - **Catalog queries** - SQL-based querying of project metadata
 - **Linting** - Check projects for common issues
 - **Unix pipe support** - Output formats designed for scripting and chaining
+
+### Design principles
+
+mxcli is built on a single bet: the agent writes a compact, human-readable DSL, and mxcli's deterministic layer turns it into the many low-level mutations, validations, and tool calls a real model change requires. The differentiators that follow:
+
+- **Token efficiency** - the agent emits one larger MDL script instead of many small, chatty tool calls. MDL is 5-10x denser than raw model JSON, and one script is one model turn -- less orchestration overhead means lower cost and faster runs.
+- **Complexity in the deterministic layer** - one MDL statement maps deterministically to multiple documents (or MCP tool calls). The LLM states intent; mxcli carries the fan-out, ordering, and read-modify-write bookkeeping.
+- **Human-readable DSL** - MDL is inspired by SQL, Ada, and PL/SQL. LLM-generated scripts are easy for humans to review, audit, and author. Readable code is reviewable code.
+- **Headless agentic loop** - build and test Mendix applications without ever opening Studio Pro.
+- **Understanding large applications** - a queryable catalog and dependency-graph tables let agents explore complex apps through straightforward SQL.
+- **Precise skills** - a concrete DSL lets skill files embed specific, copyable examples of exactly the MDL to produce, for more reliable output.
+- **Power with safety** - `mxcli init` provisions a Dev Container that scopes exactly what the agent can see, do, and modify.
+- **Deterministic verification** - `mxcli check` and `mxcli lint` verify generated projects against deterministic rules -- no LLM judgement -- keeping the feedback loop fast and reliable.
+- **Longer-term: smaller local models** - generating a constrained DSL is simpler for an LLM than orchestrating tool calls, and a grammar can be enforced via grammar-constrained decoding.
+
+See [Design Principles](https://www.mxcli.org/preface/design-principles.html) in the documentation for the full rationale.
 
 ## What is mxcli?
 
@@ -110,6 +130,40 @@ mxcli new MyApp --version 11.8.0
 
 This downloads MxBuild, creates a blank Mendix project, sets up AI tooling and a Dev Container, and installs the correct mxcli binary. Open the resulting folder in VS Code and reopen in the Dev Container — you're ready to go.
 
+### From the web or an iPad (empty repo, no local install)
+
+No machine with a CLI? Build a Mendix app **entirely in the browser** with
+[Claude Code on the web](https://claude.ai/code) (works on an iPad) — mxcli
+provisions the whole toolchain in the cloud container and commits it so future
+sessions self-bootstrap. You don't need to pick a GitHub template. The full
+workflow:
+
+1. **Create an empty GitHub repo** — this is where the app lives and where sessions run.
+2. **(Optional) Get a hub key** for a browser preview: open <https://hub.mxcli.org/cli>, sign in with GitHub, and **Create a hub key**.
+3. **Create a Claude Code environment** on the repo. Set `MXCLI_HUB_KEY=<key>` (from step 2) and allow outbound HTTPS to GitHub Releases, Mendix's CDN, and `hub.mxcli.org`.
+4. **Paste the bootstrap prompt** into a session. The agent installs mxcli, runs `mxcli new` → `mxcli init`, starts a `FINDINGS.md`, commits the config, and boots the app with `mxcli run --local --setup --ensure-db` so it comes up testable.
+5. **Iterate** with the warm loop below; add `--hub https://hub.mxcli.org` for a shareable browser preview.
+
+> **[Developing on the Web (Claude Code)](https://www.mxcli.org/tutorial/claude-code-web.html)** walks the whole workflow, and **[Bootstrap Prompt](https://www.mxcli.org/tools/bootstrap-prompt.html)** has the exact copy-paste text.
+
+Then iterate with the **warm local dev loop** — a Docker-free ~1-second edit→test cycle:
+
+```bash
+mxcli run --local -p app.mpr --watch --screenshot   # hot-reload + auto screenshots
+```
+
+`mxcli run --local` keeps `mxbuild --serve` and a standalone runtime hot: a page/microflow edit is hot-applied in seconds (a hot `reload_model`, or a restart + DDL for entity changes), and `--screenshot` captures each page with Playwright. See **[Local Dev Loop](https://www.mxcli.org/tools/run-local.html)**.
+
+Add `--hub` to preview the running app **in a browser at a public URL** — the app stays local and reverse-tunnels out over a single 443 connection, so it works even from egress-only environments (e.g. Claude Code on the web):
+
+```bash
+mxcli run --hub https://hub.example.com -p app.mpr        # -> a shareable preview URL
+```
+
+`mxcli tunnel-hub --domain example.com` is the static relay you run once on a small VPS; it can front many previews at per-subdomain hosts across projects, solutions, branches, and worktrees, with a sortable availability overview at `hub.example.com/`. See **[Local Dev Loop → External browser preview](https://www.mxcli.org/tools/run-local.html)**.
+
+> **`--hub` and `tunnel-hub` are Linux-only.** The tunnel exists to get a preview out of a Linux container — the only place it ever ran — so it is built for Linux alone. Embedding a general-purpose tunnelling tool in the Windows and macOS binaries, which can never use it, got them flagged by Microsoft Defender and enterprise EDR, blocking mxcli on the managed corporate laptops most Mendix developers work on. On those platforms the commands still exist and show help, but fail with an explanatory message; run mxcli inside the project's devcontainer to use `--hub`. Everything else in `mxcli run --local` is unaffected. We did **not** obfuscate the dependency to dodge the scanners — the fix is not shipping the capability where it is unused. Rationale: [ADR-0009](docs/13-decisions/0009-tunnel-is-linux-only.md).
+
 ### Existing project
 
 For an existing Mendix project, use `mxcli init` to add AI tooling and a Dev Container:
@@ -150,14 +204,33 @@ mxcli add-tool cursor
 
 ## Installation
 
-Download the latest release for your platform from the [releases page](https://github.com/mendixlabs/mxcli/releases), or build from source:
+Download a pre-built binary from the [releases page](https://github.com/mendixlabs/mxcli/releases) — the assets are raw binaries named `mxcli-<os>-<arch>` (nothing to extract). While mxcli is fast-moving alpha, the rolling `nightly` build is recommended (new features land there first); pin a `vX.Y.Z` release for reproducibility:
+
+```bash
+# Linux/macOS — nightly
+curl -fsSL -o mxcli \
+  https://github.com/mendixlabs/mxcli/releases/download/nightly/mxcli-linux-amd64
+chmod +x mxcli && sudo mv mxcli /usr/local/bin/
+```
+
+Or build from source (Go + Make — `make build` runs the ANTLR parser generation that `go install` can't):
 
 ```bash
 git clone https://github.com/mendixlabs/mxcli.git
 cd mxcli
+make -C mdl/grammar bootstrap        # one-time: installs the pinned ANTLR generator
+export ANTLR4_TOOLS_ANTLR_VERSION=4.13.2
 make build
 # binary is at ./bin/mxcli
 ```
+
+The generator version is pinned and load-bearing: it must match the ANTLR
+runtime in `go.mod`, or the generated parser will not compile. `antlr4-tools`
+downloads the ANTLR jar on first run, so the build needs **network and a JVM**,
+not only Go. Skip the bootstrap if you already have an `antlr4` launcher on
+PATH (e.g. `brew install antlr4`).
+
+> `go install …@latest` is not supported: the generated ANTLR parser isn't committed, so a module-source build fails. Use a pre-built binary or `make build`.
 
 ## Core Features
 
@@ -165,10 +238,10 @@ make build
 
 ```bash
 # list all modules
-mxcli -p app.mpr -c "show modules"
+mxcli -p app.mpr -c "list modules"
 
 # list entities in a module
-mxcli -p app.mpr -c "show entities in MyModule"
+mxcli -p app.mpr -c "list entities in MyModule"
 
 # describe any element (module, entity, microflow, nanoflow, page, etc.)
 mxcli describe -p app.mpr module MyModule
@@ -236,10 +309,10 @@ Find and update widget properties across pages and snippets:
 
 ```bash
 # Discover widgets by type
-mxcli -p app.mpr -c "show widgets where widgettype like '%combobox%'"
+mxcli -p app.mpr -c "list widgets where widgettype like '%combobox%'"
 
 # filter by module
-mxcli -p app.mpr -c "show widgets in MyModule"
+mxcli -p app.mpr -c "list widgets in MyModule"
 
 # Preview changes (dry run)
 mxcli -p app.mpr -c "update widgets set 'showLabel' = false where widgettype like '%DataGrid%' dry run"
@@ -283,7 +356,7 @@ mxcli lint -p app.mpr --list-rules
 mxcli lint -p app.mpr --exclude System --exclude Administration
 ```
 
-14 built-in Go rules (MPR001-MPR007, SEC001-SEC003, CONV011-CONV014) plus 27 bundled Starlark rules covering security (SEC004-SEC009), architecture (ARCH001-003), quality (QUAL001-004), design (DESIGN001), and Mendix best practice conventions (CONV001-CONV010, CONV015-CONV017). Custom `.star` rules in `.claude/lint-rules/` are loaded automatically.
+14 built-in Go rules (MPR001-MPR007, SEC001-SEC003, CONV011-CONV014) plus 29 bundled Starlark rules covering security (SEC004-SEC009), architecture (ARCH001-003), quality (QUAL001-004), design (DESIGN001), and Mendix best practice conventions (CONV001-CONV010, CONV015-CONV019). Custom `.star` rules in `.claude/lint-rules/` are loaded automatically.
 
 ### Best Practices Report
 
@@ -342,8 +415,8 @@ MDL (Mendix Definition Language) is a SQL-like syntax for working with Mendix mo
 
 ```sql
 -- Show project structure
-show modules;
-show entities in MyModule;
+list modules;
+list entities in MyModule;
 describe entity MyModule.Customer;
 describe microflow MyModule.ProcessOrder;
 describe page MyModule.CustomerOverview;
@@ -363,7 +436,7 @@ create association MyModule.Order_Product
 -- Create pages
 create page MyModule.Product_Edit
 (
-  params: { $Product: MyModule.Product },
+  params: ( $Product: MyModule.Product ),
   title: 'Edit Product',
   layout: Atlas_Core.PopupLayout
 )
@@ -373,7 +446,7 @@ create page MyModule.Product_Edit
     textbox txtPrice (label: 'Price', attribute: Price)
     checkbox cbActive (label: 'Active', attribute: IsActive)
 
-    footer footer1 {
+    footer {
       actionbutton btnSave (caption: 'Save', action: save_changes, buttonstyle: primary)
       actionbutton btnCancel (caption: 'Cancel', action: cancel_changes)
     }
@@ -385,23 +458,23 @@ create module role MyModule.Admin description 'Full access';
 create module role MyModule.Viewer description 'Read-only';
 grant execute on microflow MyModule.ProcessOrder to MyModule.Admin;
 grant view on page MyModule.Product_Edit to MyModule.Admin, MyModule.Viewer;
-grant MyModule.Admin on MyModule.Product (create, delete, read *, write *);
-grant MyModule.Viewer on MyModule.Product (read *);
+grant create, delete, read *, write * on entity MyModule.Product to MyModule.Admin;
+grant read * on entity MyModule.Product to MyModule.Viewer;
 create user role AppAdmin (MyModule.Admin) manage all roles;
-alter project security level production;
+alter app security ( SecurityLevel: production );
 show security matrix in MyModule;
 
 -- Search
 search 'validation';
 
 -- Code navigation
-show callers of MyModule.ProcessOrder transitive;
-show references to MyModule.Customer;
-show impact of MyModule.Customer;
+list callers of MyModule.ProcessOrder transitive;
+list references to MyModule.Customer;
+list impact of MyModule.Customer;
 show context of MyModule.ProcessOrder depth 3;
 
 -- Widget discovery and bulk updates
-show widgets where widgettype like '%combobox%';
+list widgets where widgettype like '%combobox%';
 update widgets set 'showLabel' = false where widgettype like '%DataGrid%' dry run;
 ```
 
@@ -435,11 +508,11 @@ mxcli add-tool cursor
 
 **Universal (all tools):**
 - `AGENTS.md` - Comprehensive guide for AI assistants
-- `.ai-context/skills/` - MDL pattern guides (write-microflows.md, create-page.md, etc.)
+- `.ai-context/skills/` - MDL pattern guides, one `<name>/SKILL.md` each (write-microflows, create-page, ...)
 - `.ai-context/examples/` - Example MDL scripts
 
 **Tool-Specific:**
-- **Claude Code**: `.claude/settings.json`, `CLAUDE.md`, commands, lint-rules, skills
+- **Claude Code**: `.claude/settings.json`, `CLAUDE.md`, commands, lint-rules, `lint-config.yaml` (System module excluded from lint), skills
 - **Cursor**: `.cursorrules` - Compact MDL reference
 - **Continue.dev**: `.continue/config.json` - Custom commands and slash commands
 - **Windsurf**: `.windsurfrules` - MDL rules for Codeium
@@ -475,14 +548,10 @@ mxcli add-tool cursor
 ./mxcli                                    # project-local mxcli binary
 ```
 
-MxBuild is auto-downloaded on first use (via `mxcli setup mxbuild -p app.mpr` or `mxcli docker build`). To validate a project:
+MxBuild is downloaded by `mxcli setup mxbuild -p app.mpr`, `mxcli new` and `mxcli docker build`. `mxcli docker check` does not download it: it uses an `mx` already on the machine and stops with `mx not found` otherwise. To validate a project:
 
 ```bash
-# Auto-download mxbuild and check project
-mxcli setup mxbuild -p app.mpr
-~/.mxcli/mxbuild/*/modeler/mx check app.mpr
-
-# or use the integrated command
+mxcli setup mxbuild -p app.mpr   # once per Mendix version
 mxcli docker check -p app.mpr
 ```
 
@@ -599,3 +668,29 @@ Apache License 2.0 - See [LICENSE](LICENSE) for details.
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
+
+## High-Level Fluent API (in api/)
+The `api/` package provides a simplified, fluent API inspired by Mendix Web Extensibility Model API:
+
+```go
+a, err := api.Open("/path/to/project.mpr")   // or api.New(b) over any backend
+defer a.Close()
+
+module, _ := a.Modules.Get("MyModule")
+a.SetModule(module)
+
+entity, _ := a.DomainModels.CreateEntity("Customer").
+    persistent().
+    WithStringAttribute("Name", 100).
+    WithIntegerAttribute("Age").
+    build()
+```
+
+Available namespaces: `DomainModels`, `enumerations`, `microflows`, `pages`, `modules`
+
+It takes a **`backend.FullBackend`, not a `*mpr.Writer`** — it used to hold a concrete legacy
+writer and so bypassed the backend abstraction entirely, which is why `AddAttribute` and
+`UpdateAttribute` sat unimplemented on the codec engine with `api/` as their only caller. The
+practical gain is that the same builders now run against any backend, including a live Studio Pro
+over MCP, which was unreachable before. `Open` owns the connection it makes; a backend passed to
+`New` belongs to the caller and `Close` leaves it alone.

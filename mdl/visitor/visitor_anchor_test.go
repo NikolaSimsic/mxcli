@@ -240,3 +240,84 @@ end loop;`
 			loop.Annotations.BodyTailAnchor)
 	}
 }
+
+// mendixlabs/mxcli#992. `@anchor(true: (to: top))` — ONE side in the nested
+// pair, the form describe emits — parsed without error and set nothing: `(to:
+// top)` matched annotationValue's expression alternative first, as `to : top`
+// (`:` is Mendix's division operator), so the nested-anchor reader never saw
+// it and the true edge kept the builder's default sides.
+func TestAnchorAnnotation_SplitBranchWithOneSide(t *testing.T) {
+	for _, tc := range []struct {
+		src      string
+		from, to ast.AnchorSide
+	}{
+		{"@anchor(true: (to: top))", ast.AnchorSideUnset, ast.AnchorSideTop},
+		{"@anchor(true: (from: bottom))", ast.AnchorSideBottom, ast.AnchorSideUnset},
+	} {
+		stmt := firstStatement(t, tc.src+"\nif true then\n  log info node 'App' 'yes';\nend if;")
+		ifStmt := stmt.(*ast.IfStmt)
+		a := ifStmt.Annotations.TrueBranchAnchor
+		if a == nil {
+			t.Errorf("%s: TrueBranchAnchor not set", tc.src)
+			continue
+		}
+		if a.From != tc.from || a.To != tc.to {
+			t.Errorf("%s: got from=%v to=%v, want from=%v to=%v", tc.src, a.From, a.To, tc.from, tc.to)
+		}
+	}
+}
+
+// An @anchor parameter the reader cannot use is recorded, so validation can
+// refuse it rather than leave the edge on its default sides in silence.
+//
+// `sideways: (…)` has the shape of a CASE outcome, so it is recorded as one;
+// validation refuses an outcome key that is not on a CASE, or that names no
+// WHEN value (TestCaseOutcomeAnchorValidation in mdl/executor).
+func TestAnchorAnnotation_RecordsWhatItCannotUse(t *testing.T) {
+	for _, src := range []string{
+		"@anchor(true: (to: middle))",
+		"@anchor(sideways: (to: top))",
+		"@anchor(from: up)",
+	} {
+		stmt := firstStatement(t, src+"\nif true then\n  log info node 'App' 'yes';\nend if;")
+		ann := stmt.(*ast.IfStmt).Annotations
+		if ann == nil || len(ann.InvalidAnchors)+len(ann.CaseAnchors) == 0 {
+			t.Errorf("%s: nothing recorded", src)
+		}
+	}
+}
+
+// A CASE names each outcome's edge by its WHEN value, including the (empty)
+// value and a value that is a lexer keyword (mendixlabs/mxcli#1587). Before,
+// the keyword key and `(empty)` fell through to the positional form and every
+// value key was recorded as invalid.
+func TestAnchorAnnotation_CaseOutcomes(t *testing.T) {
+	stmt := firstStatement(t, `@anchor(A: (from: right), (empty): (to: top), Open: (from: bottom, to: left))
+case $E
+  when A then log info node 'App' 'a';
+  when Open then log info node 'App' 'o';
+  when (empty) then log info node 'App' 'e';
+end case;`)
+	cs, ok := stmt.(*ast.EnumSplitStmt)
+	if !ok {
+		t.Fatalf("expected EnumSplitStmt, got %T", stmt)
+	}
+	ann := cs.Annotations
+	if ann == nil || len(ann.InvalidAnchors) != 0 {
+		t.Fatalf("annotations %+v", ann)
+	}
+	want := []ast.CaseAnchor{
+		{Value: "A", Anchors: &ast.FlowAnchors{From: ast.AnchorSideRight, To: ast.AnchorSideUnset}},
+		{Value: "(empty)", Anchors: &ast.FlowAnchors{From: ast.AnchorSideUnset, To: ast.AnchorSideTop}},
+		{Value: "Open", Anchors: &ast.FlowAnchors{From: ast.AnchorSideBottom, To: ast.AnchorSideLeft}},
+	}
+	if len(ann.CaseAnchors) != len(want) {
+		t.Fatalf("case anchors %+v, want %d", ann.CaseAnchors, len(want))
+	}
+	for i, w := range want {
+		got := ann.CaseAnchors[i]
+		if got.Value != w.Value || *got.Anchors != *w.Anchors {
+			t.Errorf("case anchor %d = %s %+v, want %s %+v", i, got.Value, *got.Anchors, w.Value, *w.Anchors)
+		}
+	}
+}

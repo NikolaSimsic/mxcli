@@ -1,3 +1,4 @@
+mdl 1;
 -- @version: 11.0+
 -- ============================================================================
 -- Workflow Examples — CREATE, ALTER, and microflow integration
@@ -35,43 +36,36 @@ create microflow WFTest.ACT_Validate ($OrderContext: WFTest.OrderContext)
 begin
   @position(200,200) return;
 end;
-/
 
 create microflow WFTest.ACT_Process ($OrderContext: WFTest.OrderContext)
 begin
   @position(200,200) return;
 end;
-/
 
 create microflow WFTest.ACT_Escalate ($OrderContext: WFTest.OrderContext)
 begin
   @position(200,200) return;
 end;
-/
 
 create microflow WFTest.ACT_Notify ($OrderContext: WFTest.OrderContext)
 begin
   @position(200,200) return;
 end;
-/
 
 create microflow WFTest.ACT_Review ($OrderContext: WFTest.OrderContext)
 begin
   @position(200,200) return;
 end;
-/
 
 create microflow WFTest.ACT_Finalize ($OrderContext: WFTest.OrderContext)
 begin
   @position(200,200) return;
 end;
-/
 
 create microflow WFTest.ACT_BoundaryHandler ($OrderContext: WFTest.OrderContext)
 begin
   @position(200,200) return;
 end;
-/
 
 -- Targeting microflow: (System.Workflow, context) -> List of System.User
 create microflow WFTest.ACT_TargetUsers (
@@ -84,51 +78,50 @@ begin
   retrieve $users from System.User;
   @position(400,200) return $users;
 end;
-/
 
 -- User task pages (System.WorkflowUserTask param)
 create page WFTest.TaskPage (
   title: 'Task Page',
   layout: Atlas_Core.Atlas_Default,
-  params: { $WorkflowUserTask: System.WorkflowUserTask }
+  params: ( $WorkflowUserTask: System.WorkflowUserTask )
 ) {
   layoutgrid g1 {
-    row r1 {
-      column c1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext txt1 (content: 'Task Page', rendermode: H2)
       }
     }
   }
-}
+};
 
 create page WFTest.AlternateTaskPage (
   title: 'Alternate Task',
   layout: Atlas_Core.Atlas_Default,
-  params: { $WorkflowUserTask: System.WorkflowUserTask }
+  params: ( $WorkflowUserTask: System.WorkflowUserTask )
 ) {
   layoutgrid g1 {
-    row r1 {
-      column c1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext txt1 (content: 'Alternate Task', rendermode: H2)
       }
     }
   }
-}
+};
 
 -- Overview page (System.Workflow param)
 create page WFTest.OverviewPage (
   title: 'Workflow Overview',
   layout: Atlas_Core.Atlas_Default,
-  params: { $workflow: System.Workflow }
+  params: ( $workflow: System.Workflow )
 ) {
   layoutgrid g1 {
-    row r1 {
-      column c1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext txt1 (content: 'Overview', rendermode: H2)
       }
     }
   }
-}
+};
 
 -- Sub-workflow for CALL WORKFLOW demo
 create workflow WFTest.SubProcess
@@ -137,18 +130,17 @@ create workflow WFTest.SubProcess
 begin
   call microflow WFTest.ACT_Finalize;
 end workflow;
-/
 
 -- Initial workflow — simple starting point, all richness added via ALTER
 
-create or replace workflow WFTest.OrderApproval
+create or modify workflow WFTest.OrderApproval
   parameter $WorkflowContext: WFTest.OrderContext
   display 'Order Approval'
   description 'Handles order approval process'
 begin
   user task ReviewOrder 'Review the order'
     page WFTest.TaskPage
-    targeting xpath '[Status = ''Draft'']'
+    targeting xpath [Active = true()]
     description 'Please review this order'
     outcomes
       'Approve' { call microflow WFTest.ACT_Process; }
@@ -158,7 +150,7 @@ begin
 
   call microflow WFTest.ACT_Validate;
 
-  decision '$WorkflowContext/Total > 1000'
+  decision $WorkflowContext/Total > 1000
     outcomes
       true -> { call microflow WFTest.ACT_Process; }
       false -> { call microflow WFTest.ACT_Notify; }
@@ -170,131 +162,153 @@ begin
     path 3 { }
   ;
 end workflow;
-/
 
 -- SET workflow-level properties
 
-alter workflow WFTest.OrderApproval set display 'Updated Order Approval';
-alter workflow WFTest.OrderApproval set description 'Updated workflow description';
-alter workflow WFTest.OrderApproval set export level api;
-alter workflow WFTest.OrderApproval set due date '';
-alter workflow WFTest.OrderApproval set overview page WFTest.OverviewPage;
-alter workflow WFTest.OrderApproval set parameter $WorkflowContext: WFTest.OrderContext;
+alter workflow WFTest.OrderApproval { set (Display: 'Updated Order Approval'); };
+alter workflow WFTest.OrderApproval { set (Description: 'Updated workflow description'); };
+alter workflow WFTest.OrderApproval { set (ExportLevel: api); };
+alter workflow WFTest.OrderApproval { set (DueDate: ''); };
+alter workflow WFTest.OrderApproval { set (OverviewPage: WFTest.OverviewPage); };
+alter workflow WFTest.OrderApproval { set (Parameter: $WorkflowContext: WFTest.OrderContext); };
 
 -- Multiple SET in one statement
-alter workflow WFTest.OrderApproval
-  set display 'Final Order Approval'
-  set description 'Final description';
+alter workflow WFTest.OrderApproval {
+  set (Display: 'Final Order Approval');
+  set (Description: 'Final description');
+};
 
 -- SET activity properties
 
-alter workflow WFTest.OrderApproval set activity ReviewOrder page WFTest.AlternateTaskPage;
-alter workflow WFTest.OrderApproval set activity ReviewOrder description 'Updated instructions';
-alter workflow WFTest.OrderApproval set activity ReviewOrder targeting xpath '[Status = ''Pending'']';
-alter workflow WFTest.OrderApproval set activity ReviewOrder targeting microflow WFTest.ACT_TargetUsers;
-alter workflow WFTest.OrderApproval set activity ReviewOrder due date '';
-alter workflow WFTest.OrderApproval set activity 'Review the order' description 'Referenced by caption';
+alter workflow WFTest.OrderApproval { set (Page: WFTest.AlternateTaskPage) on ReviewOrder; };
+alter workflow WFTest.OrderApproval { set (Description: 'Updated instructions') on ReviewOrder; };
+alter workflow WFTest.OrderApproval { set (Targeting: xpath [Blocked = false()]) on ReviewOrder; };
+alter workflow WFTest.OrderApproval { set (Targeting: microflow WFTest.ACT_TargetUsers) on ReviewOrder; };
+alter workflow WFTest.OrderApproval { set (DueDate: '') on ReviewOrder; };
+alter workflow WFTest.OrderApproval { set (Description: 'Referenced by caption') on 'Review the order'; };
 
 -- INSERT / DROP / REPLACE activities
 
-alter workflow WFTest.OrderApproval
-  insert after ReviewOrder call microflow WFTest.ACT_Escalate;
+alter workflow WFTest.OrderApproval {
+  insert after ReviewOrder { call microflow WFTest.ACT_Escalate; }
+};
 
-alter workflow WFTest.OrderApproval
-  insert after ACT_Escalate call microflow WFTest.ACT_Notify;
-alter workflow WFTest.OrderApproval
-  drop activity ACT_Notify@1;
+alter workflow WFTest.OrderApproval {
+  insert after ACT_Escalate { call microflow WFTest.ACT_Notify; }
+};
+alter workflow WFTest.OrderApproval {
+  drop ACT_Notify@1;
+};
 
-alter workflow WFTest.OrderApproval
-  replace activity ACT_Validate with call microflow WFTest.ACT_Process;
+alter workflow WFTest.OrderApproval {
+  replace ACT_Validate with { call microflow WFTest.ACT_Process; }
+};
 
 -- INSERT / DROP outcome
 
-alter workflow WFTest.OrderApproval
-  insert outcome 'Escalate' on ReviewOrder {
+alter workflow WFTest.OrderApproval {
+  insert into ReviewOrder { outcomes 'Escalate' {
     call microflow WFTest.ACT_Review;
-  };
+  } }
+};
 
-alter workflow WFTest.OrderApproval
-  drop outcome 'Hold' on ReviewOrder;
+alter workflow WFTest.OrderApproval {
+  drop ReviewOrder outcome 'Hold';
+};
 
 -- INSERT / DROP path
 
-alter workflow WFTest.OrderApproval
-  insert path on 'Parallel split' {
+alter workflow WFTest.OrderApproval {
+  insert into 'Parallel split' { path {
     call microflow WFTest.ACT_Finalize;
-  };
+  } }
+};
 
-alter workflow WFTest.OrderApproval
-  drop path 'Path 3' on 'Parallel split';
+alter workflow WFTest.OrderApproval {
+  drop 'Parallel split' path 3;
+};
 
 -- INSERT / DROP condition
 
-alter workflow WFTest.OrderApproval
-  insert condition 'Default' on 'Decision' {
+alter workflow WFTest.OrderApproval {
+  insert into 'Decision' { outcomes 'Default' -> {
     call microflow WFTest.ACT_Review;
-  };
+  } }
+};
 
 -- INSERT / DROP boundary event
 
-alter workflow WFTest.OrderApproval
-  insert boundary event on ReviewOrder interrupting timer 'addHours([%CurrentDateTime%], 2)' {
+alter workflow WFTest.OrderApproval {
+  insert into ReviewOrder { boundary event interrupting timer addHours([%CurrentDateTime%], 2) {
     call microflow WFTest.ACT_BoundaryHandler;
     jump to ReviewOrder;
-  };
+  } }
+};
 
-alter workflow WFTest.OrderApproval
-  insert boundary event on ACT_Escalate@1 interrupting timer;
-alter workflow WFTest.OrderApproval
-  drop boundary event on ACT_Escalate@1;
+alter workflow WFTest.OrderApproval {
+  insert into ACT_Escalate@1 { boundary event interrupting timer }
+};
+alter workflow WFTest.OrderApproval {
+  drop ACT_Escalate@1 boundary event;
+};
 
 -- INSERT into nested flows
 
-alter workflow WFTest.OrderApproval
-  insert after ACT_Process@1 call microflow WFTest.ACT_Finalize;
+alter workflow WFTest.OrderApproval {
+  insert after ACT_Process@1 { call microflow WFTest.ACT_Finalize; }
+};
 
-alter workflow WFTest.OrderApproval
-  insert after ACT_Process@2 call microflow WFTest.ACT_Review;
+alter workflow WFTest.OrderApproval {
+  insert after ACT_Process@2 { call microflow WFTest.ACT_Review; }
+};
 
 -- All remaining activity types
 
-alter workflow WFTest.OrderApproval
-  insert after ACT_Escalate@1 wait for timer 'addHours([%CurrentDateTime%], 1)' comment 'WaitOneHour';
+alter workflow WFTest.OrderApproval {
+  insert after ACT_Escalate@1 { wait for timer addHours([%CurrentDateTime%], 1) caption 'WaitOneHour'; }
+};
 
-alter workflow WFTest.OrderApproval
-  insert after WaitOneHour wait for notification comment 'WaitForApproval';
+alter workflow WFTest.OrderApproval {
+  insert after WaitOneHour { wait for notification caption 'WaitForApproval'; }
+};
 
-alter workflow WFTest.OrderApproval
-  insert after WaitForApproval call workflow WFTest.SubProcess;
+alter workflow WFTest.OrderApproval {
+  insert after WaitForApproval { call workflow WFTest.SubProcess; }
+};
 
-alter workflow WFTest.OrderApproval
-  insert after SubProcess multi user task GroupApproval 'Group Approval'
+alter workflow WFTest.OrderApproval {
+  insert after SubProcess { multi user task GroupApproval 'Group Approval'
     page WFTest.TaskPage
     outcomes
       'Approved' { }
       'Denied' { }
-  ;
+  ; }
+};
 
 -- NON INTERRUPTING TIMER boundary event (compare with INTERRUPTING above)
-alter workflow WFTest.OrderApproval
-  insert boundary event on GroupApproval non interrupting timer 'addHours([%CurrentDateTime%], 48)' {
+alter workflow WFTest.OrderApproval {
+  insert into GroupApproval { boundary event non interrupting timer addHours([%CurrentDateTime%], 48) {
     call microflow WFTest.ACT_Notify;
-  };
+  } }
+};
 
-alter workflow WFTest.OrderApproval
-  insert outcome 'Retry' on ReviewOrder@1 {
+alter workflow WFTest.OrderApproval {
+  insert into ReviewOrder@1 { outcomes 'Retry' {
     jump to ReviewOrder;
-  };
+  } }
+};
 
 -- Positional disambiguation (@N syntax)
 
-alter workflow WFTest.OrderApproval
-  set activity ACT_Escalate@1 description 'Disambiguated by @1';
+alter workflow WFTest.OrderApproval {
+  set (Description: 'Disambiguated by @1') on ACT_Escalate@1;
+};
 
 -- String literal activity reference
 
-alter workflow WFTest.OrderApproval
-  set activity 'Review the order' description 'Final description via caption';
+alter workflow WFTest.OrderApproval {
+  set (Description: 'Final description via caption') on 'Review the order';
+};
 
 
 -- ############################################################################
@@ -320,7 +334,6 @@ begin
   ;
 
 end workflow;
-/
 
 -- ############################################################################
 -- PART C: USER TARGETING — all targeting variants
@@ -350,7 +363,6 @@ begin
   retrieve $Users from System.User;
   @position(400,200) return $Users;
 end;
-/
 
 create microflow WFTarget.ACT_GetGroups (
   $Workflow: System.Workflow,
@@ -362,21 +374,20 @@ begin
   retrieve $Groups from System.WorkflowGroup;
   @position(400,200) return $Groups;
 end;
-/
 
 create page WFTarget.TaskPage (
   title: 'Task Page',
   layout: Atlas_Core.Atlas_Default,
-  params: { $WorkflowUserTask: System.WorkflowUserTask }
+  params: ( $WorkflowUserTask: System.WorkflowUserTask )
 ) {
   layoutgrid g1 {
-    row r1 {
-      column c1 (desktopwidth: 12) {
+    row {
+      column (desktopwidth: 12) {
         dynamictext txt1 (content: 'Task', rendermode: H2)
       }
     }
   }
-}
+};
 
 create workflow WFTarget.TargetingDemo
   parameter $WorkflowContext: WFTarget.Request
@@ -390,7 +401,7 @@ begin
   -- TARGETING USERS XPATH (explicit user xpath targeting)
   user task ByUserXP 'User xpath targeting'
     page WFTarget.TaskPage
-    targeting users xpath '[Name = ''admin'']'
+    targeting users xpath [Name = 'admin']
     outcomes 'Done' { };
 
   -- TARGETING GROUPS MICROFLOW (group microflow targeting)
@@ -402,7 +413,7 @@ begin
   -- TARGETING GROUPS XPATH (group xpath targeting)
   user task ByGroupXP 'Group xpath targeting'
     page WFTarget.TaskPage
-    targeting groups xpath '[Name = ''Administrators'']'
+    targeting groups xpath [Name = 'Administrators']
     outcomes 'Done' { };
 
   -- TARGETING MICROFLOW (legacy short form)
@@ -414,7 +425,7 @@ begin
   -- TARGETING XPATH (legacy short form)
   user task LegacyXP 'Legacy xpath targeting'
     page WFTarget.TaskPage
-    targeting xpath '[Name = ''admin'']'
+    targeting xpath [Name = 'admin']
     outcomes 'Done' { };
 
   -- MULTI USER TASK with group targeting
@@ -424,7 +435,6 @@ begin
     outcomes 'Done' { };
 
 end workflow;
-/
 
 
 -- ############################################################################
@@ -440,7 +450,6 @@ create microflow TestModule.ACT_Stub ($DeliveryContext: TestModule.DeliveryConte
 begin
   @position(200,200) return;
 end;
-/
 
 create workflow TestModule.WF_DeliveryDelay
   parameter $WorkflowContext: TestModule.DeliveryContext
@@ -448,7 +457,6 @@ create workflow TestModule.WF_DeliveryDelay
 begin
   call microflow TestModule.ACT_Stub;
 end workflow;
-/
 
 create microflow TestModule.MF_WorkflowActions (
   $workflow: System.Workflow,
@@ -485,4 +493,317 @@ begin
 
   -- Open workflow admin page
   open workflow $workflow;
+end;
+
+-- =============================================================================
+-- Named activities and jump targets (ako/mxcli#408)
+-- =============================================================================
+-- Mendix resolves `jump to` by JumpToActivity.TargetActivity, which stores an
+-- activity NAME. Studio Pro names every activity by type and ordinal
+-- (decision1, split1, callMicroflow1) independently of its caption, so an
+-- activity needs an explicit name for a described workflow to be re-executable.
+-- The name is optional: without one it is still derived from the caption.
+--
+-- Note where the jump sits. MxBuild refuses one that is not at the end of a
+-- path (CE6679), one that crosses a parallel-split boundary (CE6682 / CE7415),
+-- and a main flow ending in a jump makes the implicit End unreachable (CE6689)
+-- — so the jump lives at the end of a user-task outcome branch, which is where
+-- Studio Pro puts it too.
+
+create workflow WFTest.NamedActivities
+  parameter $WorkflowContext: WFTest.OrderContext
+begin
+  call microflow WFTest.ACT_Validate as callMicroflow1;
+
+  decision decision1 $WorkflowContext/Total > 1000
+    outcomes
+      true -> {
+        user task Rework 'Fix and resubmit'
+          page WFTest.TaskPage
+          outcomes
+            'Resubmit' { jump to decision1; }
+            'Abandon'  { }
+        ;
+      }
+      false -> { call microflow WFTest.ACT_Process as callMicroflow2; }
+  ;
+
+  parallel split split1
+    path 1 { call microflow WFTest.ACT_Notify as callMicroflow3; }
+    path 2 { call microflow WFTest.ACT_Review as callMicroflow4; }
+  ;
+
+  wait for timer timer1 addHours([%CurrentDateTime%], 1) ;
+  wait for notification waitForNotification1;
+end workflow;
+
+
+-- ############################################################################
+-- PART E: END WORKFLOW — ending the workflow from inside a branch
+-- ############################################################################
+--
+-- `end workflow [comment '<caption>'];` is legal as the last statement of a
+-- user-task outcome, a decision branch, a call-microflow outcome or an
+-- interrupting boundary-event path, at any depth. It ends the whole workflow.
+-- The main flow needs none — the body's closing `end workflow` is its End.
+-- See docs/11-proposals/PROPOSAL_workflow_end_activity.md.
+
+create workflow WFTest.EndInBranches
+  parameter $OrderContext: WFTest.OrderContext
+begin
+  decision decision1 $WorkflowContext/Total > 1000
+    outcomes
+      true -> {
+        user task ManagerReview 'Manager review'
+          page WFTest.TaskPage
+          outcomes
+            'Reject' { end workflow caption 'Rejected by manager'; }
+            'Approve' { };
+      }
+      false -> { };
+
+  user task FinalCheck 'Final check'
+    page WFTest.TaskPage
+    outcomes
+      'Cancel' { end workflow; }
+      'Confirm' { }
+    boundary event interrupting timer addDays([%CurrentDateTime%], 3) {
+      end workflow caption 'Expired';
+    };
+
+  wait for timer timer1 addHours([%CurrentDateTime%], 1) ;
+end workflow;
+
+alter workflow WFTest.EndInBranches {
+  insert into FinalCheck { outcomes 'Withdraw' {
+    end workflow caption 'Withdrawn';
+  } }
+};
+
+-- ############################################################################
+-- PART F: HANDLERS — on-created microflows and workflow event handlers
+-- ############################################################################
+--
+-- `on created microflow` runs when a user task is created; it takes the task
+-- and the context object, in either order, and returns nothing (CE6683,
+-- CE5012). A header `on workflow events (…) microflow …` handler runs for each
+-- listed event and takes System.WorkflowEvent, System.WorkflowRecord and
+-- System.WorkflowActivityRecord, in any order (CE6691). `on any workflow event`
+-- stores every event type the project's Mendix version has, which is what
+-- Studio Pro stores when every box is ticked. Measured on mxbuild 11.13.0;
+-- see docs/11-proposals/PROPOSAL_workflow_studio_pro_constructs.md.
+
+create microflow WFTest.ACT_TaskCreated (
+  $OrderContext: WFTest.OrderContext,
+  $WorkflowUserTask: System.WorkflowUserTask
+)
+begin
+end;
+
+create microflow WFTest.ACT_AuditWorkflowEvent (
+  $WorkflowEvent: System.WorkflowEvent,
+  $WorkflowRecord: System.WorkflowRecord,
+  $WorkflowActivityRecord: System.WorkflowActivityRecord
+)
+begin
+end;
+
+create workflow WFTest.WithHandlers
+  parameter $OrderContext: WFTest.OrderContext
+  on workflow events (UserTaskStarted, UserTaskEnded) microflow WFTest.ACT_AuditWorkflowEvent as 'Task audit'
+  on any workflow event microflow WFTest.ACT_AuditWorkflowEvent as 'OnAnyEvent'
+begin
+  user task Review 'Review the order'
+    page WFTest.TaskPage
+    on created microflow WFTest.ACT_TaskCreated
+    outcomes 'Approve' { } 'Reject' { };
+
+  multi user task Vote 'Vote on the order'
+    page WFTest.TaskPage
+    on created microflow WFTest.ACT_TaskCreated
+    outcomes 'Yes' { } 'No' { };
+end workflow;
+
+-- @version: 11.9+
+-- ############################################################################
+-- PART G: AI AGENT TASK — call agent microflow (Mendix 11.9+)
+-- ############################################################################
+--
+-- `call agent microflow` is the call-microflow statement stored as an AI agent
+-- task. Its microflow must take at least one parameter (CE1590); return Boolean
+-- or an enumeration to branch on the agent's answer.
+
+create microflow WFTest.ACT_SummariseOrder (
+  $OrderContext: WFTest.OrderContext
+)
+begin
+end;
+
+create microflow WFTest.ACT_ClassifyOrder (
+  $OrderContext: WFTest.OrderContext
+)
+returns boolean as $Urgent
+begin
+  return false;
+end;
+
+create workflow WFTest.WithAgentTasks
+  parameter $OrderContext: WFTest.OrderContext
+begin
+  call agent microflow WFTest.ACT_SummariseOrder(OrderContext = $WorkflowContext) as aiAgentTask1 caption 'Summarise the order';
+
+  call agent microflow WFTest.ACT_ClassifyOrder(OrderContext = $WorkflowContext) as aiAgentTask2 caption 'Classify the order'
+    outcomes
+      true -> {
+        user task Expedite 'Expedite the order'
+          page WFTest.TaskPage
+          outcomes 'Done' { };
+      }
+      false -> { };
+end workflow;
+
+-- @version: any
+-- ############################################################################
+-- PART H: MULTI-USER TASK COMPLETION — participants, decide by, await all users
+-- ############################################################################
+--
+-- A fallback is required for consensus, majority and threshold (CE1866), a veto
+-- needs its outcome (CE1867), and a decision microflow returns String (CE5012).
+-- Omitted clauses mean all participants, consensus on the first outcome, and not
+-- waiting for everyone.
+
+create microflow WFTest.ACT_DecideOrder (
+  $OrderContext: WFTest.OrderContext
+)
+returns string as $Outcome
+begin
+  return 'Approve';
+end;
+
+create workflow WFTest.CompletionRules
+  parameter $OrderContext: WFTest.OrderContext
+begin
+  multi user task ConsensusVote 'Consensus'
+    page WFTest.TaskPage
+    decide by consensus fallback 'Reject'
+    outcomes 'Approve' { } 'Reject' { };
+
+  multi user task MajorityVote 'Majority'
+    page WFTest.TaskPage
+    decide by majority more than half fallback 'Approve'
+    outcomes 'Approve' { } 'Reject' { };
+
+  multi user task MostChosenVote 'Most chosen'
+    page WFTest.TaskPage
+    decide by majority most chosen fallback 'Reject'
+    outcomes 'Approve' { } 'Reject' { };
+
+  multi user task ThresholdVote 'Threshold'
+    page WFTest.TaskPage
+    participants 80 percent
+    decide by threshold 60 percent fallback 'Reject'
+    outcomes 'Approve' { } 'Reject' { };
+
+  multi user task VotesVote 'Votes'
+    page WFTest.TaskPage
+    participants 3
+    decide by threshold 2 votes fallback 'Reject'
+    await all users
+    outcomes 'Approve' { } 'Reject' { };
+
+  multi user task VetoVote 'Veto'
+    page WFTest.TaskPage
+    decide by veto 'Reject'
+    outcomes 'Approve' { } 'Reject' { };
+
+  multi user task MicroflowVote 'Microflow'
+    page WFTest.TaskPage
+    decide by microflow WFTest.ACT_DecideOrder
+    outcomes 'Approve' { } 'Reject' { };
+end workflow;
+
+-- @version: 11.11+
+-- ############################################################################
+-- PART I: NOTIFICATION EVENTS AND EVENT SUB-PROCESSES (Mendix 11.11+)
+-- ############################################################################
+--
+-- A notification activity and a notification boundary event are what `notify
+-- workflow` targets, by name. An event sub-process runs outside the main flow
+-- when its start event fires: interrupting cancels every active path first,
+-- non-interrupting runs alongside. Its End is implicit, like the main flow's.
+
+create microflow WFTest.ACT_LogCancel (
+  $OrderContext: WFTest.OrderContext
+)
+begin
+end;
+
+create workflow WFTest.WithNotifications
+  parameter $OrderContext: WFTest.OrderContext
+begin
+  notification DocumentsReceived caption 'Documents received';
+
+  user task Review 'Review the order'
+    page WFTest.TaskPage
+    outcomes 'Approve' { } 'Reject' { }
+    boundary event interrupting notification Withdrawn 'Order withdrawn' {
+      end workflow;
+    }
+    boundary event non interrupting notification Nudge 'Reminder requested' {
+      call microflow WFTest.ACT_LogCancel(OrderContext = $WorkflowContext);
+    };
+
+  event subprocess ESP_Cancel 'Cancel order'
+    on interrupting notification CancelStart 'Cancel received' {
+    call microflow WFTest.ACT_LogCancel(OrderContext = $WorkflowContext);
+  };
+
+  event subprocess ESP_Audit 'Audit'
+    on non interrupting notification AuditStart {
+  };
+end workflow;
+
+-- @version: 11.13+
+-- ############################################################################
+-- PART J: TIMER-STARTED EVENT SUB-PROCESSES (Mendix 11.13+)
+-- ############################################################################
+--
+-- A timer start takes its first execution time, which Mendix requires (CE0126).
+
+create workflow WFTest.WithTimerSubProcesses
+  parameter $OrderContext: WFTest.OrderContext
+begin
+  user task Review 'Review the order'
+    page WFTest.TaskPage
+    outcomes 'Approve' { } 'Reject' { };
+
+  event subprocess ESP_Expire 'Expire'
+    on interrupting timer addDays([%CurrentDateTime%], 30) as ExpireStart caption 'After 30 days' {
+  };
+
+  event subprocess ESP_Remind 'Daily reminder'
+    on non interrupting timer addDays([%CurrentDateTime%], 1) as RemindStart {
+    call microflow WFTest.ACT_LogCancel(OrderContext = $WorkflowContext);
+  };
+end workflow;
+
+-- @version: 11.11+
+-- ############################################################################
+-- PART K: NOTIFY WORKFLOW — targets (Mendix 11.11+ for these elements)
+-- ############################################################################
+--
+-- A notify names the element it resumes: a notification-started event
+-- sub-process's start, a notification activity, a notification boundary event or
+-- a wait for notification. Without a target the build fails (CE0166).
+
+create microflow WFTest.ACT_NotifyOrder (
+  $Workflow: System.Workflow
+)
+returns boolean as $Cancelled
+begin
+  $Cancelled = notify workflow $Workflow target WFTest.WithNotifications.CancelStart;
+  $Audited = notify workflow $Workflow target WFTest.WithNotifications.AuditStart;
+  $Received = notify workflow $Workflow target WFTest.WithNotifications.DocumentsReceived;
+  $Withdrawn = notify workflow $Workflow target WFTest.WithNotifications.Withdrawn;
+  return $Cancelled and $Audited and $Received and $Withdrawn;
 end;

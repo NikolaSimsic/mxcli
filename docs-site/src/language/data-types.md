@@ -17,7 +17,7 @@ MDL has a type system that maps to the Mendix metamodel attribute types. Every a
 
 ```sql
 CREATE PERSISTENT ENTITY Demo.AllTypes (
-  Id: AutoNumber NOT NULL UNIQUE DEFAULT 1,
+  ItemNumber: AutoNumber NOT NULL UNIQUE DEFAULT 1,
   Code: String(10) NOT NULL UNIQUE,
   Name: String(200) NOT NULL,
   Description: String(unlimited),
@@ -26,7 +26,7 @@ CREATE PERSISTENT ENTITY Demo.AllTypes (
   Amount: Decimal DEFAULT 0.00,
   IsActive: Boolean DEFAULT TRUE,
   CreatedAt: DateTime,
-  BirthDate: Date,
+  BirthDate: DateTime,
   Attachment: Binary,
   Status: Enumeration(Demo.Status) DEFAULT 'Active'
 );

@@ -101,6 +101,14 @@ This preserves the audit trail.
 | [0005](0005-semantic-model-interface-currency.md) | Semantic model is the backend-interface currency; storage formats are swappable adapters | Accepted |
 | [0006](0006-mcp-capability-model.md) | Version-aware MCP capability model | Proposed |
 | [0007](0007-mcp-read-model-session-overlay.md) | MCP backend read model — disk base with session overlay | Proposed |
+| [0008](0008-identity-and-idempotence.md) | Skip unchanged writes; never renumber element IDs in place | Accepted |
+| [0009](0009-tunnel-is-linux-only.md) | The embedded tunnel ships in Linux builds only | Accepted |
+| [0010](0010-mdl-canonical-syntax-rules.md) | MDL has one canonical form, governed by twelve syntax rules | Accepted |
+| [0011](0011-mdl-language-versioning.md) | MDL evolves through deprecation aliases and a language header; meaning changes only across versions | Accepted |
+| [0012](0012-mdl-first-and-data-first-editing.md) | MDL-first and data-first editing share one syntax and one patch engine | Accepted |
+| [0013](0013-activity-settings-property-list.md) | Microflow activity settings: words for the statement, one property list for the dialog (refines R2/R3 of 0010 for activities) | Proposed |
+| [0014](0014-incremental-catalog-builds.md) | Catalog rows belong to a unit, and a refresh rebuilds only the changed units | Accepted |
+| [0015](0015-content-keyed-unit-caches.md) | What mxcli keeps of a unit is keyed by the unit's content | Proposed |
 
 ## Candidates to back-fill
 

@@ -33,7 +33,7 @@ func (b *Builder) exitAlterAgentEditorStatement(ctx *parser.AlterStatementContex
 	// MODEL / KNOWLEDGE BASE / CONSUMED MCP SERVICE — SET-only.
 	changes := parseAgentEditorAlterAssignments(ctx.AllAgentEditorAlterAssignment())
 	switch {
-	case ctx.MODEL() != nil:
+	case ctx.AiModelKw() != nil:
 		b.statements = append(b.statements, &ast.AlterModelStmt{Name: name, Changes: changes})
 	case ctx.KNOWLEDGE() != nil && ctx.BASE() != nil:
 		b.statements = append(b.statements, &ast.AlterKnowledgeBaseStmt{Name: name, Changes: changes})
@@ -76,6 +76,7 @@ func (b *Builder) applyAlterAgentAction(stmt *ast.AlterAgentStmt, ctx *parser.Al
 // KNOWLEDGE BASE block to the matching field on the ALTER AGENT stmt.
 // Mirrors the CREATE AGENT body-block parsing in ExitCreateAgentStatement.
 func (b *Builder) appendAgentBodyBlock(stmt *ast.AlterAgentStmt, blk *parser.AgentBodyBlockContext) {
+	b.checkAgentBodyBlock(blk)
 	blockProps := parseModelProps(blk.AllModelProperty())
 
 	switch {
@@ -90,6 +91,7 @@ func (b *Builder) appendAgentBodyBlock(stmt *ast.AlterAgentStmt, blk *parser.Age
 			td.Enabled = strings.EqualFold(v, "true")
 		}
 		td.Description = blockProps["description"]
+		b.toolUserSettings(&td, blockProps)
 		stmt.AddTools = append(stmt.AddTools, td)
 
 	case blk.KNOWLEDGE() != nil && blk.BASE() != nil:
@@ -111,18 +113,11 @@ func (b *Builder) appendAgentBodyBlock(stmt *ast.AlterAgentStmt, blk *parser.Age
 		if v, ok := blockProps["enabled"]; ok {
 			kbd.Enabled = strings.EqualFold(v, "true")
 		}
+		kbRetrievalSettings(&kbd, blockProps)
 		stmt.AddKBs = append(stmt.AddKBs, kbd)
 
 	case blk.TOOL() != nil:
-		td := ast.AgentToolDef{ToolType: "Microflow", Enabled: true}
-		if iok := blk.IdentifierOrKeyword(); iok != nil {
-			td.Name = iok.GetText()
-		}
-		td.Description = blockProps["description"]
-		if v, ok := blockProps["enabled"]; ok {
-			td.Enabled = strings.EqualFold(v, "true")
-		}
-		stmt.AddTools = append(stmt.AddTools, td)
+		stmt.AddTools = append(stmt.AddTools, b.toolBlockDef(blk, blockProps))
 	}
 }
 
@@ -149,7 +144,7 @@ func parseAgentEditorAlterAssignments(props []parser.IAgentEditorAlterAssignment
 
 func agentEditorAlterValueText(ctx *parser.AgentEditorAlterValueContext) string {
 	if sl := ctx.STRING_LITERAL(); sl != nil {
-		return unquoteString(sl.GetText())
+		return unquoteStringLit(sl)
 	}
 	if num := ctx.NUMBER_LITERAL(); num != nil {
 		return num.GetText()

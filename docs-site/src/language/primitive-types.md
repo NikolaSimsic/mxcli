@@ -101,20 +101,28 @@ ModifiedAt: DateTime
 ScheduledFor: DateTime
 ```
 
-DateTime values include both date and time components. For date-only display, use `Date` instead.
+A DateTime is localized (shown in the user's time zone) by default. For a
+calendar date that must not shift with the time zone, such as a birth date, add
+`NOT LOCALIZED` — see [Constraints](./constraints.md#localized--not-localized-datetime-only):
 
-## Date
-
-Date only (no time component). Internally stored as DateTime in Mendix, but the UI only shows the date portion.
-
-```sql
-Date
+```text
+BirthDate: DateTime NOT LOCALIZED
 ```
 
-```sql
-BirthDate: Date
-ExpiryDate: Date
-```
+DateTime values include both date and time components. To show only the date, format it on the widget; there is no `Date` type.
+
+## No `Date`, `Float` or `Currency`
+
+Mendix has no date-only attribute type: a date is a `DateTime`, and showing only
+its date part is a formatting choice on the widget. `Float` and `Currency` were
+removed in Mendix 7 in favour of `Decimal`. MDL refuses `float` and `currency` with
+the type to write instead — earlier versions accepted them and silently stored a
+`String`.
+
+`date` was always stored as a `DateTime`, so in a script without the `mdl 1;`
+header it is a deprecated spelling of `DateTime`: it builds a `DateTime` and warns
+`MDL-DEPR160`, and `mxcli fmt --upgrade` rewrites it to `DateTime`. Under `mdl 1;`
+it is an error.
 
 ## AutoNumber
 

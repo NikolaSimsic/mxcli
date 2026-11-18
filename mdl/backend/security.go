@@ -26,11 +26,53 @@ type ProjectSecurityBackend interface {
 	GetProjectSecurity() (*security.ProjectSecurity, error)
 	SetProjectSecurityLevel(unitID model.ID, level string) error
 	SetProjectDemoUsersEnabled(unitID model.ID, enabled bool) error
+	// SetProjectStrictMode toggles security strict mode, which mxcli has always
+	// READ (it is what lint rule SEC005 reports on) and could not write, so the
+	// rule had no remedy short of Studio Pro (ako/mxcli#526).
+	SetProjectStrictMode(unitID model.ID, enabled bool) error
+	// SetProjectAdminUserName renames the built-in administrator account
+	// (Security$ProjectSecurity.AdminUserName), which lint reads as
+	// project_security().admin_user_name (mendixlabs/mxcli#1314).
+	SetProjectAdminUserName(unitID model.ID, name string) error
+	// SetProjectAdminUserRole sets that account's user role
+	// (Security$ProjectSecurity.AdminUserRole). The caller resolves the role:
+	// mxbuild does not report a name that does not resolve, it crashes on it
+	// (ako/mxcli#2015).
+	SetProjectAdminUserRole(unitID model.ID, role string) error
+	// SetProjectAdminPassword sets that account's password
+	// (Security$ProjectSecurity.AdminPassword); an empty one is CE0129 at
+	// prototype and production level (mendixlabs/mxcli#624).
+	SetProjectAdminPassword(unitID model.ID, password string) error
+	// SetProjectGuestAccess toggles anonymous access. An empty guestUserRole
+	// leaves the stored role untouched — the caller is responsible for having
+	// established that a role exists, because Mendix raises CE0133 on guest
+	// access with no role.
+	SetProjectGuestAccess(unitID model.ID, enabled bool, guestUserRole string) error
 	AddUserRole(unitID model.ID, name string, moduleRoles []string, manageAllRoles bool) error
 	AlterUserRoleModuleRoles(unitID model.ID, userRoleName string, add bool, moduleRoles []string) error
+	// SetUserRoleProperties sets the properties props states on an existing
+	// user role and leaves the others as stored (ako/mxcli#707).
+	SetUserRoleProperties(unitID model.ID, userRoleName string, props UserRoleProperties) error
 	RemoveUserRole(unitID model.ID, name string) error
 	AddDemoUser(unitID model.ID, userName, password, entity string, userRoles []string) error
 	RemoveDemoUser(unitID model.ID, userName string) error
+}
+
+// UserRoleProperties are a user role's properties other than its name and
+// module roles. A nil field is left as stored.
+type UserRoleProperties struct {
+	Description             *string
+	ManageAllRoles          *bool
+	ManageUsersWithoutRoles *bool
+	CheckSecurity           *bool
+	// ManageableRoles is set when non-nil; an empty, non-nil slice clears it.
+	ManageableRoles []string
+}
+
+// IsZero reports whether p states no property.
+func (p UserRoleProperties) IsZero() bool {
+	return p.Description == nil && p.ManageAllRoles == nil && p.ManageUsersWithoutRoles == nil &&
+		p.CheckSecurity == nil && p.ManageableRoles == nil
 }
 
 // ModuleSecurityBackend manages module-level security.

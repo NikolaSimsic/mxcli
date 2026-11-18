@@ -13,8 +13,9 @@ Only structural MDL keywords require quoting: `Create`, `Delete`, `Begin`, `End`
 **Quoted identifiers** escape any reserved word using double-quotes (ANSI SQL style) or backticks (MySQL style):
 
 ```sql
+mdl 1;
 DESCRIBE ENTITY "ComboBox"."CategoryTreeVE";
-SHOW ENTITIES IN "ComboBox";
+LIST ENTITIES IN "ComboBox";
 CREATE PERSISTENT ENTITY Module.VATRate ("Create": DateTime, Rate: Decimal);
 ```
 

@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package exprcheck
+
+type Position struct {
+	Offset int
+	Line   int
+	Column int
+}
+
+type RobustExpr interface {
+	isRobustExpr()
+	Pos() Position
+}
+
+type baseNode struct{ P Position }
+
+func (b baseNode) Pos() Position { return b.P }
+
+type StringLit struct {
+	baseNode
+	Value string
+}
+
+type NumberLit struct {
+	baseNode
+	Value string
+	Kind  TypeKind
+}
+
+type BoolLit struct {
+	baseNode
+	Value bool
+}
+
+type EmptyExpr struct{ baseNode }
+
+type VariableExpr struct {
+	baseNode
+	Name string
+	// Bare is true when the source wrote a plain identifier (`Closed`) rather
+	// than a variable reference (`$Closed`). Mendix has no bare identifiers in
+	// expressions, so the distinction is a defect signal — see
+	// checkBareIdentifierValue.
+	Bare bool
+}
+
+type AttributePathExpr struct {
+	baseNode
+	// Variable is empty for an XPath path that starts at the queried entity
+	// (`Mod.Assoc/Mod.Entity/Attr`), which only an XPath-mode parse produces.
+	Variable string
+	Path     []string
+	// Predicates is nil unless a segment carries an XPath predicate
+	// (`Mod.Assoc/Mod.Entity[Code = 'x']/Name`); then it has one entry per
+	// Path segment, nil where that segment has none.
+	Predicates []RobustExpr
+}
+
+type QNameExpr struct {
+	baseNode
+	Module string
+	Name   string
+	Sub    string
+}
+
+type CallExpr struct {
+	baseNode
+	Name string
+	Args []RobustExpr
+	// Qualified marks a `Module.Name(...)` call. Mendix expressions have no
+	// user-callable functions, so such a call is never valid — but it IS valid
+	// MDL in a decision condition, where mxcli stores it as a rule split. The
+	// parser records it rather than rejecting it so the trailing `(` is consumed
+	// (an unconsumed one was reported as "Unexpected token after expression"),
+	// and the unknown-function check skips it: MDL066 owns that diagnostic and
+	// knows which positions are legal.
+	Qualified bool
+}
+
+type BinExpr struct {
+	baseNode
+	Op string
+	L  RobustExpr
+	R  RobustExpr
+}
+
+type UnaryExpr struct {
+	baseNode
+	Op      string
+	Operand RobustExpr
+}
+
+type ParenExpr struct {
+	baseNode
+	Inner RobustExpr
+}
+
+type IfThenElseExpr struct {
+	baseNode
+	Cond RobustExpr
+	Then RobustExpr
+	Else RobustExpr
+}
+
+type TokenExpr struct {
+	baseNode
+	Token string
+	Arg   string
+}
+
+type ConstantRef struct {
+	baseNode
+	QName string
+}
+
+type RecoveredExpr struct {
+	baseNode
+	SourceFragment string
+	Reason         string
+}
+
+func (*StringLit) isRobustExpr()         {}
+func (*NumberLit) isRobustExpr()         {}
+func (*BoolLit) isRobustExpr()           {}
+func (*EmptyExpr) isRobustExpr()         {}
+func (*VariableExpr) isRobustExpr()      {}
+func (*AttributePathExpr) isRobustExpr() {}
+func (*QNameExpr) isRobustExpr()         {}
+func (*CallExpr) isRobustExpr()          {}
+func (*BinExpr) isRobustExpr()           {}
+func (*UnaryExpr) isRobustExpr()         {}
+func (*ParenExpr) isRobustExpr()         {}
+func (*IfThenElseExpr) isRobustExpr()    {}
+func (*TokenExpr) isRobustExpr()         {}
+func (*ConstantRef) isRobustExpr()       {}
+func (*RecoveredExpr) isRobustExpr()     {}

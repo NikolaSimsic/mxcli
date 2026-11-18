@@ -9,7 +9,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/mendixlabs/mxcli/sdk/mpr/version"
+	mxversion "github.com/mendixlabs/mxcli/mdl/types"
 )
 
 // PatchResult describes the outcome of applying a single patch.
@@ -21,7 +21,7 @@ type PatchResult struct {
 
 // ApplyPatches applies version-aware patches to the PAD output directory.
 // Returns results for each patch attempted.
-func ApplyPatches(padDir string, pv *version.ProjectVersion) []PatchResult {
+func ApplyPatches(padDir string, pv *mxversion.ProjectVersion) []PatchResult {
 	var results []PatchResult
 
 	is116x := pv.MajorVersion == 11 && pv.MinorVersion == 6
@@ -49,7 +49,35 @@ func ApplyPatches(padDir string, pv *version.ProjectVersion) []PatchResult {
 	// Patch 6: Bind admin API to all interfaces (all versions)
 	results = append(results, patchAdminAddresses(padDir))
 
+	// Patch 7: Force the container's runtime/admin ports (all versions). The
+	// generated config inherits the project's configured ports, which are 0 when
+	// unset — the runtime rejects port 0 ("HTTP Port number 0 is not between 1
+	// and 65535") and won't start. The compose mapping expects 8080/8090.
+	results = append(results, patchRuntimePorts(padDir))
+
 	return results
+}
+
+// patchRuntimePorts forces the runtime HTTP port to 8080 and the admin port to
+// 8090 in the loaded config (etc/Default), matching the docker-compose port
+// mapping. It appends after the includes so it wins over the project's
+// configuration, which may leave the ports at 0 — the runtime rejects port 0 and
+// crashes on startup.
+func patchRuntimePorts(padDir string) PatchResult {
+	desc := "Set runtime/admin ports (avoid port 0 startup crash)"
+	configPath := filepath.Join(padDir, "etc", "Default")
+	content, err := os.ReadFile(configPath)
+	if err != nil {
+		return PatchResult{Description: desc, Status: "skipped"}
+	}
+	if strings.Contains(string(content), "# mxcli: runtime/admin ports") {
+		return PatchResult{Description: desc, Status: "skipped"}
+	}
+	patch := "\n# mxcli: runtime/admin ports (container mapping expects 8080/8090; project config may be 0)\nruntime.http { port = 8080 }\nadmin { port = 8090 }\n"
+	if err := os.WriteFile(configPath, append(content, []byte(patch)...), 0644); err != nil {
+		return PatchResult{Description: desc, Status: "error", Error: fmt.Errorf("writing %s: %w", configPath, err)}
+	}
+	return PatchResult{Description: desc, Status: "applied"}
 }
 
 // patchStartPermissions ensures bin/start has execute permission.

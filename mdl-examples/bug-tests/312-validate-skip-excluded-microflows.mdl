@@ -1,3 +1,4 @@
+mdl 1;
 -- ============================================================================
 -- Bug #312: Reference validation flagged broken calls inside excluded microflows
 -- ============================================================================
@@ -36,7 +37,6 @@ returns string as $msg
 begin
   return 'real target';
 end;
-/
 
 -- Excluded scaffolding that contains a broken call. mxcli check --references
 -- must NOT report this as an error.
@@ -44,11 +44,9 @@ end;
 create microflow BugTest312.MF_ExcludedWithBrokenCall ()
 returns string as $msg
 begin
-  declare $msg string = empty;
   $msg = call microflow BugTest312.NoSuchTarget();
   return $msg;
 end;
-/
 
 -- Negative control: an INCLUDED microflow whose call is valid. Together with
 -- the excluded one above, the check confirms the validator still walks
@@ -56,8 +54,6 @@ end;
 create microflow BugTest312.MF_IncludedValid ()
 returns string as $msg
 begin
-  declare $msg string = empty;
   $msg = call microflow BugTest312.MF_RealTarget();
   return $msg;
 end;
-/

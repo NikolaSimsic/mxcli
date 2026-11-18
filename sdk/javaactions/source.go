@@ -4,21 +4,42 @@ package javaactions
 
 import (
 	"fmt"
+	"regexp"
+	"sort"
 	"strings"
 )
 
-// GenerateSource renders the .java stub Studio Pro writes for a Java action:
-// package, imports, parameter fields + constructor, the executeAction method
-// wrapping the user code, toString, and the extra-code section. It is pure
-// (depends only on the action's shape), so both the legacy and modelsdk engines
-// share it to guarantee byte-identical Java output.
-func GenerateSource(moduleName, actionName string, userCode string, params []*JavaActionParameter, returnType CodeActionReturnType, extraImports []string, extraCode string) string {
-	moduleNameLower := strings.ToLower(moduleName)
+// The imports every generated action needs, and the one it needs when a
+// parameter or the return type is an object or a list of them.
+const (
+	importIContext      = "import com.mendix.systemwideinterfaces.core.IContext;"
+	importUserAction    = "import com.mendix.systemwideinterfaces.core.UserAction;"
+	importIMendixObject = "import com.mendix.systemwideinterfaces.core.IMendixObject;"
+)
 
-	returnTypeStr := "java.lang.Boolean"
-	if returnType != nil {
-		returnTypeStr, _ = javaReturnType(returnType)
-	}
+// GenerateSource renders the .java stub for a Java action — package, imports,
+// parameter fields + constructor, the executeAction method wrapping the user
+// code, toString, and the extra-code section — exactly as mxbuild generates it,
+// CRLF line endings included.
+//
+// It has to be exact, not merely equivalent: mxcli's `--watch` hot reload
+// compiles the file mxcli writes, and the next full build regenerates mxbuild's
+// over it, so user code written against one must compile against the other. An
+// object parameter's field is its proxy class (the raw IMendixObject is kept in
+// a deprecated `__Name` field), an Integer is a java.lang.Long, an enumeration
+// is its proxy enum — measured on 10.24.27 and 11.14.0, which write the same
+// bytes (testdata/mxbuild).
+//
+// imports is the import list to keep, in order — the existing file's, see
+// RetainSections. The imports the generated code needs and the list lacks are
+// appended, sorted. That is what mxbuild does: it never reorders or drops an
+// import, so for a new file it writes just the needed ones, sorted.
+//
+// documentation is the action's, written as the class javadoc (classJavadoc);
+// "" writes none.
+func GenerateSource(moduleName, actionName string, userCode string, params []*JavaActionParameter, returnType CodeActionReturnType, imports []string, extraCode string, documentation string) string {
+	moduleNameLower := strings.ToLower(moduleName)
+	returnTypeStr := javaReturnType(returnType)
 
 	var sb strings.Builder
 
@@ -33,35 +54,66 @@ func GenerateSource(moduleName, actionName string, userCode string, params []*Ja
 
 	sb.WriteString(fmt.Sprintf("package %s.actions;\n\n", moduleNameLower))
 
-	sb.WriteString("import com.mendix.systemwideinterfaces.core.IContext;\n")
-	sb.WriteString("import com.mendix.systemwideinterfaces.core.UserAction;\n")
-	for _, imp := range extraImports {
+	for _, imp := range completeImports(withCoreImport(imports, userCode, extraCode), params, returnType) {
 		sb.WriteString(imp)
 		sb.WriteString("\n")
 	}
 	sb.WriteString("\n")
 
+	sb.WriteString(classJavadoc(documentation))
 	sb.WriteString(fmt.Sprintf("public class %s extends UserAction<%s>\n", actionName, returnTypeStr))
 	sb.WriteString("{\n")
 
 	for _, param := range params {
 		javaType := javaParamType(param.ParameterType)
-		sb.WriteString(fmt.Sprintf("\tprivate final %s %s;\n", javaType, param.Name))
+		switch proxy := proxyType(param.ParameterType); {
+		case proxy == "":
+			sb.WriteString(fmt.Sprintf("\tprivate final %s %s;\n", fieldType(param.ParameterType), param.Name))
+		case isList(param.ParameterType):
+			sb.WriteString(fmt.Sprintf("\t/** @deprecated use com.mendix.utils.ListUtils.map(%s, com.mendix.systemwideinterfaces.core.IEntityProxy::getMendixObject) instead. */\n", param.Name))
+			sb.WriteString("\t@java.lang.Deprecated(forRemoval = true)\n")
+			sb.WriteString(fmt.Sprintf("\tprivate final %s __%s;\n", javaType, param.Name))
+			sb.WriteString(fmt.Sprintf("\tprivate final java.util.List<%s> %s;\n", proxy, param.Name))
+		default:
+			sb.WriteString(fmt.Sprintf("\t/** @deprecated use %s.getMendixObject() instead. */\n", param.Name))
+			sb.WriteString("\t@java.lang.Deprecated(forRemoval = true)\n")
+			sb.WriteString(fmt.Sprintf("\tprivate final %s __%s;\n", javaType, param.Name))
+			sb.WriteString(fmt.Sprintf("\tprivate final %s %s;\n", proxy, param.Name))
+		}
 	}
-	sb.WriteString("\n")
 
-	sb.WriteString(fmt.Sprintf("\tpublic %s(\n", actionName))
-	sb.WriteString("\t\tIContext context")
-	for _, param := range params {
-		javaType := javaParamType(param.ParameterType)
-		sb.WriteString(fmt.Sprintf(",\n\t\t%s _%s", javaType, strings.ToLower(param.Name[:1])+param.Name[1:]))
+	if len(params) == 0 {
+		sb.WriteString(fmt.Sprintf("\tpublic %s(IContext context)\n", actionName))
+	} else {
+		sb.WriteString("\n")
+		sb.WriteString(fmt.Sprintf("\tpublic %s(\n", actionName))
+		sb.WriteString("\t\tIContext context")
+		for _, param := range params {
+			sb.WriteString(fmt.Sprintf(",\n\t\t%s _%s", javaParamType(param.ParameterType), lowerFirst(param.Name)))
+		}
+		sb.WriteString("\n\t)\n")
 	}
-	sb.WriteString("\n\t)\n")
 	sb.WriteString("\t{\n")
 	sb.WriteString("\t\tsuper(context);\n")
 	for _, param := range params {
-		paramLower := strings.ToLower(param.Name[:1]) + param.Name[1:]
-		sb.WriteString(fmt.Sprintf("\t\tthis.%s = _%s;\n", param.Name, paramLower))
+		arg := "_" + lowerFirst(param.Name)
+		switch proxy := proxyType(param.ParameterType); {
+		case proxy == "" && enumProxy(param.ParameterType) != "":
+			sb.WriteString(fmt.Sprintf("\t\tthis.%s = %s == null ? null : %s.valueOf(%s);\n", param.Name, arg, enumProxy(param.ParameterType), arg))
+		case proxy == "":
+			sb.WriteString(fmt.Sprintf("\t\tthis.%s = %s;\n", param.Name, arg))
+		case isList(param.ParameterType):
+			element := lowerFirst(param.Name) + "Element"
+			sb.WriteString(fmt.Sprintf("\t\tthis.__%s = %s;\n", param.Name, arg))
+			sb.WriteString(fmt.Sprintf("\t\tthis.%s = java.util.Optional.ofNullable(%s)\n", param.Name, arg))
+			sb.WriteString("\t\t\t.orElse(java.util.Collections.emptyList())\n")
+			sb.WriteString("\t\t\t.stream()\n")
+			sb.WriteString(fmt.Sprintf("\t\t\t.map(%s -> %s.initialize(getContext(), %s))\n", element, proxy, element))
+			sb.WriteString("\t\t\t.collect(java.util.stream.Collectors.toList());\n")
+		default:
+			sb.WriteString(fmt.Sprintf("\t\tthis.__%s = %s;\n", param.Name, arg))
+			sb.WriteString(fmt.Sprintf("\t\tthis.%s = %s == null ? null : %s.initialize(getContext(), %s);\n", param.Name, arg, proxy, arg))
+		}
 	}
 	sb.WriteString("\t}\n\n")
 
@@ -100,63 +152,273 @@ func GenerateSource(moduleName, actionName string, userCode string, params []*Ja
 	sb.WriteString("\t// END EXTRA CODE\n")
 	sb.WriteString("}\n")
 
+	// mxbuild writes CRLF, and rewrites an LF file that is otherwise identical,
+	// so LF here would make the first build after every mxcli edit touch the
+	// file again. User and extra code may arrive with either ending.
+	src := strings.ReplaceAll(sb.String(), "\r\n", "\n")
+	return strings.ReplaceAll(src, "\n", "\r\n")
+}
+
+// classJavadoc is the javadoc block mxbuild writes above the class for an
+// action's documentation, LF-terminated like the rest of the builder's output:
+// `/**`, one ` * <line>` per line, ` */` (ako/mxcli#1700). Measured on
+// mxbuild 11.13.0 (testdata/mxbuild/JA_Doc*): `\r\n`, `\r` and `\n` each end
+// a line, so a leading or trailing break is an empty ` * ` line, and spaces
+// and tabs are kept as they stand; a backslash is doubled unless a unicode
+// escape (`u` or `U` and four hex digits) follows it, so javac cannot read
+// one as a broken escape. No documentation is no block; whitespace alone is
+// documentation. (mxbuild refuses a documentation holding `*/` as a model
+// error, so the block is never closed early by a project that builds.)
+func classJavadoc(documentation string) string {
+	if documentation == "" {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("/**\n")
+	text := strings.ReplaceAll(documentation, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	for line := range strings.SplitSeq(text, "\n") {
+		sb.WriteString(" * ")
+		sb.WriteString(escapeJavadocBackslashes(line))
+		sb.WriteString("\n")
+	}
+	sb.WriteString(" */\n")
 	return sb.String()
 }
 
-// javaReturnType maps a return type to its (fully-qualified, simple) Java names.
-func javaReturnType(t CodeActionReturnType) (string, string) {
-	if t == nil {
-		return "java.lang.Boolean", "Boolean"
+// escapeJavadocBackslashes doubles every backslash in s that does not start a
+// unicode escape — `u` or `U` followed by four hex digits — as mxbuild does.
+func escapeJavadocBackslashes(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
 	}
-	switch t.(type) {
-	case *VoidType:
-		return "java.lang.Void", "Void"
-	case *BooleanType:
-		return "java.lang.Boolean", "Boolean"
-	case *IntegerType:
-		return "java.lang.Integer", "Integer"
-	case *LongType:
-		return "java.lang.Long", "Long"
-	case *DecimalType:
-		return "java.math.BigDecimal", "BigDecimal"
-	case *StringType:
-		return "java.lang.String", "String"
-	case *DateTimeType:
-		return "java.util.Date", "Date"
-	case *EntityType:
-		return "com.mendix.systemwideinterfaces.core.IMendixObject", "IMendixObject"
-	case *ListType:
-		return "java.util.List<com.mendix.systemwideinterfaces.core.IMendixObject>", "List"
-	default:
-		return "java.lang.Object", "Object"
+	var sb strings.Builder
+	for i := 0; i < len(s); i++ {
+		sb.WriteByte(s[i])
+		if s[i] == '\\' && !startsUnicodeEscape(s[i+1:]) {
+			sb.WriteByte('\\')
+		}
 	}
+	return sb.String()
 }
 
-// javaParamType maps a parameter type to its fully-qualified Java type.
-func javaParamType(t CodeActionParameterType) string {
-	if t == nil {
-		return "java.lang.Object"
+// startsUnicodeEscape reports whether s begins with `u` or `U` and four hex
+// digits.
+func startsUnicodeEscape(s string) bool {
+	if len(s) < 5 || (s[0] != 'u' && s[0] != 'U') {
+		return false
 	}
+	for _, c := range []byte(s[1:5]) {
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// completeImports returns imports, deduplicated, with the ones the generated
+// code needs and imports lacks appended in sorted order.
+func completeImports(imports []string, params []*JavaActionParameter, returnType CodeActionReturnType) []string {
+	needed := []string{importIContext, importUserAction}
+	usesObject := strings.Contains(javaReturnType(returnType), "IMendixObject")
+	for _, p := range params {
+		usesObject = usesObject || strings.Contains(javaParamType(p.ParameterType), "IMendixObject")
+	}
+	if usesObject {
+		needed = append(needed, importIMendixObject)
+	}
+	sort.Strings(needed)
+
+	out := make([]string, 0, len(imports)+len(needed))
+	seen := make(map[string]bool, len(imports)+len(needed))
+	for _, imp := range imports {
+		if imp = strings.TrimSpace(imp); imp != "" && !seen[imp] {
+			seen[imp] = true
+			out = append(out, imp)
+		}
+	}
+	for _, imp := range needed {
+		if !seen[imp] {
+			out = append(out, imp)
+		}
+	}
+	return out
+}
+
+// javaReturnType maps a return type to the Java type mxbuild declares for it.
+func javaReturnType(t CodeActionReturnType) string {
 	switch t.(type) {
-	case *BooleanType:
+	case nil, *BooleanType:
 		return "java.lang.Boolean"
-	case *IntegerType:
-		return "java.lang.Integer"
-	case *LongType:
+	case *VoidType:
+		return "java.lang.Void"
+	case *IntegerType, *LongType:
+		// Mendix's Integer is 64-bit; mxbuild declares both as Long.
 		return "java.lang.Long"
 	case *DecimalType:
 		return "java.math.BigDecimal"
-	case *StringType:
+	case *StringType, *EnumerationType:
+		// An enumeration is returned as its value's name.
 		return "java.lang.String"
 	case *DateTimeType:
 		return "java.util.Date"
-	case *EntityType:
-		return "com.mendix.systemwideinterfaces.core.IMendixObject"
+	case *EntityType, *FileDocumentType, *TypeParameter:
+		return "IMendixObject"
 	case *ListType:
-		return "java.util.List<com.mendix.systemwideinterfaces.core.IMendixObject>"
-	case *StringTemplateParameterType:
-		return "java.lang.String"
+		return "java.util.List<IMendixObject>"
 	default:
 		return "java.lang.Object"
 	}
+}
+
+// javaParamType maps a parameter type to the Java type of its constructor
+// argument — for an object or list parameter also its deprecated raw `__`
+// field; fieldType and proxyType give the field the user code reads.
+func javaParamType(t CodeActionParameterType) string {
+	switch t.(type) {
+	case *BooleanType:
+		return "java.lang.Boolean"
+	case *IntegerType, *LongType:
+		return "java.lang.Long"
+	case *DecimalType:
+		return "java.math.BigDecimal"
+	case *StringType, *MicroflowType, *EnumerationType, *EntityTypeParameterType:
+		// A microflow arrives as its qualified name, an entity type selector as
+		// the entity's, an enumeration as its value's name.
+		return "java.lang.String"
+	case *StringTemplateParameterType:
+		// What mxbuild declares for a text template (Text or Sql), fully
+		// qualified and not imported — measured on the source it generated for
+		// BusinessEvents 3.12's PublishBusinessEvent_V2.Subject.
+		return "com.mendix.systemwideinterfaces.javaactions.parameters.IStringTemplate"
+	case *DateTimeType:
+		return "java.util.Date"
+	case *EntityType, *FileDocumentType, *TypeParameter:
+		return "IMendixObject"
+	case *ListType:
+		return "java.util.List<IMendixObject>"
+	default:
+		return "java.lang.Object"
+	}
+}
+
+// fieldType is the type of a parameter's field when it has no proxy class: the
+// constructor argument's, except an enumeration's, which is its proxy enum.
+func fieldType(t CodeActionParameterType) string {
+	if e := enumProxy(t); e != "" {
+		return e
+	}
+	return javaParamType(t)
+}
+
+// proxyType is the proxy class an object parameter's field is typed as — for a
+// list, its element's — or "" when the field keeps the argument's type: a
+// primitive, an enumeration, or an object of a type parameter, which has no
+// class to name.
+func proxyType(t CodeActionParameterType) string {
+	switch v := t.(type) {
+	case *EntityType:
+		return proxyClass(v.Entity)
+	case *FileDocumentType:
+		return proxyClass("System.FileDocument")
+	case *ListType:
+		if v.TypeParameter != "" || v.TypeParameterID != "" {
+			return ""
+		}
+		return proxyClass(v.Entity)
+	}
+	return ""
+}
+
+func isList(t CodeActionParameterType) bool {
+	_, ok := t.(*ListType)
+	return ok
+}
+
+// enumProxy is the proxy enum of an enumeration parameter, "" for any other.
+func enumProxy(t CodeActionParameterType) string {
+	if e, ok := t.(*EnumerationType); ok {
+		return proxyClass(e.Enumeration)
+	}
+	return ""
+}
+
+// proxyClass maps Module.Name to its generated proxy class, module.proxies.Name.
+func proxyClass(qualifiedName string) string {
+	module, name, ok := strings.Cut(qualifiedName, ".")
+	if !ok || module == "" || name == "" {
+		return ""
+	}
+	return strings.ToLower(module) + ".proxies." + name
+}
+
+// lowerFirst lower-cases the first character only, the way mxbuild names a
+// constructor argument: URL -> _uRL.
+func lowerFirst(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToLower(s[:1]) + s[1:]
+}
+
+// importCore is the Mendix runtime API's entry point, which nearly every
+// action body reaches for (Core.getConfiguration, Core.getLogger, …).
+const importCore = "import com.mendix.core.Core;"
+
+// coreUseRe is a use of the class Core: `Core.` as a word of its own.
+var coreUseRe = regexp.MustCompile(`(^|[^A-Za-z0-9_$.])Core\s*\.`)
+
+// withCoreImport returns imports with importCore appended when the user code
+// or the extra code uses Core and the list imports no Core of its own
+// (ako/mxcli#2310). Without it the file compiled only once the author added
+// the line: check, exec and docker check passed — mx check does not compile
+// Java — and the build failed with "cannot find symbol: variable Core".
+// mxbuild never drops an import it finds, so its regeneration keeps the line.
+func withCoreImport(imports []string, userCode, extraCode string) []string {
+	if !coreUseRe.MatchString(javaCodeOnly(userCode)) && !coreUseRe.MatchString(javaCodeOnly(extraCode)) {
+		return imports
+	}
+	for _, imp := range imports {
+		imp = strings.TrimSpace(imp)
+		if strings.HasSuffix(imp, ".Core;") || imp == "import com.mendix.core.*;" {
+			return imports
+		}
+	}
+	return append(append([]string(nil), imports...), importCore)
+}
+
+// javaCodeOnly is src with its comments and string and character literals
+// blanked, so a name inside one is not read as code.
+func javaCodeOnly(src string) string {
+	out := []byte(src)
+	for i := 0; i < len(out); i++ {
+		switch {
+		case out[i] == '/' && i+1 < len(out) && out[i+1] == '/':
+			for ; i < len(out) && out[i] != '\n'; i++ {
+				out[i] = ' '
+			}
+		case out[i] == '/' && i+1 < len(out) && out[i+1] == '*':
+			for ; i < len(out) && !(out[i] == '*' && i+1 < len(out) && out[i+1] == '/'); i++ {
+				out[i] = ' '
+			}
+			if i+1 < len(out) {
+				out[i], out[i+1] = ' ', ' '
+				i++
+			}
+		case out[i] == '"' || out[i] == '\'':
+			q := out[i]
+			out[i] = ' '
+			for i++; i < len(out) && out[i] != q; i++ {
+				if out[i] == '\\' && i+1 < len(out) {
+					out[i] = ' '
+					i++
+				}
+				out[i] = ' '
+			}
+			if i < len(out) {
+				out[i] = ' '
+			}
+		}
+	}
+	return string(out)
 }

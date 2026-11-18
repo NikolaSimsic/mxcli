@@ -51,3 +51,34 @@ Dockerfile text eol=lf
 *.vsix binary
 *.cdx.json binary
 bun.lock binary
+
+# mxbuild's generated Java, kept byte for byte: its CRLF line endings are part
+# of what the generator is tested against.
+sdk/javaactions/testdata/mxbuild/* -text
+
+# Append-only knowledge files use git's union merge driver.
+#
+# The bug findings USED to be here: one shared findings/<area>.jsonl per area,
+# appended to by every fix, with merge=union keeping both sides. That resolved
+# the conflict locally, but GitHub's server-side merge does not run merge
+# drivers, so every merged fix-PR put every other open fix-PR into conflict —
+# measured: eight PRs re-conflicting after each merge. The findings are now one
+# file per finding (findings/<area>/<date>-<slug>.json), so two fixes add two
+# different files and there is nothing to merge. See
+# .claude/skills/fix-issue/findings/README.md.
+
+# docs-wiki/SYNC_LOG.md is append-only by its own stated rule ("Append only.
+# Never edit historical rows."), so two syncs appending a row each is the same
+# situation as two fixes appending a finding. Without this, every parallel wiki
+# PR conflicts on one line and the work gets serialised for no reason — which is
+# what happened to the five bug-pattern PRs.
+docs-wiki/SYNC_LOG.md merge=union
+
+# The wiki's page list. A table and nothing else, in its own file precisely so
+# union is safe on it: every sync appends a row, and without this two parallel
+# syncs collide on one line. The prose that used to surround it stays in
+# maintain-wiki.md, where union would be a hazard rather than a help.
+.claude/skills/maintain-wiki/pages.md merge=union
+
+# Holds raw CR bytes on purpose: the case is a CRLF note vs an LF one (#1505).
+mdl-examples/bug-tests/1505-free-annotation-crlf-splice.mdl -text

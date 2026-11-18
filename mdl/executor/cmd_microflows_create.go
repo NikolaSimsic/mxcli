@@ -9,9 +9,8 @@ import (
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
 	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
-	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
-	"github.com/mendixlabs/mxcli/sdk/microflows"
+	"github.com/mendixlabs/mxcli/modelsdk/meta"
 )
 
 // isBuiltinModuleEntity returns true for modules whose entities are defined
@@ -20,6 +19,38 @@ import (
 // ("System.Workflow", "System.User", etc.) and resolved at runtime.
 func isBuiltinModuleEntity(moduleName string) bool {
 	return moduleName == "System"
+}
+
+// systemEnumerations holds the qualified name of every enumeration the System
+// module declares. Like its entities they are not stored in the project, so
+// ListEnumerations never returns them and findEnumeration cannot see them.
+var systemEnumerations = func() map[string]bool {
+	set := make(map[string]bool, len(meta.SystemEnumerations))
+	for _, e := range meta.SystemEnumerations {
+		set[e.Name] = true
+	}
+	return set
+}()
+
+// isKnownEnumeration reports whether module.name is an enumeration — one of the
+// project's, or one of the System module's.
+func isKnownEnumeration(ctx *ExecContext, module, name string) bool {
+	return systemEnumerations[module+"."+name] || findEnumeration(ctx, module, name) != nil
+}
+
+// settleSystemEnumeration retypes a bare System enumeration in a flow
+// parameter or return type. The visitor types every bare qualified name there
+// as an entity, and the entity-then-enumeration fallback the callers apply is
+// skipped for the System module (its entities are not in the project to look
+// up), so without this `$T: System.UserType` was written as an ObjectType with
+// Entity "System.UserType" — accepted by the local engines, refused by Studio
+// Pro ("Reference with qualified name System.UserType of type
+// DomainModels$Entity not found").
+func settleSystemEnumeration(dt ast.DataType) ast.DataType {
+	if dt.Kind == ast.TypeEntity && dt.EntityRef != nil && systemEnumerations[dt.EntityRef.Module+"."+dt.EntityRef.Name] {
+		return ast.DataType{Kind: ast.TypeEnumeration, EnumRef: dt.EntityRef}
+	}
+	return dt
 }
 
 // execCreateMicroflow handles CREATE MICROFLOW statements.
@@ -37,241 +68,42 @@ func execCreateMicroflow(ctx *ExecContext, s *ast.CreateMicroflowStmt) error {
 		return mdlerrors.NewNotConnectedWrite()
 	}
 
-	// Validate name is not empty
-	if strings.TrimSpace(s.Name.Name) == "" {
-		return mdlerrors.NewValidation("microflow name must not be empty")
+	// An existing flow is modified as a patch of what is stored, not rebuilt
+	// (ADR-0012 decision 3); see cmd_flow_modify.go.
+	if s.CreateOrModify && strings.TrimSpace(s.Name.Name) != "" {
+		if err := validateMicroflowRules(s); err != nil {
+			return err
+		}
+		// The splice path does not reach the rebuild's queue guard, and a
+		// call restated without its stored retry is an edit it would make.
+		if stored := findMicroflowByQualifiedName(ctx, s.Name.String()); stored != nil {
+			if err := checkNoDroppedQueueRetries(ctx, stored.ID, s.Name.String(), s, nil); err != nil {
+				return err
+			}
+		}
+		if handled, err := modifyFlowInPlace(ctx, microflowDecl(s)); handled || err != nil {
+			return err
+		}
 	}
 
-	// Find or auto-create module
-	module, err := findOrCreateModule(ctx, s.Name.Module)
+	built, err := buildMicroflowFromStmt(ctx, s, buildFlowOpts{AllowCreate: true})
 	if err != nil {
 		return err
 	}
-
-	// Resolve folder if specified
-	containerID := module.ID
-	if s.Folder != "" {
-		folderID, err := resolveFolder(ctx, module.ID, s.Folder)
-		if err != nil {
-			return mdlerrors.NewBackend("resolve folder "+s.Folder, err)
-		}
-		containerID = folderID
-	}
-
-	// Check if microflow with same name already exists in this module
-	var existingID model.ID
-	var existingContainerID model.ID
-	var existingAllowedRoles []model.ID
-	preserveAllowedRoles := false
-	existingMicroflows, err := ctx.Backend.ListMicroflows()
-	if err != nil {
-		return mdlerrors.NewBackend("check existing microflows", err)
-	}
-	for _, existing := range existingMicroflows {
-		if existing.Name == s.Name.Name && getModuleID(ctx, existing.ContainerID) == module.ID {
-			if !s.CreateOrModify {
-				return mdlerrors.NewAlreadyExistsMsg("microflow", s.Name.Module+"."+s.Name.Name, "microflow '"+s.Name.Module+"."+s.Name.Name+"' already exists (use create or modify to overwrite)")
-			}
-			existingID = existing.ID
-			existingContainerID = existing.ContainerID
-			existingAllowedRoles = cloneRoleIDs(existing.AllowedModuleRoles)
-			preserveAllowedRoles = true
-			break
-		}
-	}
-
-	// For CREATE OR REPLACE/MODIFY, reuse the existing ID to preserve references
-	qualifiedName := s.Name.Module + "." + s.Name.Name
-	microflowID := model.ID(types.GenerateID())
-	if existingID != "" {
-		microflowID = existingID
-		// Keep the original folder unless a new folder is explicitly specified
-		if s.Folder == "" {
-			containerID = existingContainerID
-		}
-	} else if dropped := consumeDroppedMicroflow(ctx, qualifiedName); dropped != nil {
-		// A prior DROP MICROFLOW in the same session removed the unit. Reuse
-		// its original UnitID and (unless a new folder is specified)
-		// ContainerID so that Studio Pro sees the rewrite as an in-place
-		// update rather than a delete+insert pair, which produces
-		// ".mpr does not look like a Mendix Studio Pro project file" errors.
-		microflowID = dropped.ID
-		if s.Folder == "" && dropped.ContainerID != "" {
-			containerID = dropped.ContainerID
-		}
-		// consumeDroppedMicroflow removed the cache entry, so we own this
-		// slice — no need to clone it again.
-		existingAllowedRoles = dropped.AllowedRoles
-		preserveAllowedRoles = true
-	}
-
-	// Build the microflow
-	mf := &microflows.Microflow{
-		BaseElement: model.BaseElement{
-			ID: microflowID,
-		},
-		ContainerID:              containerID,
-		Name:                     s.Name.Name,
-		Documentation:            s.Documentation,
-		AllowConcurrentExecution: true, // Default: allow concurrent execution
-		MarkAsUsed:               false,
-		Excluded:                 s.Excluded,
-	}
-	if preserveAllowedRoles {
-		mf.AllowedModuleRoles = existingAllowedRoles
-	} else {
-		mf.AllowedModuleRoles = defaultDocumentAccessRoles(ctx, module)
-	}
-
-	// Build entity resolver function for parameter/return types
-	entityResolver := func(qn ast.QualifiedName) model.ID {
-		// Get all domain models and build module name map
-		dms, err := ctx.Backend.ListDomainModels()
-		if err != nil {
-			return ""
-		}
-		modules, _ := ctx.Backend.ListModules()
-		moduleNames := make(map[model.ID]string)
-		for _, m := range modules {
-			moduleNames[m.ID] = m.Name
-		}
-		// Search for entity in all domain models
-		for _, dm := range dms {
-			modName := moduleNames[dm.ContainerID]
-			if modName != qn.Module {
-				continue
-			}
-			for _, ent := range dm.Entities {
-				if ent.Name == qn.Name {
-					return ent.ID
-				}
-			}
-		}
-		return ""
-	}
-
-	// Validate and add parameters
-	for i, p := range s.Parameters {
-		// Validate entity references for List and Entity types.
-		// Built-in modules (e.g. System) are not stored in the MPR domain models;
-		// their types are serialized by qualified name and resolved at runtime.
-		if p.Type.EntityRef != nil && !isBuiltinModuleEntity(p.Type.EntityRef.Module) {
-			entityID := entityResolver(*p.Type.EntityRef)
-			if entityID == "" {
-				// Bare qualified name in microflow context is treated as TypeEntity by the
-				// visitor, but it may actually be an enumeration. Try enum lookup before failing.
-				if found := findEnumeration(ctx, p.Type.EntityRef.Module, p.Type.EntityRef.Name); found != nil {
-					s.Parameters[i].Type = ast.DataType{Kind: ast.TypeEnumeration, EnumRef: p.Type.EntityRef}
-					p = s.Parameters[i]
-				} else {
-					return mdlerrors.NewNotFoundMsg("entity", p.Type.EntityRef.Module+"."+p.Type.EntityRef.Name,
-						fmt.Sprintf("entity '%s.%s' not found for parameter '%s'", p.Type.EntityRef.Module, p.Type.EntityRef.Name, p.Name))
-				}
-			}
-		}
-		// Validate enumeration references for Enumeration types
-		if p.Type.Kind == ast.TypeEnumeration && p.Type.EnumRef != nil {
-			if found := findEnumeration(ctx, p.Type.EnumRef.Module, p.Type.EnumRef.Name); found == nil {
-				return mdlerrors.NewNotFoundMsg("enumeration", p.Type.EnumRef.Module+"."+p.Type.EnumRef.Name,
-					fmt.Sprintf("enumeration '%s.%s' not found for parameter '%s'", p.Type.EnumRef.Module, p.Type.EnumRef.Name, p.Name))
-			}
-		}
-		param := &microflows.MicroflowParameter{
-			BaseElement: model.BaseElement{
-				ID: model.ID(types.GenerateID()),
-			},
-			ContainerID: mf.ID,
-			Name:        p.Name,
-			Type:        convertASTToMicroflowDataType(p.Type, entityResolver),
-		}
-		mf.Parameters = append(mf.Parameters, param)
-	}
-
-	// Validate and set return type
-	if s.ReturnType != nil {
-		// Validate entity references for return type.
-		// Built-in modules (e.g. System) are not stored in the MPR domain models;
-		// their types are serialized by qualified name and resolved at runtime.
-		if s.ReturnType.Type.EntityRef != nil && !isBuiltinModuleEntity(s.ReturnType.Type.EntityRef.Module) {
-			entityID := entityResolver(*s.ReturnType.Type.EntityRef)
-			if entityID == "" {
-				return mdlerrors.NewNotFoundMsg("entity", s.ReturnType.Type.EntityRef.Module+"."+s.ReturnType.Type.EntityRef.Name,
-					fmt.Sprintf("entity '%s.%s' not found for return type", s.ReturnType.Type.EntityRef.Module, s.ReturnType.Type.EntityRef.Name))
-			}
-		}
-		// Validate enumeration references for return type
-		if s.ReturnType.Type.Kind == ast.TypeEnumeration && s.ReturnType.Type.EnumRef != nil {
-			if found := findEnumeration(ctx, s.ReturnType.Type.EnumRef.Module, s.ReturnType.Type.EnumRef.Name); found == nil {
-				return mdlerrors.NewNotFoundMsg("enumeration", s.ReturnType.Type.EnumRef.Module+"."+s.ReturnType.Type.EnumRef.Name,
-					fmt.Sprintf("enumeration '%s.%s' not found for return type", s.ReturnType.Type.EnumRef.Module, s.ReturnType.Type.EnumRef.Name))
-			}
-		}
-		mf.ReturnType = convertASTToMicroflowDataType(s.ReturnType.Type, entityResolver)
-		// Set return variable name if provided (AS $VarName)
-		if s.ReturnType.Variable != "" {
-			mf.ReturnVariableName = s.ReturnType.Variable
-		}
-	} else {
-		mf.ReturnType = &microflows.VoidType{}
-	}
-
-	// Build flow graph from body statements
-	// Initialize variable types from parameters
-	varTypes := make(map[string]string)
-	declaredVars := make(map[string]string)
-
-	for _, p := range s.Parameters {
-		if p.Type.EntityRef != nil {
-			entityQN := p.Type.EntityRef.Module + "." + p.Type.EntityRef.Name
-			if p.Type.Kind == ast.TypeListOf {
-				// Store "List of Module.Entity" for list parameters
-				varTypes[p.Name] = "List of " + entityQN
-			} else {
-				// Store "Module.Entity" for single entity parameters
-				varTypes[p.Name] = entityQN
-			}
-		} else {
-			// Primitive type parameters are also considered declared
-			declaredVars[p.Name] = p.Type.Kind.String()
-		}
-	}
-	// Get hierarchy for resolving page/microflow references
-	hierarchy, _ := getHierarchy(ctx)
-
-	restServices, _ := loadRestServices(ctx)
-
-	builder := &flowBuilder{
-		posX:         200,
-		posY:         200,
-		baseY:        200, // Base Y for happy path
-		spacing:      HorizontalSpacing,
-		varTypes:     varTypes,
-		declaredVars: declaredVars,
-		measurer:     &layoutMeasurer{varTypes: varTypes},
-		backend:      ctx.Backend,
-		hierarchy:    hierarchy,
-		restServices: restServices,
-	}
-
-	mf.ObjectCollection = builder.buildFlowGraph(s.Body, s.ReturnType)
-
-	// Check for validation errors
-	if errors := builder.GetErrors(); len(errors) > 0 {
-		// Report all errors to the user
-		var errMsg strings.Builder
-		errMsg.WriteString(fmt.Sprintf("microflow '%s.%s' has validation errors:\n", s.Name.Module, s.Name.Name))
-		for _, err := range errors {
-			errMsg.WriteString(fmt.Sprintf("  - %s\n", err))
-		}
-		return fmt.Errorf("%s", errMsg.String())
-	}
+	mf := built.Microflow
+	containerID := built.ContainerID
+	existingID := built.ExistingID
+	existingContainerID := built.ExistingContainerID
 
 	// Create or update the microflow
 	if existingID != "" {
 		if err := ctx.Backend.UpdateMicroflow(mf); err != nil {
 			return mdlerrors.NewBackend("update microflow", err)
 		}
-		fmt.Fprintf(ctx.Output, "Replaced microflow: %s.%s\n", s.Name.Module, s.Name.Name)
+		if _, err := applyDocumentFolder(ctx, mf.ID, existingContainerID, containerID); err != nil {
+			return err
+		}
+		ctx.ReportMutation("Replaced", "microflow: %s.%s", s.Name.Module, s.Name.Name)
 	} else {
 		if err := ctx.Backend.CreateMicroflow(mf); err != nil {
 			return mdlerrors.NewBackend("create microflow", err)
@@ -286,4 +118,24 @@ func execCreateMicroflow(ctx *ExecContext, s *ast.CreateMicroflowStmt) error {
 	// Invalidate hierarchy cache so the new microflow's container is visible
 	invalidateHierarchy(ctx)
 	return nil
+}
+
+// storedStartPosition reads the StartEvent position off the microflow being
+// replaced, when a person put it there rather than mxcli's own layout — see
+// authoredStartPosition for how the two are told apart, and why carrying the
+// position over unconditionally pinned the start of every rewritten flow (#951).
+//
+// Nil for a fresh CREATE, and nil for a start sitting where the layout would
+// have put it anyway; both derive from the new first activity. Best-effort: a
+// backend that cannot read the flow yields the derived placement rather than
+// failing the statement.
+func storedStartPosition(ctx *ExecContext, existingID model.ID) *model.Point {
+	if existingID == "" || ctx.Backend == nil {
+		return nil
+	}
+	mf, err := ctx.Backend.GetMicroflow(existingID)
+	if err != nil || mf == nil {
+		return nil
+	}
+	return authoredStartPosition(mf.ObjectCollection)
 }

@@ -24,13 +24,24 @@ func checkFeature(ctx *ExecContext, area, name, statement, hint string) error {
 		return nil // Registry unavailable; don't block execution
 	}
 	rpv := ctx.Backend.ProjectVersion()
+	if rpv == nil {
+		// A backend that cannot report a version cannot be version-checked. Skip,
+		// matching what this function already does when the project is not
+		// connected or the registry will not load: a version gate exists to give
+		// an actionable error, never to block work it cannot evaluate. (The mock
+		// backend returns nil unless a test configures it, so without this guard
+		// every gated handler panics under test rather than under a user.)
+		return nil
+	}
 	pv := versions.SemVer{Major: rpv.MajorVersion, Minor: rpv.MinorVersion, Patch: rpv.PatchVersion}
 	if reg.IsAvailable(area, name, pv) {
 		return nil
 	}
 
-	// Find the min_version for the error message.
-	features := reg.FeaturesForVersion(versions.SemVer{Major: 99, Minor: 0, Patch: 0})
+	// Find the min_version for the error message: the floor an upgrade from
+	// this project reaches first. A feature on two release lines has two
+	// (STRING_AGG: 10.24.22 and 11.2.0), and an 11.1 project needs the second.
+	features := reg.FeaturesForVersion(pv)
 	minV := "a newer version"
 	for _, f := range features {
 		if f.Area == area && f.Name == name {

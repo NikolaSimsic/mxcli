@@ -9,39 +9,53 @@ A navigation profile defines the navigation structure for a specific device type
 | Responsive web | `Responsive` | Default browser navigation |
 | Tablet web | `Tablet` | Tablet-optimized browser navigation |
 | Phone web | `Phone` | Phone-optimized browser navigation |
+| Responsive web offline | `ResponsiveOffline` | Offline-capable (PWA) |
+| Tablet web offline | `TabletOffline` | Offline-capable (PWA) |
+| Phone web offline | `PhoneOffline` | Offline-capable (PWA) |
 | Native mobile | `NativePhone` | React Native mobile navigation |
 
-## CREATE OR REPLACE NAVIGATION
+The web kinds are a closed set and the profile is **created** if the project
+does not have it yet. The offline kinds are the online names plus `Offline`.
 
-Replaces an entire navigation profile:
+## CREATE OR MODIFY NAVIGATION
+
+Sets the clauses it states on a navigation profile. Every clause is optional,
+and an omitted clause keeps the stored value: a statement with only a menu
+keeps the home page, role home pages, login page and not-found page. The
+`{ }` block replaces the whole menu, and `HOME … FOR <UserRole>` replaces the
+home page of that role only.
 
 ```sql
-CREATE OR REPLACE NAVIGATION <Profile>
+CREATE OR MODIFY NAVIGATION <Profile>
   HOME PAGE <Module>.<Page>
-  [HOME PAGE <Module>.<Page> FOR <Module>.<Role>]
+  [HOME PAGE <Module>.<Page> FOR <UserRole>]
   [LOGIN PAGE <Module>.<Page>]
   [NOT FOUND PAGE <Module>.<Page>]
-  [MENU (
+  [{
     <menu-items>
-  )]
+  }]
 ```
+
+The menu items are the profile's children, in `{ }` after its clauses and with
+no `;` between them. The old `MENU ( … )` block still parses and warns
+(MDL-DEPR121).
 
 ### Full Example
 
 ```sql
-CREATE OR REPLACE NAVIGATION Responsive
+CREATE OR MODIFY NAVIGATION Responsive
   HOME PAGE MyModule.Home_Web
-  HOME PAGE MyModule.AdminHome FOR MyModule.Administrator
+  HOME PAGE MyModule.AdminHome FOR Administrator
   LOGIN PAGE Administration.Login
   NOT FOUND PAGE MyModule.Custom404
-  MENU (
-    MENU ITEM 'Home' PAGE MyModule.Home_Web;
-    MENU ITEM 'Orders' PAGE Shop.Order_Overview;
-    MENU 'Administration' (
-      MENU ITEM 'Users' PAGE Administration.Account_Overview;
-      MENU ITEM 'Settings' PAGE MyModule.Settings;
-    );
-  );
+  {
+    MENU ITEM 'Home' ( OnClick: SHOW PAGE MyModule.Home_Web )
+    MENU ITEM 'Orders' ( OnClick: SHOW PAGE Shop.Order_Overview )
+    MENU 'Administration' {
+      MENU ITEM 'Users' ( OnClick: SHOW PAGE Administration.Account_Overview )
+      MENU ITEM 'Settings' ( OnClick: SHOW PAGE MyModule.Settings )
+    }
+  };
 ```
 
 ### Minimal Example
@@ -49,9 +63,45 @@ CREATE OR REPLACE NAVIGATION Responsive
 A profile only requires a home page:
 
 ```sql
-CREATE OR REPLACE NAVIGATION Phone
+CREATE OR MODIFY NAVIGATION Phone
   HOME PAGE MyModule.Home_Phone;
 ```
+
+## Offline Synchronization
+
+An offline profile downloads **nothing** until its entities have a sync mode.
+Without a `sync` block the app builds, routes and installs as a PWA — and shows
+an empty screen. This is the most common way an offline profile looks broken
+while every check passes.
+
+```sql
+create or modify navigation PhoneOffline
+  home page MyModule.Mobile_Dashboard
+  sync (
+    sync MyModule.Setting online;
+    sync MyModule.Order all;
+    sync MyModule.Trip where [Distance > 0];
+    sync MyModule.Audit never;
+    sync MyModule.Lookup none;
+    sync MyModule.Draft none preserve data;
+  );
+```
+
+| Mode | Meaning |
+|------|---------|
+| `online` | fetched from the server, never held on the device |
+| `all` | every object downloaded |
+| `where [xpath]` | only the objects the XPath selects |
+| `never` | not synchronized |
+| `none` | not downloaded; anything already on the device is dropped |
+| `none preserve data` | not downloaded; what is on the device stays |
+
+The words are the values Mendix stores, not Studio Pro's captions — its
+"All Objects" is `all` and its "By XPath" is `where`. Copying a caption gives a
+parse error rather than a broken document.
+
+See [CREATE NAVIGATION](../reference/navigation/create-navigation.md#offline-synchronization)
+for the full reference.
 
 ## DESCRIBE NAVIGATION
 
@@ -65,7 +115,28 @@ DESCRIBE NAVIGATION;
 DESCRIBE NAVIGATION Responsive;
 ```
 
-The output is round-trippable -- you can copy it, modify it, and execute it as a `CREATE OR REPLACE NAVIGATION` statement.
+The output is round-trippable -- you can copy it, modify it, and execute it as a `CREATE OR MODIFY NAVIGATION` statement.
+
+## ALTER NAVIGATION
+
+To change one menu item, or to clear a page clause, edit the stored profile
+instead of restating it. The items are addressed by the captions DESCRIBE
+prints, as a path (`'Admin' > 'Users'`); `LIST NAVIGATION MENU` prints each
+item's address.
+
+```sql
+ALTER NAVIGATION Responsive {
+  INSERT AFTER 'Home' { MENU ITEM 'Orders' ( OnClick: SHOW PAGE Shop.Order_Overview ) }
+  SET ( Caption: 'User accounts' ) ON 'Admin' > 'Users';
+  MOVE 'Log out' AFTER 'Help';
+  DROP 'Old import';
+  DROP NOT FOUND PAGE;
+};
+```
+
+Everything the statement does not name stays exactly as stored. See
+[ALTER NAVIGATION](../reference/navigation/alter-navigation.md) for every
+operation; `ALTER MENU` does the same for a menu document.
 
 ## See Also
 

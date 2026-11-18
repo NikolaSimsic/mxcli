@@ -5,13 +5,14 @@ package mcp
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/mendixlabs/mxcli/mdl/backend"
+	modelsdkbackend "github.com/mendixlabs/mxcli/mdl/backend/modelsdk"
 	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
-	"github.com/mendixlabs/mxcli/sdk/mpr"
 	"github.com/mendixlabs/mxcli/sdk/pages"
 	"github.com/mendixlabs/mxcli/sdk/workflows"
 )
@@ -40,28 +41,51 @@ type Backend struct {
 	tracer *backend.Tracer
 
 	client *Client
-	reader *mpr.Reader
+	reader backend.FullBackend
 	path   string
 	server ServerInfo
 
-	// concord is an optional second MCP client to the Concord extension server,
-	// used ONLY for capabilities the built-in PED server lacks (delete, save,
-	// validate, run). nil unless configured via WithConcord. PED stays the
-	// authoring path; Concord is the gap-filler.
-	concordURL  string
-	concordDial string
-	concord     *Client
-	// On-Disconnect Concord actions (the gap-fillers PED lacks). saveOnExit flushes
-	// via save_all (--mcp-save), checkOnExit validates via check_model
-	// (--mcp-check), runOnExit starts the app via run_app and prints its URL
-	// (--mcp-run).
-	saveOnExit  bool
+	// On-Disconnect actions. checkOnExit runs a project-wide ped_check_errors
+	// (--mcp-check); runOnExit starts the app through the mendix_app handler and
+	// prints its URL (--mcp-run).
 	checkOnExit bool
 	runOnExit   bool
+	// handlers caches query_handlers getDetails answers by handler name.
+	handlers map[string]bool
 
 	// schemaFetched records element types already fetched via ped_get_schema
 	// this session (the contract asks for a schema fetch before create/add).
 	schemaFetched map[string]bool
+
+	// workflowCtorContext caches whether the server's Workflows$Workflow
+	// constructor takes the context entity as `context` (Studio Pro 11.14) rather
+	// than a `parameter` element; nil until probed. See
+	// workflowConstructorTakesContext.
+	workflowCtorContext *bool
+	// workflowCtorTitle records, from the same probe, that the constructor names
+	// the workflow title `title` (11.15+) rather than `caption`.
+	workflowCtorTitle bool
+
+	// microflowCtorSkeleton caches whether the server's Microflows$Microflow
+	// constructor takes only the canvas (Studio Pro 11.14), with behaviour set by a
+	// follow-up update; nil until probed. See microflowConstructorTakesSkeleton.
+	microflowCtorSkeleton *bool
+
+	// multiTaskPageCtor caches whether the server's MultiUserTaskActivity
+	// constructor takes the page as a `taskPage` element (Studio Pro 11.14)
+	// rather than a bare `pageReference`; nil until probed.
+	multiTaskPageCtor *bool
+
+	// capsCache memoizes the session's resolved capability set. Every authoring
+	// gate consults it and resolution costs a tools/list round-trip, so it is
+	// computed once per connection.
+	capsCache *Capabilities
+
+	// settleDelay / settleWindow pace every ped_check_errors call against Studio
+	// Pro's lagging error list; see pedCheckDocument. Both zero means "ask once,
+	// now", which is what the unit tests want. New sets them.
+	settleDelay  time.Duration
+	settleWindow time.Duration
 
 	// dirty holds module names whose live (in-memory) domain model has diverged
 	// from the on-disk .mpr because of writes this session. Reads of a dirty
@@ -134,20 +158,18 @@ func New(mcpURL, dial string) *Backend {
 	return &Backend{
 		mcpURL:        mcpURL,
 		dial:          dial,
+		settleDelay:   settleDelay,
+		settleWindow:  settleWindow,
 		schemaFetched: map[string]bool{},
 		dirty:         map[string]bool{},
 		synthetic:     map[model.ID]string{},
 	}
 }
 
-// ConcordConfig configures the optional second MCP client to the Concord
-// extension server (gap-filler for capabilities PED lacks) and which of its
-// on-Disconnect actions to run.
-type ConcordConfig struct {
-	URL, Dial   string
-	SaveOnExit  bool // run save_all   (--mcp-save)
-	CheckOnExit bool // run check_model (--mcp-check)
-	RunOnExit   bool // run run_app    (--mcp-run)
+// ExitActions selects what Disconnect runs after the command's writes.
+type ExitActions struct {
+	Check bool // project-wide ped_check_errors (--mcp-check)
+	Run   bool // execute_handler mendix_app run (--mcp-run)
 }
 
 // WithTracer attaches a tool-call tracer (--mcp-verbose / --mcp-trace). The same
@@ -158,32 +180,34 @@ func (b *Backend) WithTracer(t *backend.Tracer) *Backend {
 	return b
 }
 
-// WithConcord enables the Concord client. Returns the receiver for chaining.
-func (b *Backend) WithConcord(cfg ConcordConfig) *Backend {
-	b.concordURL = cfg.URL
-	b.concordDial = cfg.Dial
-	b.saveOnExit = cfg.SaveOnExit
-	b.checkOnExit = cfg.CheckOnExit
-	b.runOnExit = cfg.RunOnExit
+// WithExitActions sets what Disconnect runs. Returns the receiver for chaining.
+func (b *Backend) WithExitActions(a ExitActions) *Backend {
+	b.checkOnExit = a.Check
+	b.runOnExit = a.Run
 	return b
 }
 
 // Connect opens the local .mpr read-only (for reads/enumeration) and completes
 // the MCP handshake with Studio Pro (for writes).
 func (b *Backend) Connect(path string) error {
-	r, err := mpr.Open(path) // read-only: never lock the file Studio Pro owns
-	if err != nil {
+	// Read-only: never lock the file Studio Pro owns. This is the codec engine
+	// rather than a concrete sdk/mpr reader — MCP holding one of those was the
+	// reason GetDomainModelByID, GetWorkflow and ListNavigationDocuments sat on
+	// FullBackend with no caller through a backend value. See Phase 3 of
+	// docs/plans/2026-09-14-retire-legacy-engine.md.
+	r := modelsdkbackend.New()
+	if err := r.ConnectReadOnly(path); err != nil {
 		return fmt.Errorf("open local project %q: %w", path, err)
 	}
 	c, err := NewClient(ClientOptions{URL: b.mcpURL, Dial: b.dial})
 	if err != nil {
-		r.Close()
+		_ = r.Disconnect()
 		return err
 	}
 	c.trace = b.tracer
 	si, err := c.Initialize()
 	if err != nil {
-		r.Close()
+		_ = r.Disconnect()
 		return fmt.Errorf("connect to MCP server %q: %w", b.mcpURL, err)
 	}
 	b.reader = r
@@ -191,19 +215,6 @@ func (b *Backend) Connect(path string) error {
 	b.server = si
 	b.path = path
 
-	// Optional Concord gap-filler client. A failure here is fatal only because the
-	// user explicitly asked for it (--mcp-concord); PED authoring already succeeded.
-	if b.concordURL != "" {
-		cc, err := NewClient(ClientOptions{URL: b.concordURL, Dial: b.concordDial})
-		if err != nil {
-			return fmt.Errorf("create Concord client: %w", err)
-		}
-		cc.trace = b.tracer
-		if _, err := cc.Initialize(); err != nil {
-			return fmt.Errorf("connect to Concord MCP server %q: %w", b.concordURL, err)
-		}
-		b.concord = cc
-	}
 	return nil
 }
 
@@ -215,37 +226,31 @@ func (b *Backend) ServerInfo() ServerInfo { return b.server }
 // ---------------------------------------------------------------------------
 
 func (b *Backend) Disconnect() error {
-	// Persist PED's in-memory writes via Concord before tearing down (PED has no
-	// save tool). A save failure must not be silent — surface it on stderr — but
-	// it does not block teardown (the writes still live in Studio Pro's memory).
-	if b.saveOnExit && b.concord != nil {
-		if err := b.SaveAll(); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: --mcp-save failed, changes remain unsaved in Studio Pro: %v\n", err)
-		}
-	}
-	// Validate the (in-memory) model after writes if requested. Diagnostic, so it
-	// prints to stderr and never blocks teardown.
-	if b.checkOnExit && b.concord != nil {
-		if r, err := b.CheckModel(""); err != nil {
+	// PED persists every write to disk as it lands (measured on 11.12.0 and
+	// 11.16.0), so there is nothing to save here.
+	//
+	// Validate the model after writes if requested. Diagnostic, so it prints to
+	// stderr and never blocks teardown.
+	if b.checkOnExit && b.client != nil {
+		if problems, err := b.CheckProject(); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: --mcp-check failed: %v\n", err)
 		} else {
-			writeCheckReport(os.Stderr, r)
+			writeCheckReport(os.Stderr, problems)
 		}
 	}
 	// Start the app (build + deploy current model) and report its URL, for a
 	// change-then-run loop.
-	if b.runOnExit && b.concord != nil {
-		if err := b.RunApp(); err != nil {
+	if b.runOnExit && b.client != nil {
+		if s, err := b.RunApp(0); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: --mcp-run failed: %v\n", err)
-		} else if s, err := b.GetAppStatus(); err == nil && s.Data.RunningURL != "" {
-			fmt.Fprintf(os.Stderr, "app running at %s\n", s.Data.RunningURL)
+		} else {
+			writeAppStatus(os.Stderr, s)
 		}
 	}
 	if b.reader != nil {
-		err := b.reader.Close()
+		err := b.reader.Disconnect()
 		b.reader = nil
 		b.client = nil
-		b.concord = nil
 		b.path = ""
 		return err
 	}

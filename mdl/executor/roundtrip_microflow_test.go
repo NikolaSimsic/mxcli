@@ -91,8 +91,8 @@ func TestRoundtripMicroflow_LogWithTemplate(t *testing.T) {
 	}
 
 	// Verify LOG statement with WITH clause
-	if !containsProperty(output, "log info node") {
-		t.Error("Expected log info node in output")
+	if !containsProperty(output, "log node") {
+		t.Error("Expected log node in output (the default level info is not printed, R12)")
 	}
 	if !containsProperty(output, "Processing order {1}") {
 		t.Error("Expected template text 'Processing order {1}' in output")
@@ -148,7 +148,7 @@ func TestRoundtripMicroflow_LogWithNodeExpression(t *testing.T) {
 		t.Fatalf("Failed to describe microflow: %v", err)
 	}
 
-	if !containsProperty(output, "log info node @"+testModule+".SecurityLogNode") {
+	if !containsProperty(output, "log node @"+testModule+".SecurityLogNode") {
 		t.Fatalf("Expected constant node expression in output, got:\n%s", output)
 	}
 
@@ -278,7 +278,7 @@ begin
 end;`
 
 	assertMicroflowContains(t, env, mfName, createMDL,
-		[]string{"if", "end if", "log info", "return"},
+		[]string{"if", "end if", "log node", "return"},
 		nil,
 	)
 }
@@ -369,7 +369,9 @@ begin
 end;`
 
 	assertMicroflowContains(t, env, mfName, createMDL,
-		[]string{"retrieve", "RoundtripTest.MfTestItem", "limit 1", "return"},
+		// No header, so `limit 1` is the object range, which describe
+		// prints as `first` (ako/mxcli#734).
+		[]string{"retrieve", "RoundtripTest.MfTestItem", "first", "return"},
 		nil,
 	)
 }
@@ -477,7 +479,7 @@ begin
 end;`
 
 	assertMicroflowContains(t, env, mfName, createMDL,
-		[]string{"loop", "$Items", "log info", "end loop", "return"},
+		[]string{"loop", "$Items", "log node", "end loop", "return"},
 		nil,
 	)
 }
@@ -507,7 +509,7 @@ begin
 end;`
 
 	assertMicroflowContains(t, env, mfName, createMDL,
-		[]string{"if", "retrieve", "loop", "log info", "In loop", "end loop", "else", "No items", "end if", "return"},
+		[]string{"if", "retrieve", "loop", "log node", "In loop", "end loop", "else", "No items", "end if", "return"},
 		nil,
 	)
 }
@@ -573,26 +575,94 @@ end;`
 	t.Logf("describe output for %s:\n%s", mfName, output)
 }
 
-// TestRoundtripMicroflow_CommitWithEvents tests COMMIT with WITH EVENTS flag.
-func TestRoundtripMicroflow_CommitWithEvents(t *testing.T) {
+// TestRoundtripMicroflow_CommitEvents round-trips the Commit activity's
+// With-events flag through a real project.
+//
+// The asymmetry is the assertion (#895). Events ON is Mendix's default, so it
+// renders as nothing — and `WITH EVENTS`, which says the default out loud,
+// round-trips to the bare form rather than to itself. Events OFF is the
+// deviation and must come back spelled out; that is the direction that can
+// actually lose information, because a dropped `without events` silently turns
+// the objects' commit handlers back on.
+func TestRoundtripMicroflow_CommitEvents(t *testing.T) {
+	tests := []struct {
+		name           string
+		mfSuffix       string
+		commitStmt     string
+		wantStmt       string
+		wantNotContain []string
+	}{
+		{
+			name:           "bare commit stays bare",
+			mfSuffix:       "RT_CommitDefault",
+			commitStmt:     "commit $Obj;",
+			wantStmt:       "commit $Obj;",
+			wantNotContain: []string{"without events"},
+		},
+		{
+			name:       "redundant WITH EVENTS round-trips to the default form",
+			mfSuffix:   "RT_CommitWithEvents",
+			commitStmt: "commit $Obj with events;",
+			wantStmt:   "commit $Obj;",
+			// Not "with events": it means the default, and DESCRIBE prints
+			// defaults as nothing. Not "without events" either — that would be
+			// the opposite activity.
+			wantNotContain: []string{"without events"},
+		},
+		{
+			name:       "WITHOUT EVENTS survives, and is the case that matters",
+			mfSuffix:   "RT_CommitWithoutEvents",
+			commitStmt: "commit $Obj without events;",
+			wantStmt:   "commit $Obj without events;",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := setupTestEnv(t)
+			defer env.teardown()
+
+			if err := env.executeMDL(`create or modify persistent entity RoundtripTest.MfCommitItem (Status: String(50));`); err != nil {
+				t.Fatalf("Failed to create entity: %v", err)
+			}
+
+			mfName := testModule + "." + tt.mfSuffix
+			createMDL := `create microflow ` + mfName + ` () returns Boolean
+begin
+  $Obj = create RoundtripTest.MfCommitItem;
+  ` + tt.commitStmt + `
+  return true;
+end;`
+
+			assertMicroflowContains(t, env, mfName, createMDL,
+				[]string{tt.wantStmt, "return"},
+				tt.wantNotContain,
+			)
+		})
+	}
+}
+
+// TestRoundtripMicroflow_RefreshOnDeleteAndCreate is the #407 sibling through a
+// real project: REFRESH existed on change and rollback only, so the flag was
+// dropped on the next describe -> exec for the other two.
+func TestRoundtripMicroflow_RefreshOnDeleteAndCreate(t *testing.T) {
 	env := setupTestEnv(t)
 	defer env.teardown()
 
-	// Create prerequisite entity
 	if err := env.executeMDL(`create or modify persistent entity RoundtripTest.MfCommitItem (Status: String(50));`); err != nil {
 		t.Fatalf("Failed to create entity: %v", err)
 	}
 
-	mfName := testModule + ".RT_Commit"
+	mfName := testModule + ".RT_RefreshDeleteCreate"
 	createMDL := `create microflow ` + mfName + ` () returns Boolean
 begin
-  $Obj = create RoundtripTest.MfCommitItem;
-  commit $Obj with events;
+  $Obj = create RoundtripTest.MfCommitItem refresh;
+  delete $Obj refresh;
   return true;
 end;`
 
 	assertMicroflowContains(t, env, mfName, createMDL,
-		[]string{"commit", "with events", "return"},
+		[]string{"= create RoundtripTest.MfCommitItem refresh;", "delete $Obj refresh;"},
 		nil,
 	)
 }
@@ -611,12 +681,14 @@ func TestRoundtripMicroflow_ErrorHandlingContinue(t *testing.T) {
 	createMDL := `create microflow ` + mfName + ` () returns Boolean
 begin
   $Obj = create RoundtripTest.MfCommitItem;
-  commit $Obj on error continue;
+  delete $Obj on error continue;
   return true;
 end;`
 
+	// delete, not commit: `commit … on error continue` is CE6035 (MDL076),
+	// which exec now refuses as check always did (mendixlabs/mxcli#175).
 	assertMicroflowContains(t, env, mfName, createMDL,
-		[]string{"commit", "on error continue", "return"},
+		[]string{"delete", "on error continue", "return"},
 		nil,
 	)
 }
@@ -635,7 +707,7 @@ begin
 end;`
 
 	assertMicroflowContains(t, env, mfName, createMDL,
-		[]string{"@annotation", "test annotation", "log info", "return"},
+		[]string{"@annotation", "test annotation", "log node", "return"},
 		nil,
 	)
 }
@@ -655,7 +727,7 @@ begin
 end;`
 
 	assertMicroflowContains(t, env, mfName, createMDL,
-		[]string{"@caption 'Custom Caption'", "@color Green", "log info", "return"},
+		[]string{"@caption 'Custom Caption'", "@color Green", "log node", "return"},
 		nil,
 	)
 }
@@ -702,7 +774,7 @@ end;`
 	// @position is always emitted but the exact coordinates depend on the BSON roundtrip
 	// (RelativeMiddle vs RelativeMiddlePoint key mismatch). Verify @position appears.
 	assertMicroflowContains(t, env, mfName, createMDL,
-		[]string{"@position(", "log info", "return"},
+		[]string{"@position(", "log node", "return"},
 		nil,
 	)
 }

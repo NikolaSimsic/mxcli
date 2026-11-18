@@ -6,13 +6,18 @@ package executor
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/backend"
 	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
+	"github.com/mendixlabs/mxcli/mdl/folderpath"
 	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
+	"github.com/mendixlabs/mxcli/modelsdk/meta"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
+	"github.com/mendixlabs/mxcli/sdk/microflows"
 )
 
 // ----------------------------------------------------------------------------
@@ -21,25 +26,44 @@ import (
 
 // getModulesFromCache returns cached modules or loads them.
 func getModulesFromCache(ctx *ExecContext) ([]*model.Module, error) {
-	if ctx.Cache != nil && ctx.Cache.modules != nil {
-		return ctx.Cache.modules, nil
+	if ctx.Cache == nil {
+		return ctx.Backend.ListModules()
 	}
-	modules, err := ctx.Backend.ListModules()
+	return ctx.Cache.cachedModules(ctx.Backend.ListModules)
+}
+
+// cachedModules returns the cached module list, filling it with list on first
+// use.
+//
+// The list is filled lazily, and `refresh catalog full source` reaches this
+// from a pool of goroutines sharing one executorCache (every describeEntity
+// calls findModule). The fill is therefore made under modulesMu: unguarded,
+// one worker published its freshly built slice while another read the field,
+// which the race detector reported twice per refresh (ako/mxcli#765). The
+// slice is never mutated once published, so returning it after the lock is
+// released is safe.
+func (c *executorCache) cachedModules(list func() ([]*model.Module, error)) ([]*model.Module, error) {
+	c.modulesMu.Lock()
+	defer c.modulesMu.Unlock()
+	if c.modules != nil {
+		return c.modules, nil
+	}
+	modules, err := list()
 	if err != nil {
 		return nil, err
 	}
-	if ctx.Cache != nil {
-		ctx.Cache.modules = modules
-	}
+	c.modules = modules
 	return modules, nil
 }
 
 // invalidateModuleCache clears the module cache so next lookup gets fresh data.
 // Also invalidates the hierarchy cache since new modules affect hierarchy.
 func invalidateModuleCache(ctx *ExecContext) {
-	if ctx.Cache != nil {
-		ctx.Cache.modules = nil
-		ctx.Cache.hierarchy = nil
+	if c := ctx.Cache; c != nil {
+		c.modulesMu.Lock()
+		c.modules = nil
+		c.modulesMu.Unlock()
+		c.hierarchy = nil
 	}
 }
 
@@ -81,21 +105,6 @@ func findOrCreateModule(ctx *ExecContext, name string) (*model.Module, error) {
 	return findModule(ctx, name)
 }
 
-func findModuleByID(ctx *ExecContext, id model.ID) (*model.Module, error) {
-	modules, err := getModulesFromCache(ctx)
-	if err != nil {
-		return nil, mdlerrors.NewBackend("list modules", err)
-	}
-
-	for _, m := range modules {
-		if m.ID == id {
-			return m, nil
-		}
-	}
-
-	return nil, mdlerrors.NewNotFoundMsg("module", string(id), "module not found with ID: "+string(id))
-}
-
 // resolveFolder resolves a folder path (e.g., "Resources/Images") to a folder ID.
 // The path is relative to the given module. If the folder doesn't exist, it creates it.
 func resolveFolder(ctx *ExecContext, moduleID model.ID, folderPath string) (model.ID, error) {
@@ -108,14 +117,9 @@ func resolveFolder(ctx *ExecContext, moduleID model.ID, folderPath string) (mode
 		return "", mdlerrors.NewBackend("list folders", err)
 	}
 
-	// Split path into parts
-	parts := strings.Split(folderPath, "/")
 	currentContainerID := moduleID
 
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
+	for _, part := range folderpath.Split(folderPath) {
 
 		// Find folder with this name under current container
 		var foundFolder *types.FolderInfo
@@ -149,7 +153,19 @@ func resolveFolder(ctx *ExecContext, moduleID model.ID, folderPath string) (mode
 	return currentContainerID, nil
 }
 
-// createFolder creates a new folder in the project.
+// createFolder creates a new folder in the project, and is the only place the
+// executor does (TestFolderCreationHasOneCallSite).
+//
+// It also records the folder in the cached container hierarchy. Every document
+// lookup by qualified name walks up from the document's container through that
+// cache to find its module, and the cache is commonly built by the very CREATE
+// that is about to make the folder — its own existence check runs first. A
+// folder the cache has not seen ends the walk at the folder, the module name
+// comes back "", and the document is "not found": a GRANT on a published REST
+// service created in a new folder earlier in the same script was rolled back
+// that way, and a re-run CREATE OR MODIFY fell through to creating a duplicate
+// (ako/mxcli#1486). Every other write that changes containers already kept the
+// cache in step; this one did not.
 func createFolder(ctx *ExecContext, name string, containerID model.ID) (model.ID, error) {
 	folder := &model.Folder{
 		BaseElement: model.BaseElement{
@@ -163,6 +179,9 @@ func createFolder(ctx *ExecContext, name string, containerID model.ID) (model.ID
 	if err := ctx.Backend.CreateFolder(folder); err != nil {
 		return "", err
 	}
+	if ctx.Cache != nil && ctx.Cache.hierarchy != nil {
+		ctx.Cache.hierarchy.addFolder(folder.ID, containerID, name)
+	}
 
 	return folder.ID, nil
 }
@@ -172,6 +191,22 @@ func createFolder(ctx *ExecContext, name string, containerID model.ID) (model.ID
 // ----------------------------------------------------------------------------
 
 // enumerationExists checks if an enumeration exists in the project.
+//
+// It defers to findEnumeration rather than matching containers itself. The
+// second implementation this used to carry compared `enum.ContainerID ==
+// module.ID`, which only ever matches an enumeration sitting directly in the
+// module root: one inside a FOLDER has the folder as its container, so
+// `mxcli check --references` reported it missing while DESCRIBE, SHOW, ALTER
+// and mxbuild all resolved it — a false negative on a script that executes
+// cleanly (mendixlabs/mxcli#1071).
+//
+// That is the same defect upstream #976 fixed in DROP, which patched the one
+// reported command and left the other caller of this question behind. Deleting
+// the duplicate is the point of this change: two functions answering "does this
+// enumeration exist" is what let them drift, and only one of them was exercised
+// by the commands people run interactively. findEnumeration also prefers a live
+// enumeration over an excluded twin of the same name (#914), which the copy did
+// not do.
 func enumerationExists(ctx *ExecContext, qualifiedName string) bool {
 	if !ctx.Connected() {
 		return false
@@ -182,26 +217,8 @@ func enumerationExists(ctx *ExecContext, qualifiedName string) bool {
 	if len(parts) != 2 {
 		return false
 	}
-	moduleName, enumName := parts[0], parts[1]
 
-	// Find the module to get its ID
-	module, err := findModule(ctx, moduleName)
-	if err != nil {
-		return false
-	}
-
-	// Get all enumerations and check if one matches
-	enums, err := ctx.Backend.ListEnumerations()
-	if err != nil {
-		return false
-	}
-
-	for _, enum := range enums {
-		if enum.ContainerID == module.ID && enum.Name == enumName {
-			return true
-		}
-	}
-	return false
+	return findEnumeration(ctx, parts[0], parts[1]) != nil
 }
 
 // ----------------------------------------------------------------------------
@@ -219,6 +236,7 @@ func validateWidgetReferences(ctx *ExecContext, widgets []*ast.WidgetV3, sc *scr
 	// Collect all references from the widget tree
 	refs := &widgetRefCollector{}
 	refs.collectFromWidgets(widgets)
+	refs.dedupe()
 
 	if refs.empty() {
 		return nil
@@ -239,7 +257,12 @@ func validateWidgetReferences(ctx *ExecContext, widgets []*ast.WidgetV3, sc *scr
 	if len(refs.nanoflows) > 0 {
 		known := buildNanoflowQualifiedNames(ctx)
 		for _, ref := range refs.nanoflows {
-			if !known[ref] {
+			// sc.nanoflows is the same-script exemption every branch here
+			// applies. It was the one branch that did not, so a snippet button
+			// bound to a nanoflow created three statements earlier was reported
+			// as missing — under the line that says such references are skipped
+			// (ledger #138).
+			if !known[ref] && !sc.nanoflows[ref] {
 				errors = append(errors, fmt.Sprintf("nanoflow not found: %s", ref))
 			}
 		}
@@ -272,7 +295,39 @@ func validateWidgetReferences(ctx *ExecContext, widgets []*ast.WidgetV3, sc *scr
 		}
 	}
 
+	if len(refs.menus) > 0 {
+		known := buildMenuDocumentQualifiedNames(ctx)
+		for _, ref := range refs.menus {
+			if known != nil && !known[ref] && !sc.menus[ref] {
+				errors = append(errors, menuNotFoundMessage(ref, known))
+			}
+		}
+	}
+
+	if len(refs.images) > 0 {
+		errors = append(errors, resolveImageRefs(ctx, refs.images, sc)...)
+	}
+
 	return errors
+}
+
+// resolveImageRefs reports the image-collection references that resolve
+// neither against the project nor against what this script creates
+// (mendixlabs/mxcli#1419). A nil project set means the project could not be
+// read, and stays nil: imageRefErrors then reports nothing rather than calling
+// every other collection missing. Shared by CREATE's widget trees and ALTER
+// PAGE SET (mendixlabs/mxcli#1464), so the two resolve a name the same way.
+func resolveImageRefs(ctx *ExecContext, refs []string, sc *scriptContext) []string {
+	known, collections := buildImageQualifiedNames(ctx)
+	if known != nil && collections != nil && sc != nil {
+		for qn := range sc.imageCollections {
+			collections[qn] = true
+		}
+		for qn := range sc.images {
+			known[qn] = true
+		}
+	}
+	return imageRefErrors(refs, known, collections)
 }
 
 // widgetRefCollector collects qualified name references from a widget tree.
@@ -282,11 +337,58 @@ type widgetRefCollector struct {
 	pages      []string
 	snippets   []string
 	entities   []string
+	images     []string
+	menus      []string
+	// dataSources holds the subset of the references above that a widget's
+	// DATA SOURCE names (flow or entity). An excluded document may keep a
+	// dangling action target, but not a dangling data source — see
+	// splitExcludedWidgetRefs.
+	dataSources map[string]bool
+}
+
+func (c *widgetRefCollector) addDataSource(ref string) {
+	if c.dataSources == nil {
+		c.dataSources = map[string]bool{}
+	}
+	c.dataSources[ref] = true
+}
+
+// dedupe collapses repeated references within each category, preserving first
+// occurrence order. A single widget tree often points at the same target more
+// than once (e.g. an overview page with both a New button and a per-row Edit
+// button referencing the same edit page), which would otherwise produce
+// duplicate identical diagnostics.
+func (c *widgetRefCollector) dedupe() {
+	c.microflows = uniqueStrings(c.microflows)
+	c.nanoflows = uniqueStrings(c.nanoflows)
+	c.pages = uniqueStrings(c.pages)
+	c.snippets = uniqueStrings(c.snippets)
+	c.entities = uniqueStrings(c.entities)
+	c.images = uniqueStrings(c.images)
+	c.menus = uniqueStrings(c.menus)
+}
+
+// uniqueStrings returns s with duplicate values removed, preserving order.
+func uniqueStrings(s []string) []string {
+	if len(s) < 2 {
+		return s
+	}
+	seen := make(map[string]bool, len(s))
+	out := s[:0]
+	for _, v := range s {
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
 }
 
 func (c *widgetRefCollector) empty() bool {
 	return len(c.microflows) == 0 && len(c.nanoflows) == 0 &&
-		len(c.pages) == 0 && len(c.snippets) == 0 && len(c.entities) == 0
+		len(c.pages) == 0 && len(c.snippets) == 0 && len(c.entities) == 0 &&
+		len(c.images) == 0 && len(c.menus) == 0
 }
 
 func (c *widgetRefCollector) collectFromWidgets(widgets []*ast.WidgetV3) {
@@ -302,14 +404,17 @@ func (c *widgetRefCollector) collectFromWidget(w *ast.WidgetV3) {
 		case "microflow":
 			if ds.Reference != "" {
 				c.microflows = append(c.microflows, ds.Reference)
+				c.addDataSource(ds.Reference)
 			}
 		case "nanoflow":
 			if ds.Reference != "" {
 				c.nanoflows = append(c.nanoflows, ds.Reference)
+				c.addDataSource(ds.Reference)
 			}
 		case "database":
 			if ds.Reference != "" {
 				c.entities = append(c.entities, ds.Reference)
+				c.addDataSource(ds.Reference)
 			}
 		}
 	}
@@ -322,6 +427,25 @@ func (c *widgetRefCollector) collectFromWidget(w *ast.WidgetV3) {
 	// Check Snippet reference
 	if snippet := w.GetSnippet(); snippet != "" {
 		c.snippets = append(c.snippets, snippet)
+	}
+
+	// An image-collection entry, Module.Collection.Image. Which property holds
+	// one is a property of the WIDGET, so the table decides — `Image` on a
+	// widget that is not in it is not a collection reference and must not be
+	// resolved as one.
+	for _, key := range imageRefProps[strings.ToLower(w.Type)] {
+		if img := strings.TrimSpace(w.GetStringProp(key)); img != "" {
+			c.images = append(c.images, img)
+		}
+	}
+
+	// A menu widget's menu document (`Menu: Module.Menu`). Only on the three
+	// menu widgets: `Menu` means nothing on any other.
+	switch strings.ToLower(w.Type) {
+	case "navigationtree", "menubar", "simplemenubar":
+		if m := strings.TrimSpace(w.GetStringProp("Menu")); m != "" {
+			c.menus = append(c.menus, m)
+		}
 	}
 
 	// Recurse into children
@@ -357,6 +481,43 @@ func (c *widgetRefCollector) collectFromAction(action *ast.ActionV3) {
 // Qualified Name Builders (used by validation and autocomplete)
 // ----------------------------------------------------------------------------
 
+// buildMenuDocumentQualifiedNames returns the project's menu documents by
+// qualified name, or nil when they could not be listed — then nothing is
+// reported, rather than every reference being called missing.
+func buildMenuDocumentQualifiedNames(ctx *ExecContext) map[string]bool {
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return nil
+	}
+	mds, err := ctx.Backend.ListMenuDocuments()
+	if err != nil {
+		return nil
+	}
+	result := make(map[string]bool, len(mds))
+	for _, md := range mds {
+		result[h.GetQualifiedName(md.ContainerID, md.Name)] = true
+	}
+	return result
+}
+
+// menuNotFoundMessage names the menu documents that do exist, since MDL has no
+// statement that lists them.
+func menuNotFoundMessage(ref string, known map[string]bool) string {
+	names := make([]string, 0, len(known))
+	for qn := range known {
+		names = append(names, qn)
+	}
+	sort.Strings(names)
+	const max = 10
+	if len(names) > max {
+		names = append(names[:max:max], "…")
+	}
+	if len(names) == 0 {
+		return fmt.Sprintf("menu document not found: %s — the project has none; create one with `create menu`", ref)
+	}
+	return fmt.Sprintf("menu document not found: %s — the project has: %s", ref, strings.Join(names, ", "))
+}
+
 // buildMicroflowQualifiedNames returns a set of all microflow qualified names in the project.
 func buildMicroflowQualifiedNames(ctx *ExecContext) map[string]bool {
 	result := make(map[string]bool)
@@ -364,13 +525,208 @@ func buildMicroflowQualifiedNames(ctx *ExecContext) map[string]bool {
 	if err != nil {
 		return result
 	}
-	mfs, err := ctx.Backend.ListMicroflows()
+	mfs, err := microflowHeaders(ctx)
 	if err != nil {
 		return result
 	}
 	for _, mf := range mfs {
 		qn := h.GetQualifiedName(mf.ContainerID, mf.Name)
 		result[qn] = true
+	}
+	// The System module's microflows ship with the platform and are never in
+	// the listing; describe navigation prints `call microflow
+	// System.ShowHomePage` (ako/mxcli#2247). Added only to a listing that has
+	// an answer: callers read an empty set as "could not be read" and skip
+	// the check, and adding these would turn that into false errors.
+	if len(result) > 0 {
+		for _, qn := range meta.SystemMicroflows {
+			result[qn] = true
+		}
+	}
+	return result
+}
+
+// microflowLookup is a backend that can find microflows without decoding
+// every one of them (the modelsdk backend).
+type microflowLookup interface {
+	ListMicroflowsNamed(name string) ([]*microflows.Microflow, error)
+	ListMicroflowHeaders() ([]types.DocumentHeader, error)
+}
+
+// microflowsNamed is the project's microflows whose local name is name, in
+// every module. A caller that looks one microflow up needs no other: the
+// modelsdk backend decodes only these, where ListMicroflows decoded the whole
+// flow of every microflow in the project — for a lookup check makes several
+// times per statement (mendixlabs/mxcli#1272).
+func microflowsNamed(ctx *ExecContext, name string) ([]*microflows.Microflow, error) {
+	if l, ok := ctx.Backend.(microflowLookup); ok {
+		return l.ListMicroflowsNamed(name)
+	}
+	all, err := projectMicroflows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []*microflows.Microflow
+	for _, mf := range all {
+		if mf.Name == name {
+			out = append(out, mf)
+		}
+	}
+	return out, nil
+}
+
+// pinnedMicroflow is the microflow a describe is pinned to (ctx.describeID),
+// read by ID, when it is the named one; nil when there is no pin or the pinned
+// document is not that microflow, so the caller falls back to the name lookup.
+func pinnedMicroflow(ctx *ExecContext, h *ContainerHierarchy, name ast.QualifiedName) ([]*microflows.Microflow, error) {
+	if ctx.describeID == "" {
+		return nil, nil
+	}
+	mf, err := ctx.Backend.GetMicroflow(ctx.describeID)
+	if err != nil || mf == nil {
+		return nil, err
+	}
+	if mf.Name != name.Name || h.GetModuleName(h.FindModuleID(mf.ContainerID)) != name.Module {
+		return nil, nil
+	}
+	return []*microflows.Microflow{mf}, nil
+}
+
+// microflowsInModule is the microflows of one module, or of the project when
+// moduleName is "". A module's are found by their headers and decoded one by
+// one, so `show microflows in M` decodes M's microflows, not the project's
+// (ako/mxcli#1791).
+func microflowsInModule(ctx *ExecContext, h *ContainerHierarchy, moduleName string) ([]*microflows.Microflow, error) {
+	if moduleName == "" {
+		return projectMicroflows(ctx)
+	}
+	if _, ok := ctx.Backend.(microflowLookup); !ok {
+		return projectMicroflows(ctx)
+	}
+	hs, err := microflowHeaders(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []*microflows.Microflow
+	for _, hd := range hs {
+		if h.GetModuleName(h.FindModuleID(hd.ContainerID)) != moduleName {
+			continue
+		}
+		mf, err := ctx.Backend.GetMicroflow(hd.ID)
+		if err != nil {
+			return nil, err
+		}
+		if mf != nil {
+			out = append(out, mf)
+		}
+	}
+	return out, nil
+}
+
+// microflowHeaders is every microflow's ID, container, name and Excluded flag,
+// for a name set or an ID-to-name map: no flow is decoded where the backend
+// can avoid it.
+func microflowHeaders(ctx *ExecContext) ([]types.DocumentHeader, error) {
+	if l, ok := ctx.Backend.(microflowLookup); ok {
+		return l.ListMicroflowHeaders()
+	}
+	all, err := projectMicroflows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]types.DocumentHeader, len(all))
+	for i, mf := range all {
+		out[i] = types.DocumentHeader{ID: mf.ID, ContainerID: mf.ContainerID, Name: mf.Name, Excluded: mf.Excluded}
+	}
+	return out, nil
+}
+
+// pageHeaders lists every page's ID, container and name: without decoding a
+// page on the modelsdk backend.
+func pageHeaders(ctx *ExecContext) ([]types.DocumentHeader, error) {
+	return pageHeadersOf(ctx.Backend)
+}
+
+func pageHeadersOf(be backend.FullBackend) ([]types.DocumentHeader, error) {
+	if l, ok := be.(pageHeaderLister); ok {
+		return l.ListPageHeaders()
+	}
+	all, err := be.ListPages()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]types.DocumentHeader, len(all))
+	for i, pg := range all {
+		out[i] = types.DocumentHeader{ID: pg.ID, ContainerID: pg.ContainerID, Name: pg.Name, Excluded: pg.Excluded}
+	}
+	return out, nil
+}
+
+// buildMicroflowReturnTypes maps each stored microflow's qualified name to the
+// name of its return type ("Boolean", "String", …), or "" for a microflow that
+// returns nothing.
+//
+// Separate from buildMicroflowQualifiedNames rather than folded into it: that
+// set answers "does this name resolve", which several callers want and which
+// must keep working when the return type is unavailable. A microflow missing
+// here is a microflow whose type nothing may conclude anything from.
+func buildMicroflowReturnTypes(ctx *ExecContext) map[string]string {
+	result := make(map[string]string)
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return result
+	}
+	mfs, err := projectMicroflows(ctx)
+	if err != nil {
+		return result
+	}
+	for _, mf := range liveFirst(mfs, microflowExcluded) {
+		qn := h.GetQualifiedName(mf.ContainerID, mf.Name)
+		if _, seen := result[qn]; seen {
+			continue // an excluded twin of a live flow (#1928)
+		}
+		if mf.ReturnType == nil {
+			result[qn] = ""
+			continue
+		}
+		result[qn] = mf.ReturnType.GetTypeName()
+	}
+	return result
+}
+
+// buildQueueQualifiedNames returns the set of task queue qualified names in the
+// project, lower-cased — Mendix name resolution is case-insensitive and the
+// caller compares an author-written name against it.
+func buildQueueQualifiedNames(ctx *ExecContext) map[string]bool {
+	result := make(map[string]bool)
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return result
+	}
+	queues, err := ctx.Backend.ListQueues()
+	if err != nil {
+		return result
+	}
+	for _, q := range queues {
+		result[strings.ToLower(h.GetQualifiedName(q.ContainerID, q.Name))] = true
+	}
+	return result
+}
+
+// buildImportMappingQualifiedNames returns the set of import mapping qualified
+// names in the project, matched exactly as GetImportMappingByQualifiedName does.
+func buildImportMappingQualifiedNames(ctx *ExecContext) map[string]bool {
+	result := make(map[string]bool)
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return result
+	}
+	ims, err := ctx.Backend.ListImportMappings()
+	if err != nil {
+		return result
+	}
+	for _, im := range ims {
+		result[h.GetQualifiedName(im.ContainerID, im.Name)] = true
 	}
 	return result
 }
@@ -382,7 +738,7 @@ func buildNanoflowQualifiedNames(ctx *ExecContext) map[string]bool {
 	if err != nil {
 		return result
 	}
-	nfs, err := ctx.Backend.ListNanoflows()
+	nfs, err := projectNanoflows(ctx)
 	if err != nil {
 		return result
 	}
@@ -400,7 +756,7 @@ func buildPageQualifiedNames(ctx *ExecContext) map[string]bool {
 	if err != nil {
 		return result
 	}
-	pgs, err := ctx.Backend.ListPages()
+	pgs, err := projectPages(ctx)
 	if err != nil {
 		return result
 	}
@@ -440,7 +796,7 @@ func buildEntityQualifiedNames(ctx *ExecContext) map[string]bool {
 	for _, m := range modules {
 		moduleNames[m.ID] = m.Name
 	}
-	dms, err := ctx.Backend.ListDomainModels()
+	dms, err := projectDomainModels(ctx)
 	if err != nil {
 		return result
 	}
@@ -472,7 +828,7 @@ func buildEntityEnumAttrMap(ctx *ExecContext, entityQN string) map[string]string
 	if err != nil {
 		return result
 	}
-	dms, err := ctx.Backend.ListDomainModels()
+	dms, err := projectDomainModels(ctx)
 	if err != nil {
 		return result
 	}
@@ -491,6 +847,111 @@ func buildEntityEnumAttrMap(ctx *ExecContext, entityQN string) map[string]string
 			}
 			return result
 		}
+	}
+	return result
+}
+
+// buildAssociationQualifiedNames returns a set of all association qualified names
+// in the project, covering both intra-module associations and cross-module ones
+// (which live on the FROM entity's domain model, so both come off the same walk).
+func buildAssociationQualifiedNames(ctx *ExecContext) map[string]bool {
+	result := make(map[string]bool)
+	modules, err := getModulesFromCache(ctx)
+	if err != nil {
+		return result
+	}
+	moduleNames := make(map[model.ID]string)
+	for _, m := range modules {
+		moduleNames[m.ID] = m.Name
+	}
+	dms, err := projectDomainModels(ctx)
+	if err != nil {
+		return result
+	}
+	for _, dm := range dms {
+		modName := moduleNames[dm.ContainerID]
+		if modName == "" {
+			continue
+		}
+		for _, assoc := range dm.Associations {
+			result[modName+"."+assoc.Name] = true
+		}
+		for _, ca := range dm.CrossAssociations {
+			result[modName+"."+ca.Name] = true
+		}
+	}
+	return result
+}
+
+// buildModuleRoleQualifiedNames returns the module roles a plain
+// CREATE MODULE ROLE would collide with, as Module.Role.
+//
+// Roles mxcli auto-provisioned are deliberately EXCLUDED. `execCreateModuleRole`
+// treats one of those as a hit rather than a conflict — it adopts the caller's
+// casing, rewrites the references, and returns nil — so listing it here would
+// make `check` refuse a script that runs fine, and refuse it over a role the
+// user never asked mxcli to create (an earlier mxcli made one per role-less module). A check that
+// reports a statement exec accepts is worse than the under-report it replaces.
+//
+// Known limit: exec matches role names case-insensitively (Mendix does, CE0123),
+// while this set is keyed exactly, like every other doc type's. So
+// `create module role M.admin` against a stored `M.Admin` is still reported only
+// by exec. That is an under-report of a rare spelling, not a false positive, and
+// closing it would mean case-folding the shared name registry for one type.
+func buildModuleRoleQualifiedNames(ctx *ExecContext) map[string]bool {
+	result := make(map[string]bool)
+	modules, err := getModulesFromCache(ctx)
+	if err != nil {
+		return result
+	}
+	for _, m := range modules {
+		ms, err := ctx.Backend.GetModuleSecurity(m.ID)
+		if err != nil || ms == nil {
+			continue
+		}
+		for _, mr := range ms.ModuleRoles {
+			if mr == nil || mr.Description == autoDocumentRoleDescription {
+				continue
+			}
+			result[m.Name+"."+mr.Name] = true
+		}
+	}
+	return result
+}
+
+// buildRuleQualifiedNames returns a set of all rule qualified names in the project.
+func buildRuleQualifiedNames(ctx *ExecContext) map[string]bool {
+	result := make(map[string]bool)
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return result
+	}
+	rules, err := ctx.Backend.ListRules()
+	if err != nil {
+		return result
+	}
+	for _, r := range rules {
+		result[h.GetQualifiedName(r.ContainerID, r.Name)] = true
+	}
+	return result
+}
+
+// buildEnumerationQualifiedNames returns a set of all enumeration qualified names in the project.
+func buildEnumerationQualifiedNames(ctx *ExecContext) map[string]bool {
+	result := make(map[string]bool)
+	h, err := getHierarchy(ctx)
+	if err != nil || h == nil {
+		return result
+	}
+	enums, err := ctx.Backend.ListEnumerations()
+	if err != nil {
+		return result
+	}
+	for _, e := range enums {
+		if e == nil {
+			continue
+		}
+		result[h.GetQualifiedName(e.ContainerID, e.Name)] = true
 	}
 	return result
 }
@@ -551,13 +1012,18 @@ func convertDataType(dt ast.DataType) domainmodel.AttributeType {
 	case ast.TypeBoolean:
 		return &domainmodel.BooleanAttributeType{}
 	case ast.TypeDateTime:
-		return &domainmodel.DateTimeAttributeType{LocalizeDate: true}
+		// `not localized` is the one spelling of false; unstated is Mendix's
+		// default, true. A rewrite that leaves it unstated carries the stored
+		// value afterwards (carryStoredAttributeState, MODIFY ATTRIBUTE).
+		return &domainmodel.DateTimeAttributeType{LocalizeDate: dt.Localize.LocalizeDate()}
 	case ast.TypeDate:
 		return &domainmodel.DateAttributeType{}
 	case ast.TypeAutoNumber:
 		return &domainmodel.AutoNumberAttributeType{}
 	case ast.TypeBinary:
 		return &domainmodel.BinaryAttributeType{}
+	case ast.TypeHashedString:
+		return &domainmodel.HashedStringAttributeType{}
 	case ast.TypeEnumeration:
 		enumRef := ""
 		if dt.EnumRef != nil {
@@ -595,6 +1061,8 @@ func getAttributeTypeName(at domainmodel.AttributeType) string {
 		return "AutoNumber"
 	case *domainmodel.BinaryAttributeType:
 		return "Binary"
+	case *domainmodel.HashedStringAttributeType:
+		return "HashedString"
 	case *domainmodel.EnumerationAttributeType:
 		// Prefer EnumerationRef (qualified name), fall back to EnumerationID
 		if t.EnumerationRef != "" {
@@ -611,4 +1079,85 @@ func getAttributeTypeName(at domainmodel.AttributeType) string {
 
 func formatAttributeType(at domainmodel.AttributeType) string {
 	return getAttributeTypeName(at)
+}
+
+// localizeClause renders a DateTime attribute's LocalizeDate as the constraint
+// that follows its type: " not localized" when false, and nothing for the
+// default, so describe only says what differs from a fresh `DateTime` (#1373).
+func localizeClause(at domainmodel.AttributeType) string {
+	if dt, ok := at.(*domainmodel.DateTimeAttributeType); ok && !dt.LocalizeDate {
+		return " not localized"
+	}
+	return ""
+}
+
+// buildWorkflowQualifiedNames returns a set of all workflow qualified names in
+// the project. Mirrors buildPageQualifiedNames; needed so a workflow's
+// `call workflow` target can be resolved (issue #943).
+func buildWorkflowQualifiedNames(ctx *ExecContext) map[string]bool {
+	result := make(map[string]bool)
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return result
+	}
+	wfs, err := ctx.Backend.ListWorkflows()
+	if err != nil {
+		return result
+	}
+	for _, w := range wfs {
+		result[h.GetQualifiedName(w.ContainerID, w.Name)] = true
+	}
+	return result
+}
+
+// buildConstantQualifiedNames indexes the project's constants by qualified name,
+// for the reference checks that name one (a settings override, for instance).
+//
+// The second return says whether the index is TRUSTWORTHY. A backend that cannot
+// list constants yields an empty map, which is indistinguishable from a project
+// that has none — and the difference matters: "no constants exist" makes every
+// override dangling, while "cannot tell" must not reject anything. Callers that
+// resolve a name check it.
+func buildConstantQualifiedNames(ctx *ExecContext) (map[string]bool, bool) {
+	result := make(map[string]bool)
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return result, false
+	}
+	consts, err := ctx.Backend.ListConstants()
+	if err != nil {
+		return result, false
+	}
+	for _, c := range consts {
+		if c == nil {
+			continue
+		}
+		result[h.GetQualifiedName(c.ContainerID, c.Name)] = true
+	}
+	// A backend that has no constant listing at all reports success with nothing
+	// in it; treat that as "cannot tell" rather than "the project has none".
+	return result, len(consts) > 0
+}
+
+// imageRefProps maps a widget type to the properties that hold an
+// image-collection entry (Module.Collection.Image).
+//
+// It is a table rather than a condition on the widget type because the set grew
+// and the condition did not. `Image:` was wired for the pluggable `image`
+// widget, and mendixlabs/mxcli#1057 then gave the SAME reference to
+// `staticimage` — the widget Studio Pro puts in a Selection helper's custom
+// states, which is the whole reason #1057 exists — and to `dynamicimage`'s
+// fallback. Neither was collected, so a name that does not resolve passed
+// `mxcli check --references` and failed the build (mendixlabs/mxcli#1149):
+//
+//	[error] [CE1613] "The selected image 'Atlas_UI_Resources.Atlas_Icons.
+//	        checkbox_checked' no longer exists."   at Static image 'imgAll'
+//
+// Adding a widget that names an image means adding a row here. The keys are the
+// ones `validate_widgets.go` already accepts for these widgets and DESCRIBE
+// already emits, so the two lists say the same thing about the same property.
+var imageRefProps = map[string][]string{
+	"image":        {"Image", "DefaultImage"},
+	"staticimage":  {"Image"},
+	"dynamicimage": {"DefaultImage"},
 }

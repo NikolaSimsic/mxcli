@@ -16,6 +16,34 @@ type DataType struct {
 	EntityRef       *QualifiedName // For Entity or List of Entity types
 	TemplateContext string         // For StringTemplate(Sql), stores "Sql", "OQL", etc.
 	TypeParamName   string         // For TypeEntityTypeParam: the declared name (e.g., "pEntity")
+	// ExplicitEnum is true when the type was written with the unambiguous
+	// `ENUM Module.Name` / `Enumeration(Module.Name)` syntax (vs. a bare
+	// `Module.Name`, which the parser cannot tell apart from an entity and also
+	// records as TypeEnumeration). Consumers that must serialize entity vs.
+	// enumeration distinctly (e.g. Java/JavaScript action parameters, #680) use
+	// this as the authoritative signal that the name is an enumeration.
+	ExplicitEnum bool
+	// Localize is a DateTime attribute's `localized` / `not localized`
+	// constraint (DateTimeAttributeType.LocalizeDate, #1373). It is tri-state
+	// because "not stated" is a third answer: a rewrite that does not state it
+	// keeps the stored value (#743), while a stated one wins.
+	Localize LocalizeSpec
+}
+
+// LocalizeSpec is what an attribute definition says about a DateTime's
+// LocalizeDate.
+type LocalizeSpec int
+
+const (
+	LocalizeUnstated     LocalizeSpec = iota // no clause: new attribute true, rewrite keeps stored
+	LocalizeLocalized                        // `localized`: LocalizeDate = true
+	LocalizeNotLocalized                     // `not localized`: LocalizeDate = false
+)
+
+// LocalizeDate resolves the spec for a newly built DateTime attribute: true
+// unless `not localized` was stated. Mendix's default is true.
+func (s LocalizeSpec) LocalizeDate() bool {
+	return s != LocalizeNotLocalized
 }
 
 // DataTypeKind represents the kind of data type.
@@ -42,6 +70,11 @@ const (
 	TypeVoid            // Void return type (for microflows)
 	TypeStringTemplate  // StringTemplate(Sql) etc. for Java actions
 	TypeEntityTypeParam // ENTITY <pEntity> type parameter declaration for Java actions
+	// TypeHashedString is DomainModels$HashedStringAttributeType: an entity
+	// attribute type only. No microflow, constant or Java action type exists
+	// for it, so the visitor refuses it everywhere but an attribute definition.
+	// Appended last so no existing kind's value moves.
+	TypeHashedString
 )
 
 func (k DataTypeKind) String() string {
@@ -84,6 +117,8 @@ func (k DataTypeKind) String() string {
 		return "StringTemplate"
 	case TypeEntityTypeParam:
 		return "EntityTypeParam"
+	case TypeHashedString:
+		return "HashedString"
 	default:
 		return "Unknown"
 	}

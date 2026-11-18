@@ -17,42 +17,41 @@ sits above both axes — how the whole Maia/mxcli spectrum compares.)
 
 ## Agent × tooling at a glance (Maia vs mxcli)
 
-One-slide comparison of how a Mendix app can be edited by an AI agent across five
+One-slide comparison of how a Mendix app can be edited by an AI agent across four
 setups: **Maia** (Studio Pro's built-in agent — reads/writes the model through
 Studio Pro's *internal* model APIs) → **Maia + MCP** (those same APIs now exposed
-via the PED MCP server) → **Maia + MCP + Concord** (plus the Concord extension's
-tools) → **mxcli** (external CLI, file-based on the on-disk `.mpr`, project closed) →
-**mxcli + MCP + Concord** (external CLI driving the **live** model while Studio Pro
-is open).
+via the PED MCP server) → **mxcli** (external CLI, file-based on the on-disk `.mpr`,
+project closed) → **mxcli + MCP** (external CLI driving the **live** model while
+Studio Pro is open).
 
-The first three columns share Maia's **native reach** — MCP/Concord don't change
+The first two columns share Maia's **native reach** — MCP doesn't change
 *what Maia can do*; they expose that reach to **external** agents (the bottom
 *drivable externally* row). PED is exactly that exposure of Studio Pro's model APIs,
-and mxcli (cols 4–5) is the external agent consuming it. The capability rows show
+and mxcli (cols 3–4) is the external agent consuming it. The capability rows show
 each setup's *own* reach; a Maia–vs–mxcli-live gap on a row is either a PED-subset
 limit or just where each agent's implementation has gotten to.
 
 Legend: ✓ full · ◑ partial / subset · ✗ none · — n/a.
 
-| Capability | Maia | Maia + MCP | Maia + MCP + Concord | mxcli (file) | mxcli + MCP + Concord |
-|------------|:----:|:----------:|:--------------------:|:------------:|:---------------------:|
-| **Authoring** | | | | | |
-| Domain model — entities, view entities, enums, associations, constraints | ✓ | ✓ | ✓ | ✓ | ◑¹ |
-| Pages (incl. pluggable widgets) | ◑² | ◑² | ◑² | ✓ | ◑² |
-| Microflows | ◑³ | ◑³ | ◑³ | ✓ | ◑³ |
-| Workflows | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Theming / styling | ✓ | ✓ | ✓ | ◑⁴ | ◑⁴ |
-| Integrations — REST/OData/SOAP, business events, mappings, mobile | ✗ | ✗ | ✗ | ◑⁵ | ✗ |
-| Security — roles & access | ✗ | ✗ | ✗ | ✓ | ✗ |
-| Java / JS / CSS source | ✓⁶ | ✓⁶ | ✓⁶ | ✓ | ✓ |
-| **Search & analysis** | | | | | |
-| Impact / lint / catalog SQL / full-text | ✗ | ✗ | ✗ | ✓ | ✓ |
-| Mendix KB search / NL→OQL | ✓ | ✓ | ✓ | ✗ | ✗ |
-| **Reach & workflow** | | | | | |
-| Validation before writing | ◑⁷ | ◑⁷ | ◑⁷ | ✓ | ✓ |
-| Batch / scriptable / CI | ✗ | ✗ | ✗ | ✓ | ✓ |
-| Live edits in the open IDE | ✓ | ✓ | ✓ | ✗⁸ | ✓ |
-| Drivable by an external agent (headless) | ✗ | ◑⁹ | ✓ | ✓ | ✓ |
+| Capability | Maia | Maia + MCP | mxcli (file) | mxcli + MCP |
+|------------|:----:|:----------:|:------------:|:-----------:|
+| **Authoring** | | | | |
+| Domain model — entities, view entities, enums, associations, constraints | ✓ | ✓ | ✓ | ◑¹ |
+| Pages (incl. pluggable widgets) | ◑² | ◑² | ✓ | ◑² |
+| Microflows | ◑³ | ◑³ | ✓ | ◑³ |
+| Workflows | ✓ | ✓ | ✓ | ✓ |
+| Theming / styling | ✓ | ✓ | ◑⁴ | ◑⁴ |
+| Integrations — REST/OData/SOAP, business events, mappings, mobile | ✗ | ✗ | ◑⁵ | ✗ |
+| Security — roles & access | ✗ | ✗ | ✓ | ✗ |
+| Java / JS / CSS source | ✓⁶ | ✓⁶ | ✓ | ✓ |
+| **Search & analysis** | | | | |
+| Impact / lint / catalog SQL / full-text | ✗ | ✗ | ✓ | ✓ |
+| Mendix KB search / NL→OQL | ✓ | ✓ | ✗ | ✗ |
+| **Reach & workflow** | | | | |
+| Validation before writing | ◑⁷ | ◑⁷ | ✓ | ✓ |
+| Batch / scriptable / CI | ✗ | ✗ | ✓ | ✓ |
+| Live edits in the open IDE | ✓ | ✓ | ✗⁸ | ✓ |
+| Drivable by an external agent (headless) | ✗ | ◑⁹ | ✓ | ✓ |
 
 ¹ mxcli over MCP can't author indexes or entity validation rules (file mode can);
 Maia does constraints, not indexes. &nbsp; ² Pluggable widgets: Maia not yet; mxcli
@@ -65,8 +64,9 @@ reads. &nbsp; ⁶ Maia via the `write_file` virtual FS; mxcli edits source on di
 directly (any mode). &nbsp; ⁷ Maia: live, reactive validation in the IDE; mxcli:
 static pre-flight (`mxcli check`) *before* writing. &nbsp; ⁸ File mode edits the
 on-disk `.mpr`; reopen Studio Pro to see changes. &nbsp; ⁹ MCP exposes Maia's
-read + authoring surface (the PED subset) to external agents; Concord additionally
-exposes delete + save / build-run. Maia performs all of this natively in-IDE — its
+read + authoring surface (the PED subset) to external agents; Studio Pro 11.16
+adds delete (`ped_delete_document`) and run (the `mendix_app` handler), though on
+11.16.0 delete fails for callers outside Studio Pro's own agent session. Maia performs all of this natively in-IDE — its
 column is about *external* reach.
 
 **Takeaway:** Maia has broad **native** authoring (domain model, pages, microflows,
@@ -74,7 +74,7 @@ workflows, theming, source), and **MCP is what exposes that surface to external
 agents** — the architectural point. mxcli is that external agent: **mxcli (file)** is
 the only setup with *full* authoring (indexes, security, integrations) plus analysis
 + pre-flight validation + batch/CI, at the cost of the project being closed;
-**mxcli + MCP + Concord** keeps the analysis / validation / scripting while editing
+**mxcli + MCP** keeps the analysis / validation / scripting while editing
 the **live** model (authoring capped to the PED subset, which differs slightly from
 Maia's — pluggable widgets yes, theming/source via disk). Maia owns the
 conversational + Mendix-KB experience and in-IDE liveness. (Maia capabilities per the
@@ -97,7 +97,7 @@ linked from the notes — this matrix never restates it:
 - **MCP** per-feature shapes, gaps, and Studio-Pro-version surface:
   [`../03-development/PED_MCP_CAPABILITIES.md`](../03-development/PED_MCP_CAPABILITIES.md).
 - **MPR** is the reference backend the executor was built on; it realizes everything MDL
-  expresses (read `sdk/mpr/` and `mdl/backend/mpr/` for specifics).
+  expresses (read `modelsdk/` and `mdl/backend/modelsdk/` for specifics).
 
 `Mendix` and `MDL` are `Y` for every row below *by construction* (a row exists only because
 MDL expresses a Mendix feature); they are kept as columns to make the stack explicit. The
@@ -110,19 +110,19 @@ live distinction is **MPR vs MCP**.
 | **Modules** | Y | Y | Y | P | CREATE only (flushes to disk); no module DROP |
 | **Entities** | Y | Y | Y | Y | CREATE/DROP; ALTER add/drop/rename/docs — MODIFY *type* rejected (PED can't migrate) |
 | **Associations** | Y | Y | Y | P | Within-module CREATE/DROP; no custom delete behavior; cross-module / external N |
-| **Enumerations** | Y | Y | Y | P | CREATE; DROP via Concord; ALTER (modify values) N |
+| **Enumerations** | Y | Y | Y | P | CREATE; DROP via `ped_delete_document` (Studio Pro 11.16+); ALTER (modify values) N |
 | **Microflows** | Y | Y | Y | P | Broad CREATE (most actions + control flow); rejects show-page, cast, retrieve sort/range, inheritance/rule splits |
-| **Nanoflows** | Y | Y | Y | N | **Not creatable** — PED's `ped_create_document` rejects `Microflows$Nanoflow` (create whitelist covers microflows, not nanoflows); CREATE/ALTER rejected with a clear error. DROP of an existing nanoflow works via Concord. |
+| **Nanoflows** | Y | Y | Y | N | **Not creatable** — PED's `ped_create_document` rejects `Microflows$Nanoflow` (create whitelist covers microflows, not nanoflows); CREATE/ALTER rejected with a clear error. DROP of an existing nanoflow uses `ped_delete_document` (Studio Pro 11.16+). |
 | **Pages** | Y | Y | Y | P | CREATE + ALTER via `pg_*`; widget/data-source coverage grows one type at a time |
 | **Snippets** | Y | Y | Y | P | ALTER via the page mutator; CREATE not wired |
 | **Layouts** | Y | Y | Y | N | Not wired (reads delegate to the local `.mpr`) |
 | **View Entities** | Y | Y | Y | P | CREATE; CREATE OR REPLACE fails (no delete-document); DROP orphans the source doc |
 | **Workflows** | Y | Y | Y | Y | **Complete** — CREATE / CREATE OR REPLACE / DROP / ALTER, all activity types & ops, any nesting depth |
 | **Java Actions** | Y | Y | Y | N | **Not authorable** — PED refuses to create `JavaActions$JavaAction` (backed by a `.java` source the IDE manages); CREATE/ALTER rejected with a clear error. *Calling* a Java action from a microflow IS supported. |
-| **Constants** | Y | Y | Y | P | CREATE / CREATE OR MODIFY (value + exposed-to-client) / DROP (via Concord); type limited to String/Integer/Decimal/Boolean/DateTime; in-place type change rejected; documentation not carried |
+| **Constants** | Y | Y | Y | P | CREATE / CREATE OR MODIFY (value + exposed-to-client) / DROP (`ped_delete_document`, Studio Pro 11.16+); type limited to String/Integer/Decimal/Boolean/DateTime; in-place type change rejected; documentation not carried |
 | **OData Clients / Services** | Y | Y | Y | N | Not wired |
 | **External Entities** | Y | Y | Y | N | Not wired |
-| **Business Events** | Y | Y | Y | P | SHOW/DESCRIBE read the local `.mpr`; DROP via Concord. **CREATE/ALTER blocked** — PED won't create `BusinessEvents$BusinessEventService` (off the create whitelist). The supporting domain model (published-event entities `extends BusinessEvents.PublishedBusinessEvent`, constants) IS creatable. |
+| **Business Events** | Y | Y | Y | P | SHOW/DESCRIBE read the local `.mpr`; DROP via `ped_delete_document` (Studio Pro 11.16+). **CREATE/ALTER blocked** — PED won't create `BusinessEvents$BusinessEventService` (off the create whitelist). The supporting domain model (published-event entities `extends BusinessEvents.PublishedBusinessEvent`, constants) IS creatable. |
 | **Navigation** | Y | Y | Y | N | Not wired |
 | **Project Settings** | Y | Y | Y | N | Not wired |
 
@@ -130,7 +130,7 @@ live distinction is **MPR vs MCP**.
 
 | Feature | Mendix | MDL | MPR | MCP | MCP notes |
 |---------|:------:|:---:|:---:|:---:|-----------|
-| **Module / user roles, demo users, project security, entity / microflow / nanoflow / page access** | Y | Y | Y | N | **Not authorable via MCP** — PED's document tools reject every `Security$*` type and Concord exposes security *reads* only; neither server has a write path. |
+| **Module / user roles, demo users, project security, entity / microflow / nanoflow / page access** | Y | Y | Y | N | **Not authorable via MCP** — PED's document tools reject every `Security$*` type; there is no write path. |
 
 ### Project organization
 
@@ -166,10 +166,11 @@ live distinction is **MPR vs MCP**.
 | **Associations** | Y | Y | Y | N | Y | Y | 01 | Y | N | Y | Y | Y | Y | Y | Y | Y | N |
 | **Enumerations** | Y | Y | Y | Y | Y | Y | 01 | Y | Y | N | Y | Y | Y | N | Y | Y | Y |
 | **Microflows** | Y | Y | Y | Y | Y | N | 02 | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y |
-| **Nanoflows** | Y | Y | Y | Y | Y | N | Y | Y | Y | Y | Y | Y | Y | Y | P | N | N |
+| **Nanoflows** | Y | Y | Y | Y | Y | N | 02b | Y | Y | Y | Y | Y | Y | Y | P | N | N |
+| **Rules** | Y | Y | Y | Y | Y | N | Y | Y | Y | Y | N | Y | Y | N | N | Y | N |
 | **Pages** | Y | Y | Y | N | Y | Y | 03 | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y |
 | **Snippets** | Y | Y | Y | N | Y | Y | 03 | Y | Y | Y | Y | Y | Y | N | Y | Y | Y |
-| **Layouts** | Y | Y | N | N | N | N | N | N | Y | Y | Y | N | Y | N | Y | N | N |
+| **Layouts** | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | Y | N | Y | Y | N |
 | **Java Actions** | Y | Y | Y | N | Y | N | 07 | Y | Y | Y | Y | Y | Y | N | Y | Y | N |
 | **Constants** | Y | Y | Y | Y | Y | N | 09 | Y | N | P | Y | N | Y | N | P | N | N |
 | **OData Clients** | Y | Y | Y | Y | Y | Y | 10 | Y | Y | P | Y | Y | Y | N | Y | Y | N |
@@ -178,7 +179,25 @@ live distinction is **MPR vs MCP**.
 | **Modules** | Y | Y | Y | N | Y | N | all | Y | Y | Y | Y | Y | Y | N | Y | N | N |
 | **Navigation** | Y | Y | Y | - | - | Y | 11 | N | Y | Y | Y | Y | Y | N | N | Y | N |
 | **Business Events** | Y | Y | Y | N | Y | N | 13 | N | Y | N | Y | N | Y | N | Y | Y | N |
-| **Project Settings** | Y | Y | - | - | - | Y | N | N | Y | Y | Y | N | Y | N | N | Y | P |
+| **Project Settings** | Y | Y | - | - | - | Y | 14 | N | Y | Y | Y | N | Y | N | N | Y | P |
+| **Task Queues** | Y | Y | Y | Y | Y | N | Y | Y | Y | N | N | Y | Y | N | Y | Y | N |
+| **Scheduled Events** | Y | Y | Y | Y | Y | N | Y | Y | Y | Y | N | Y | Y | N | Y | Y | N |
+| **Database Connections** | Y | Y | Y | Y | Y | N | 05 | Y | Y | N | N | Y | Y | N | Y | Y | N |
+| **Regular Expressions** | Y | Y | Y | Y | Y | N | Y | Y | Y | Y | N | N | Y | N | Y | Y | N |
+| **Validation Rules** | - | Y | Y | - | - | Y | Y | Y | N | Y | N | N | Y | N | N | Y | N |
+| **Menus** | - | Y | Y | Y | Y | N | 26 | Y | N | N | N | N | Y | N | N | Y | N |
+| **Image Collections** | Y | Y | Y | N | Y | N | 19 | Y | N | N | N | N | Y | N | Y | Y | N |
+| **JavaScript Actions** | Y | Y | Y | N | Y | N | 07b | Y | Y | Y | N | N | Y | N | Y | N | N |
+| **Published REST Services** | Y | Y | Y | Y | Y | N | 22 | N | Y | N | P | N | Y | N | N | Y | N |
+| **REST Clients** | Y | Y | Y | Y | Y | Y | 06 | Y | Y | P | Y | Y | Y | N | Y | Y | N |
+| **Import Mappings** | Y | Y | Y | N | Y | N | 21 | Y | N | N | P | Y | N | N | N | Y | N |
+| **Export Mappings** | Y | Y | Y | N | Y | N | 21 | Y | N | N | P | Y | N | N | N | Y | N |
+| **JSON Structures** | Y | Y | Y | Y | Y | N | 20 | Y | N | N | P | N | N | N | N | N | N |
+| **Message Definitions** | Y | Y | Y | Y | Y | Y | 40 | Y | N | N | N | N | Y | N | N | Y | N |
+| **Workflows** | Y | Y | Y | N | Y | Y | 24 | Y | Y | Y | N | Y | Y | N | N | Y | N |
+| **AI Agent documents** | Y | Y | Y | N | Y | N | 27 | Y | N | N | N | Y | Y | N | Y | Y | N |
+| **Pluggable widgets** | Y | Y | Y | - | Y | Y | 30 | Y | N | N | P | Y | Y | N | N | Y | N |
+| **Data Transformers** | Y | Y | Y | N | Y | N | 23 | Y | N | N | N | N | Y | N | Y | Y | N |
 
 ## Security Features
 
@@ -197,7 +216,7 @@ live distinction is **MPR vs MCP**.
 
 | Feature | SHOW | DESCRIBE | CREATE | OR MODIFY | DROP | ALTER | Examples | Tests | Catalog | REFS | LSP | Skills | Help | Viz | REPL | Syntax | Starlark |
 |---------|------|----------|--------|-----------|------|-------|----------|-------|---------|------|-----|--------|------|-----|------|--------|----------|
-| **Folders** | N | N | P | N | N | N | N | P | N | N | P | Y | Y | - | N | N | N |
+| **Folders** | N | N | P | N | N | N | 18 | P | N | N | P | Y | Y | - | N | N | N |
 | **MOVE** | - | - | - | - | - | - | N | P | N | N | P | Y | Y | - | N | Y | N |
 
 ## External SQL & Data
@@ -219,7 +238,7 @@ live distinction is **MPR vs MCP**.
 | **Catalog Query** | `select ... from CATALOG.<table>` | Y | Y | SQL against project metadata |
 | **Cross-References** | `show callers/callees/references/impact/context of` | Y | Y | Requires `refresh catalog full` |
 | **Full-Text Search** | `search '<keyword>'` | Y | Y | Across all strings and source |
-| **Linting** | `mxcli lint -p app.mpr` | Y | Y | 14 built-in + 27 Starlark rules |
+| **Linting** | `mxcli lint -p app.mpr` | Y | Y | 19 built-in + 31 Starlark rules |
 | **Report** | `mxcli report -p app.mpr` | Y | Y | Scored best practices report |
 | **Widget Discovery** | `show widgets [in module] [where ...]` | Y | Y | Experimental |
 | **Widget Update** | `update widgets set ... where ...` | Y | Y | Bulk pluggable widget updates |
@@ -277,7 +296,6 @@ These types are not covered in `help.go` output:
 
 ### Missing Skills
 
-- **Layouts** — Read-only, no skill needed
 - **Constants** — No dedicated skill
 
 ### Missing Tests
@@ -286,7 +304,6 @@ These types are not covered in `help.go` output:
 
 ### Missing Examples
 
-- **Layouts** — Read-only, no example needed
 - **Folders / MOVE** — No dedicated example file
 
 ### Missing REPL Autocomplete
@@ -301,7 +318,6 @@ These types are not covered in `help.go` output:
 
 - **Constants** — No `mxcli syntax constant` topic
 - **Nanoflows** — No dedicated syntax topic (covered by microflow topic)
-- **Layouts** — Read-only, no syntax topic
 - **Modules** — No dedicated syntax topic
 
 ### Missing Starlark APIs
@@ -332,62 +348,50 @@ Not yet implemented:
 - **Call graphs** — `show context of` / `show callers of` as directed graphs
 - **Module overview** — Combined ER + dependency diagram
 
-### Not Yet Implemented
+### Partially Implemented
 
-Document types that exist in Mendix but have no MDL support:
+Features with an MDL surface that does not yet cover the whole document type.
 
 | Feature | SHOW | DESCRIBE | CREATE | OR MODIFY | DROP | ALTER | Examples | Tests | Catalog | REFS | LSP | Skills | Help | Viz | REPL | Syntax | Starlark | Notes |
 |---------|------|----------|--------|-----------|------|-------|----------|-------|---------|------|-----|--------|------|-----|------|--------|----------|-------|
 | **Microflow activities** | - | - | P | - | - | - | 02 | Y | P | P | P | Y | Y | - | - | - | P | 60+ activities supported; some edge cases missing |
-| **Building blocks** | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | Reusable page building blocks |
-| **Styling** | P | Y | P | N | N | Y | Y | Y | N | N | N | P | N | P | N | N | N | Class/Style/DesignProperties on widgets via ALTER STYLING (#631); full theme system not yet |
-| **Extensions** | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | Mendix extensions / add-ons |
-| **Custom JS actions** | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | JavaScript actions for nanoflows |
-| **Custom widgets** | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | Pluggable widget packages |
-| **REST publish** | Y | Y | Y | N | Y | N | N | N | Y | N | P | N | Y | N | N | Y | N | Published REST services (CREATE/DROP/SHOW/DESCRIBE) |
-| **REST consume (v2)** | N | N | N | N | N | N | 06 | N | N | N | N | Y | N | N | N | N | N | Consumed REST services; partial grammar exists |
-| **Web service publish** | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | Published SOAP web services |
-| **Web service consume** | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | Consumed SOAP web services |
-| **Ext. DB connector** | N | N | N | N | N | N | 05 | N | N | N | N | Y | N | N | N | N | N | External database connections |
-| **Import mappings** | Y | Y | Y | N | Y | N | 06 | Y | N | N | P | Y | N | N | N | Y | N | JSON import mappings with v2 syntax |
-| **Export mappings** | Y | Y | Y | N | Y | N | 06 | Y | N | N | P | Y | N | N | N | Y | N | JSON export mappings with v2 syntax |
-| **JSON transformations** | Y | Y | Y | Y | Y | N | 20 | Y | N | N | P | N | N | N | N | N | N | JSON structure definitions |
-| **Message definitions** | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | Message definition documents |
-| **XML schemas** | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | Imported XML schema documents |
-| **Workflows** | Y | Y | Y | N | Y | N | N | N | Y | Y | N | N | Y | N | N | N | N | SHOW/DESCRIBE/CREATE/DROP implemented; GRANT/REVOKE removed (workflows lack AllowedModuleRoles) |
-| **Module settings** | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | Module-level configuration |
-| **Image collection** | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | Image document collections |
-| **Icon collection** | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | Icon/glyph collections |
-| **Task queue** | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | Background task queue config |
-| **Rules** | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | Microflow rules (decision logic) |
-| **Regular expressions** | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | Reusable regex definitions |
-| **Scheduled events** | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | Timer-triggered microflows |
-| **Data importer** | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | N | Excel/CSV data import documents |
+| **Styling** | P | Y | P | N | N | Y | Y | Y | N | N | N | P | N | P | N | N | N | Class/Style/DesignProperties on widgets via ALTER STYLING (#631); `mxcli theme` covers the file side, the full theme system is not modelled |
+| **Icon collections** | Y | Y | N | N | N | N | N | Y | N | N | N | Y | Y | N | Y | Y | N | **Read-only by design** — collections ship with Atlas/the theme; DESCRIBE lists each icon's reference form for use in a widget's `icon:` |
+| **Module settings** | - | - | - | - | - | Y | N | Y | N | N | N | Y | Y | N | N | Y | N | `ALTER MODULE … ADD JAR DEPENDENCY` + `mxcli sync-java-deps`; other module-level settings are not modelled |
+| **REST consume** | Y | Y | Y | Y | Y | Y | 06 | Y | Y | P | Y | Y | Y | N | Y | Y | N | Consumed REST services via `CREATE CONSUMED REST SERVICE`; OpenAPI-driven generation is partial |
+| **Building blocks** | Y | N | N | N | N | N | N | Y | N | N | N | N | Y | N | Y | Y | N | **Read-only** — `show building blocks`; authoring one is not supported |
 
-## Checklist for New Features
+### Not Yet Implemented
 
-When adding a new MDL document type, ensure all dimensions are covered:
+Document types that exist in Mendix and have **no** MDL surface at all.
 
-- [ ] **Grammar** — Add tokens to `MDLLexer.g4`, rules to `MDLParser.g4`, regenerate parser
-- [ ] **AST** — Add statement types in `mdl/ast/` (Show, Describe, Create, Drop)
-- [ ] **Visitor** — Add listener methods in `mdl/visitor/` to build AST from parse tree
-- [ ] **Executor** — Add execution handlers in `mdl/executor/`
-  - [ ] SHOW handler (list all, filter by module)
-  - [ ] DESCRIBE handler (output MDL format)
-  - [ ] CREATE handler (with OR MODIFY support)
-  - [ ] DROP handler
-  - [ ] ALTER handler (if applicable)
-- [ ] **Catalog** — Add table in `mdl/catalog/tables.go` and builder in `builder_modules.go`
-- [ ] **REFS** — Track cross-references in `refs` table for impact analysis
-- [ ] **LSP** — Add completions in `cmd/mxcli/lsp_completions_gen.go`, hover/definition in `lsp.go`
-- [ ] **REPL** — Add autocomplete entries in `mdl/repl/repl.go` (prefix completer) and `mdl/executor/autocomplete.go` (dynamic name completions)
-- [ ] **Syntax** — Add help topic file in `cmd/mxcli/help_topics/<topic>.txt` and register in `cmd/mxcli/help.go`
-- [ ] **Starlark** — Expose query function in `mdl/linter/starlark.go` (e.g., `my_types()`) and conversion in `context.go`
-- [ ] **Help** — Document in `cmd/mxcli/help.go`
-- [ ] **CLAUDE.md** — Add to syntax quick reference
-- [ ] **Examples** — Create `mdl-examples/doctype-tests/NN-<feature>-examples.mdl`
-- [ ] **Tests** — Add roundtrip tests in `mdl/executor/roundtrip_test.go`
-- [ ] **Skills** — Create or update skill file in `cmd/mxcli/skills/`
-- [ ] **VS Code** — Ensure syntax highlighting covers new keywords in `vscode-mdl/`
-- [ ] **Viz** — Add Mermaid diagram generator in `mdl/executor/cmd_mermaid.go` (if visual representation is useful)
-- [ ] **Init docs** — Update generated CLAUDE.md template in `cmd/mxcli/init.go`
+| Feature | Notes |
+|---------|-------|
+| **XML schemas** | Imported XSD documents |
+| **Web service publish / consume** | SOAP. `CALL WEB SERVICE` exists in microflows for a stored service; the service documents themselves are not authorable |
+| **Data importer** | Excel/CSV import documents |
+| **Extensions** | Mendix extensions / add-ons |
+| **Custom widget packages** | Authoring a `.mpk`. Note this is NOT "using a pluggable widget on a page", which is supported — see **Pluggable widgets** above |
+| **System text collections** (`Texts$SystemTextCollection`) | Translatable system text |
+| **Data sets** | Dataset documents (reporting) |
+| **Page templates** | Reusable page starting points offered by Studio Pro's New Page dialog |
+| **ML model mappings** | Mapping a model to entities for the ML Kit |
+| **Change data capture services** (beta) | CDC service documents |
+
+> **Keeping this honest.** Every row above was checked against the grammar's
+> statement rules and `mxcli syntax`, not against memory: a row claiming a gap
+> that has since been filled is worse than no table, because it sends people to
+> Studio Pro for work mxcli can do. FINDINGS #20 in `ako/mxcli-owid` is the
+> worked example — the External Database Connector was recorded here as
+> unsupported long after `CREATE DATABASE CONNECTION` shipped, and a reader
+> designed around a blocker that no longer existed.
+>
+> **Where the list of rows comes from matters as much as their values.** This
+> table is enumerated from **Studio Pro's own `Add other` menu** — the full set
+> of document types the product offers — and not from inverting what mxcli
+> happens to support. Inverting mxcli can only rediscover gaps someone already
+> wrote down; enumerating the product finds the ones nobody has thought about.
+> Doing that pass is what surfaced **data sets, page templates, ML model
+> mappings and change-data-capture services**, none of which appeared in any
+> mxcli document before. Re-run it against the menu when onboarding a new
+> Mendix major.

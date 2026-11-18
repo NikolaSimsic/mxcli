@@ -1,3 +1,4 @@
+mdl 1;
 -- ============================================================================
 -- Bug #369: REST/import mapping result range cardinality conflated
 -- ============================================================================
@@ -41,14 +42,13 @@
 create module BugTest369;
 
 create json structure BugTest369.JSON_Pet
-snippet '{"id": 1, "name": "Fido", "status": "available"}';
+sample '{"id": 1, "name": "Fido", "status": "available"}';
 
 create non-persistent entity BugTest369.PetResponse (
   PetId : integer,
   Name : string,
   Status : string
 );
-/
 
 create import mapping BugTest369.IMM_Pet
   with json structure BugTest369.JSON_Pet
@@ -69,4 +69,3 @@ returns BugTest369.PetResponse as $Pet
 begin
   $Pet = import from mapping BugTest369.IMM_Pet ($Json);
 end;
-/

@@ -3,9 +3,81 @@
   "mdlName": "DROPDOWNFILTER",
   "templateFile": "datagrid-dropdown-filter.json",
   "defaultEditable": "Always",
-  "propertyMappings": [
-    {"propertyKey": "attrChoice", "value": "auto", "operation": "primitive"},
-    {"propertyKey": "attributes", "source": "Attributes", "operation": "attributeObjects"},
-    {"propertyKey": "defaultFilter", "source": "FilterType", "operation": "primitive"}
+  "knownProperties": [
+    "refCaptionSource",
+    "refCaptionExp",
+    "refSearchAttr"
+  ],
+  "modes": [
+    {
+      "name": "association",
+      "condition": "hasDataSource",
+      "description": "Association mode — filter the grid by a reference (baseType 'ref'). The widget's `datasource:` is the OPTION list (the associated entity), not the grid's own datasource; `Association:` names the reference on the grid entity and `CaptionAttribute:` is what each option shows. `linkedDs` (the grid's own list) is deliberately NOT mapped: the widget declares it isLinked, so the containing Data Grid 2 fills it. Measured on 11.6.6 — five Studio Pro-authored filters store it empty, this shape passes mx check at 0 errors, and a filter written WITH it still fails CE0642 \"Property 'Datasource to Filter' is required\". A definition mapping it is refused at build time.",
+      "propertyMappings": [
+        {
+          "propertyKey": "baseType",
+          "value": "ref",
+          "operation": "primitive"
+        },
+        {
+          "propertyKey": "refOptions",
+          "source": "DataSource",
+          "operation": "datasource"
+        },
+        {
+          "propertyKey": "refEntity",
+          "source": "Association",
+          "operation": "association"
+        },
+        {
+          "propertyKey": "refCaption",
+          "source": "CaptionAttribute",
+          "operation": "attribute"
+        },
+        {
+          "propertyKey": "onChange",
+          "source": "OnChange",
+          "operation": "action"
+        }
+      ]
+    },
+    {
+      "name": "attribute",
+      "condition": "hasAttributes",
+      "description": "Custom attribute — `attributes: [Attr]` names the ONE attribute the filter compares. DataWidgets 3.x stores it on `attr`, which the widget's editorConfig shows only when attrChoice is \"linked\" (Custom); it has no `attributes` list and no `defaultFilter`, the text filter's keys this mode used to write to, so the attribute was dropped (mendixlabs/mxcli#1519). This is the form a gallery's filter bar needs: there is no column to inherit an attribute from. More than one attribute is refused — the widget has a single slot.",
+      "propertyMappings": [
+        {
+          "propertyKey": "attrChoice",
+          "value": "linked",
+          "operation": "primitive"
+        },
+        {
+          "propertyKey": "attr",
+          "source": "Attributes",
+          "operation": "attribute"
+        },
+        {
+          "propertyKey": "onChange",
+          "source": "OnChange",
+          "operation": "action"
+        }
+      ]
+    },
+    {
+      "name": "default",
+      "description": "Auto — no attribute given: the filter takes the attribute of the Data grid 2 column it sits in (attrChoice \"auto\"), so it only works inside a column.",
+      "propertyMappings": [
+        {
+          "propertyKey": "attrChoice",
+          "value": "auto",
+          "operation": "primitive"
+        },
+        {
+          "propertyKey": "onChange",
+          "source": "OnChange",
+          "operation": "action"
+        }
+      ]
+    }
   ]
 }

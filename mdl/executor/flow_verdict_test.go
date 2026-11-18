@@ -1,0 +1,83 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package executor
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/langver"
+	"github.com/mendixlabs/mxcli/mdl/visitor"
+)
+
+// check reports the flow refusal under the rule ID exec's warning carries, so
+// a reader of either finds the same language change (ako/mxcli#876).
+func TestFlowRebuildRuleIsTheLanguageChange(t *testing.T) {
+	if FlowRebuildRule != flowRebuildRefused.Code {
+		t.Fatalf("FlowRebuildRule = %q, flowRebuildRefused.Code = %q", FlowRebuildRule, flowRebuildRefused.Code)
+	}
+}
+
+// The refusal check reports and the one exec returns are one function's text.
+func TestFlowRefusalNamesTheFlowAndTheReason(t *testing.T) {
+	d := &flowDecl{name: ast.QualifiedName{Module: "M", Name: "F"}}
+	why := cannotSplice("the Loop at (1, 2) changes inside its body")
+	msg := flowRefusal(d, why).Error()
+	for _, want := range []string{"create or modify microflow M.F", "changes inside its body", "Nothing was written"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("want %q in %q", want, msg)
+		}
+	}
+	if !strings.Contains(msg, "Change activities with `alter microflow M.F") {
+		t.Errorf("control: a change outside a loop keeps the generic alter advice: %q", msg)
+	}
+	// A drop in one run and a create in the next loses the grants (#944):
+	// the advice to rebuild says to do both in one script, and why.
+	if !strings.Contains(msg, "drop the microflow and create it in the same script") ||
+		!strings.Contains(msg, "not to one in a later run") {
+		t.Errorf("the rebuild advice must keep drop and create in one script: %q", msg)
+	}
+
+	// Inside a loop alter splices what create or modify does: the refusal
+	// names the alter that replaces the loop's body (ako/mxcli#1693), a
+	// while addressed by its handle like any loop.
+	inLoop := &notSpliceable{reason: "the While at (1, 2) changes inside its body", loopHandle: "while $N < 3"}
+	msg = flowRefusal(d, inLoop).Error()
+	want := "`alter microflow M.F { replace body of while $N < 3 with begin … end; };`"
+	if !strings.Contains(msg, want) || strings.Contains(msg, "Change activities with") ||
+		strings.Contains(msg, "replace while") {
+		t.Errorf("want %q and no generic alter advice in %q", want, msg)
+	}
+	w := flowRebuildWarning(&ExecContext{LanguageVersion: langver.V0}, d, why)
+	if !strings.Contains(w, "microflow M.F is rebuilt as a whole") {
+		t.Errorf("rebuild warning: %q", w)
+	}
+}
+
+// ako/mxcli#1681: "The refusal names `create or modify` even for `create or
+// replace`". The two splice alike, so the refusal must name the statement the
+// author wrote, not the one it is treated as.
+func TestFlowRefusalNamesTheStatementAsWritten(t *testing.T) {
+	why := cannotSplice("the Loop at (1, 2) changes inside its body")
+	for _, tc := range []struct{ src, want string }{
+		{"create or replace microflow M.F () begin end;", "create or replace microflow M.F:"},
+		{"create or modify microflow M.F () begin end;", "create or modify microflow M.F:"},
+		{"create or replace nanoflow M.N () begin end;", "create or replace nanoflow M.N:"},
+	} {
+		prog, errs := visitor.Build(tc.src)
+		if len(errs) > 0 {
+			t.Fatalf("parse %q: %v", tc.src, errs)
+		}
+		var d *flowDecl
+		switch s := prog.Statements[0].(type) {
+		case *ast.CreateMicroflowStmt:
+			d = microflowDecl(s)
+		case *ast.CreateNanoflowStmt:
+			d = nanoflowDecl(s)
+		}
+		if msg := flowRefusal(d, why).Error(); !strings.HasPrefix(msg, tc.want) {
+			t.Errorf("%s: refusal %q, want it to start with %q", tc.src, msg, tc.want)
+		}
+	}
+}

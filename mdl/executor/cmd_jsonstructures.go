@@ -4,7 +4,9 @@
 package executor
 
 import (
+	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 	"unicode"
@@ -85,52 +87,136 @@ func describeJsonStructure(ctx *ExecContext, name ast.QualifiedName) error {
 
 	qualifiedName := fmt.Sprintf("%s.%s", modName, js.Name)
 
-	// Documentation as doc comment
+	// Documentation as doc comment (R9). A text with `*/` in it would end the
+	// doc comment early, so it keeps the deprecated `comment '…'` clause.
+	docClause := false
 	if js.Documentation != "" {
-		fmt.Fprintf(ctx.Output, "/**\n * %s\n */\n", js.Documentation)
+		if !strings.Contains(js.Documentation, "*/") {
+			fmt.Fprintf(ctx.Output, "/**\n * %s\n */\n", strings.ReplaceAll(js.Documentation, "\n", "\n * "))
+		} else {
+			docClause = true
+		}
 	}
 
 	// Re-executable CREATE OR MODIFY statement
 	fmt.Fprintf(ctx.Output, "create or modify json structure %s", qualifiedName)
 	if folderPath := h.BuildFolderPath(js.ContainerID); folderPath != "" {
-		fmt.Fprintf(ctx.Output, "\n  folder '%s'", folderPath)
+		fmt.Fprintf(ctx.Output, "\n  folder %s", mdlQuote(ctx, folderPath))
 	}
-	if js.Documentation != "" {
+	if docClause {
 		fmt.Fprintf(ctx.Output, "\n  comment '%s'", strings.ReplaceAll(js.Documentation, "'", "''"))
 	}
 
 	if js.JsonSnippet != "" {
 		snippet := types.PrettyPrintJSON(js.JsonSnippet)
 		if strings.Contains(snippet, "'") || strings.Contains(snippet, "\n") {
-			fmt.Fprintf(ctx.Output, "\n  snippet $$%s$$", snippet)
+			fmt.Fprintf(ctx.Output, "\n  sample %s", mdlDollarQuote(ctx, snippet))
 		} else {
-			fmt.Fprintf(ctx.Output, "\n  snippet '%s'", snippet)
+			fmt.Fprintf(ctx.Output, "\n  sample '%s'", snippet)
 		}
 	}
 
 	// Detect custom name mappings by comparing ExposedName to auto-generated names
 	customMappings := collectCustomNameMappings(js.Elements)
-	if len(customMappings) > 0 {
+	itemMappings := collectCustomItemNames(js.Elements)
+	if len(customMappings) > 0 || len(itemMappings) > 0 {
 		// Sort keys for deterministic DESCRIBE output
-		keys := make([]string, 0, len(customMappings))
-		for k := range customMappings {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
+		keys := sortedMapKeys(customMappings)
+		itemKeys := sortedMapKeys(itemMappings)
+		last := len(keys) + len(itemKeys)
 
 		fmt.Fprintf(ctx.Output, "\n  CUSTOM NAME map (\n")
-		for i, jsonKey := range keys {
-			sep := ","
-			if i == len(keys)-1 {
-				sep = ""
-			}
-			fmt.Fprintf(ctx.Output, "    '%s' as '%s'%s\n", jsonKey, customMappings[jsonKey], sep)
+		n := 0
+		for _, jsonKey := range keys {
+			n++
+			fmt.Fprintf(ctx.Output, "    '%s' as '%s'%s\n", jsonKey, customMappings[jsonKey], commaUnlessLast(n, last))
+		}
+		// `item of` entries come last so the plain renames stay grouped; both
+		// orders re-execute identically.
+		for _, jsonKey := range itemKeys {
+			n++
+			fmt.Fprintf(ctx.Output, "    item of '%s' as '%s'%s\n", jsonKey, itemMappings[jsonKey], commaUnlessLast(n, last))
 		}
 		fmt.Fprintf(ctx.Output, "  )")
 	}
 
 	fmt.Fprintln(ctx.Output, ";")
 	return nil
+}
+
+// sortedMapKeys returns a map's keys in a deterministic order, which DESCRIBE
+// output depends on.
+func sortedMapKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func commaUnlessLast(n, last int) string {
+	if n == last {
+		return ""
+	}
+	return ","
+}
+
+// collectCustomItemNames returns array JSON key → its ITEM element's ExposedName,
+// for items whose name differs from the generated default.
+//
+// It exists because an item element has no JSON key, so collectCustomNames skips
+// it (its path segment is the structural marker "(Object)" or "(Wrapper)"). Without
+// this, a named item was written on CREATE and lost on DESCRIBE — so
+// describe → exec silently renamed it back (ako/mxcli#272).
+func collectCustomItemNames(elements []*types.JsonElement) map[string]string {
+	out := make(map[string]string)
+	for _, elem := range elements {
+		collectItemNames(elem, out, true)
+	}
+	return out
+}
+
+func collectItemNames(elem *types.JsonElement, out map[string]string, isRoot bool) {
+	if elem.ElementType == "Array" {
+		key := arrayJsonKey(elem, isRoot)
+		for _, child := range elem.Children {
+			if key != "" && child.ExposedName != "" && child.ExposedName != defaultItemName(elem, isRoot) {
+				out[key] = child.ExposedName
+			}
+		}
+	}
+	for _, child := range elem.Children {
+		collectItemNames(child, out, false)
+	}
+}
+
+// arrayJsonKey is the key `item of` addresses this array by: its own JSON key,
+// or the root sentinel when the array IS the root and has none.
+func arrayJsonKey(elem *types.JsonElement, isRoot bool) string {
+	if isRoot {
+		return types.RootArrayItemKey
+	}
+	parts := strings.Split(elem.Path, "|")
+	last := parts[len(parts)-1]
+	if last == "" || last[0] == '(' {
+		return ""
+	}
+	return last
+}
+
+// defaultItemName is what the builder would have generated, so DESCRIBE emits an
+// entry only for a name someone actually chose.
+func defaultItemName(arrayElem *types.JsonElement, isRoot bool) string {
+	if isRoot {
+		return "JsonObject"
+	}
+	for _, child := range arrayElem.Children {
+		if child.ElementType == "Wrapper" {
+			return types.SingularizeExposedName(arrayElem.ExposedName)
+		}
+	}
+	return arrayElem.ExposedName + "Item"
 }
 
 // collectCustomNameMappings walks the element tree and returns JSON key → ExposedName
@@ -200,7 +286,7 @@ func execCreateJsonStructure(ctx *ExecContext, s *ast.CreateJsonStructureStmt) e
 	}
 
 	// Build element tree from JSON snippet, applying custom name mappings
-	elements, err := types.BuildJsonElementsFromSnippet(s.JsonSnippet, s.CustomNameMap)
+	elements, err := types.BuildJsonElementsFromSnippet(s.JsonSnippet, s.CustomNameMap, s.CustomItemNameMap)
 	if err != nil {
 		return mdlerrors.NewBackend("build element tree", err)
 	}
@@ -217,13 +303,32 @@ func execCreateJsonStructure(ctx *ExecContext, s *ast.CreateJsonStructureStmt) e
 		JsonSnippet:   types.PrettyPrintJSON(s.JsonSnippet),
 		Elements:      elements,
 	}
+	// Keep the stored snippet's FORMATTING when the content is the same. mxcli
+	// pretty-prints on describe, so describe -> exec — how a document is copied
+	// — otherwise rewrote a snippet Studio Pro had stored on one line into a
+	// multi-line one. Same JSON, different bytes, and a diff against the
+	// original for nothing (ako/mxcli#379).
+	if existing != nil && sameJSONContent(existing.JsonSnippet, js.JsonSnippet) {
+		js.JsonSnippet = existing.JsonSnippet
+	}
+	// A rewrite that carried no doc comment keeps the stored one (#1018).
+	if existing != nil {
+		js.Documentation = carriedDocumentation(s.DocumentationSet, s.Documentation, existing.Documentation)
+	}
+	if existing != nil {
+		// Excluded is model state, not script state (#914).
+		js.Excluded = existing.Excluded
+	}
 
 	if existing != nil {
 		js.ID = existing.ID
 		if err := ctx.Backend.UpdateJsonStructure(js); err != nil {
 			return mdlerrors.NewBackend("update json structure", err)
 		}
-		fmt.Fprintf(ctx.Output, "Modified json structure: %s\n", s.Name)
+		if _, err := applyDocumentFolder(ctx, js.ID, existing.ContainerID, containerID); err != nil {
+			return err
+		}
+		ctx.ReportMutation("Modified", "json structure: %s", s.Name)
 	} else {
 		if err := ctx.Backend.CreateJsonStructure(js); err != nil {
 			return mdlerrors.NewBackend("create json structure", err)
@@ -275,4 +380,24 @@ func findJsonStructure(ctx *ExecContext, moduleName, structName string) *types.J
 		}
 	}
 	return nil
+}
+
+// sameJSONContent reports whether two snippets carry the same JSON, ignoring
+// whitespace. Comparing the decoded values rather than the strings is the point:
+// the question is whether a rewrite would change anything that matters.
+//
+// Anything that does not parse is treated as different, so a malformed snippet
+// is replaced rather than silently kept.
+func sameJSONContent(a, b string) bool {
+	if a == b {
+		return true
+	}
+	var va, vb any
+	if err := json.Unmarshal([]byte(a), &va); err != nil {
+		return false
+	}
+	if err := json.Unmarshal([]byte(b), &vb); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(va, vb)
 }

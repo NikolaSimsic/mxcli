@@ -12,18 +12,20 @@ Open the [mxcli Playground](https://github.com/mendixlabs/mxcli-playground) in a
 
 **Option B: Binary download**
 
-Download from the [GitHub Releases page](https://github.com/mendixlabs/mxcli/releases) and extract:
+Release assets are raw binaries named `mxcli-<os>-<arch>` (nothing to extract). Use the rolling `nightly` build while mxcli is alpha:
 
 ```bash
 # macOS / Linux
-tar xzf mxcli_<platform>.tar.gz
-sudo mv mxcli /usr/local/bin/
+curl -fsSL -o mxcli \
+  https://github.com/mendixlabs/mxcli/releases/download/nightly/mxcli-linux-amd64
+chmod +x mxcli && sudo mv mxcli /usr/local/bin/
 ```
 
-**Option C: Build from source**
+**Option C: Build from source** (Go + Make)
 
 ```bash
-go install github.com/mendixlabs/mxcli/cmd/mxcli@latest
+git clone https://github.com/mendixlabs/mxcli.git && cd mxcli && make build
+# binary at ./bin/mxcli  (go install @latest doesn't work — see Installation)
 ```
 
 Verify: `mxcli --version` should print the version number.
@@ -55,7 +57,7 @@ LIST MODULES;
 LIST ENTITIES IN MyFirstModule;
 
 -- See the full structure at a glance
-LIST STRUCTURE;
+DESCRIBE STRUCTURE;
 ```
 
 ## 4. Create something
@@ -84,10 +86,10 @@ DESCRIBE ENTITY MyFirstModule.Customer;
 Output:
 ```
 @Position(100, 100)
-CREATE OR REPLACE PERSISTENT ENTITY MyFirstModule.Customer (
-  Name: String(200) NOT NULL,
+create or modify persistent entity MyFirstModule.Customer (
+  Name: String(200) not null,
   Email: String(200),
-  IsActive: Boolean DEFAULT true
+  IsActive: Boolean default true
 );
 ```
 
@@ -118,7 +120,7 @@ No errors? You're done. Open in Studio Pro and everything is there.
 
 | I want to... | Read... |
 |---|---|
-| Explore my project deeper | [SHOW Commands](show-commands.md) |
+| Explore my project deeper | [SHOW Commands](list-commands.md) |
 | Create pages with widgets | [Creating a Page](create-page.md) |
 | Use AI to generate code | [Claude Code Integration](claude-code.md) |
 | Set up for a team | [Skills and CLAUDE.md](skills.md) |
@@ -132,6 +134,6 @@ No errors? You're done. Open in Studio Pro and everything is there.
 mxcli setup mxbuild -p your-app.mpr
 ```
 
-**"CGO not available"** -- mxcli uses pure Go SQLite. No C compiler needed. If you see CGO errors, ensure you're using the official binary or `go install`.
+**"CGO not available"** -- mxcli uses pure Go SQLite. No C compiler needed. If you see CGO errors, ensure you're using the official pre-built binary or a `make build` from source.
 
-**Project won't open in Studio Pro after changes** -- Close Studio Pro before running mxcli write commands, then reopen. See [F4 sync support](../appendixes/version-compatibility.md) for details.
+**"refusing to write …: Studio Pro has this project open"** -- Close the project in Studio Pro before running mxcli write commands, then reopen it. Studio Pro does not reload the model from disk, so its next save would silently discard mxcli's changes. If Studio Pro is not running, the `.mpr.lock` was left behind by a crash: delete it, or pass `--force` to `exec`.

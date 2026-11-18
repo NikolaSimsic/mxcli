@@ -3,71 +3,278 @@
 ## Synopsis
 
 ```sql
-CREATE LAYOUT module.Name
+CREATE [OR REPLACE] LAYOUT module.Name
+(
+    layouttype: 'Responsive',
+    class: 'layout-atlas layout-atlas-responsive-topbar'
+)
 {
-    widget_tree
+    SCROLLCONTAINER name [( layoutmode: 'Headline' | 'Sidebar' )] {
+        REGION top | right | bottom | left | center ( region_properties ) {
+            widgets
+        }
+    }
 }
 ```
 
 ## Description
 
-Creates a page layout in the specified module. Layouts define the overall structure of pages -- they typically include a header, navigation, content placeholder, and footer. Pages reference a layout via the `Layout` property.
+Creates a layout — the frame every page renders inside: the topbar, the
+navigation sidebar, and the hole a page's own content drops into. A page names
+one with its `Layout` property, and its widgets land in the layout's `Main`
+placeholder.
 
-Layout creation in MDL has limited support. Most Mendix projects use layouts provided by the Atlas UI module (e.g., `Atlas_Core.Atlas_Default`, `Atlas_Core.PopupLayout`) rather than creating custom layouts through MDL. For advanced layout customization, use Mendix Studio Pro.
+A layout's body uses the whole page widget vocabulary plus four element types
+that only a layout has: `SCROLLCONTAINER`, `REGION`, `PLACEHOLDER` and
+`NAVIGATIONTREE` (with `MENUBAR` for the topbar's horizontal menu).
 
-### Common Atlas Layouts
+`OR REPLACE` rewrites an existing layout. To change one without rebuilding it,
+use [ALTER LAYOUT](alter-layout.md) instead — it edits the stored document and
+leaves alone anything it was not asked about, including widgets MDL cannot
+express.
 
-These layouts are available in most Mendix projects that include Atlas Core:
+### Do not write into a Marketplace module
 
-| Layout | Description |
-|--------|-------------|
-| `Atlas_Core.Atlas_Default` | Standard responsive page with sidebar navigation |
-| `Atlas_Core.Atlas_TopBar` | Page with top navigation bar |
-| `Atlas_Core.PopupLayout` | Modal popup dialog |
-| `Atlas_Core.Atlas_Default_NativePhone` | Native mobile layout |
+Mendix's own guidance is *"Do not change the supplied layouts. Either create a
+separate module with the custom layouts … or create your own."* A Marketplace
+update replaces the module wholesale and every local edit is gone, silently.
+
+`CREATE LAYOUT` refuses a Marketplace target for that reason:
+
+```
+Error: layout Atlas_Core.T2: Atlas_Core is a marketplace module — a layout
+written there is overwritten by the next module update. Create the layout in a
+module of your own (Mendix's own guidance) and point pages at it with
+ALTER PAGE … SET LAYOUT.
+```
+
+The usual starting point is a copy of an Atlas layout. `DESCRIBE LAYOUT` emits
+re-executable MDL, so describe → rename → run *is* the copy operation:
+
+```bash
+mxcli -p app.mpr -c "describe layout Atlas_Core.Atlas_Default" > mine.mdl
+# change the qualified name to your own module, then:
+mxcli exec mine.mdl -p app.mpr
+```
+
+Read the describe output before running it. A widget MDL cannot express is
+emitted as a comment ending `-- NOT re-executable`, naming exactly what a
+re-run would drop.
+
+Atlas's responsive sidebar toggle is the `sidebartoggle` widget, so a copied
+layout keeps its slide-in navigation on phones and tablets:
+
+```sql
+sidebartoggle sidebarToggle3 (
+  Tooltip: 'Toggle Menu', ButtonStyle: Primary,
+  Icon: 'Atlas_Core.Atlas_Filled.navigation-menu', Class: 'toggle-btn'
+)
+```
+
+It takes an action button's `Caption`, `Tooltip`, `ButtonStyle` and `Icon`,
+and `RenderMode: Link` to render as a link; it has no `Action`.
+
+The phone and tablet layouts keep their header bar in a `layoutheader`, whose
+two sides are spelled like a scroll container's regions:
+
+```sql
+layoutheader header1 {
+  region left { sidebartoggle sidebarToggle2 (RenderMode: Link, Icon: 'Atlas_Core.Atlas_Filled.navigation-menu') }
+  region right { placeholder HeaderRight }
+}
+```
+
+A native layout keeps three things beside its content tree: the placeholder on
+the header's right, whether the bottom bar shows, and the sidebar.
+
+```sql
+create layout MyModule.Native_SideMenu (layouttype: 'Default', showbottombar: true) {
+  placeholder Main
+  region header { placeholder Header }
+  region sidebar { placeholder Placeholder1 }
+};
+```
 
 ## Parameters
 
 `module.Name`
-:   The qualified name of the layout (`Module.LayoutName`).
+:   The qualified name of the layout (`Module.LayoutName`). Must be a module you
+    own.
 
-## Examples
+`layouttype`
+:   **Required.** Omitting it is an error, not a default:
+    `Error: layout needs a layouttype`.
 
-Reference an existing layout when creating a page:
+    | Platform | Values |
+    |----------|--------|
+    | Web | `Responsive`, `Phone`, `Tablet`, `ModalPopup` |
+    | Native | `Default`, `Popup` |
+
+    The two sets are disjoint, so the platform is **inferred** from the type —
+    there is no separate `native:` flag to contradict it.
+
+`class`
+:   The layout's own CSS class. Not decoration — Atlas scopes around two dozen
+    of its layout rules to `.layout-atlas` and its variants, and every Atlas
+    layout with chrome carries one. A layout written without it builds cleanly,
+    passes `mx check`, and renders with **no topbar bar and no sidebar rail**.
+
+    | Shape | Class |
+    |-------|-------|
+    | Topbar navigation | `layout-atlas layout-atlas-responsive-topbar` |
+    | Sidebar navigation | `layout-atlas layout-atlas-responsive-default` |
+    | Popup | *(none — `PopupLayout` is bare)* |
+
+`style`
+:   Inline CSS on the layout element.
+
+`Layout`
+:   The layout this one is built on — see
+    [A layout built on another layout](#a-layout-built-on-another-layout).
+
+`layouttype`, `class`, `style` and `Layout` are the **only** header properties.
+Anything else is an error rather than an ignored key:
+
+```
+Error: layout MyModule.T1: unknown property "bogus" (a layout header takes
+layouttype, class, style and layout; which placeholder is "main" is set by
+naming one Main, not by a property)
+```
+
+### A layout built on another layout
+
+Studio Pro lets a layout wrap another one rather than have a tree of its own
+(ConversationalUI's `Layout_MasterBase` wraps `Atlas_Core.Atlas_Default`). Name
+the outer layout with `Layout:` and write the body exactly as a page body:
+`PLACEHOLDER X { … }` fills the outer layout's placeholder `X`, and bare widgets
+fill its `Main`. The placeholders the new layout declares for its own pages go
+inside those blocks, bodiless as anywhere else in a layout:
 
 ```sql
-CREATE PAGE MyModule.Dashboard
-(
-    Title: 'Dashboard',
-    Layout: Atlas_Core.Atlas_Default
-)
-{
-    CONTAINER cntMain {
-        DYNAMICTEXT txtWelcome (Attribute: WelcomeMessage)
+CREATE OR MODIFY LAYOUT MyModule.Layout_Framed (
+  layouttype: 'Responsive',
+  Layout: Atlas_Core.Atlas_Default
+) {
+  PLACEHOLDER Main {
+    CONTAINER banner (Class: 'card') {
+      DYNAMICTEXT heading (Content: 'Framed area', RenderMode: H3)
     }
+    PLACEHOLDER Main
+  }
 };
 ```
 
-Reference a popup layout for a dialog page:
+- The layout still needs exactly one declared `Main` (CE0848), counted inside
+  the blocks.
+- A block naming a placeholder the outer layout does not declare is refused;
+  mxbuild would report it as CE1613.
+- Only web layouts can be built on another layout.
+- `DESCRIBE LAYOUT` prints this form, with one block per stored argument.
+
+### Scroll container properties
+
+| Property | Values | Notes |
+|----------|--------|-------|
+| `layoutmode` | `Headline`, `Sidebar` | The frame. `Headline` runs the top region across the full width and starts the left one under it; `Sidebar` runs the left region the full height and puts the top bar beside it (Atlas's `Atlas_SideBar` and `Atlas_TopBar`). Unset is `Headline`, and `DESCRIBE LAYOUT` prints it only when it is `Sidebar`. Change it on a stored layout with `ALTER LAYOUT … { SET (layoutmode: 'Sidebar') ON layoutContainer; }` |
+
+### Region properties
+
+| Property | Values | Notes |
+|----------|--------|-------|
+| `size` | integer | Unset is Studio Pro's `200` |
+| `sizemode` | `Fixed`, `Pixels`, `Auto` | Unset is `Auto` |
+| `togglemode` | `None`, `PushContentAside`, `SlideOverContent`, `ShrinkContentInitiallyOpen`, `ShrinkContentInitiallyClosed` | How a `SIDEBARTOGGLE` opens and closes the region. Unset is `None` |
+| `class` | CSS class | e.g. `region-topbar`, `region-content`. The only appearance property a region stores: `style` on one is refused (MDL-WIDGET52) |
+
+## The four elements only a layout has
+
+| Element | MDL | Notes |
+|---------|-----|-------|
+| Scroll container | `SCROLLCONTAINER name { … }` | The layout's root. Its children are **regions**, never widgets |
+| Region | `REGION top \| right \| bottom \| left \| center` | Five **named slots**, not a list. One region per slot |
+| Placeholder | `PLACEHOLDER Main` | The hole a page's content goes into. No properties, no body |
+| Navigation tree | `NAVIGATIONTREE name (profile: 'Responsive')` | The sidebar menu — vertical |
+| Menu bar | `MENUBAR name (profile: 'Responsive')` | The topbar menu — horizontal |
+| Simple menu bar | `SIMPLEMENUBAR name (menu: Module.Menu [, orientation: Vertical])` | A phone layout's bottom bar, as Atlas's `Phone_BottomBar` has it. `orientation` defaults to `Horizontal` |
+
+Every menu widget renders **either** a navigation profile (`profile: 'Responsive'`)
+**or** a menu document (`menu: Module.Menu`, created with `CREATE MENU`) — the two
+are alternatives for the same slot, and naming both is refused. With neither, the
+`Responsive` profile is used.
+
+## Examples
+
+A topbar layout, which is the shape `mxcli new` scaffolds:
 
 ```sql
-CREATE PAGE MyModule.ConfirmDelete
+CREATE OR MODIFY LAYOUT MyModule.App_Default
 (
-    Params: { $Item: MyModule.Item },
-    Title: 'Confirm Delete',
-    Layout: Atlas_Core.PopupLayout
+    layouttype: 'Responsive',
+    class: 'layout-atlas layout-atlas-responsive-topbar'
 )
 {
-    DATAVIEW dvItem (DataSource: $Item) {
-        DYNAMICTEXT txtMessage (Attribute: Name)
-        FOOTER footer1 {
-            ACTIONBUTTON btnDelete (Caption: 'Delete', Action: DELETE, ButtonStyle: Danger)
-            ACTIONBUTTON btnCancel (Caption: 'Cancel', Action: CANCEL_CHANGES)
+    SCROLLCONTAINER layoutContainer {
+        REGION top (size: 60, sizemode: 'Fixed', class: 'region-topbar') {
+            MENUBAR mainMenu (profile: 'Responsive')
+        }
+        REGION center (class: 'region-content') {
+            PLACEHOLDER Main
         }
     }
 };
 ```
 
+A sidebar layout, with a navigation tree in the left region running the full
+height (`layoutmode: 'Sidebar'`; leave it out and the top region spans the page):
+
+```sql
+CREATE LAYOUT MyModule.App_Sidebar
+(
+    layouttype: 'Responsive',
+    class: 'layout-atlas layout-atlas-responsive-sidebar'
+)
+{
+    SCROLLCONTAINER layoutContainer (layoutmode: 'Sidebar') {
+        REGION left (size: 232, sizemode: 'Pixels', class: 'region-sidebar') {
+            NAVIGATIONTREE navMenu (profile: 'Responsive')
+        }
+        REGION center (class: 'region-content') {
+            PLACEHOLDER Main
+        }
+    }
+};
+```
+
+A page then names the layout, and its widgets land in `Main`:
+
+```sql
+CREATE PAGE MyModule.Dashboard
+(
+    Title: 'Dashboard',
+    Layout: MyModule.App_Default
+)
+{
+    CONTAINER cntMain {
+        DYNAMICTEXT txtWelcome (Content: 'Welcome')
+    }
+};
+```
+
+## Notes
+
+- **A layout must declare at least one placeholder.** Without one a page's
+  content has nowhere to go, and the statement is refused:
+  `layout "X" declares no placeholder`.
+- **Name one placeholder `Main`.** `Forms$Layout` has no property recording
+  which placeholder is the main one — the convention is the mechanism, and all
+  22 layouts Atlas ships follow it. There is deliberately no
+  `mainplaceholder:` property: writing the underlying key produces a layout
+  that builds cleanly and that Studio Pro cannot open.
+- **A placeholder's name is API.** Pages bind to it as `Module.Layout.Name`.
+  Renaming one unbinds every page that used it — those pages still build, and
+  their content vanishes.
+
 ## See Also
 
-[CREATE PAGE](create-page.md), [SHOW PAGES](/reference/query/show-pages.md)
+[ALTER LAYOUT](alter-layout.md), [CREATE PAGE](create-page.md),
+[ALTER PAGE / ALTER SNIPPET](alter-page.md)

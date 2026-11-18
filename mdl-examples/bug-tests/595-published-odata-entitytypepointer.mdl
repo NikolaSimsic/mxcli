@@ -1,3 +1,4 @@
+mdl 1;
 -- Bug test: published OData service EntitySet must carry EntityTypePointer.
 -- Issue #595: serializePublishedODataService keyed its entityTypeIDMap by
 -- ExposedName but looked it up by qualified entity name, so the resolved
@@ -17,16 +18,16 @@ create module bug595;
 
 create persistent entity bug595.Customer (
   Name: string(200),
-  Email: string(200)
+  Email: string(200) unique
 );
 
-create odata service bug595.CustomerAPI (
-  path: '/odata/customers',
+create published odata service bug595.CustomerAPI (
+  path: 'odata/customers/',
   version: '1.0.0',
   ODataVersion: OData4,
-  namespace: 'bug595.Customers'
+  namespace: 'bug595.Customers',
+  Authentication: (basic)
 )
-authentication basic
 {
   publish entity bug595.Customer as 'Customers' (
     ReadMode: source,
@@ -34,5 +35,8 @@ authentication basic
     UpdateMode: source,
     DeleteMode: not_supported
   )
-  expose (*);
+  -- Not `expose (*)`: that publishes no KEY, which is CE6585 and refused by
+  -- check as MDL-ODATA08 (mendixlabs/mxcli#1426). A single key needs a unique
+  -- rule on its attribute (CE6624).
+  expose (Name, Email (KEY));
 };

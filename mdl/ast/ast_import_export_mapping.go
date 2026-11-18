@@ -17,29 +17,67 @@ package ast
 //	  }
 //	};
 type CreateImportMappingStmt struct {
-	Name           QualifiedName
-	SchemaKind     string        // "JSON_STRUCTURE" or "XML_SCHEMA" or ""
-	SchemaRef      QualifiedName // qualified name of the schema source
+	CreateGuard // `create … if not exists` (ako/mxcli#731)
+	Name        QualifiedName
+	Folder      string        // Folder path within module (empty = leave placement alone)
+	SchemaKind  string        // "JSON_STRUCTURE" or "XML_SCHEMA" or ""
+	SchemaRef   QualifiedName // qualified name of the schema source
+	// SchemaRoot selects the element the mapping STARTS at, when that is not the
+	// structure's own root (#267). Written in member names, "/"-separated.
+	SchemaRoot string
+	// Parameter is the entity of the mapping's INPUT object (#265), which its
+	// custom handlers bind via `Param: parameter`. Empty means the mapping takes
+	// no input object, which is stored as the DataTypes$UnknownType marker.
+	Parameter      QualifiedName
 	RootElement    *ImportMappingElementDef
 	CreateOrModify bool // true for CREATE OR MODIFY / CREATE OR REPLACE
+	Excluded       bool // @excluded — document excluded from project
+	// Documentation is the `/** … */` doc comment before the statement
+	// (mendixlabs/mxcli#1510). DocumentationSet says one was written: absent
+	// keeps the stored documentation on a rewrite, empty clears it (#1018).
+	Documentation    string
+	DocumentationSet bool
 }
 
 func (s *CreateImportMappingStmt) isStatement() {}
 
 // DropImportMappingStmt represents: DROP IMPORT MAPPING Module.Name
 type DropImportMappingStmt struct {
+	DropGuard
 	Name QualifiedName
 }
 
 func (s *DropImportMappingStmt) isStatement() {}
 
 // ImportMappingElementDef represents one element in the mapping tree.
+// MappingCustomHandlerDef is the `by Module.Microflow(...)` clause: a microflow
+// resolves the object instead of Create/Find (#264).
+type MappingCustomHandlerDef struct {
+	Microflow  string
+	Parameters []*MappingCallParameterDef
+}
+
+// MappingCallParameterDef binds one parameter of the called microflow.
+// Source is "parent", "parameter", "ancestor" or "path".
+type MappingCallParameterDef struct {
+	Parameter string
+	Source    string
+	Level     int
+	Path      string
+}
+
 type ImportMappingElementDef struct {
 	// Object mapping fields
 	Entity         string // qualified entity name (e.g. "Module.Customer")
 	ObjectHandling string // "Create", "Find", "FindOrCreate"
 	Association    string // qualified association name (from Assoc/Entity path)
-	Children       []*ImportMappingElementDef
+	CustomHandler  *MappingCustomHandlerDef
+	// Backup is what happens when the object is not found: "Create", "Error" or
+	// "Ignore" (#261). Empty when the statement did not say.
+	Backup string
+	// BackupOverridable sets ObjectHandlingBackupAllowOverride.
+	BackupOverridable bool
+	Children          []*ImportMappingElementDef
 
 	// Value mapping fields
 	Attribute string // entity attribute name (LHS of =)
@@ -68,18 +106,27 @@ type ImportMappingElementDef struct {
 //	  }
 //	};
 type CreateExportMappingStmt struct {
-	Name            QualifiedName
-	SchemaKind      string        // "JSON_STRUCTURE" or "XML_SCHEMA" or ""
-	SchemaRef       QualifiedName // qualified name of the schema source
-	NullValueOption string        // "LeaveOutElement" or "SendAsNil" (default: "LeaveOutElement")
+	CreateGuard // `create … if not exists` (ako/mxcli#731)
+	Name        QualifiedName
+	Folder      string        // Folder path within module (empty = leave placement alone)
+	SchemaKind  string        // "JSON_STRUCTURE" or "XML_SCHEMA" or ""
+	SchemaRef   QualifiedName // qualified name of the schema source
+	// SchemaRoot — see the note on CreateImportMappingStmt (#267).
+	SchemaRoot      string
+	NullValueOption string // "LeaveOutElement" or "SendAsNil" (default: "LeaveOutElement")
 	RootElement     *ExportMappingElementDef
 	CreateOrModify  bool // true for CREATE OR MODIFY / CREATE OR REPLACE
+	Excluded        bool // @excluded — document excluded from project
+	// Documentation — see the note on CreateImportMappingStmt (#1510).
+	Documentation    string
+	DocumentationSet bool
 }
 
 func (s *CreateExportMappingStmt) isStatement() {}
 
 // DropExportMappingStmt represents: DROP EXPORT MAPPING Module.Name
 type DropExportMappingStmt struct {
+	DropGuard
 	Name QualifiedName
 }
 
@@ -88,12 +135,19 @@ func (s *DropExportMappingStmt) isStatement() {}
 // ExportMappingElementDef represents one element in an export mapping tree.
 type ExportMappingElementDef struct {
 	// Object mapping fields
-	Entity      string // qualified entity name (e.g. "Module.Customer")
-	Association string // qualified association name (from Assoc/Entity path)
-	Children    []*ExportMappingElementDef
+	Entity        string // qualified entity name (e.g. "Module.Customer")
+	Association   string // qualified association name (from Assoc/Entity path)
+	CustomHandler *MappingCustomHandlerDef
+	// Group marks an entity-less grouping node: a JSON object with no Mendix
+	// object behind it (#262).
+	Group    bool
+	Children []*ExportMappingElementDef
 
 	// Value mapping fields
 	Attribute string // entity attribute name (RHS of =)
+	// Converter is the microflow the value passes through on its way out
+	// (#266): `jsonKey = Module.MF(Attr)`.
+	Converter string
 
 	// Shared
 	JsonName string // JSON field name (LHS of = for values, RHS of AS for objects)

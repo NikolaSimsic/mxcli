@@ -7,20 +7,26 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 
+	modelsdkbackend "github.com/mendixlabs/mxcli/mdl/backend/modelsdk"
 	"github.com/mendixlabs/mxcli/mdl/executor"
+	"github.com/mendixlabs/mxcli/mdl/folderpath"
 	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
-	"github.com/mendixlabs/mxcli/sdk/mpr"
 	"github.com/spf13/cobra"
 )
 
 // TreeNode represents a node in the project tree JSON output.
 type TreeNode struct {
-	Label         string      `json:"label"`
-	Type          string      `json:"type"`
-	QualifiedName string      `json:"qualifiedName,omitempty"`
-	Children      []*TreeNode `json:"children,omitempty"`
+	Label         string `json:"label"`
+	Type          string `json:"type"`
+	QualifiedName string `json:"qualifiedName,omitempty"`
+	// Describable says `mxcli describe <type> <qualifiedName>` answers this
+	// node, so a client can offer its MDL source without keeping its own list
+	// of which types have one (see treeTypesWithoutSource).
+	Describable bool        `json:"describable,omitempty"`
+	Children    []*TreeNode `json:"children,omitempty"`
 }
 
 // treeElement holds a name, type, and container ID for building the tree hierarchy.
@@ -57,6 +63,7 @@ Example:
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+		markDescribable(tree)
 
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -67,14 +74,70 @@ Example:
 	},
 }
 
+// treeTypesWithoutSource lists the node types project-tree emits that have no
+// MDL of their own, with the reason. Every other type it emits must be one
+// `describe` answers; TestProjectTree_EveryNodeTypeIsDescribableOrDeclaredWithoutSource
+// holds the two together.
+var treeTypesWithoutSource = map[string]string{
+	"root":             "the tree's own root",
+	"folder":           "a container",
+	"category":         "a container (User Roles, Demo Users)",
+	"security":         "a container of module roles",
+	"module":           "a container here: describe module prints the whole module",
+	"domainmodel":      "a container of entities, associations and enumerations",
+	"settingscategory": "a group inside Settings, which describes as a whole",
+	"settingsitem":     "a line of Settings",
+	"navhome":          "a line of a navigation profile",
+	"navlogin":         "a line of a navigation profile",
+	"navmenu":          "part of a navigation profile",
+	"navmenuitem":      "part of a navigation profile",
+	"restresource":     "part of a published REST service",
+	"restoperation":    "part of a REST service or client",
+	"odataentityset":   "part of an OData service or client",
+	"odatamember":      "part of an OData entity set",
+	"bechannel":        "part of a business event service",
+	"bemessage":        "part of a business event service",
+	"beattribute":      "part of a business event message",
+	"dbquery":          "part of a database connection",
+	"dbqueryparam":     "part of a database connection",
+	"dbtablemapping":   "part of a database connection",
+	"dbcolumnmapping":  "part of a database connection",
+	"pagetemplate":     "no describe form exists for page templates",
+	"systemoverview":   "a diagram only (describe --format elk)",
+}
+
+// treeNodeDescribable reports whether describe answers a tree node of this type.
+func treeNodeDescribable(nodeType string) bool {
+	if _, none := treeTypesWithoutSource[nodeType]; none {
+		return false
+	}
+	stmt, ok := describeMDLCommand(strings.ToUpper(nodeType), "x")
+	return ok && stmt != ""
+}
+
+// markDescribable sets Describable on every node that has a qualified name and
+// a type describe answers.
+func markDescribable(nodes []*TreeNode) {
+	for _, n := range nodes {
+		n.Describable = n.QualifiedName != "" && treeNodeDescribable(n.Type)
+		markDescribable(n.Children)
+	}
+}
+
 func buildProjectTree(projectPath string) ([]*TreeNode, error) {
-	reader, err := mpr.Open(projectPath)
-	if err != nil {
+	// Through the backend, not a concrete reader: every call below is a semantic
+	// read (ListModules, ListMicroflows, ListWorkflows, …) already on
+	// FullBackend. This was never a raw-unit tool — the Phase 3 write-up in
+	// docs/plans/2026-09-14-retire-legacy-engine.md lumped it in with the bson
+	// dumpers, which was wrong, and the census could not catch the mistake
+	// because it only records bypasses that reach an UNIMPLEMENTED method.
+	reader := modelsdkbackend.New()
+	if err := reader.ConnectReadOnly(projectPath); err != nil {
 		return nil, fmt.Errorf("failed to open project: %w", err)
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Disconnect() }()
 
-	h, err := executor.NewContainerHierarchy(reader)
+	h, err := executor.NewContainerHierarchyFromBackend(reader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build hierarchy: %w", err)
 	}
@@ -239,6 +302,28 @@ func buildProjectTree(projectPath string) ([]*TreeNode, error) {
 			continue
 		}
 		md.documents = append(md.documents, treeElement{Name: se.Name, ContainerID: se.ContainerID, Type: "scheduledevent"})
+	}
+
+	// Collect task queues
+	queues, _ := reader.ListQueues()
+	for _, q := range queues {
+		modID := h.FindModuleID(q.ContainerID)
+		md, ok := modData[modID]
+		if !ok {
+			continue
+		}
+		md.documents = append(md.documents, treeElement{Name: q.Name, ContainerID: q.ContainerID, Type: "queue"})
+	}
+
+	// Collect regular expressions
+	regexes, _ := reader.ListRegularExpressions()
+	for _, re := range regexes {
+		modID := h.FindModuleID(re.ContainerID)
+		md, ok := modData[modID]
+		if !ok {
+			continue
+		}
+		md.documents = append(md.documents, treeElement{Name: re.Name, ContainerID: re.ContainerID, Type: "regularexpression"})
 	}
 
 	// Collect JavaScript actions
@@ -443,6 +528,16 @@ func buildProjectTree(projectPath string) ([]*TreeNode, error) {
 			continue
 		}
 		md.documents = append(md.documents, treeElement{Name: svc.Name, ContainerID: svc.ContainerID, Type: "consumedmcpservice"})
+	}
+
+	pubServices, _ := reader.ListAgentEditorPublishedMCPServices()
+	for _, svc := range pubServices {
+		modID := h.FindModuleID(svc.ContainerID)
+		md, ok := modData[modID]
+		if !ok {
+			continue
+		}
+		md.documents = append(md.documents, treeElement{Name: svc.Name, ContainerID: svc.ContainerID, Type: "publishedmcpservice"})
 	}
 
 	agents, _ := reader.ListAgentEditorAgents()
@@ -792,7 +887,7 @@ func getOrCreateFolder(root *TreeNode, cache map[string]*TreeNode, path string) 
 		if builtPath != "" {
 			builtPath += "/"
 		}
-		builtPath += part
+		builtPath += folderpath.Escape(part)
 
 		if node, ok := cache[builtPath]; ok {
 			current = node
@@ -1029,23 +1124,8 @@ func buildMenuTreeNodes(parent *TreeNode, items []*types.NavMenuItem) {
 	}
 }
 
-// splitFolderPath splits a folder path like "Parent/Child" into parts.
+// splitFolderPath splits a folder path like "Parent/Child" into folder names,
+// reading a `\/` inside a name as part of it (mendixlabs/mxcli#1367).
 func splitFolderPath(path string) []string {
-	if path == "" {
-		return nil
-	}
-	var parts []string
-	start := 0
-	for i := 0; i < len(path); i++ {
-		if path[i] == '/' {
-			if i > start {
-				parts = append(parts, path[start:i])
-			}
-			start = i + 1
-		}
-	}
-	if start < len(path) {
-		parts = append(parts, path[start:])
-	}
-	return parts
+	return folderpath.Split(path)
 }

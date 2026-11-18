@@ -11,7 +11,7 @@ import (
 	mdltypes "github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 func TestBuildFlowGraph_WebServiceCallCreatesRealAction(t *testing.T) {
@@ -70,12 +70,24 @@ func TestBuildFlowGraph_WebServiceCallCreatesRealAction(t *testing.T) {
 	if action.ServiceID != "SampleSOAP.OrderService" {
 		t.Errorf("ServiceID = %q, want SampleSOAP.OrderService", action.ServiceID)
 	}
-	if action.SendMappingID != sendMappingID {
-		t.Errorf("SendMappingID = %q, want %q", action.SendMappingID, sendMappingID)
+	// The QUALIFIED NAMES, not the mappings' unit ids.
+	//
+	// This test used to assert the ids, locking in a defect: the stored
+	// ImportMappingCall's ReturnValueMapping is an ImportMappingIdentifier, and a
+	// UUID there makes the project impossible to LOAD — `mx check` stops with a
+	// StorageLoadException before validation. Measured on 11.14.0 against
+	// ako/TestApp. The mock resolving these names is what made the old
+	// expectation reachable at all; the only SOAP fixture names mappings that do
+	// not exist, so exec never took the resolving branch and nothing else noticed.
+	if string(action.SendMappingID) != "SampleSOAP.OrderRequest" {
+		t.Errorf("SendMappingID = %q, want the qualified name", action.SendMappingID)
 	}
-	if action.ReceiveMappingID != receiveMappingID {
-		t.Errorf("ReceiveMappingID = %q, want %q", action.ReceiveMappingID, receiveMappingID)
+	if string(action.ReceiveMappingID) != "SampleSOAP.OrderResponse" {
+		t.Errorf("ReceiveMappingID = %q, want the qualified name", action.ReceiveMappingID)
 	}
+	// Unused now that the ids must not reach the action, but kept wired into the
+	// mock above: a future change that starts resolving them again fails here.
+	_, _ = sendMappingID, receiveMappingID
 	if action.OutputVariable != "Root" || !action.UseReturnVariable {
 		t.Errorf("output = %q/%v", action.OutputVariable, action.UseReturnVariable)
 	}

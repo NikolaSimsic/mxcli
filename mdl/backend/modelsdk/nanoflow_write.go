@@ -5,6 +5,8 @@ package modelsdkbackend
 import (
 	"fmt"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
+
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/modelsdk/codec"
 	"github.com/mendixlabs/mxcli/modelsdk/element"
@@ -16,7 +18,7 @@ import (
 // CreateNanoflow inserts a new Microflows$Nanoflow document unit. A nanoflow
 // shares the microflow flow model (parameters + object collection + sequence
 // flows), so it reuses the microflow object/flow converters; only the top-level
-// field set differs (no ExportLevel / concurrency / URL fields).
+// field set differs (no concurrency / URL fields).
 func (b *Backend) CreateNanoflow(nf *microflows.Nanoflow) error {
 	if nf == nil {
 		return fmt.Errorf("CreateNanoflow: nil nanoflow")
@@ -27,7 +29,7 @@ func (b *Backend) CreateNanoflow(nf *microflows.Nanoflow) error {
 	if nf.ID == "" {
 		nf.ID = model.ID(mmpr.GenerateID())
 	}
-	g := nanoflowToGen(nf, b.majorVersion())
+	g := nanoflowToGen(nf, b.flowVersion())
 	g.SetID(element.ID(nf.ID))
 	assignNanoflowIDs(g)
 	contents, err := (&codec.Encoder{}).Encode(g)
@@ -48,9 +50,10 @@ func (b *Backend) UpdateNanoflow(nf *microflows.Nanoflow) error {
 	if b.writer == nil {
 		return fmt.Errorf("UpdateNanoflow: not connected for writing")
 	}
-	g := nanoflowToGen(nf, b.majorVersion())
+	g := nanoflowToGen(nf, b.flowVersion())
 	g.SetID(element.ID(nf.ID))
 	assignNanoflowIDs(g)
+	b.carryStoredNanoflowHeader(nf, g)
 	contents, err := (&codec.Encoder{}).Encode(g)
 	if err != nil {
 		return fmt.Errorf("UpdateNanoflow: encode: %w", err)
@@ -73,7 +76,7 @@ func (b *Backend) DeleteNanoflow(id model.ID) error {
 // serializeNanoflow field set (AllowedModuleRoles, Documentation, Excluded,
 // Flows, MarkAsUsed, MicroflowReturnType [only when non-void], Name,
 // ObjectCollection with parameters merged in first).
-func nanoflowToGen(nf *microflows.Nanoflow, major int) *genMf.Nanoflow {
+func nanoflowToGen(nf *microflows.Nanoflow, v flowVersion) *genMf.Nanoflow {
 	out := genMf.NewNanoflow()
 	out.SetName(nf.Name)
 	out.SetDocumentation(nf.Documentation)
@@ -83,10 +86,23 @@ func nanoflowToGen(nf *microflows.Nanoflow, major int) *genMf.Nanoflow {
 	if nf.ReturnType != nil {
 		out.SetMicroflowReturnType(microflowDataTypeToGen(nf.ReturnType))
 	}
+	// Only when authored, and only where the version declares it (10.12.0,
+	// MicroflowBase.returnVariableName); UpdateNanoflow carries a stored one
+	// otherwise.
+	if nf.ReturnVariableName != "" && v.hasReturnVariableName() {
+		out.SetReturnVariableName(nf.ReturnVariableName)
+	}
+	// Only when authored (`export level api | hidden`, mendixlabs/mxcli#1498);
+	// UpdateNanoflow carries a stored one otherwise. The metamodel's version
+	// data records no introduction for MicroflowBase.exportLevel, so it is
+	// declared at every version the writer supports.
+	if nf.ExportLevel != "" {
+		out.SetExportLevel(nf.ExportLevel)
+	}
 
 	oc := genMf.NewMicroflowObjectCollection()
 	for i, p := range nf.Parameters {
-		oc.AddObjects(microflowParameterToGen(p, i, major))
+		oc.AddObjects(microflowParameterToGen(p, i, nf.Parameters, v))
 	}
 	if nf.ObjectCollection != nil {
 		for _, obj := range nf.ObjectCollection.Objects {
@@ -97,12 +113,59 @@ func nanoflowToGen(nf *microflows.Nanoflow, major int) *genMf.Nanoflow {
 	}
 	out.SetObjectCollection(oc)
 
+	// Sequence flows and annotation flows share the Flows list, as on a
+	// microflow. The annotation flows were not written at all, so every
+	// rewrite detached each note from the activity it documents
+	// (ako/mxcli#705).
 	if nf.ObjectCollection != nil {
 		for _, f := range nf.ObjectCollection.Flows {
-			out.AddFlows(sequenceFlowToGen(f, major))
+			out.AddFlows(sequenceFlowToGen(f, v))
+		}
+		for _, af := range nf.ObjectCollection.AnnotationFlows {
+			out.AddFlows(annotationFlowToGen(af, v))
 		}
 	}
 	return out
+}
+
+// carryStoredNanoflowHeader copies onto a rebuilt nanoflow the header keys the
+// statement did not author: UseListParameterByReference, which MDL has no
+// spelling for, ExportLevel unless the statement gave `export level …`, and
+// ReturnVariableName unless it gave `returns T as $Var`. A rebuild used to omit all three, so describe -> exec
+// deleted them (ako/mxcli#705).
+//
+// Only a key the stored document carries is written. The nanoflow writer has
+// never emitted these on a new document, and Studio Pro fills an absent one on
+// load — while a key the project's metamodel does not declare makes the
+// document unopenable. Carrying what is there is safe at every version.
+func (b *Backend) carryStoredNanoflowHeader(nf *microflows.Nanoflow, g *genMf.Nanoflow) {
+	if b.reader == nil || nf.ID == "" {
+		return
+	}
+	raw, err := b.reader.GetRawUnitBytes(string(nf.ID))
+	if err != nil {
+		return
+	}
+	var stored bson.D
+	if err := bson.Unmarshal(raw, &stored); err != nil {
+		return
+	}
+	for _, e := range stored {
+		switch e.Key {
+		case "ExportLevel":
+			if v, ok := e.Value.(string); ok && v != "" && nf.ExportLevel == "" {
+				g.SetExportLevel(v)
+			}
+		case "UseListParameterByReference":
+			if v, ok := e.Value.(bool); ok {
+				g.SetUseListParameterByReference(v)
+			}
+		case "ReturnVariableName":
+			if v, ok := e.Value.(string); ok && nf.ReturnVariableName == "" {
+				g.SetReturnVariableName(v)
+			}
+		}
+	}
 }
 
 // assignNanoflowIDs assigns fresh IDs to the nanoflow's return type, object
@@ -118,10 +181,7 @@ func assignNanoflowIDs(n *genMf.Nanoflow) {
 	for _, el := range n.FlowsItems() {
 		assignID(el)
 		if sf, ok := el.(*genMf.SequenceFlow); ok {
-			for _, cv := range sf.CaseValuesItems() {
-				assignID(cv)
-			}
-			assignID(sf.Line())
+			assignSequenceFlowIDs(sf)
 		}
 	}
 }

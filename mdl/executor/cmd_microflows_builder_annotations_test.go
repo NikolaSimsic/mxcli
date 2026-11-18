@@ -146,8 +146,8 @@ func TestIfAnnotationStaysWithCorrectSplit(t *testing.T) {
 			&ast.ReturnStmt{Value: &ast.LiteralExpr{Value: false, Kind: ast.LiteralBoolean}},
 		},
 		Annotations: &ast.ActivityAnnotations{
-			Caption:        "Right format?",
-			AnnotationText: "Inner IF note",
+			Caption: "Right format?",
+			Notes:   []ast.MicroflowAnnotation{{Text: "Inner IF note"}},
 		},
 	}
 	outerIf := &ast.IfStmt{
@@ -161,8 +161,8 @@ func TestIfAnnotationStaysWithCorrectSplit(t *testing.T) {
 			&ast.ReturnStmt{Value: &ast.LiteralExpr{Value: false, Kind: ast.LiteralBoolean}},
 		},
 		Annotations: &ast.ActivityAnnotations{
-			Caption:        "String not empty?",
-			AnnotationText: "Outer IF note",
+			Caption: "String not empty?",
+			Notes:   []ast.MicroflowAnnotation{{Text: "Outer IF note"}},
 		},
 	}
 
@@ -228,7 +228,7 @@ func TestLoopBodyIfAnnotationPromotedToParentFlows(t *testing.T) {
 			&ast.LogStmt{Level: ast.LogInfo, Message: &ast.LiteralExpr{Kind: ast.LiteralString, Value: "active"}},
 		},
 		Annotations: &ast.ActivityAnnotations{
-			AnnotationText: "Nested decision note",
+			Notes: []ast.MicroflowAnnotation{{Text: "Nested decision note"}},
 		},
 	}
 	loop := &ast.LoopStmt{
@@ -263,7 +263,7 @@ func TestLoopBodyIfAnnotationPromotedToParentFlows(t *testing.T) {
 	}
 
 	annotations := buildAnnotationsByTarget(oc)
-	if got := annotations[splitID]; len(got) != 1 || got[0] != "Nested decision note" {
+	if got := annotations.byTarget[splitID]; len(got) != 1 || got[0].Caption != "Nested decision note" {
 		t.Fatalf("annotations for nested split = %#v, want Nested decision note", got)
 	}
 }
@@ -271,7 +271,7 @@ func TestLoopBodyIfAnnotationPromotedToParentFlows(t *testing.T) {
 // TestLoopCaptionPreserved covers the loop caption case — previously untested
 // per PR review. The fix for the outer-IF caption contamination bug also applied
 // the same snapshot/restore pattern to addLoopStatement and addWhileStatement.
-func TestLoopCaptionPreserved(t *testing.T) {
+func TestLoopCaptionNotStorable(t *testing.T) {
 	innerReturn := &ast.ReturnStmt{Value: &ast.LiteralExpr{Value: true, Kind: ast.LiteralBoolean}}
 	loop := &ast.LoopStmt{
 		LoopVariable: "item",
@@ -299,13 +299,18 @@ func TestLoopCaptionPreserved(t *testing.T) {
 	if len(loops) != 1 {
 		t.Fatalf("expected 1 LoopedActivity, got %d", len(loops))
 	}
-	if loops[0].Caption != "Process each item" {
-		t.Errorf("loop caption: got %q, want %q", loops[0].Caption, "Process each item")
+	// The builder must NOT carry a caption onto a LoopedActivity. generated/metamodel
+	// declares no Caption on Microflows$LoopedActivity, so the value cannot reach
+	// storage: measured on 11.6.6, `@caption` on a loop is absent from `describe`
+	// after `exec`, while `@annotation` round-trips. Setting it here wrote a field
+	// nothing reads and contradicted MDL042 (mendixlabs/mxcli#1187).
+	if loops[0].Caption != "" {
+		t.Errorf("loop caption: got %q, want %q — a loop caption is not storable, MDL042 reports it", loops[0].Caption, "")
 	}
 }
 
-// TestWhileLoopCaptionPreserved — same coverage for the WHILE shape.
-func TestWhileLoopCaptionPreserved(t *testing.T) {
+// TestWhileLoopCaptionNotStorable — same coverage for the WHILE shape.
+func TestWhileLoopCaptionNotStorable(t *testing.T) {
 	whileStmt := &ast.WhileStmt{
 		Condition: &ast.BinaryExpr{
 			Left:     &ast.VariableExpr{Name: "n"},
@@ -337,8 +342,10 @@ func TestWhileLoopCaptionPreserved(t *testing.T) {
 	if len(loops) != 1 {
 		t.Fatalf("expected 1 LoopedActivity (WHILE), got %d", len(loops))
 	}
-	if loops[0].Caption != "Until n >= 10" {
-		t.Errorf("while caption: got %q, want %q", loops[0].Caption, "Until n >= 10")
+	// Same as the for-each case above: a while builds the same LoopedActivity, so
+	// its caption is equally unstorable and equally reported as MDL042.
+	if loops[0].Caption != "" {
+		t.Errorf("while caption: got %q, want %q — a while caption is not storable, MDL042 reports it", loops[0].Caption, "")
 	}
 }
 
@@ -365,8 +372,8 @@ func TestFreeAnnotationBeforePositionStaysUnattached(t *testing.T) {
 			Level:   ast.LogInfo,
 			Message: &ast.LiteralExpr{Kind: ast.LiteralString, Value: "message"},
 			Annotations: &ast.ActivityAnnotations{
-				FreeAnnotations: []string{"free synthetic note"},
-				Position:        &ast.Position{X: 120, Y: 240},
+				FreeNotes: []ast.MicroflowAnnotation{{Text: "free synthetic note"}},
+				Position:  &ast.Position{X: 120, Y: 240},
 			},
 		},
 	}
@@ -375,14 +382,14 @@ func TestFreeAnnotationBeforePositionStaysUnattached(t *testing.T) {
 	oc := fb.buildFlowGraph(body, nil)
 
 	freeAnnotations := collectFreeAnnotations(oc)
-	if len(freeAnnotations) != 1 || freeAnnotations[0] != "free synthetic note" {
+	if len(freeAnnotations) != 1 || freeAnnotations[0].Caption != "free synthetic note" {
 		t.Fatalf("free annotations = %#v, want one free note", freeAnnotations)
 	}
 
 	attached := buildAnnotationsByTarget(oc)
-	for activityID, captions := range attached {
-		for _, caption := range captions {
-			if caption == "free synthetic note" {
+	for activityID, notes := range attached.byTarget {
+		for _, n := range notes {
+			if n.Caption == "free synthetic note" {
 				t.Fatalf("free note was attached to activity %s", activityID)
 			}
 		}
@@ -395,8 +402,8 @@ func TestMultipleFreeAnnotationsBeforePositionStayUnattached(t *testing.T) {
 			Level:   ast.LogInfo,
 			Message: &ast.LiteralExpr{Kind: ast.LiteralString, Value: "message"},
 			Annotations: &ast.ActivityAnnotations{
-				FreeAnnotations: []string{"first free note", "second free note"},
-				Position:        &ast.Position{X: 120, Y: 240},
+				FreeNotes: []ast.MicroflowAnnotation{{Text: "first free note"}, {Text: "second free note"}},
+				Position:  &ast.Position{X: 120, Y: 240},
 			},
 		},
 	}
@@ -410,8 +417,8 @@ func TestMultipleFreeAnnotationsBeforePositionStayUnattached(t *testing.T) {
 		t.Fatalf("free annotations = %#v, want %#v", freeAnnotations, want)
 	}
 	for i, wantText := range want {
-		if freeAnnotations[i] != wantText {
-			t.Fatalf("free annotation %d = %q, want %q", i, freeAnnotations[i], wantText)
+		if freeAnnotations[i].Caption != wantText {
+			t.Fatalf("free annotation %d = %q, want %q", i, freeAnnotations[i].Caption, wantText)
 		}
 	}
 }
@@ -457,7 +464,7 @@ func TestIfBranchActionAnnotationStaysWithAction(t *testing.T) {
 				Level:   ast.LogInfo,
 				Message: &ast.LiteralExpr{Kind: ast.LiteralString, Value: "branch"},
 				Annotations: &ast.ActivityAnnotations{
-					AnnotationText: "Branch note",
+					Notes: []ast.MicroflowAnnotation{{Text: "Branch note"}},
 				},
 			},
 		},
@@ -482,7 +489,7 @@ func TestIfBranchActionAnnotationStaysWithAction(t *testing.T) {
 	}
 
 	attached := buildAnnotationsByTarget(oc)
-	if got := attached[logID]; len(got) != 1 || got[0] != "Branch note" {
+	if got := attached.byTarget[logID]; len(got) != 1 || got[0].Caption != "Branch note" {
 		t.Fatalf("branch log annotations = %#v, want [Branch note]", got)
 	}
 }

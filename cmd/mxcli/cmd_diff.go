@@ -4,20 +4,38 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 
+	"github.com/mendixlabs/mxcli/mdl/backend"
+	modelsdkbackend "github.com/mendixlabs/mxcli/mdl/backend/modelsdk"
 	"github.com/mendixlabs/mxcli/mdl/executor"
+	"github.com/mendixlabs/mxcli/mdl/scriptdiff"
 	"github.com/mendixlabs/mxcli/mdl/visitor"
 	"github.com/spf13/cobra"
 )
 
 var diffCmd = &cobra.Command{
 	Use:   "diff <script.mdl>",
-	Short: "Compare an MDL script against the current project state",
-	Long: `Compare an MDL script file against the current state of a Mendix project.
+	Short: "Show what executing an MDL script would change in the project",
+	Long: `Show what "mxcli exec" would change in a Mendix project, without changing it.
 
-Shows the differences between what the script would create/modify and what
-currently exists in the project.
+The script is executed by exec itself, against a scratch copy of the project,
+and the copy is then compared with the project unit by unit. What diff reports
+is therefore exactly what exec would write: the documents it adds, rewrites,
+moves or removes (an entity or association counts as its own document), and
+the files next to the model it writes. Each change is shown as the DESCRIBE of
+the document before and after. A unit exec rewrites whose description does
+not change says which properties change instead.
+
+Like exec, diff runs the pre-flight checks first (skip them with --no-check),
+runs the statements in order under the script's language header, and stops at
+the first error (--continue-on-error runs every statement). A script exec
+would refuse, or a statement it would stop at, is reported as Refused.
+
+The project itself is only read. The scratch copy leaves out .git, deployment,
+releases and node_modules, and is deleted afterwards.
 
 Output Formats:
   unified  - Traditional unified diff format (default)
@@ -44,20 +62,24 @@ Examples:
 		format, _ := cmd.Flags().GetString("format")
 		useColor, _ := cmd.Flags().GetBool("color")
 		width, _ := cmd.Flags().GetInt("width")
+		skipCheck, _ := cmd.Flags().GetBool("no-check")
+		verbose, _ := cmd.Flags().GetBool("verbose")
+		continueOnError, _ := cmd.Flags().GetBool("continue-on-error")
+		showExecOutput, _ := cmd.Flags().GetBool("exec-output")
+		depPolicy := deprecationPolicy(cmd)
+		refuseJSONFlag("diff", "--format unified|side|struct")
 
 		if projectPath == "" {
 			fmt.Fprintln(os.Stderr, "Error: --project (-p) is required")
 			os.Exit(1)
 		}
 
-		// Read the script file
-		content, err := os.ReadFile(filePath)
+		content, err := readMDLSource(filePath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error reading file: %v\n", err)
 			os.Exit(1)
 		}
 
-		// Parse the script
 		prog, errs := visitor.Build(string(content))
 		if len(errs) > 0 {
 			fmt.Fprintf(os.Stderr, "Syntax errors found:\n")
@@ -66,31 +88,38 @@ Examples:
 			}
 			os.Exit(1)
 		}
+		if line, bad := unparsableInput(string(content), len(prog.Statements)); bad {
+			fmt.Fprintln(os.Stderr, unparsableInputError(filePath, line))
+			os.Exit(1)
+		}
 
-		// Create executor and connect
-		exec, logger := newLoggedExecutor("subcommand")
-		defer logger.Close()
-		defer exec.Close()
-
-		connectProg, _ := visitor.Build(fmt.Sprintf("CONNECT LOCAL '%s'", visitor.QuoteString(projectPath)))
-		for _, stmt := range connectProg.Statements {
-			if err := exec.Execute(stmt); err != nil {
-				fmt.Fprintf(os.Stderr, "Error connecting: %v\n", err)
-				os.Exit(1)
+		opts := scriptdiff.Options{
+			// Always the file engine, whatever --mcp says: the script is
+			// executed for real, and only the scratch copy may receive it.
+			NewBackend:      func() backend.FullBackend { return modelsdkbackend.New() },
+			ContinueOnError: continueOnError,
+			Preflight: func(scratch *executor.Executor, w io.Writer) string {
+				// Predict exec: a forward flow call only without --continue-on-error (#1405).
+				scratch.SetForwardFlowCalls(!continueOnError)
+				return execPreflight(scratch, prog, projectPath, filePath, skipCheck, verbose, continueOnError, depPolicy, w, useColor)
+			},
+		}
+		if filePath != "-" {
+			if abs, absErr := filepath.Abs(filePath); absErr == nil {
+				opts.ScriptDir = filepath.Dir(abs)
 			}
 		}
 
-		// Run diff
-		opts := executor.DiffOptions{
-			Format:   executor.DiffFormat(format),
-			UseColor: useColor,
-			Width:    width,
-		}
-
-		if err := exec.DiffProgram(prog, opts); err != nil {
+		report, err := scriptdiff.Run(projectPath, prog, opts)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
+		report.Write(os.Stdout, executor.DiffOptions{
+			Format:   executor.DiffFormat(format),
+			UseColor: useColor,
+			Width:    width,
+		}, showExecOutput)
 	},
 }
 
@@ -101,6 +130,11 @@ var diffLocalCmd = &cobra.Command{
 
 This command finds modified mxunit files in the mprcontents/ folder and shows
 the differences as MDL. Only works with MPR v2 format (Mendix 10.18+).
+
+A unit that changed only in properties the MDL does not show (navigation,
+security, an index, …) is listed on one line naming those properties.
+Configuration constant values are masked: a changed one shows as
+<masked: old value> against <masked: new value>.
 
 The --ref flag accepts any git ref or range (e.g., HEAD, main, main..feature-branch).
 
@@ -129,6 +163,7 @@ Examples:
 		format, _ := cmd.Flags().GetString("format")
 		useColor, _ := cmd.Flags().GetBool("color")
 		width, _ := cmd.Flags().GetInt("width")
+		refuseJSONFlag("diff-local", "--format unified|side|struct")
 
 		if projectPath == "" {
 			fmt.Fprintln(os.Stderr, "Error: --project (-p) is required")

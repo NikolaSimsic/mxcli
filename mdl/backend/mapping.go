@@ -23,6 +23,29 @@ type MappingBackend interface {
 	DeleteExportMapping(id model.ID) error
 	MoveExportMapping(em *model.ExportMapping) error
 
+	// ListMessageDefinitionCollections reads the message-definition documents.
+	ListMessageDefinitionCollections() ([]*model.MessageDefinitionCollection, error)
+	// CreateMessageDefinitionCollection / Update / Delete author the document
+	// (ako/mxcli#272). A message definition is a selection over the domain
+	// model — unlike an XML schema or a WSDL it holds nothing external — which
+	// is what makes it the one non-JSON mapping source a script can create.
+	CreateMessageDefinitionCollection(c *model.MessageDefinitionCollection) error
+	UpdateMessageDefinitionCollection(c *model.MessageDefinitionCollection) error
+	DeleteMessageDefinitionCollection(id string) error
+
+	// ListMessageDefinitionDocuments reads the MessageDefinition2 documents,
+	// the per-definition storage that replaced collections in Mendix 11.15
+	// (ako/mxcli#987). Create / Update / Delete author one.
+	ListMessageDefinitionDocuments() ([]*model.MessageDefinitionDocument, error)
+	CreateMessageDefinitionDocument(d *model.MessageDefinitionDocument) error
+	UpdateMessageDefinitionDocument(d *model.MessageDefinitionDocument) error
+	DeleteMessageDefinitionDocument(id string) error
+
+	// ListXmlSchemas reads the project's XML schema documents. Read-only —
+	// there is no CREATE for one — and used to resolve a mapping's
+	// `with xml schema` reference before mxbuild reports it as CE1613.
+	ListXmlSchemas() ([]*types.XmlSchema, error)
+
 	ListJsonStructures() ([]*types.JsonStructure, error)
 	GetJsonStructureByQualifiedName(moduleName, name string) (*types.JsonStructure, error)
 	CreateJsonStructure(js *types.JsonStructure) error

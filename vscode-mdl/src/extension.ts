@@ -21,7 +21,8 @@ const BUILD_TIME = typeof __BUILD_TIME__ !== 'undefined' ? __BUILD_TIME__ : 'dev
 const GIT_COMMIT = typeof __GIT_COMMIT__ !== 'undefined' ? __GIT_COMMIT__ : 'unknown';
 
 let client: LanguageClient | undefined;
-const outputChannel = vscode.window.createOutputChannel('MDL Language Server');
+// { log: true } yields a LogOutputChannel, which is what LanguageClientOptions.outputChannel requires.
+const outputChannel = vscode.window.createOutputChannel('MDL Language Server', { log: true });
 
 const MDL_SCHEME = 'mendix-mdl';
 
@@ -117,7 +118,7 @@ export function activate(context: vscode.ExtensionContext) {
 			}
 
 			// Try the given type first, then fallback to other common types
-			const fallbackTypes = ['entity', 'microflow', 'nanoflow', 'page', 'enumeration', 'snippet', 'constant', 'javaaction', 'javascriptaction', 'scheduledevent', 'buildingblock', 'pagetemplate', 'imagecollection', 'businesseventservice', 'databaseconnection', 'publishedrestservice', 'workflow', 'layout', 'importmapping', 'exportmapping', 'restclient', 'jsonstructure', 'agent', 'aimodel', 'knowledgebase', 'consumedmcpservice', 'datatransformer'];
+			const fallbackTypes = ['entity', 'microflow', 'nanoflow', 'page', 'enumeration', 'snippet', 'constant', 'javaaction', 'javascriptaction', 'scheduledevent', 'queue', 'buildingblock', 'pagetemplate', 'imagecollection', 'businesseventservice', 'databaseconnection', 'publishedrestservice', 'workflow', 'layout', 'importmapping', 'exportmapping', 'restclient', 'jsonstructure', 'agent', 'aimodel', 'knowledgebase', 'consumedmcpservice', 'datatransformer'];
 			const typesToTry = [type, ...fallbackTypes.filter(t => t !== type)];
 
 			for (const tryType of typesToTry) {

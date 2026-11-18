@@ -3,6 +3,8 @@
 package executor
 
 import (
+	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/visitor"
 	"strings"
 	"testing"
 
@@ -15,7 +17,7 @@ func formatSingleActivity(act workflows.WorkflowActivity, indent string) []strin
 	flow := &workflows.Flow{
 		Activities: []workflows.WorkflowActivity{act},
 	}
-	return formatWorkflowActivities(flow, indent)
+	return formatWorkflowActivities(nil, flow, indent)
 }
 
 // --- P0: strip Module.Microflow prefix from parameter names ---
@@ -54,7 +56,7 @@ func TestFormatCallMicroflowTask_ParameterNameStripping(t *testing.T) {
 			task.Name = "callMfTask"
 			task.Caption = "Call MF"
 
-			lines := formatCallMicroflowTask(task, "  ")
+			lines := formatCallMicroflowTask(nil, task, "  ")
 			output := strings.Join(lines, "\n")
 
 			wantFragment := tc.wantParamName + " = "
@@ -83,19 +85,32 @@ func TestFormatJumpTo_CaptionCommentFormat(t *testing.T) {
 			name:    "caption used over name",
 			caption: "Go Back to Review",
 			actName: "jumpAct1",
-			want:    "jump to target1 comment 'Go Back to Review'",
+			want:    "jump to target1 caption 'Go Back to Review'",
 		},
 		{
-			name:    "name fallback when caption empty",
+			// Was: fell back to the activity name and rendered
+			// `caption 'jumpAct1'`. That comment was never authored — echoing it
+			// made a plain `jump to X;` round-trip as `jump to X caption '…'`
+			// (issuetracker #16). An absent caption must emit no comment clause.
+			name:    "no comment clause when caption empty",
 			caption: "",
 			actName: "jumpAct1",
-			want:    "jump to target1 comment 'jumpAct1'",
+			want:    "jump to target1;",
+		},
+		{
+			// buildJumpTo defaults Caption to the TARGET name, which is the exact
+			// shape issuetracker #16 reported. It carries no authored information,
+			// so it must not be echoed either.
+			name:    "no comment clause when caption is the derived target name",
+			caption: "target1",
+			actName: "jumpAct2",
+			want:    "jump to target1;",
 		},
 		{
 			name:    "caption with single quote escaped",
 			caption: "it's done",
 			actName: "jumpAct1",
-			want:    "jump to target1 comment 'it''s done'",
+			want:    "jump to target1 caption 'it''s done'",
 		},
 	}
 
@@ -130,14 +145,18 @@ func TestFormatWaitForTimer_CaptionCommentFormat(t *testing.T) {
 			caption: "Wait 2 Hours",
 			actName: "waitAct1",
 			delay:   "${PT2H}",
-			want:    "wait for timer '${PT2H}' comment 'Wait 2 Hours'",
+			// The stored name is not derivable from the caption, so describe
+			// emits it — dropping it is what broke `jump to` (ako/mxcli#408).
+			want: "wait for timer waitAct1 '${PT2H}' caption 'Wait 2 Hours'",
 		},
 		{
 			name:    "name fallback no delay",
 			caption: "",
 			actName: "waitAct1",
 			delay:   "",
-			want:    "wait for timer comment 'waitAct1'",
+			// Caption falls back to the name here, so the name is derivable and
+			// the clause is suppressed: unchanged output.
+			want: "wait for timer caption 'waitAct1'",
 		},
 	}
 
@@ -170,13 +189,14 @@ func TestFormatCallWorkflowActivity_CaptionCommentFormat(t *testing.T) {
 			name:    "caption used",
 			caption: "Run Sub-Workflow",
 			actName: "callWf1",
-			want:    "call workflow Module.SubFlow comment 'Run Sub-Workflow'",
+			// callWf1 is not the called workflow's name, so it is emitted.
+			want: "call workflow Module.SubFlow as callWf1 caption 'Run Sub-Workflow'",
 		},
 		{
 			name:    "name fallback",
 			caption: "",
 			actName: "callWf1",
-			want:    "call workflow Module.SubFlow comment 'callWf1'",
+			want:    "call workflow Module.SubFlow as callWf1 caption 'callWf1'",
 		},
 	}
 
@@ -188,12 +208,220 @@ func TestFormatCallWorkflowActivity_CaptionCommentFormat(t *testing.T) {
 			activity.Name = tc.actName
 			activity.Caption = tc.caption
 
-			lines := formatCallWorkflowActivity(activity, "")
+			lines := formatCallWorkflowActivity(nil, activity, "")
 			output := strings.Join(lines, "\n")
 
 			if !strings.Contains(output, tc.want) {
 				t.Errorf("expected output to contain %q, got:\n%s", tc.want, output)
 			}
 		})
+	}
+}
+
+// TestExclusiveSplit_NormalizesWorkflowContextExpression pins issuetracker #17:
+// a decision's condition was written verbatim while call-microflow parameter
+// mappings were normalized, so the documented `$workflowContext` reached Mendix
+// as an undefined variable and the build failed CE0117 "Error(s) in expression".
+// mxcli always names the context parameter `WorkflowContext`, and Mendix
+// expressions are case-sensitive, so every case variant must normalize to it.
+func TestExclusiveSplit_NormalizesWorkflowContextExpression(t *testing.T) {
+	for _, written := range []string{
+		"$workflowContext/Title = 'x'",
+		"$WORKFLOWCONTEXT/Title = 'x'",
+		"$WorkflowContext/Title = 'x'",
+	} {
+		split := &workflows.ExclusiveSplitActivity{Expression: written}
+		split.Name = "Decision"
+		autoBindActivitiesInFlow(nil, []workflows.WorkflowActivity{split}, contextExprNormalizer{})
+		if want := "$WorkflowContext/Title = 'x'"; split.Expression != want {
+			t.Errorf("expression %q normalized to %q, want %q", written, split.Expression, want)
+		}
+	}
+}
+
+// TestContextExprNormalizer_AliasesDeclaredParameterName pins the other half of
+// issuetracker #17: `create workflow … parameter $Ctx: …` lets the author name
+// the context, but mxcli stores the parameter as `WorkflowContext` regardless —
+// so `$Ctx` in an expression was an undefined variable (CE0117). The declared
+// name must be aliased onto the stored one.
+func TestContextExprNormalizer_AliasesDeclaredParameterName(t *testing.T) {
+	tests := []struct {
+		name     string
+		declared string
+		expr     string
+		want     string
+	}{
+		{
+			name:     "declared alias rewritten",
+			declared: "$Ctx",
+			expr:     "$Ctx/Total > 1000",
+			want:     "$WorkflowContext/Total > 1000",
+		},
+		{
+			name:     "declared alias without sigil",
+			declared: "Request",
+			expr:     "$Request/Status = 'New'",
+			want:     "$WorkflowContext/Status = 'New'",
+		},
+		{
+			name:     "canonical name still normalized when an alias is declared",
+			declared: "$Ctx",
+			expr:     "$workflowContext/Total > 1000",
+			want:     "$WorkflowContext/Total > 1000",
+		},
+		{
+			// A variable that merely starts with the declared name must not be
+			// mangled — the alias is a whole-word match.
+			name:     "longer variable sharing the prefix is untouched",
+			declared: "$Ctx",
+			expr:     "$CtxItem/Total > $Ctx/Limit",
+			want:     "$CtxItem/Total > $WorkflowContext/Limit",
+		},
+		{
+			name:     "no declared name normalizes casing only",
+			declared: "",
+			expr:     "$workflowcontext/Total > 1000",
+			want:     "$WorkflowContext/Total > 1000",
+		},
+		{
+			name:     "empty expression stays empty",
+			declared: "$Ctx",
+			expr:     "",
+			want:     "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := newContextExprNormalizer(tc.declared).rewrite(tc.expr)
+			if got != tc.want {
+				t.Errorf("rewrite(%q) with declared %q = %q, want %q", tc.expr, tc.declared, got, tc.want)
+			}
+		})
+	}
+}
+
+// Describe output must re-parse with every boundary event intact. The integration
+// round trips compare describe output but never feed it back, which is how an
+// activity with two boundary events described into MDL that did not parse.
+func TestWorkflowDescribe_TwoBoundaryEventsReparse(t *testing.T) {
+	events := func() []*workflows.BoundaryEvent {
+		return []*workflows.BoundaryEvent{
+			{EventType: "InterruptingTimer", TimerDelay: "addDays([%CurrentDateTime%], 3)"},
+			{EventType: "NonInterruptingTimer", TimerDelay: "addDays([%CurrentDateTime%], 1)"},
+		}
+	}
+	task := &workflows.UserTask{Page: "M.P", Outcomes: []*workflows.UserTaskOutcome{{Value: "Ok"}, {Value: "No"}}}
+	task.Name, task.Caption = "T", "Task"
+	task.BoundaryEvents = events()
+	wait := &workflows.WaitForNotificationActivity{}
+	wait.Name, wait.Caption = "w1", "Wait"
+	wait.BoundaryEvents = events()
+
+	for name, act := range map[string]workflows.WorkflowActivity{"user task": task, "wait for notification": wait} {
+		t.Run(name, func(t *testing.T) {
+			body := strings.Join(formatSingleActivity(act, "  "), "\n")
+			src := "create workflow M.W parameter $C: M.E\nbegin\n" + body + "\nend workflow;"
+			prog, errs := visitor.Build(src)
+			if len(errs) > 0 {
+				t.Fatalf("describe output does not parse: %v\n%s", errs, src)
+			}
+			var n int
+			switch a := prog.Statements[0].(*ast.CreateWorkflowStmt).Activities[0].(type) {
+			case *ast.WorkflowUserTaskNode:
+				n = len(a.BoundaryEvents)
+			case *ast.WorkflowWaitForNotificationNode:
+				n = len(a.BoundaryEvents)
+			}
+			if n != 2 {
+				t.Errorf("boundary events after re-parse = %d, want 2\n%s", n, src)
+			}
+		})
+	}
+}
+
+// A workflow whose branch ends the workflow described as if it did not: every
+// EndWorkflowActivity was skipped as "implicit", nested ones included, so Studio
+// Pro's `Reject -> End` came out as `'Reject' { }` — which, re-executed, falls
+// through into the main flow. Only the main flow's own End is implicit.
+func TestDescribeWorkflow_NestedEndIsEmitted(t *testing.T) {
+	end := func(caption string) *workflows.Flow {
+		e := &workflows.EndWorkflowActivity{}
+		e.Name = "end1"
+		e.Caption = caption
+		return &workflows.Flow{Activities: []workflows.WorkflowActivity{e}}
+	}
+	decision := &workflows.ExclusiveSplitActivity{Expression: "$WorkflowContext/Flag"}
+	decision.Name = "decision1"
+	decision.Caption = "Decision"
+	decision.Outcomes = []workflows.ConditionOutcome{
+		&workflows.BooleanConditionOutcome{Value: true, Flow: end("Rejected")},
+		&workflows.BooleanConditionOutcome{Value: false, Flow: end("End")},
+	}
+
+	out := strings.Join(formatSingleActivity(decision, "  "), "\n")
+	if !strings.Contains(out, "end workflow caption 'Rejected';") {
+		t.Errorf("a captioned nested End must describe as `end workflow caption 'Rejected';`, got:\n%s", out)
+	}
+	if strings.Count(out, "end workflow") != 2 || !strings.Contains(out, "end workflow;") {
+		t.Errorf("a nested End with the default caption must describe as a bare `end workflow;`, got:\n%s", out)
+	}
+}
+
+// ako/mxcli#1715: describe prints a timer boundary event's caption, and the
+// output re-parses with it, so describe -> create or modify keeps it.
+func TestWorkflowDescribe_TimerBoundaryEventCaptionReparses(t *testing.T) {
+	task := &workflows.UserTask{Page: "M.P", Outcomes: []*workflows.UserTaskOutcome{{Value: "Ok"}}}
+	task.Name, task.Caption = "T", "Task"
+	task.BoundaryEvents = []*workflows.BoundaryEvent{
+		{EventType: "InterruptingTimer", TimerDelay: "addDays([%CurrentDateTime%], 3)", Caption: "Escalate"},
+		{EventType: "NonInterruptingTimer", Caption: "It's late"},
+		{EventType: "NonInterruptingTimer", TimerDelay: "addDays([%CurrentDateTime%], 1)"}, // control: no caption
+	}
+	body := strings.Join(formatSingleActivity(task, "  "), "\n")
+	src := "create workflow M.W parameter $C: M.E\nbegin\n" + body + "\nend workflow;"
+	prog, errs := visitor.Build(src)
+	if len(errs) > 0 {
+		t.Fatalf("describe output does not parse: %v\n%s", errs, src)
+	}
+	got := prog.Statements[0].(*ast.CreateWorkflowStmt).Activities[0].(*ast.WorkflowUserTaskNode).BoundaryEvents
+	if len(got) != 3 {
+		t.Fatalf("boundary events after re-parse = %d, want 3\n%s", len(got), src)
+	}
+	for i, want := range []string{"Escalate", "It's late", ""} {
+		if got[i].Caption != want {
+			t.Errorf("event %d caption = %q, want %q\n%s", i, got[i].Caption, want, src)
+		}
+	}
+}
+
+// ako/mxcli#1714: describe prints a text's parameters and a task name that is
+// not the caption, and the output re-parses into the same values.
+func TestWorkflowDescribe_TextTemplatesReparse(t *testing.T) {
+	task := &workflows.UserTask{Page: "M.P", Outcomes: []*workflows.UserTaskOutcome{{Value: "Ok"}},
+		TaskName: "Review {1}", TaskNameParams: []string{"$WorkflowContext/Name"},
+		TaskDescription: "It's {1} by {2}", TaskDescriptionParams: []string{"toString($WorkflowContext/Amount)", "$WorkflowInstance/Name"}}
+	task.Name, task.Caption = "T", "Task"
+	same := &workflows.UserTask{Page: "M.P", Outcomes: []*workflows.UserTaskOutcome{{Value: "Ok"}}, TaskName: "Same"}
+	same.Name, same.Caption = "S", "Same" // control: the task name is the caption, so no clause
+	body := strings.Join(append(formatSingleActivity(task, "  "), formatSingleActivity(same, "  ")...), "\n")
+	if strings.Count(body, "task name") != 1 {
+		t.Errorf("want one `task name` clause (not for the task named by its caption):\n%s", body)
+	}
+	src := "create workflow M.W parameter $C: M.E\n  display " + workflowTemplateMDL("For {1}", []string{"$WorkflowContext/Name"}) + "\nbegin\n" + body + "\nend workflow;"
+	prog, errs := visitor.Build(src)
+	if len(errs) > 0 {
+		t.Fatalf("describe output does not parse: %v\n%s", errs, src)
+	}
+	wf := prog.Statements[0].(*ast.CreateWorkflowStmt)
+	got := wf.Activities[0].(*ast.WorkflowUserTaskNode)
+	if got.TaskName != "Review {1}" || strings.Join(workflowTemplateExprs(got.TaskNameParams), ",") != "$WorkflowContext/Name" {
+		t.Errorf("task name re-parsed as %q %v\n%s", got.TaskName, got.TaskNameParams, src)
+	}
+	if got.TaskDescription != "It's {1} by {2}" || strings.Join(workflowTemplateExprs(got.TaskDescriptionParams), ",") != "toString($WorkflowContext/Amount),$WorkflowInstance/Name" {
+		t.Errorf("description re-parsed as %q %v\n%s", got.TaskDescription, got.TaskDescriptionParams, src)
+	}
+	if strings.Join(workflowTemplateExprs(wf.DisplayParams), ",") != "$WorkflowContext/Name" {
+		t.Errorf("display re-parsed as %v", wf.DisplayParams)
 	}
 }

@@ -4,7 +4,9 @@ package modelsdkbackend
 
 import (
 	"fmt"
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"sort"
+	"strconv"
 
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/modelsdk/codec"
@@ -15,6 +17,7 @@ import (
 	genTexts "github.com/mendixlabs/mxcli/modelsdk/gen/texts"
 	mmpr "github.com/mendixlabs/mxcli/modelsdk/mpr"
 	"github.com/mendixlabs/mxcli/modelsdk/property"
+	"github.com/mendixlabs/mxcli/sdk/javaactions"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
 )
 
@@ -48,6 +51,12 @@ func init() {
 	codec.RegisterTypeDefaults("Microflows$NanoflowCall", codec.TypeDefaults{
 		MandatoryListMarkers: map[string]int32{"ParameterMappings": 2},
 	})
+	// A rule split's RuleCall follows the same shape: the ParameterMappings list
+	// is always emitted, with marker 2 (legacy writer, verified vs mxbuild 11.13).
+	codec.RegisterTypeDefaults("Microflows$RuleCall", codec.TypeDefaults{
+		MandatoryListMarkers: map[string]int32{"ParameterMappings": 2},
+	})
+	codec.RegisterListMarker("Microflows$RuleCallParameterMapping", 2)
 	codec.RegisterListMarker("Microflows$MicroflowCallParameterMapping", 2)
 	codec.RegisterListMarker("Microflows$NanoflowCallParameterMapping", 2)
 	// A JavaActionCallAction always serializes QueueSettings as null; its
@@ -56,10 +65,19 @@ func init() {
 	codec.RegisterTypeDefaults("Microflows$JavaActionCallAction", codec.TypeDefaults{
 		NullFields: []string{"QueueSettings"},
 	})
+	// A QueueSettings written by `IN QUEUE` names the queue and configures no
+	// retry. Retry (Queues$QueueFixedRetry / Queues$QueueExponentialRetry) has no
+	// MDL surface; serializing it as null mirrors how the call itself serializes
+	// an absent QueueSettings. A stored retry is never overwritten by this —
+	// checkNoQueuedCalls refuses the rewrite instead (guard-don't-drop).
+	codec.RegisterTypeDefaults("Queues$QueueSettings", codec.TypeDefaults{
+		NullFields: []string{"Retry"},
+	})
 	codec.RegisterListMarker("Microflows$JavaActionParameterMapping", 2)
 	codec.RegisterTypeDefaults("Microflows$TypedTemplate", codec.TypeDefaults{
 		MandatoryListMarkers: map[string]int32{"Arguments": 2},
 	})
+	codec.RegisterListMarker("Microflows$PrimitiveTypedTemplateArgument", 2)
 	// EXECUTE DATABASE QUERY action: both mapping lists empty as marker 2; their
 	// child mapping $Types use marker 2 too.
 	codec.RegisterListMarker("DatabaseConnector$ConnectionParameterMapping", 2)
@@ -110,12 +128,12 @@ func init() {
 	codec.RegisterTypeDefaults("Microflows$ResultHandling", codec.TypeDefaults{
 		NullFields: []string{"ImportMappingCall"},
 	})
-	// A ShowPage FormSettings always carries a TitleOverride (empty Microflows$TextTemplate)
-	// and each PageParameterMapping a Variable (empty Forms$PageVariable); both are built
-	// directly. FormSettings' ParameterMappings list empties as marker 2.
-	codec.RegisterTypeDefaults("Forms$FormSettings", codec.TypeDefaults{
-		MandatoryListMarkers: map[string]int32{"ParameterMappings": 2},
-	})
+	// Each PageParameterMapping carries a Variable (empty Forms$PageVariable), built
+	// directly. Forms$FormSettings' own defaults — the marker-2 ParameterMappings list
+	// and the null TitleOverride — are registered ONCE, in widget_write.go:
+	// RegisterTypeDefaults overwrites rather than merges, so a second registration for
+	// the same $Type silently wins by init order. A duplicate here is what swallowed
+	// the TitleOverride null and kept #812 alive after the first attempt at fixing it.
 }
 
 // majorVersion returns the project's Mendix major version (for version-gated BSON).
@@ -126,10 +144,69 @@ func (b *Backend) majorVersion() int {
 	return 11
 }
 
+// flowVersion is the Mendix version a flow document — microflow, nanoflow or
+// rule — is written for. Flow properties changed shape within Mendix 10, so
+// the major alone cannot gate them (mendixlabs/mxcli#1410: every flow write on
+// a Mendix 9 project was refused for a StableId and a CaseValues list it
+// cannot store, and 10.0–10.14 for the CaseValues list).
+//
+// The floors are the Model SDK's StructureVersionInfo (mendixmodelsdk
+// 4.116.0), and the shapes are measured: a Studio Pro 9.24.30 document, and
+// the same document after `mx convert` to 10.12.19.
+type flowVersion struct{ major, minor int }
+
+// newestFlowVersion is what an unreadable project version is written as —
+// the newest shape, as majorVersion() has always defaulted to 11.
+var newestFlowVersion = flowVersion{major: 11}
+
+func (v flowVersion) atLeast(major, minor int) bool {
+	return v.major > major || v.major == major && v.minor >= minor
+}
+
+// Microflow.stableId, introduced in 10.2.0.
+func (v flowVersion) hasStableID() bool { return v.atLeast(10, 2) }
+
+// SequenceFlow.caseValues, introduced in 10.15.0 when the single caseValue
+// (stored as NewCaseValue) was deleted.
+func (v flowVersion) hasCaseValueList() bool { return v.atLeast(10, 15) }
+
+// Flow.line, introduced in 10.16.0 when Origin/DestinationBezierVector were
+// deleted. Flow.lineType lived between 10.8.0 and 10.16.0.
+func (v flowVersion) hasLine() bool     { return v.atLeast(10, 16) }
+func (v flowVersion) hasLineType() bool { return v.atLeast(10, 8) && !v.hasLine() }
+
+// MicroflowBase.returnVariableName, introduced in 10.12.0.
+func (v flowVersion) hasReturnVariableName() bool { return v.atLeast(10, 12) }
+
+// MicroflowParameterObject.isRequired / defaultValue, introduced in 10.17.0.
+func (v flowVersion) hasParameterDefaults() bool { return v.atLeast(10, 17) }
+
+// flowVersion returns the version this project's flow documents are written for.
+func (b *Backend) flowVersion() flowVersion {
+	pv := b.ProjectVersion()
+	if pv == nil || pv.MajorVersion == 0 {
+		return newestFlowVersion
+	}
+	return flowVersion{major: pv.MajorVersion, minor: pv.MinorVersion}
+}
+
+// microflowEncoder encodes a Microflows$Microflow for v. StableId comes from a
+// registered Studio Pro default (a fresh GUID), not a gen property, so leaving
+// it out below its floor is the encoder's job.
+func microflowEncoder(v flowVersion) *codec.Encoder {
+	if v.hasStableID() {
+		return &codec.Encoder{}
+	}
+	return &codec.Encoder{OmitKeys: map[string]map[string]bool{"Microflows$Microflow": {"StableId": true}}}
+}
+
 // CreateMicroflow adds a new microflow document (a top-level unit).
 func (b *Backend) CreateMicroflow(mf *microflows.Microflow) error {
 	if mf == nil {
 		return fmt.Errorf("CreateMicroflow: nil microflow")
+	}
+	if err := flowImportMappingEntityError(mf.ObjectCollection); err != nil {
+		return fmt.Errorf("CreateMicroflow %s: %w", mf.Name, err)
 	}
 	if b.writer == nil {
 		return fmt.Errorf("CreateMicroflow: not connected for writing")
@@ -137,12 +214,16 @@ func (b *Backend) CreateMicroflow(mf *microflows.Microflow) error {
 	if mf.ID == "" {
 		mf.ID = model.ID(mmpr.GenerateID())
 	}
-	gm := microflowToGen(mf, b.majorVersion())
+	fv := b.flowVersion()
+	gm := microflowToGen(mf, fv)
 	gm.SetID(element.ID(mf.ID))
 	assignMicroflowIDs(gm)
-	contents, err := (&codec.Encoder{}).Encode(gm)
+	contents, err := microflowEncoder(fv).Encode(gm)
 	if err != nil {
 		return fmt.Errorf("CreateMicroflow: encode: %w", err)
+	}
+	if contents, err = patchMicroflowToolboxEntries(contents, mf); err != nil {
+		return fmt.Errorf("CreateMicroflow: %w", err)
 	}
 	return b.writer.InsertUnit(string(mf.ID), string(mf.ContainerID), "Documents", "Microflows$Microflow", contents)
 }
@@ -152,15 +233,22 @@ func (b *Backend) UpdateMicroflow(mf *microflows.Microflow) error {
 	if mf == nil {
 		return fmt.Errorf("UpdateMicroflow: nil microflow")
 	}
+	if err := flowImportMappingEntityError(mf.ObjectCollection); err != nil {
+		return fmt.Errorf("UpdateMicroflow %s: %w", mf.Name, err)
+	}
 	if b.writer == nil {
 		return fmt.Errorf("UpdateMicroflow: not connected for writing")
 	}
-	gm := microflowToGen(mf, b.majorVersion())
+	fv := b.flowVersion()
+	gm := microflowToGen(mf, fv)
 	gm.SetID(element.ID(mf.ID))
 	assignMicroflowIDs(gm)
-	contents, err := (&codec.Encoder{}).Encode(gm)
+	contents, err := microflowEncoder(fv).Encode(gm)
 	if err != nil {
 		return fmt.Errorf("UpdateMicroflow: encode: %w", err)
+	}
+	if contents, err = patchMicroflowToolboxEntries(contents, mf); err != nil {
+		return fmt.Errorf("UpdateMicroflow: %w", err)
 	}
 	return b.writer.UpdateRawUnit(string(mf.ID), contents)
 }
@@ -174,26 +262,50 @@ func (b *Backend) DeleteMicroflow(id model.ID) error {
 }
 
 // microflowToGen builds a gen Microflow wrapper from the model. Mirrors the legacy
-// serializer (writer_microflow.go). v10+ adds ReturnVariableName/StableId/Url/
-// UrlSearchParameters.
-func microflowToGen(mf *microflows.Microflow, major int) *genMf.Microflow {
+// serializer (writer_microflow.go). v10+ adds Url/UrlSearchParameters (the
+// property floor drops them empty below 10.1/10.9), 10.12+ ReturnVariableName,
+// and 10.2+ StableId (via microflowEncoder).
+func microflowToGen(mf *microflows.Microflow, v flowVersion) *genMf.Microflow {
 	out := genMf.NewMicroflow()
 	out.SetName(mf.Name)
 	out.SetDocumentation(mf.Documentation)
 	out.SetExcluded(mf.Excluded)
-	out.SetExportLevel("Hidden")
+	// Carried, not hardcoded — but defaulted, because "" is not a member of
+	// MicroflowsExportLevel and an enum-valued property must never be written
+	// with a value the metamodel does not declare. A fresh microflow and a
+	// stored document that says nothing both get "Hidden", which is what this
+	// line always wrote, so the default case is unchanged.
+	exportLevel := mf.ExportLevel
+	if exportLevel == "" {
+		exportLevel = "Hidden"
+	}
+	out.SetExportLevel(exportLevel)
 	out.SetAllowConcurrentExecution(mf.AllowConcurrentExecution)
-	out.SetApplyEntityAccess(false)
+	// Carried, not hardcoded. This was `false` unconditionally, which silently
+	// turned a microflow's "apply entity access" OFF on every rewrite.
+	out.SetApplyEntityAccess(mf.ApplyEntityAccess)
 	out.SetMarkAsUsed(mf.MarkAsUsed)
-	out.SetConcurrencyErrorMicroflowQualifiedName("")
-	out.SetConcurrencyErrorMessage(genTexts.NewText()) // empty Texts$Text (Items=[3] via default)
+	// Carried, not hardcoded. These two are what Mendix does to a second caller
+	// when AllowConcurrentExecution is false, and Mendix requires one of them in
+	// that case (CE4899) — writing both empty on every rewrite deleted the
+	// answer along with the question. nil still yields the bare empty
+	// Texts$Text this line always wrote (Items=[3] via the registered default),
+	// so a microflow without a message is unchanged — semantically, which is
+	// the level that matters: the element's $ID is minted fresh on every encode,
+	// so it is canon.Equal that holds here, never bytes.Equal (ADR-0008).
+	out.SetConcurrencyErrorMicroflowQualifiedName(mf.ConcurrencyErrorMicroflow)
+	if mf.ConcurrencyErrorMessage != nil {
+		out.SetConcurrencyErrorMessage(textToGen(mf.ConcurrencyErrorMessage))
+	} else {
+		out.SetConcurrencyErrorMessage(genTexts.NewText())
+	}
 	out.SetAllowedModuleRolesQualifiedNames(moduleRoleNames(mf.AllowedModuleRoles))
 	out.SetMicroflowReturnType(microflowDataTypeToGen(mf.ReturnType))
 
 	// Object collection (parameters merged first, then objects).
 	oc := genMf.NewMicroflowObjectCollection()
 	for i, p := range mf.Parameters {
-		oc.AddObjects(microflowParameterToGen(p, i, major))
+		oc.AddObjects(microflowParameterToGen(p, i, mf.Parameters, v))
 	}
 	if mf.ObjectCollection != nil {
 		for _, obj := range mf.ObjectCollection.Objects {
@@ -204,19 +316,30 @@ func microflowToGen(mf *microflows.Microflow, major int) *genMf.Microflow {
 	}
 	out.SetObjectCollection(oc)
 
-	// Flows live on the microflow, not in the object collection.
+	// Flows live on the microflow, not in the object collection. Sequence flows
+	// and annotation flows share the same Flows list.
 	if mf.ObjectCollection != nil {
 		for _, f := range mf.ObjectCollection.Flows {
-			out.AddFlows(sequenceFlowToGen(f, major))
+			out.AddFlows(sequenceFlowToGen(f, v))
+		}
+		for _, af := range mf.ObjectCollection.AnnotationFlows {
+			out.AddFlows(annotationFlowToGen(af, v))
 		}
 	}
 
-	if major >= 10 {
+	if v.hasReturnVariableName() {
 		out.SetReturnVariableName(mf.ReturnVariableName)
-		out.SetUrl("")
+	}
+	if v.major >= 10 {
+		// Carried, not hardcoded. These two were `""` and `nil` unconditionally,
+		// so every rewrite deleted the microflow's deep link (#1120). A fresh
+		// microflow has neither, so the empty values still come out empty —
+		// SetUrlSearchParametersQualifiedNames(nil) is the empty marker-1 list.
+		out.SetUrl(mf.URL)
 		// StableId is emitted as a fresh GUID binary via the registered default
-		// (the gen mistypes it as a string), not set here.
-		out.SetUrlSearchParametersQualifiedNames(nil) // empty marker-1 list
+		// (the gen mistypes it as a string), not set here; microflowEncoder
+		// leaves it out below 10.2.
+		out.SetUrlSearchParametersQualifiedNames(mf.URLSearchParameters)
 	}
 	return out
 }
@@ -261,6 +384,22 @@ func microflowObjectToGen(obj microflows.MicroflowObject) element.Element {
 		g.SetRelativeMiddlePoint(pointStr(o.Position))
 		g.SetSize(sizeStr(o.Size))
 		return g
+	case *microflows.BreakEvent:
+		// `break;` in a loop. Same hazard as ErrorEvent above: dropping it left the
+		// branch's SequenceFlow pointing at a non-existent object, so Studio Pro
+		// failed to open the project with KeyNotFoundException (#791).
+		g := genMf.NewBreakEvent()
+		g.SetID(element.ID(o.ID))
+		g.SetRelativeMiddlePoint(pointStr(o.Position))
+		g.SetSize(sizeStr(o.Size))
+		return g
+	case *microflows.ContinueEvent:
+		// `continue;` in a loop — see BreakEvent above.
+		g := genMf.NewContinueEvent()
+		g.SetID(element.ID(o.ID))
+		g.SetRelativeMiddlePoint(pointStr(o.Position))
+		g.SetSize(sizeStr(o.Size))
+		return g
 	case *microflows.ActionActivity:
 		g := genMf.NewActionActivity()
 		g.SetID(element.ID(o.ID))
@@ -287,6 +426,21 @@ func microflowObjectToGen(obj microflows.MicroflowObject) element.Element {
 			g.SetSplitCondition(sc)
 		}
 		return g
+	case *microflows.InheritanceSplit:
+		// Without this the split hit `default: return nil` and was dropped, while
+		// the sequence flows referencing its $ID were still written — a dangling
+		// pointer that mxbuild cannot even load ("KeyNotFoundException ... at
+		// StreamingBsonUnitReader.ResolvePostponedProperties"). Same shape as the
+		// ErrorEvent/BreakEvent gap in #791. Fields mirror the legacy serializer
+		// in sdk/mpr/writer_microflow.go.
+		g := genMf.NewInheritanceSplit()
+		g.SetID(element.ID(o.ID))
+		g.SetCaption(o.Caption)
+		g.SetDocumentation(o.Documentation)
+		g.SetRelativeMiddlePoint(pointStr(o.Position))
+		g.SetSize(sizeStr(o.Size))
+		g.SetSplitVariableName(o.VariableName)
+		return g
 	case *microflows.ExclusiveMerge:
 		g := genMf.NewExclusiveMerge()
 		g.SetID(element.ID(o.ID))
@@ -296,6 +450,10 @@ func microflowObjectToGen(obj microflows.MicroflowObject) element.Element {
 	case *microflows.LoopedActivity:
 		g := genMf.NewLoopedActivity()
 		g.SetID(element.ID(o.ID))
+		// Always written, empty included: the reader keeps it, and a loop
+		// without the key is one Mendix's merge engine cannot compare with
+		// the Studio Pro revision that has it (mendixlabs/mxcli#1373).
+		g.SetDocumentation(o.Documentation)
 		g.SetErrorHandlingType(string(o.ErrorHandlingType))
 		if ls := loopSourceToGen(o.LoopSource); ls != nil {
 			g.SetLoopSource(ls)
@@ -314,9 +472,52 @@ func microflowObjectToGen(obj microflows.MicroflowObject) element.Element {
 		g.SetRelativeMiddlePoint(pointStr(o.Position))
 		g.SetSize(sizeStr(o.Size))
 		return g
+	case *microflows.Annotation:
+		// A microflow annotation (yellow note); its caption is the note text.
+		// Connected to an activity by an AnnotationFlow (serialized in
+		// microflowToGen). Without this, `@annotation` was silently dropped.
+		g := genMf.NewAnnotation()
+		g.SetID(element.ID(o.ID))
+		g.SetCaption(o.Caption)
+		g.SetRelativeMiddlePoint(pointStr(o.Position))
+		g.SetSize(sizeStr(o.Size))
+		return g
 	default:
 		return nil // unsupported object type (added in later activity groups)
 	}
+}
+
+// annotationFlowToGen builds a Microflows$AnnotationFlow connecting an Annotation
+// (origin) to the activity it documents (destination). The line shape is
+// version-specific, mirroring the legacy serializeAnnotationFlow.
+func annotationFlowToGen(af *microflows.AnnotationFlow, v flowVersion) element.Element {
+	g := genMf.NewAnnotationFlow()
+	g.SetID(element.ID(af.ID))
+	g.SetOriginID(element.ID(af.OriginID))
+	g.SetDestinationID(element.ID(af.DestinationID))
+	// The builder picks the sides that face each other (orientAnnotationFlows);
+	// a flow nothing oriented is drawn as for a note ABOVE its element — out of
+	// the note's bottom edge, into the element's top. Both indexes were once 0
+	// (top), which drew the line out of the top of the note and back down
+	// around it.
+	sides := af.SidesOrDefault()
+	g.SetOriginConnectionIndex(int32(sides.Origin))
+	g.SetDestinationConnectionIndex(int32(sides.Destination))
+	// An annotation flow is a Flow like a sequence flow, with the same floors:
+	// the Line was written from 10.0 on, six minors before it existed.
+	if v.hasLine() {
+		line := genMf.NewBezierCurve()
+		line.SetOriginControlVector("0;0")
+		line.SetDestinationControlVector("0;0")
+		g.SetLine(line)
+	} else {
+		g.SetOriginBezierVector("0;0")
+		g.SetDestinationBezierVector("0;0")
+		if v.hasLineType() {
+			g.SetLineType("BezierCurve")
+		}
+	}
+	return g
 }
 
 // loopSourceToGen builds a loop's source (iterate-over-list or while-condition).
@@ -354,7 +555,7 @@ func microflowActionToGen(action microflows.MicroflowAction) element.Element {
 		for _, m := range a.InitialMembers {
 			g.AddItems(memberChangeToGen(m))
 		}
-		g.SetRefreshInClient(false)
+		g.SetRefreshInClient(a.RefreshInClient)
 		g.SetOutputVariableName(a.OutputVariable)
 		return g
 	case *microflows.ChangeObjectAction:
@@ -379,19 +580,47 @@ func microflowActionToGen(action microflows.MicroflowAction) element.Element {
 	case *microflows.DeleteObjectAction:
 		g := genMf.NewDeleteAction()
 		g.SetID(element.ID(a.ID))
+		// Studio Pro writes no ErrorHandlingType on a delete; set it only when the
+		// author asked for one.
+		if a.ErrorHandlingType != "" {
+			g.SetErrorHandlingType(string(a.ErrorHandlingType))
+		}
 		g.SetDeleteVariableName(a.DeleteVariable)
 		g.SetRefreshInClient(a.RefreshInClient)
+		return g
+	case *microflows.SendExternalObjectAction:
+		// Microflows$SendExternalObject (mendixlabs/mxcli#1735).
+		g := genMf.NewSendExternalObject()
+		g.SetID(element.ID(a.ID))
+		g.SetVariableNameToBeSent(a.Variable)
+		g.SetRefreshInClient(a.RefreshInClient)
+		g.SetErrorHandlingType(orDefault(string(a.ErrorHandlingType), "Rollback"))
+		return g
+	case *microflows.DeleteExternalObjectAction:
+		// Microflows$DeleteExternalObject (mendixlabs/mxcli#1735).
+		g := genMf.NewDeleteExternalObject()
+		g.SetID(element.ID(a.ID))
+		g.SetDeleteVariableName(a.Variable)
+		g.SetRefreshInClient(a.RefreshInClient)
+		g.SetErrorHandlingType(orDefault(string(a.ErrorHandlingType), "Rollback"))
 		return g
 	case *microflows.RollbackObjectAction:
 		g := genMf.NewRollbackAction()
 		g.SetID(element.ID(a.ID))
 		g.SetRollbackVariableName(a.RollbackVariable)
 		g.SetRefreshInClient(a.RefreshInClient)
+		// Like delete: set only when the author wrote an `on error` clause, so a
+		// rollback without one is written exactly as it always was (#1252).
+		if a.ErrorHandlingType != "" {
+			g.SetErrorHandlingType(string(a.ErrorHandlingType))
+		}
 		return g
 	case *microflows.RetrieveAction:
 		g := genMf.NewRetrieveAction()
 		g.SetID(element.ID(a.ID))
-		g.SetErrorHandlingType("Rollback")
+		// Only an explicit ON ERROR clause moves this off the literal both engines
+		// have always written (ako/CapTrackV3 FINDINGS §11).
+		g.SetErrorHandlingType(orDefault(string(a.ErrorHandlingType), "Rollback"))
 		g.SetOutputVariableName(a.OutputVariable)
 		if src := retrieveSourceToGen(a.Source); src != nil {
 			g.SetRetrieveSource(src)
@@ -411,6 +640,9 @@ func microflowActionToGen(action microflows.MicroflowAction) element.Element {
 				m.SetParameterQualifiedName(pm.Parameter)
 				m.SetArgument(pm.Argument)
 				mc.AddParameterMappings(m)
+			}
+			if qs := queueSettingsToGen(a.MicroflowCall.QueueSettings); qs != nil {
+				mc.SetQueueSettings(qs)
 			}
 			g.SetMicroflowCall(mc)
 		}
@@ -443,6 +675,20 @@ func microflowActionToGen(action microflows.MicroflowAction) element.Element {
 		addPartList(g, "ParameterMappings", params)
 		addStr(g, "Query", a.Query)
 		return g
+	case *microflows.SendEmailAction:
+		return sendEmailActionToGen(a)
+	case *microflows.SynchronizeAction:
+		// Built directly rather than through genMf.NewSynchronizeAction: gen binds
+		// VariableNames as a scalar Primitive[string] and exposes no setter for
+		// it, so a Specific-mode action could not be written at all through the
+		// generated type. An EnumList[string] encodes the BSON array of names the
+		// platform actually stores.
+		g := newElem("Microflows$SynchronizeAction", string(a.ID))
+		addStr(g, "ErrorHandlingType", orDefault(string(a.ErrorHandlingType), "Rollback"))
+		addStr(g, "Type", orDefault(string(a.SyncType), string(microflows.SynchronizationTypeAll)))
+		addStrList(g, "VariableNames", a.VariableNames)
+		return g
+
 	case *microflows.JavaActionCallAction:
 		// Built directly: the gen JavaActionCallAction binds the wrong BSON keys
 		// (JavaActionQualifiedName/OutputVariableName) vs the verified storage keys
@@ -464,6 +710,50 @@ func microflowActionToGen(action microflows.MicroflowAction) element.Element {
 			mappings = append(mappings, m)
 		}
 		addPartList(g, "ParameterMappings", mappings)
+		if qs := queueSettingsToGen(a.QueueSettings); qs != nil {
+			addPart(g, "QueueSettings", qs)
+		}
+		return g
+	case *microflows.JavaScriptActionCallAction:
+		// Built directly like JavaActionCallAction: the JS action call binds
+		// distinct storage keys (JavaScriptAction/OutputVariableName, and the
+		// parameter value goes under "ParameterValue", not "Value"). Mirrors the
+		// legacy serializer (sdk/mpr/writer_microflow_actions.go). Without this
+		// case the action fell through to `default: return nil`, so the
+		// ActionActivity was written with no Action → CE0008 "No action defined."
+		// and CE0109 on the (now-missing) output variable.
+		g := newElem("Microflows$JavaScriptActionCallAction", string(a.ID))
+		addStr(g, "ErrorHandlingType", orDefault(string(a.ErrorHandlingType), "Rollback"))
+		addStr(g, "JavaScriptAction", a.JavaScriptAction)
+		addStr(g, "OutputVariableName", a.OutputVariableName)
+		addBool(g, "UseReturnVariable", a.UseReturnVariable)
+		mappings := make([]element.Element, 0, len(a.ParameterMappings))
+		for _, pm := range a.ParameterMappings {
+			m := newElem("Microflows$JavaScriptActionParameterMapping", string(pm.ID))
+			addStr(m, "Parameter", pm.Parameter)
+			if pm.Value != nil {
+				if v := codeActionParameterValueToGen(pm.Value); v != nil {
+					addPart(m, "ParameterValue", v)
+				}
+			}
+			mappings = append(mappings, m)
+		}
+		addPartList(g, "ParameterMappings", mappings)
+		return g
+	case *microflows.DownloadFileAction:
+		// DOWNLOAD FILE. Without this case the action fell through to
+		// `default: return nil` and the enclosing ActionActivity was written with
+		// no Action at all — `mxcli exec` reported "Created microflow" and only
+		// `mx check` noticed, as CE0008 "No action defined." (issue #850).
+		//
+		// The storage key is ShowFileInBrowser, not ShowInBrowser; the gen setter
+		// binds the right one (legacy's parseDownloadFileAction reads the wrong
+		// key — see TestActionFromGen_DownloadFile).
+		g := genMf.NewDownloadFileAction()
+		g.SetID(element.ID(a.ID))
+		g.SetErrorHandlingType(orDefault(string(a.ErrorHandlingType), "Rollback"))
+		g.SetFileDocumentVariableName(a.FileDocument)
+		g.SetShowFileInBrowser(a.ShowInBrowser)
 		return g
 	case *microflows.LogMessageAction:
 		g := genMf.NewLogMessageAction()
@@ -517,7 +807,7 @@ func microflowActionToGen(action microflows.MicroflowAction) element.Element {
 		// Storage $Type Microflows$CastAction; output bound to "VariableName".
 		g := genMf.NewCastAction()
 		g.SetID(element.ID(a.ID))
-		g.SetErrorHandlingType("Rollback")
+		g.SetErrorHandlingType(orDefault(string(a.ErrorHandlingType), "Rollback"))
 		g.SetOutputVariableName(a.OutputVariable)
 		return g
 	case *microflows.AggregateListAction:
@@ -526,14 +816,23 @@ func microflowActionToGen(action microflows.MicroflowAction) element.Element {
 		// by-name ref. Expression mode is mutually exclusive with Attribute.
 		g := genMf.NewAggregateListAction()
 		g.SetID(element.ID(a.ID))
-		g.SetErrorHandlingType("Rollback")
+		g.SetErrorHandlingType(orDefault(string(a.ErrorHandlingType), "Rollback"))
 		g.SetAggregateFunction(string(a.Function))
 		g.SetInputListVariableName(a.InputVariable)
 		if a.UseExpression {
 			g.SetUseExpression(true)
 			g.SetExpression(a.Expression)
-		} else if a.AttributeQualifiedName != "" {
-			g.SetAttributeQualifiedName(a.AttributeQualifiedName)
+		}
+		// Written even when unused: every Studio Pro reference document carries
+		// Attribute as "". Omitting it made a freshly described Studio Pro
+		// aggregate rewrite on its first execution for no semantic reason.
+		g.SetAttributeQualifiedName(a.AttributeQualifiedName)
+		// Reduce's fold. Written for the functions a reference document shows
+		// Mendix storing them on, and otherwise only to carry back what the
+		// stored document already had (#1004).
+		if a.Function.WritesReduceProperties() || a.ReduceInitialValue != "" || a.ReduceReturnType != nil {
+			g.SetReduceInitialValueExpression(a.ReduceInitialValue)
+			g.SetReduceReturnDataType(microflowDataTypeToGen(a.ReduceReturnType))
 		}
 		g.SetOutputVariableName(a.OutputVariable)
 		return g
@@ -541,7 +840,10 @@ func microflowActionToGen(action microflows.MicroflowAction) element.Element {
 		// Storage $Type Microflows$CreateListAction; output bound to "VariableName".
 		g := genMf.NewCreateListAction()
 		g.SetID(element.ID(a.ID))
-		g.SetErrorHandlingType("Rollback")
+		// The flow flavour's default, which the builder supplies: Rollback in a
+		// microflow, Abort in a nanoflow — "Rollback" there is CE6035
+		// (mendixlabs/mxcli#591). Same for the other list activities and cast.
+		g.SetErrorHandlingType(orDefault(string(a.ErrorHandlingType), "Rollback"))
 		if a.EntityQualifiedName != "" {
 			g.SetEntityQualifiedName(a.EntityQualifiedName)
 		}
@@ -553,7 +855,7 @@ func microflowActionToGen(action microflows.MicroflowAction) element.Element {
 		// when called, so guard it the same way.
 		g := genMf.NewChangeListAction()
 		g.SetID(element.ID(a.ID))
-		g.SetErrorHandlingType("Rollback")
+		g.SetErrorHandlingType(orDefault(string(a.ErrorHandlingType), "Rollback"))
 		g.SetChangeVariableName(a.ChangeVariable)
 		g.SetType(string(a.Type))
 		if a.Value != "" {
@@ -586,7 +888,7 @@ func microflowActionToGen(action microflows.MicroflowAction) element.Element {
 		// "VariableName"), so this action and its operation sub-elements are
 		// built directly with the verified legacy BSON keys.
 		e := newElem("Microflows$ListOperationsAction", string(a.ID))
-		addStr(e, "ErrorHandlingType", "Rollback")
+		addStr(e, "ErrorHandlingType", orDefault(string(a.ErrorHandlingType), "Rollback"))
 		if a.Operation != nil {
 			addPart(e, "NewOperation", listOperationToGen(a.Operation))
 		}
@@ -601,23 +903,28 @@ func microflowActionToGen(action microflows.MicroflowAction) element.Element {
 		g.SetID(element.ID(a.ID))
 		g.SetErrorHandlingType(orDefault(string(a.ErrorHandlingType), "Rollback"))
 		g.SetPageSettings(showPageFormSettingsToGen(a))
-		g.SetNumberOfPagesToClose("")
+		// An expression; "" (the default) closes no page. It was always written
+		// as "", whatever the statement said (mendixlabs/mxcli#1617).
+		g.SetNumberOfPagesToClose(a.NumberOfPagesToClose)
 		return g
 	case *microflows.ClosePageAction:
-		// Storage $Type Microflows$CloseFormAction. Legacy emits only
-		// ErrorHandlingType + NumberOfPages (int32); the gen's extra
-		// NumberOfPagesToClose string is left unset (not dirty → not emitted).
+		// Storage $Type Microflows$CloseFormAction. The count is the string
+		// NumberOfPagesToClose ("" = one page), as Studio Pro stores it. The
+		// int NumberOfPages was deleted in 8.11: writing it (as the legacy
+		// serializer did) made `close page 2` close one page, and left a key
+		// Mendix's merge engine does not have (mendixlabs/mxcli#1373).
 		g := genMf.NewCloseFormAction()
 		g.SetID(element.ID(a.ID))
 		g.SetErrorHandlingType(orDefault(string(a.ErrorHandlingType), "Rollback"))
-		g.SetNumberOfPages(int32(a.NumberOfPages))
+		g.SetNumberOfPagesToClose(numberOfPagesToClose(a.NumberOfPages))
 		return g
 	case *microflows.ShowHomePageAction:
-		// Storage $Type Microflows$ShowHomePageAction. Legacy emits only
-		// ErrorHandlingType (always "Rollback").
+		// Storage $Type Microflows$ShowHomePageAction. Its only property is
+		// ErrorHandlingType: the authored clause, else the literal "Rollback" the
+		// writer has always stored (#1252).
 		g := genMf.NewShowHomePageAction()
 		g.SetID(element.ID(a.ID))
-		g.SetErrorHandlingType("Rollback")
+		g.SetErrorHandlingType(orDefault(string(a.ErrorHandlingType), "Rollback"))
 		return g
 	case *microflows.ShowMessageAction:
 		// Storage $Type Microflows$ShowMessageAction. Template is a
@@ -666,13 +973,65 @@ func microflowActionToGen(action microflows.MicroflowAction) element.Element {
 		// set task outcome, workflow operation pause/continue/abort/…, etc.).
 		// Mirrors sdk/mpr/writer_microflow_workflow.go field-for-field.
 		return workflowMicroflowActionToGen(a)
+	case *microflows.TransformJsonAction:
+		// "transform $In with Module.Transformer". Without this case the action
+		// fell through to `default: return nil` and the enclosing ActionActivity
+		// was written with NO action at all — `mxcli exec` reported success and
+		// mxbuild then failed CE0008 "No action defined." This is the #850 shape,
+		// and it means `transform` was unusable on the default engine while the
+		// legacy writer handled it. Keys mirror sdk/mpr.serializeTransformJsonAction.
+		g := newElem("Microflows$TransformJsonAction", string(a.ID))
+		addStr(g, "ErrorHandlingType", orDefault(string(a.ErrorHandlingType), "Rollback"))
+		addStr(g, "InputVariableName", a.InputVariableName)
+		addStr(g, "OutputVariableName", a.OutputVariableName)
+		addStr(g, "Transformation", a.Transformation)
+		return g
+
 	case *microflows.RestOperationCallAction:
 		// "call rest operation" — Microflows$RestOperationCallAction. Mirrors
 		// serializeRestOperationCallAction.
 		return restOperationCallActionToGen(a)
+	case *microflows.CallExternalAction:
+		// "call external action" — Microflows$CallExternalAction. Without this
+		// the activity serialized with no action → CE0008 "No action defined".
+		return callExternalActionToGen(a)
+	case *microflows.WebServiceCallAction:
+		// "call web service" (legacy SOAP) — Microflows$CallWebServiceAction.
+		// Same CE0008 shape as the two cases above, and the reason the legacy
+		// engine was still the documented fallback for SOAP. See
+		// microflow_webservice_write.go.
+		return webServiceCallActionToGen(a)
 	default:
 		return nil // not yet supported (added in later groups)
 	}
+}
+
+// importMappingRangeToGen builds the Range child of a Microflows$ImportMappingCall.
+//
+// Mendix has two variants and mxcli only ever wrote the first, so Studio Pro's
+// "Custom" setting was unrepresentable rather than merely undescribed:
+//
+//	Microflows$ConstantRange{SingleObject}                     All (false) / First (true)
+//	Microflows$CustomRange{LimitExpression, OffsetExpression}  Custom
+//
+// A limit or an offset selects CustomRange; SingleObject has no meaning there,
+// because a bounded range is always a list.
+//
+// Shared because the ImportMappingCall is built at THREE sites in this engine —
+// importXmlActionToGen (the `import from mapping` statement), the
+// ResultHandlingMapping case (REST result handling), and the legacy writer's own
+// copy. Fixing one and not the others is how a limit reached the model and was
+// still written as a ConstantRange. (issue #881)
+func importMappingRangeToGen(h *microflows.ResultHandlingMapping) *element.Base {
+	if h.LimitExpression != "" || h.OffsetExpression != "" {
+		rng := newElem("Microflows$CustomRange", "")
+		addStr(rng, "LimitExpression", h.LimitExpression)
+		addStr(rng, "OffsetExpression", h.OffsetExpression)
+		return rng
+	}
+	rng := newElem("Microflows$ConstantRange", "")
+	addBool(rng, "SingleObject", microflows.RangeSingleObjectOf(h))
+	return rng
 }
 
 // importXmlActionToGen builds a Microflows$ImportXmlAction ("import from mapping").
@@ -693,14 +1052,15 @@ func importXmlActionToGen(a *microflows.ImportXmlAction) element.Element {
 	}
 
 	imc := newElem("Microflows$ImportMappingCall", "")
-	addStr(imc, "Commit", "YesWithoutEvents")
-	addStr(imc, "ContentType", "Json")
+	// Both were constants, so a mapping with an input object could not be
+	// called (mxbuild CE0244) and a non-default commit mode was unwritable
+	// (ako/mxcli#1681).
+	addStr(imc, "Commit", orDefault(rh.Commit, "YesWithoutEvents"))
+	addStr(imc, "ContentType", orDefault(rh.ContentType, "Json"))
 	addBool(imc, "ForceSingleOccurrence", forceSingle)
 	addStr(imc, "ObjectHandlingBackup", "Create")
-	addStr(imc, "ParameterVariableName", "")
-	rng := newElem("Microflows$ConstantRange", "")
-	addBool(rng, "SingleObject", rh.SingleObject)
-	addPart(imc, "Range", rng)
+	addStr(imc, "ParameterVariableName", rh.ParameterVariable)
+	addPart(imc, "Range", importMappingRangeToGen(rh))
 	addStr(imc, "ReturnValueMapping", string(rh.MappingID))
 
 	var vt *element.Base
@@ -757,13 +1117,33 @@ func exportXmlActionToGen(a *microflows.ExportXmlAction) element.Element {
 func codeActionParameterValueToGen(v microflows.CodeActionParameterValue) element.Element {
 	switch val := v.(type) {
 	case *microflows.StringTemplateParameterValue:
+		// A text-template (or SQL-template) Java action parameter: the text with
+		// {n} placeholders plus one PrimitiveTypedTemplateArgument per
+		// placeholder, each an expression and its result type
+		// (ako/mxcli#1451; shape from the metamodel, accepted by mxbuild 11.13).
 		g := newElem("Microflows$StringTemplateParameterValue", string(val.ID))
 		if val.TypedTemplate != nil {
 			tt := newElem("Microflows$TypedTemplate", string(val.TypedTemplate.ID))
-			addPartList(tt, "Arguments", nil) // empty (marker 2, registered in init)
+			var args []element.Element
+			for _, a := range val.TypedTemplate.Arguments {
+				if a == nil {
+					continue
+				}
+				ae := newElem("Microflows$PrimitiveTypedTemplateArgument", string(a.ID))
+				addStr(ae, "Expression", a.Expression)
+				addStr(ae, "Type", a.Type)
+				args = append(args, ae)
+			}
+			addPartList(tt, "Arguments", args) // marker 2, registered in init
 			addStr(tt, "Text", val.TypedTemplate.Text)
 			addPart(g, "TypedTemplate", tt)
 		}
+		return g
+	case *microflows.CustomBlobDocumentCodeActionParameterValue:
+		// A document of a custom type (an agent-editor Agent), by name
+		// (ako/mxcli#1451).
+		g := newElem("Microflows$CustomBlobDocumentCodeActionParameterValue", string(val.ID))
+		addStr(g, "CustomDocument", val.CustomDocument)
 		return g
 	case *microflows.ExpressionBasedCodeActionParameterValue:
 		g := newElem("Microflows$ExpressionBasedCodeActionParameterValue", string(val.ID))
@@ -780,6 +1160,53 @@ func codeActionParameterValueToGen(v microflows.CodeActionParameterValue) elemen
 	case *microflows.EntityTypeCodeActionParameterValue:
 		g := newElem("Microflows$EntityTypeCodeActionParameterValue", string(val.ID))
 		addStr(g, "Entity", val.Entity)
+		return g
+	}
+	return nil
+}
+
+// queueSettingsToGen builds the Queues$QueueSettings child that binds a call
+// activity to a task queue. Returns nil for an unqueued call, so the call's
+// registered NullFields default writes QueueSettings: null as before.
+//
+// Only the QueueSettings element is written — NOT the call's sibling `Queue`
+// string. gen carries a `Queue` ByNameRef on both call types, but
+// generated/metamodel (the arbiter) has neither, and measured on 11.13 a call
+// carrying only `Queue` is inert: mx check does not read it. Writing both would
+// mean two places to keep in sync, one of which nothing consumes.
+func queueSettingsToGen(qs *microflows.QueueSettings) element.Element {
+	if qs == nil || qs.Queue == "" {
+		return nil
+	}
+	g := newElem("Queues$QueueSettings", string(qs.ID))
+	addStr(g, "Queue", qs.Queue)
+	if r := queueRetryToGen(qs.RetryPolicy); r != nil {
+		addPart(g, "Retry", r)
+	}
+	return g
+}
+
+// queueRetryToGen builds the Queues$QueueFixedRetry / Queues$QueueExponentialRetry
+// a `retry fixed|exponential (…)` clause states (mendixlabs/mxcli#1729), with
+// exactly the properties the type has. nil — no retry — leaves Retry to the
+// registered null default.
+func queueRetryToGen(r *microflows.QueueRetry) element.Element {
+	if r == nil {
+		return nil
+	}
+	switch r.Kind {
+	case microflows.QueueRetryFixed:
+		g := newElem("Queues$QueueFixedRetry", string(r.ID))
+		addInt32(g, "Retries", int32(r.Retries))
+		addInt32(g, "Interval", int32(r.Interval))
+		addStr(g, "IntervalType", r.IntervalType)
+		return g
+	case microflows.QueueRetryExponential:
+		g := newElem("Queues$QueueExponentialRetry", string(r.ID))
+		addInt32(g, "Retries", int32(r.Retries))
+		addInt32(g, "InitialInterval", int32(r.InitialInterval))
+		addInt32(g, "MaximumInterval", int32(r.MaximumInterval))
+		addStr(g, "IntervalType", r.IntervalType)
 		return g
 	}
 	return nil
@@ -809,11 +1236,35 @@ func addBool(b *element.Base, name string, val bool) {
 	p.Set(val)
 }
 
-// addInt32 adds a dirty int32 property (BSON key = name) to a bare element.
+// addInt32 adds a dirty Integer property (BSON key = name) to a bare element.
+// It is stored as BSON int64, like every Integer property Studio Pro writes —
+// the widening is property.Primitive's (ako/mxcli#1264) — so this and addInt64
+// produce the same document; the int32 parameter is only the Go-side type.
 func addInt32(b *element.Base, name string, val int32) {
 	p := property.NewPrimitive[int32](name, property.DecodeInt32)
 	b.AddProperty(p, uint(len(b.Properties())))
 	p.Set(val)
+}
+
+// addStrList adds a dirty string-list property (BSON key = name).
+//
+// The leading int32 is Mendix's array version marker, and it is load-bearing:
+// every array in a Mendix document carries one, and the reader treats element 0
+// as the version rather than as data. Written without it, a one-element list
+// reads back as an empty list — mxbuild reported CE2004 "No variables to
+// synchronize have been selected." for a Synchronize action whose VariableNames
+// array plainly held the variable (#863).
+//
+// property.EnumList is NOT used here for exactly that reason: its BSONValue
+// returns a bare []string, so the codec's scalar path emits an unmarked array.
+func addStrList(b *element.Base, name string, vals []string) {
+	arr := bson.A{int32(1)}
+	for _, v := range vals {
+		arr = append(arr, v)
+	}
+	p := property.NewPrimitive[bson.A](name, func(raw bson.Raw, key string) bson.A { return nil })
+	b.AddProperty(p, uint(len(b.Properties())))
+	p.Set(arr)
 }
 
 // addPart adds a dirty single-child property (BSON key = name).
@@ -910,16 +1361,26 @@ func listOperationToGen(op microflows.ListOperation) element.Element {
 		addStr(e, "SecondListOrObjectName", o.ListVariable2)
 		return e
 	case *microflows.ListRangeOperation:
-		// Mirrors legacy parser key "Microflows$ListRange". No legacy writer
-		// case existed; the example MDL does not exercise it, so emit the verified
-		// storage name with ListName + range expressions.
+		// The bounds are NOT properties of the ListRange. Mendix nests them:
+		//
+		//	Microflows$ListRange{ListName, CustomRange}
+		//	  └── Microflows$CustomRange{LimitExpression, OffsetExpression}
+		//
+		// Writing them flat produced a range mxbuild reads as unbounded —
+		// CE6520 "Amount and offset are not specified. Either amount or offset
+		// or both must be specified." It survived review because the reader
+		// beside it looked flat too, so mxcli round-tripped its own documents
+		// perfectly and only Mendix disagreed. (issue #966)
+		//
+		// The nesting matches the ImportMappingCall's Range (importMappingRangeToGen
+		// above) — same CustomRange element, a different parent.
 		e := newElem("Microflows$ListRange", string(o.ID))
 		addStr(e, "ListName", o.ListVariable)
-		if o.LimitExpression != "" {
-			addStr(e, "LimitExpression", o.LimitExpression)
-		}
-		if o.OffsetExpression != "" {
-			addStr(e, "OffsetExpression", o.OffsetExpression)
+		if o.LimitExpression != "" || o.OffsetExpression != "" {
+			cr := newElem("Microflows$CustomRange", "")
+			addStr(cr, "LimitExpression", o.LimitExpression)
+			addStr(cr, "OffsetExpression", o.OffsetExpression)
+			addPart(e, "CustomRange", cr)
 		}
 		return e
 	default:
@@ -961,8 +1422,15 @@ func entityRefToGen(steps []microflows.EntityRefStep) element.Element {
 	return ref
 }
 
-// splitConditionToGen builds an exclusive-split condition. Rule conditions are a
-// later slice (RuleCall + parameter mappings).
+// splitConditionToGen builds an exclusive-split condition — either an expression
+// or a call into a rule. Inverse of splitConditionFromGen.
+//
+// The rule case is the one #939 reported: it used to fall through to nil and the
+// caller skipped SetSplitCondition entirely, so a decision that reads
+// `if Module.SomeRule(...) then` was stored with its Condition missing — mx check
+// CE0080 "The 'Condition' property is required", with the Decision's caption
+// still showing the call. The legacy engine had always written it
+// (sdk/mpr/writer_microflow.go), which is why the same script passed there.
 func splitConditionToGen(sc microflows.SplitCondition) element.Element {
 	switch c := sc.(type) {
 	case *microflows.ExpressionSplitCondition:
@@ -970,9 +1438,32 @@ func splitConditionToGen(sc microflows.SplitCondition) element.Element {
 		g.SetID(element.ID(c.ID))
 		g.SetExpression(c.Expression)
 		return g
+	case *microflows.RuleSplitCondition:
+		g := genMf.NewRuleSplitCondition()
+		g.SetID(element.ID(c.ID))
+		g.SetRuleCall(ruleCallToGen(c))
+		return g
 	default:
 		return nil
 	}
+}
+
+// ruleCallToGen builds the RuleCall sub-document a RuleSplitCondition wraps. The
+// rule's qualified name goes to the "Microflow" storage key (patched in
+// initRuleCall); the RuleCall itself carries no semantic ID, so it gets a fresh
+// one like every other synthesized part.
+func ruleCallToGen(c *microflows.RuleSplitCondition) element.Element {
+	rc := genMf.NewRuleCall()
+	assignID(rc)
+	rc.SetRuleQualifiedName(c.RuleQualifiedName)
+	for _, pm := range c.ParameterMappings {
+		g := genMf.NewRuleCallParameterMapping()
+		g.SetID(element.ID(pm.ID))
+		g.SetParameterQualifiedName(pm.ParameterName)
+		g.SetArgument(pm.Argument)
+		rc.AddParameterMappings(g)
+	}
+	return rc
 }
 
 // caseValueToGen renders a sequence-flow case. ExpressionCase is serialized AS an
@@ -990,6 +1481,8 @@ func caseValueToGen(cv microflows.CaseValue) element.Element {
 		cv = &c
 	case microflows.NoCase:
 		cv = &c
+	case microflows.InheritanceCase:
+		cv = &c
 	}
 	switch c := cv.(type) {
 	case *microflows.EnumerationCase:
@@ -1001,6 +1494,14 @@ func caseValueToGen(cv microflows.CaseValue) element.Element {
 		g := genMf.NewEnumerationCase()
 		g.SetID(element.ID(c.ID))
 		g.SetValue(c.Expression)
+		return g
+	case *microflows.InheritanceCase:
+		// A type-split branch selects on an entity. Without this it fell through
+		// to NoCase, so every branch lost the entity it matches on — the second
+		// half of the `split type` corruption.
+		g := genMf.NewInheritanceCase()
+		g.SetID(element.ID(c.ID))
+		g.SetValueQualifiedName(c.EntityQualifiedName)
 		return g
 	default:
 		return genMf.NewNoCase()
@@ -1022,7 +1523,18 @@ func retrieveSourceToGen(src microflows.RetrieveSource) element.Element {
 		if s.XPathConstraint != "" {
 			g.SetXPathConstraint(s.XPathConstraint)
 		}
-		g.SetSortItemList(genMf.NewSortItemList()) // empty Sortings=[2] via default; sort columns are a later slice
+		// Build the SortingsList (stored under "NewSortings") with the actual sort
+		// columns. The generated SortItemList type serializes its items under
+		// "Items", but Mendix stores retrieve/sort columns under "Sortings" — so
+		// build the envelope manually, mirroring the Sort list-operation branch.
+		// Without this, "retrieve … sort by …" columns are dropped on write.
+		sl := newElem("Microflows$SortingsList", "")
+		items := make([]element.Element, 0, len(s.Sorting))
+		for _, it := range s.Sorting {
+			items = append(items, sortItemToGen(it))
+		}
+		addPartList(sl, "Sortings", items)
+		g.SetSortItemList(sl)
 		return g
 	case *microflows.AssociationRetrieveSource:
 		g := genMf.NewAssociationRetrieveSource()
@@ -1079,17 +1591,22 @@ func memberChangeToGen(m *microflows.MemberChange) element.Element {
 	return g
 }
 
-// microflowParameterToGen builds a gen MicroflowParameter (position derives from
-// index, matching the legacy serializer).
-func microflowParameterToGen(p *microflows.MicroflowParameter, idx, major int) element.Element {
+// microflowParameterToGen builds a gen MicroflowParameter. An authored position
+// is written as given; without one the position derives from the index and the
+// names of all the flow's parameters (params), which space the row.
+func microflowParameterToGen(p *microflows.MicroflowParameter, idx int, params []*microflows.MicroflowParameter, v flowVersion) element.Element {
 	g := genMf.NewMicroflowParameter()
 	g.SetID(element.ID(p.ID))
 	g.SetDocumentation(p.Documentation)
 	g.SetHasVariableNameBeenChanged(false)
 	g.SetName(p.Name)
-	g.SetRelativeMiddlePoint(fmt.Sprintf("%d;53", 200+idx*100))
+	pos := microflows.DerivedParameterPosition(idx, params)
+	if p.Position != nil {
+		pos = *p.Position
+	}
+	g.SetRelativeMiddlePoint(fmt.Sprintf("%d;%d", pos.X, pos.Y))
 	g.SetSize("30;30")
-	if major >= 10 {
+	if v.hasParameterDefaults() {
 		g.SetDefaultValue("")
 		g.SetIsRequired(true)
 	}
@@ -1097,9 +1614,13 @@ func microflowParameterToGen(p *microflows.MicroflowParameter, idx, major int) e
 	return g
 }
 
-// sequenceFlowToGen builds a gen SequenceFlow. v10+ uses CaseValues + a BezierCurve
-// Line; the case defaults to NoCase.
-func sequenceFlowToGen(f *microflows.SequenceFlow, major int) element.Element {
+// sequenceFlowToGen builds a gen SequenceFlow in the shape v stores; the case
+// defaults to NoCase. Measured shapes (mendixlabs/mxcli#1410):
+//
+//	< 10.15   the case as one NewCaseValue document; 10.15+ a CaseValues list
+//	< 10.16   Origin/DestinationBezierVector strings (with LineType "BezierCurve"
+//	          from 10.8); 10.16+ a BezierCurve Line holding the control vectors
+func sequenceFlowToGen(f *microflows.SequenceFlow, v flowVersion) element.Element {
 	g := genMf.NewSequenceFlow()
 	g.SetID(element.ID(f.ID))
 	g.SetOriginID(element.ID(f.OriginID))
@@ -1107,14 +1628,26 @@ func sequenceFlowToGen(f *microflows.SequenceFlow, major int) element.Element {
 	g.SetOriginConnectionIndex(int32(f.OriginConnectionIndex))
 	g.SetDestinationConnectionIndex(int32(f.DestinationConnectionIndex))
 	g.SetIsErrorHandler(f.IsErrorHandler)
-	g.AddCaseValues(caseValueToGen(f.CaseValue))
+	if v.hasCaseValueList() {
+		g.AddCaseValues(caseValueToGen(f.CaseValue))
+	} else {
+		g.SetCaseValue(caseValueToGen(f.CaseValue))
+	}
 
 	originCV := orDefault(f.OriginControlVector, "0;0")
 	destCV := orDefault(f.DestinationControlVector, "0;0")
-	line := genMf.NewBezierCurve()
-	line.SetOriginControlVector(originCV)
-	line.SetDestinationControlVector(destCV)
-	g.SetLine(line)
+	if v.hasLine() {
+		line := genMf.NewBezierCurve()
+		line.SetOriginControlVector(originCV)
+		line.SetDestinationControlVector(destCV)
+		g.SetLine(line)
+	} else {
+		g.SetOriginBezierVector(originCV)
+		g.SetDestinationBezierVector(destCV)
+		if v.hasLineType() {
+			g.SetLineType("BezierCurve")
+		}
+	}
 	return g
 }
 
@@ -1186,7 +1719,12 @@ func showPageFormSettingsToGen(a *microflows.ShowPageAction) element.Element {
 		mappings = append(mappings, m)
 	}
 	addPartList(fs, "ParameterMappings", mappings)
-	addPart(fs, "TitleOverride", emptyTextTemplateToGen())
+	// TitleOverride is nil unless the action actually overrides the page title. An
+	// empty template is not "no override" — it overrides with the empty string, which
+	// blanked the caption of every popup an mxcli-authored action opened (#812).
+	if a.OverridePageTitle != nil {
+		addPart(fs, "TitleOverride", textTemplateToGen(a.OverridePageTitle, nil))
+	}
 	return fs
 }
 
@@ -1217,7 +1755,7 @@ func restCallActionToGen(a *microflows.RestCallAction) element.Element {
 			addPart(e, "RequestHandling", rh)
 		}
 	}
-	addStr(e, "RequestHandlingType", "Custom")
+	addStr(e, "RequestHandlingType", requestHandlingTypeOf(a.RequestHandling))
 	addStr(e, "RequestProxyType", "DefaultProxy")
 	resultHandlingType := "String"
 	if a.ResultHandling != nil {
@@ -1229,6 +1767,8 @@ func restCallActionToGen(a *microflows.RestCallAction) element.Element {
 			resultHandlingType = "HttpResponse"
 		case *microflows.ResultHandlingMapping:
 			resultHandlingType = "Mapping"
+		case *microflows.ResultHandlingFileDocument:
+			resultHandlingType = "FileDocument"
 		case *microflows.ResultHandlingNone:
 			resultHandlingType = "None"
 		}
@@ -1289,6 +1829,29 @@ func stringTemplateElem(text string, params []string) element.Element {
 
 // restRequestHandlingToGen builds a REST RequestHandling sub-element. Mirrors
 // serializeRestRequestHandling (Custom/Mapping/Simple).
+// requestHandlingTypeOf is the action-level discriminator that must agree with
+// the RequestHandling sub-element. It was hardcoded to "Custom" in both engines
+// regardless of the handler, so an export-mapping body claimed to be a custom
+// template.
+//
+// Measured against Studio Pro microflows (ako/TestApp, 11.13.0): Custom,
+// Mapping, FormData and Binary each pair with the matching sub-element. Simple
+// follows the same name rule but has no measured reference.
+func requestHandlingTypeOf(rh microflows.RequestHandling) string {
+	switch rh.(type) {
+	case *microflows.MappingRequestHandling:
+		return "Mapping"
+	case *microflows.BinaryRequestHandling:
+		return "Binary"
+	case *microflows.FormDataRequestHandling:
+		return "FormData"
+	case *microflows.SimpleRequestHandling:
+		return "Simple"
+	default:
+		return "Custom"
+	}
+}
+
 func restRequestHandlingToGen(rh microflows.RequestHandling) element.Element {
 	switch h := rh.(type) {
 	case *microflows.CustomRequestHandling:
@@ -1298,8 +1861,18 @@ func restRequestHandlingToGen(rh microflows.RequestHandling) element.Element {
 	case *microflows.MappingRequestHandling:
 		e := newElem("Microflows$MappingRequestHandling", string(h.ID))
 		addStr(e, "MappingId", string(h.MappingID))
-		addStr(e, "ContentType", h.ContentType)
-		addStr(e, "ParameterVariable", h.ParameterVariable)
+		// generated/metamodel gives this type exactly three properties:
+		// contentType (Json|Xml), mappingId, mappingVariableName. mxcli wrote
+		// "ParameterVariable" — a key the type does not own, which mxbuild
+		// tolerates and Studio Pro refuses to open — and left ContentType empty,
+		// which is not a member of the enum. Studio Pro writes
+		// {ContentType: "Json", MappingVariableName: "<var>"}.
+		addStr(e, "ContentType", orDefault(h.ContentType, "Json"))
+		addStr(e, "MappingVariableName", h.ParameterVariable)
+		return e
+	case *microflows.BinaryRequestHandling:
+		e := newElem("Microflows$BinaryRequestHandling", string(h.ID))
+		addStr(e, "Expression", h.Expression)
 		return e
 	case *microflows.SimpleRequestHandling:
 		return newElem("Microflows$SimpleRequestHandling", string(h.ID))
@@ -1328,6 +1901,14 @@ func restResultHandlingToGen(rh microflows.ResultHandling, outputVar string) ele
 		addStr(vt, "Entity", "System.HttpResponse")
 		addPart(e, "VariableType", vt)
 		return e
+	case *microflows.ResultHandlingFileDocument:
+		e := newElem("Microflows$ResultHandling", string(h.ID))
+		addBool(e, "Bind", outputVar != "")
+		addStr(e, "ResultVariableName", outputVar)
+		vt := newElem("DataTypes$ObjectType", "")
+		addStr(vt, "Entity", h.EntityRef)
+		addPart(e, "VariableType", vt)
+		return e
 	case *microflows.ResultHandlingNone:
 		e := newElem("Microflows$ResultHandling", string(h.ID))
 		addBool(e, "Bind", false)
@@ -1343,13 +1924,11 @@ func restResultHandlingToGen(rh microflows.ResultHandling, outputVar string) ele
 		}
 		imc := newElem("Microflows$ImportMappingCall", "")
 		addStr(imc, "Commit", "YesWithoutEvents")
-		addStr(imc, "ContentType", "Json")
+		addStr(imc, "ContentType", orDefault(h.ContentType, "Json"))
 		addBool(imc, "ForceSingleOccurrence", forceSingle)
 		addStr(imc, "ObjectHandlingBackup", "Create")
 		addStr(imc, "ParameterVariableName", "")
-		rng := newElem("Microflows$ConstantRange", "")
-		addBool(rng, "SingleObject", h.SingleObject)
-		addPart(imc, "Range", rng)
+		addPart(imc, "Range", importMappingRangeToGen(h))
 		addStr(imc, "ReturnValueMapping", string(h.MappingID))
 		addPart(e, "ImportMappingCall", imc)
 		var vt *element.Base
@@ -1434,12 +2013,19 @@ func assignMicroflowIDs(m *genMf.Microflow) {
 	for _, el := range m.FlowsItems() {
 		assignID(el)
 		if sf, ok := el.(*genMf.SequenceFlow); ok {
-			for _, cv := range sf.CaseValuesItems() {
-				assignID(cv)
-			}
-			assignID(sf.Line())
+			assignSequenceFlowIDs(sf)
 		}
 	}
+}
+
+// assignSequenceFlowIDs assigns IDs to a sequence flow's case and line, in
+// whichever shape the flow was built (sequenceFlowToGen).
+func assignSequenceFlowIDs(sf *genMf.SequenceFlow) {
+	assignID(sf.CaseValue())
+	for _, cv := range sf.CaseValuesItems() {
+		assignID(cv)
+	}
+	assignID(sf.Line())
 }
 
 // assignObjectCollectionIDs assigns IDs to a collection's objects and their
@@ -1519,4 +2105,42 @@ func orDefault(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// patchMicroflowToolboxEntries writes the two "expose as … action" sub-documents
+// into an encoded microflow unit.
+//
+// They are injected post-encode for the same reason the Java action's is (#656):
+// the four icon/image fields are BSON *binary*, and gen declares them as string,
+// so anything routed through the gen accessors would silently turn a real PNG
+// into an empty value. Going to the document directly is the only lossless path.
+//
+// A nil entry writes BSON null — the absence of a toolbox entry — which is what
+// gen already encodes, so the patch is a no-op in that case.
+func patchMicroflowToolboxEntries(contents []byte, mf *microflows.Microflow) ([]byte, error) {
+	var err error
+	for _, e := range []struct {
+		key  string
+		info *javaactions.MicroflowActionInfo
+	}{
+		{"MicroflowActionInfo", mf.MicroflowActionInfo},
+		{"WorkflowActionInfo", mf.WorkflowActionInfo},
+	} {
+		if e.info == nil {
+			continue
+		}
+		if contents, err = codec.PatchBSONField(contents, e.key, microflowActionInfoBSON(e.info)); err != nil {
+			return nil, fmt.Errorf("patch %s: %w", e.key, err)
+		}
+	}
+	return contents, nil
+}
+
+// numberOfPagesToClose renders a close-page count as Studio Pro stores it: the
+// empty string for the default single page, the number otherwise.
+func numberOfPagesToClose(n int) string {
+	if n <= 1 {
+		return ""
+	}
+	return strconv.Itoa(n)
 }

@@ -28,11 +28,11 @@ func (m *MockBackend) RenameReferences(oldName, newName string, dryRun bool) ([]
 	return nil, nil
 }
 
-func (m *MockBackend) RenameDocumentByName(moduleName, oldName, newName string) error {
-	if m.RenameDocumentByNameFunc != nil {
-		return m.RenameDocumentByNameFunc(moduleName, oldName, newName)
+func (m *MockBackend) RenameDocument(id model.ID, oldName, newName string) error {
+	if m.RenameDocumentFunc != nil {
+		return m.RenameDocumentFunc(id, oldName, newName)
 	}
-	return nil
+	return fmt.Errorf("MockBackend.RenameDocument not configured")
 }
 
 // ---------------------------------------------------------------------------
@@ -88,6 +88,23 @@ func (m *MockBackend) UpdateRawUnit(unitID string, contents []byte) error {
 	return nil
 }
 
+func (m *MockBackend) UpdateRawUnitOwningTranslations(unitID string, contents []byte) error {
+	if m.UpdateRawUnitOwningTranslationsFunc != nil {
+		return m.UpdateRawUnitOwningTranslationsFunc(unitID, contents)
+	}
+	if m.UpdateRawUnitFunc != nil {
+		return m.UpdateRawUnitFunc(unitID, contents)
+	}
+	return fmt.Errorf("MockBackend.UpdateRawUnitOwningTranslations not configured")
+}
+
+func (m *MockBackend) UpdateRawUnitOwningStorageGUIDs(unitID string, contents []byte) error {
+	if m.UpdateRawUnitOwningStorageGUIDsFunc != nil {
+		return m.UpdateRawUnitOwningStorageGUIDsFunc(unitID, contents)
+	}
+	return fmt.Errorf("MockBackend.UpdateRawUnitOwningStorageGUIDs not configured")
+}
+
 // ---------------------------------------------------------------------------
 // MetadataBackend
 // ---------------------------------------------------------------------------
@@ -102,13 +119,6 @@ func (m *MockBackend) ListAllUnitIDs() ([]string, error) {
 func (m *MockBackend) ListUnits() ([]*types.UnitInfo, error) {
 	if m.ListUnitsFunc != nil {
 		return m.ListUnitsFunc()
-	}
-	return nil, nil
-}
-
-func (m *MockBackend) GetUnitTypes() (map[string]int, error) {
-	if m.GetUnitTypesFunc != nil {
-		return m.GetUnitTypesFunc()
 	}
 	return nil, nil
 }
@@ -253,6 +263,34 @@ func (m *MockBackend) DeleteAgentEditorConsumedMCPService(id string) error {
 	return fmt.Errorf("MockBackend.DeleteAgentEditorConsumedMCPService not configured")
 }
 
+func (m *MockBackend) ListAgentEditorPublishedMCPServices() ([]*agenteditor.PublishedMCPService, error) {
+	if m.ListAgentEditorPublishedMCPServicesFunc != nil {
+		return m.ListAgentEditorPublishedMCPServicesFunc()
+	}
+	return nil, fmt.Errorf("MockBackend.ListAgentEditorPublishedMCPServices not configured")
+}
+
+func (m *MockBackend) CreateAgentEditorPublishedMCPService(svc *agenteditor.PublishedMCPService) error {
+	if m.CreateAgentEditorPublishedMCPServiceFunc != nil {
+		return m.CreateAgentEditorPublishedMCPServiceFunc(svc)
+	}
+	return fmt.Errorf("MockBackend.CreateAgentEditorPublishedMCPService not configured")
+}
+
+func (m *MockBackend) UpdateAgentEditorPublishedMCPService(svc *agenteditor.PublishedMCPService) error {
+	if m.UpdateAgentEditorPublishedMCPServiceFunc != nil {
+		return m.UpdateAgentEditorPublishedMCPServiceFunc(svc)
+	}
+	return fmt.Errorf("MockBackend.UpdateAgentEditorPublishedMCPService not configured")
+}
+
+func (m *MockBackend) DeleteAgentEditorPublishedMCPService(id string) error {
+	if m.DeleteAgentEditorPublishedMCPServiceFunc != nil {
+		return m.DeleteAgentEditorPublishedMCPServiceFunc(id)
+	}
+	return fmt.Errorf("MockBackend.DeleteAgentEditorPublishedMCPService not configured")
+}
+
 func (m *MockBackend) CreateAgentEditorAgent(a *agenteditor.Agent) error {
 	if m.CreateAgentEditorAgentFunc != nil {
 		return m.CreateAgentEditorAgentFunc(a)
@@ -272,4 +310,11 @@ func (m *MockBackend) DeleteAgentEditorAgent(id string) error {
 		return m.DeleteAgentEditorAgentFunc(id)
 	}
 	return fmt.Errorf("MockBackend.DeleteAgentEditorAgent not configured")
+}
+
+func (m *MockBackend) AddRawUnit(unitID, containerID, containmentName, unitType string, contents []byte) error {
+	if m.AddRawUnitFunc != nil {
+		return m.AddRawUnitFunc(unitID, containerID, containmentName, unitType, contents)
+	}
+	return fmt.Errorf("MockBackend.AddRawUnit not configured")
 }

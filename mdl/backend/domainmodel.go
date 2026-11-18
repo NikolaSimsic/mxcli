@@ -3,6 +3,7 @@
 package backend
 
 import (
+	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 )
@@ -15,12 +16,38 @@ type DomainModelBackend interface {
 	GetDomainModel(moduleID model.ID) (*domainmodel.DomainModel, error)
 	GetDomainModelByID(id model.ID) (*domainmodel.DomainModel, error)
 	UpdateDomainModel(dm *domainmodel.DomainModel) error
+	// ParseDomainModelFromRaw converts a DomainModels$DomainModel document
+	// that is not in storage — diff-local's historical revision of the unit,
+	// read back with `git show` — the way GetDomainModel converts the stored
+	// one. Read-only.
+	ParseDomainModelFromRaw(raw map[string]any, unitID, containerID model.ID) (*domainmodel.DomainModel, error)
+
+	// SetDomainModelAnnotations replaces the canvas notes on a domain model.
+	//
+	// Separate from UpdateDomainModel because that one deliberately carries
+	// annotations through as untouched storage (ADR-0005) — it rebuilds only the
+	// entity and association lists, which is what protects notes from every
+	// unrelated edit. Folding annotation authoring into it would put the
+	// preservation and the mutation on the same code path, which is how they got
+	// deleted in the first place.
+	SetDomainModelAnnotations(domainModelID model.ID, annotations []*domainmodel.Annotation) error
+
+	// SetDomainModelDocumentation sets the domain model's own documentation —
+	// the only documentation a module has (mendixlabs/mxcli#1314). Separate
+	// from UpdateDomainModel for the same reason as annotations: that one
+	// carries the stored value through untouched.
+	SetDomainModelDocumentation(domainModelID model.ID, documentation string) error
 
 	// Entities
 	CreateEntity(domainModelID model.ID, entity *domainmodel.Entity) error
 	UpdateEntity(domainModelID model.ID, entity *domainmodel.Entity) error
 	DeleteEntity(domainModelID model.ID, entityID model.ID) error
-	MoveEntity(entity *domainmodel.Entity, sourceDMID, targetDMID model.ID, sourceModuleName, targetModuleName string) ([]string, error)
+	// MoveEntity moves an entity between domain models, converting each association
+	// that touches it into a cross-module association. It reports one entry per
+	// conversion with the qualified name the association had and the one it has
+	// afterwards, because the two move directions differ and the caller must sweep
+	// references from the names rather than derive them (#605).
+	MoveEntity(entity *domainmodel.Entity, sourceDMID, targetDMID model.ID, sourceModuleName, targetModuleName string) ([]types.MovedAssociation, error)
 
 	// Attributes
 	AddAttribute(domainModelID model.ID, entityID model.ID, attr *domainmodel.Attribute) error
@@ -35,11 +62,18 @@ type DomainModelBackend interface {
 
 	// View entities
 	CreateViewEntitySourceDocument(moduleID model.ID, moduleName, docName, oqlQuery, documentation string) (model.ID, error)
+	// WriteViewEntitySourceDocument stores the OQL document, updating the unit
+	// already there rather than replacing it — see the modelsdk implementation
+	// for why the difference is load-bearing (ako/mxcli#583).
+	WriteViewEntitySourceDocument(moduleID model.ID, moduleName, docName, oqlQuery, documentation string) (model.ID, error)
 	DeleteViewEntitySourceDocument(id model.ID) error
 	DeleteViewEntitySourceDocumentByName(moduleName, docName string) error
 	FindViewEntitySourceDocumentID(moduleName, docName string) (model.ID, error)
 	FindAllViewEntitySourceDocumentIDs(moduleName, docName string) ([]model.ID, error)
 	MoveViewEntitySourceDocument(sourceModuleName string, targetModuleID model.ID, docName string) error
+	// RenameViewEntitySourceDocument renames the module's source document
+	// oldName to newName; no-op when there is none.
+	RenameViewEntitySourceDocument(moduleName, oldName, newName string) error
 	UpdateOqlQueriesForMovedEntity(oldQualifiedName, newQualifiedName string) (int, error)
 	UpdateEnumerationRefsInAllDomainModels(oldQualifiedName, newQualifiedName string) error
 }

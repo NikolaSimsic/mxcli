@@ -8,8 +8,11 @@ These files are shared by all AI tools:
 
 ```
 your-mendix-project/
-├── AGENTS.md                          # Comprehensive AI assistant guide
+├── AGENTS.md                          # Comprehensive AI assistant guide (mxcli section between markers)
+├── mdlsource/                         # MDL scripts, one file per concern
+│   └── README.md
 ├── .ai-context/
+│   ├── mxcli-tooling.json             # Which mxcli wrote this tooling (version stamp)
 │   ├── skills/                        # MDL pattern guides
 │   │   ├── write-microflows.md        # Microflow syntax and patterns
 │   │   ├── create-page.md            # Page/widget syntax reference
@@ -42,9 +45,28 @@ your-mendix-project/
 ├── settings.json          # Claude Code project settings
 ├── commands/              # Slash commands for Claude
 │   └── mendix/           # Mendix-specific commands
-└── lint-rules/            # Starlark lint rules
+├── lint-rules/            # Starlark lint rules
+└── lint-config.yaml       # Lint settings (excluded modules, rule overrides)
 CLAUDE.md                  # Project context for Claude
 ```
+
+#### `lint-config.yaml`
+
+Seeded with the **System module excluded**. System is Mendix's own platform
+module — you cannot document its entities, give them access rules, or rename
+their members — so linting it produces findings you can never action. On a
+blank app that was the large majority of all issues.
+
+`mxcli init` writes this file only when the project has no lint config yet
+(`.claude/lint-config.yaml`, `lint-config.yaml`, or `.lint-config.yaml`), so
+re-running init never discards your edits.
+
+Add Marketplace modules (`Atlas_Core`, `Administration`, …) to `excludeModules`
+if their findings distract you — they are equally read-only in practice.
+
+To lint System after all, remove it from `excludeModules`. Note the list always
+wins: it merges with `--exclude`, and a module listed there stays excluded even
+if you name it with `--modules` (lint warns when you try).
 
 ### Cursor
 

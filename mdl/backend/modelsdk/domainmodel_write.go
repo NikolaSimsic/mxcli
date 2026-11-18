@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync/atomic"
 
+	"github.com/mendixlabs/mxcli/generated/metamodel"
 	"github.com/mendixlabs/mxcli/modelsdk/codec"
 	"github.com/mendixlabs/mxcli/modelsdk/element"
 	genDm "github.com/mendixlabs/mxcli/modelsdk/gen/domainmodels"
+	genRest "github.com/mendixlabs/mxcli/modelsdk/gen/rest"
 	genTexts "github.com/mendixlabs/mxcli/modelsdk/gen/texts"
 	mmpr "github.com/mendixlabs/mxcli/modelsdk/mpr"
 
@@ -46,6 +49,14 @@ func init() {
 	codec.RegisterTypeDefaults("DomainModels$IndexedAttribute", codec.TypeDefaults{
 		ZeroGUIDFields: []string{"AssociationPointer"},
 	})
+	// A member access names either an attribute or an association, and Studio
+	// Pro writes BOTH keys, the unused one as "" — all 361 member accesses in
+	// PedApp (11.13) and ako/TestApp (11.14). The writers set only the one in
+	// use, so every rebuilt access rule differed from its stored self by the
+	// missing key, which is how an unchanged rule still churned (ako/mxcli#801).
+	codec.RegisterTypeDefaults("DomainModels$MemberAccess", codec.TypeDefaults{
+		EmptyStringFields: []string{"Attribute", "Association"},
+	})
 	// The index's IndexedAttribute list uses typed-array marker 2, not the
 	// domain-model default of 3 (verified in the same reference project).
 	codec.RegisterListMarker("DomainModels$IndexedAttribute", 2)
@@ -67,6 +78,11 @@ func (b *Backend) CreateAssociation(domainModelID model.ID, assoc *domainmodel.A
 	}
 	ga := assocToGen(assoc)
 	assignAssociationIDs(ga)
+	// Same contract as CreateEntity: report the minted identity rather than
+	// leaving the caller holding an empty one.
+	if assoc.ID == "" {
+		assoc.ID = model.ID(ga.ID())
+	}
 	dm.AddAssociations(ga)
 
 	contents, err := (&codec.Encoder{}).Encode(dm)
@@ -88,7 +104,7 @@ func assocToGen(a *domainmodel.Association) *genDm.Association {
 	out := genDm.NewAssociation()
 	out.SetName(a.Name)
 	out.SetDocumentation(a.Documentation)
-	out.SetExportLevel("Hidden")
+	out.SetExportLevel(orDefault(a.ExportLevel, "Hidden"))
 	out.SetParentID(element.ID(string(a.ParentID)))
 	out.SetChildID(element.ID(string(a.ChildID)))
 	out.SetType(string(a.Type))
@@ -98,8 +114,11 @@ func assocToGen(a *domainmodel.Association) *genDm.Association {
 		sf = "Column"
 	}
 	out.SetStorageFormat(sf)
-	out.SetParentConnection("0;50")
-	out.SetChildConnection("100;50")
+	// Carry the stored line anchors rather than resetting them — assocToGen runs
+	// on every association write, so hardcoding here discarded whatever the
+	// developer had dragged the connector to in Studio Pro (issue #872).
+	out.SetParentConnection(domainmodel.FormatConnectionPoint(a.ParentConnection, domainmodel.DefaultParentConnection))
+	out.SetChildConnection(domainmodel.FormatConnectionPoint(a.ChildConnection, domainmodel.DefaultChildConnection))
 
 	db := genDm.NewAssociationDeleteBehavior()
 	parentDB, childDB := "DeleteMeButKeepReferences", "DeleteMeButKeepReferences"
@@ -111,7 +130,29 @@ func assocToGen(a *domainmodel.Association) *genDm.Association {
 	}
 	db.SetParentDeleteBehavior(parentDB)
 	db.SetChildDeleteBehavior(childDB)
+	// A "delete me if no references" child side carries the message the user sees
+	// when the delete is refused. Studio Pro writes a Texts$Text there and mxcli
+	// wrote null, which does not fail the BUILD — it stops the runtime STARTING,
+	// with a stack trace naming SchemeFactory and nothing about the model
+	// (CapTrackV2 §1).
+	//
+	// Only that behaviour, and only the child side. A census of 47,789 units
+	// across 122 projects found 423 delete behaviours, every one of them keep or
+	// cascade with both messages null — so writing a text element unconditionally
+	// would differ from Studio Pro on every association that exists in the wild.
+	// The Studio Pro reference (ako/TestApp, Mappings.Order_Customer) shows the
+	// same: the message appears on the restrict side, and ParentErrorMessage
+	// stays null.
+	if childDB == string(domainmodel.DeleteBehaviorTypeDeleteMeIfNoReferences) {
+		db.SetChildErrorMessage(textToGen(deleteErrorText(a.ChildDeleteBehavior)))
+	}
 	out.SetDeleteBehavior(db)
+
+	// An association between external entities carries a Rest$OData* source; a
+	// plain association leaves Source unset (the registered TypeDefaults null it).
+	if src := externalAssociationSourceToGen(a); src != nil {
+		out.SetSource(src)
+	}
 	return out
 }
 
@@ -138,6 +179,13 @@ func (b *Backend) CreateEntity(domainModelID model.ID, entity *domainmodel.Entit
 	}
 	ge := entityToGen(entity, b.moduleNameFor(domainModelID), b.majorVersion())
 	assignEntityIDs(ge)
+	// Report the minted identities back to the caller. assignEntityIDs fills
+	// them on the gen element, so a caller that did not pre-assign an ID is
+	// otherwise left holding an entity with an empty one — and its very next
+	// call (AddAttribute, CreateAssociation) fails with "entity not found: ".
+	// The legacy writer populated these, so not doing it is a silent behaviour
+	// difference rather than a design choice; examples/modify_project caught it.
+	copyAssignedIDs(entity, ge)
 	dm.AddEntities(ge)
 
 	enc := &codec.Encoder{}
@@ -180,6 +228,14 @@ func (b *Backend) loadDomainModelGen(id model.ID) (*genDm.DomainModel, error) {
 // domain-model breadth step.
 func entityToGen(e *domainmodel.Entity, moduleName string, major int) *genDm.Entity {
 	out := genDm.NewEntity()
+	// Honor a caller-provided ID so the persisted entity keeps the same $ID the
+	// caller recorded. Otherwise assignEntityIDs generates a fresh one and any
+	// association the caller wires up with ChildID/ParentID = entity.ID dangles
+	// — e.g. the Trip_TripTag NPE association in the external-entities import,
+	// which made the project unopenable in Studio Pro (KeyNotFoundException).
+	if e.ID != "" {
+		out.SetID(element.ID(e.ID))
+	}
 	out.SetName(e.Name)
 	out.SetDocumentation(e.Documentation)
 	out.SetLocation(fmt.Sprintf("%d;%d", e.Location.X, e.Location.Y))
@@ -197,12 +253,24 @@ func entityToGen(e *domainmodel.Entity, moduleName string, major int) *genDm.Ent
 		}
 		out.SetSource(src)
 	}
+	// External (OData remote) entities carry a Rest$OData* source referencing the
+	// consumed service (issue #718). Without it the entity serializes as a plain
+	// persistent/non-persistent entity, losing its "external / from service"
+	// nature. The attributes also switch to OData mapped values (isExternal).
+	isExternal := e.Source == "Rest$ODataRemoteEntitySource" ||
+		e.Source == "Rest$ODataEntityTypeSource" ||
+		e.Source == "Rest$ODataPrimitiveCollectionEntitySource"
+	if isExternal && e.RemoteServiceName != "" {
+		out.SetSource(externalEntitySourceToGen(e))
+	}
 	// ExportLevel is a mandatory scalar NewEntity's pending applyDefaults does not
-	// yet set (engalar tech-debt Fix 4). The entity GUID and the empty member
+	// yet set (engalar tech-debt Fix 4), so an unset one is written "Hidden"; a
+	// rewrite of a stored entity carries the stored level onto it instead
+	// (carryStoredEntity). The entity GUID and the empty member
 	// arrays (Attributes/AccessRules/…) legacy also emits are NOT settable on the
 	// gen Entity / not emitted for unset PartLists — that residual is the
 	// documented applyDefaults gap (see the write-parity known-gap test).
-	out.SetExportLevel("Hidden")
+	out.SetExportLevel(orDefault(e.ExportLevel, "Hidden"))
 
 	if e.GeneralizationRef != "" {
 		g := genDm.NewGeneralization()
@@ -211,25 +279,19 @@ func entityToGen(e *domainmodel.Entity, moduleName string, major int) *genDm.Ent
 	} else {
 		ng := genDm.NewNoGeneralization()
 		ng.SetPersistable(e.Persistable)
-		// Legacy omits the system-attribute flags when false, so only set the
-		// true ones to keep the BSON in parity.
-		if e.HasOwner {
-			ng.SetHasOwner(true)
-		}
-		if e.HasChangedBy {
-			ng.SetHasChangedBy(true)
-		}
-		if e.HasCreatedDate {
-			ng.SetHasCreatedDate(true)
-		}
-		if e.HasChangedDate {
-			ng.SetHasChangedDate(true)
-		}
+		// All four system-attribute flags, false ones included: Studio Pro stores
+		// every one (ako/TestApp 11.14.0, PedApp 11.13.0). Writing only the true
+		// ones, as the legacy serializer did, deleted the false flags on every
+		// rewrite of a Studio Pro domain model (#721 B, #743).
+		ng.SetHasOwner(e.HasOwner)
+		ng.SetHasChangedBy(e.HasChangedBy)
+		ng.SetHasCreatedDate(e.HasCreatedDate)
+		ng.SetHasChangedDate(e.HasChangedDate)
 		out.SetGeneralization(ng)
 	}
 
 	for _, a := range e.Attributes {
-		out.AddAttributes(attributeToGen(a))
+		out.AddAttributes(attributeToGen(a, isExternal))
 	}
 	// Validation rules reference their attribute by qualified name
 	// (Module.Entity.Attr); resolve attribute IDs → names within this entity.
@@ -360,7 +422,14 @@ func indexToGen(idx *domainmodel.Index) *genDm.Index {
 	segs := idx.Attributes
 	for _, ia := range segs {
 		seg := genDm.NewIndexedAttribute()
-		seg.SetType("Normal")
+		// A system-member segment (CreatedDate / ChangedDate) indexes no
+		// attribute; writing it as "Normal" leaves an attribute segment pointing
+		// at nothing (mendixlabs/mxcli#1401).
+		segType := ia.Type
+		if segType == "" {
+			segType = genDm.IndexedAttributeTypeNormal
+		}
+		seg.SetType(segType)
 		seg.SetAscending(ia.Ascending)
 		seg.SetAttributeID(element.ID(ia.AttributeID))
 		out.AddAttributes(seg)
@@ -392,20 +461,116 @@ func validationRuleToGen(vr *domainmodel.ValidationRule, moduleName, entityName 
 	if vr.ErrorMessage != nil && len(vr.ErrorMessage.Translations) > 0 {
 		out.SetErrorMessage(textToGen(vr.ErrorMessage))
 	}
-	out.SetRuleInfo(ruleInfoToGen(vr.Type))
+	out.SetRuleInfo(ruleInfoToGen(vr))
 	return out
 }
 
-// ruleInfoToGen maps a validation rule type to its RuleInfo element.
-func ruleInfoToGen(ruleType string) element.Element {
-	switch ruleType {
+// validationRulesAreReproducible reports the first stored validation rule this
+// writer cannot serialize, so the caller can refuse the write instead of
+// downgrading it. See ruleInfoToGen.
+func validationRulesAreReproducible(e *domainmodel.Entity) (string, bool) {
+	for _, vr := range e.ValidationRules {
+		if !reproducibleRule(vr) {
+			return vr.Type, false
+		}
+	}
+	return "", true
+}
+
+// ruleInfoToGen builds the RuleInfo element for a validation rule, or nil for
+// one this writer cannot reproduce.
+//
+// A nil return is a REFUSAL, not a default. The previous code fell back to
+// RequiredRuleInfo, which turned every entity rewrite into a silent downgrade:
+// a RegEx rule came back as Required, the pattern reference gone and the field
+// merely mandatory, with mxbuild none the wiser because both are valid rules.
+//
+// It takes the whole rule rather than its type, because the type alone does not
+// determine the document: a RegEx rule is its reference and a Range rule is its
+// bounds. Writing the bare RuleInfo for either would produce a rule Mendix
+// accepts and that constrains nothing — the same silent downgrade wearing the
+// right type name. So a rule whose payload did not survive the read is refused
+// as firmly as a type this writer does not know.
+func ruleInfoToGen(vr *domainmodel.ValidationRule) element.Element {
+	if vr == nil {
+		return nil
+	}
+	switch vr.Type {
 	case "Unique":
 		return genDm.NewUniqueRuleInfo()
-	case "Required":
+	case "Required", "":
 		return genDm.NewRequiredRuleInfo()
+
+	case "RegEx":
+		// Writable only since the RegExIdentifier storage-name override in
+		// modelsdk/gen — before it, this emitted a key Mendix does not read.
+		info, ok := vr.Rule.(*domainmodel.RegexValidationRuleInfo)
+		if !ok || info.RegularExpressionQualifiedName == "" {
+			return nil
+		}
+		out := genDm.NewRegExRuleInfo()
+		out.SetRegularExpressionQualifiedName(info.RegularExpressionQualifiedName)
+		return out
+
+	case "Range":
+		info, ok := vr.Rule.(*domainmodel.RangeValidationRuleInfo)
+		if !ok {
+			return nil
+		}
+		typeOfRange, ok := rangeKind(info)
+		if !ok {
+			return nil
+		}
+		out := genDm.NewRangeRuleInfo()
+		out.SetTypeOfRange(typeOfRange)
+		out.SetUseMinValue(info.UseMinValue)
+		out.SetUseMaxValue(info.UseMaxValue)
+		if info.MinValue != nil {
+			out.SetMinValue(*info.MinValue)
+		}
+		if info.MaxValue != nil {
+			out.SetMaxValue(*info.MaxValue)
+		}
+		// A bound may point at another attribute instead of a literal. MDL
+		// cannot author that, but a stored rule must survive the rewrite.
+		if info.MinAttributeQualifiedName != "" {
+			out.SetMinAttributeQualifiedName(info.MinAttributeQualifiedName)
+		}
+		if info.MaxAttributeQualifiedName != "" {
+			out.SetMaxAttributeQualifiedName(info.MaxAttributeQualifiedName)
+		}
+		return out
+
 	default:
-		return genDm.NewRequiredRuleInfo()
+		// MaxLength and EqualsTo. Neither is authorable in MDL, so one only
+		// reaches here through a read-modify-write, and neither survives the
+		// read — the model carries no payload type for them. (EqualsTo would
+		// also need a gen storage-name override: it binds "EqualsToValue"
+		// where Studio Pro stores "value".)
+		return nil
 	}
+}
+
+// rangeKind derives the TypeOfRange enum from which bounds are in use. Mendix
+// has exactly three values and no strict inequality, so a range using neither
+// bound has no representation and is refused.
+func rangeKind(info *domainmodel.RangeValidationRuleInfo) (string, bool) {
+	switch {
+	case info.UseMinValue && info.UseMaxValue:
+		return string(metamodel.DomainModelsTypeOfRangeBetween), true
+	case info.UseMinValue:
+		return string(metamodel.DomainModelsTypeOfRangeGreaterThanOrEqualTo), true
+	case info.UseMaxValue:
+		return string(metamodel.DomainModelsTypeOfRangeSmallerThanOrEqualTo), true
+	default:
+		return "", false
+	}
+}
+
+// reproducibleRule reports whether this writer can serialize a validation rule.
+// Everything else must be preserved rather than rewritten.
+func reproducibleRule(vr *domainmodel.ValidationRule) bool {
+	return ruleInfoToGen(vr) != nil
 }
 
 // textToGen converts a model.Text to a gen Texts$Text with sorted translations.
@@ -425,17 +590,48 @@ func textToGen(t *model.Text) *genTexts.Text {
 	return out
 }
 
+// moduleNameListings counts the project listings moduleNameFor makes. Each is
+// a full read of every unit on an MPR v1 project, so tests use it to bound how
+// often a caller pays for one.
+var moduleNameListings atomic.Int64
+
 // moduleNameFor returns the name of the module that contains the given unit.
 func (b *Backend) moduleNameFor(unitID model.ID) string {
+	moduleNameListings.Add(1)
 	units, err := b.reader.ListUnits()
 	if err != nil {
 		return ""
 	}
+	parentOf := make(map[string]string, len(units))
 	for _, u := range units {
-		if u.ID == string(unitID) {
-			if mi, _ := b.reader.GetModule(u.ContainerID); mi != nil {
-				return mi.Name
-			}
+		parentOf[u.ID] = u.ContainerID
+	}
+
+	// A document is not necessarily a direct child of its module — Studio Pro
+	// nests documents in folders, and folders in folders, which is the norm in
+	// marketplace modules. So walk the containment chain up to the first
+	// enclosing module rather than reading only the immediate container.
+	// The project root is its own container, so stop on a self-reference as
+	// well as on a missing entry.
+	//
+	// The modules are listed once, not once per ancestor: on an MPR v1 project
+	// every listing reads every unit's contents from SQLite.
+	moduleNameListings.Add(1)
+	modules, err := b.reader.ListModules()
+	if err != nil {
+		return ""
+	}
+	moduleName := make(map[string]string, len(modules))
+	for _, m := range modules {
+		if _, dup := moduleName[m.ID]; !dup {
+			moduleName[m.ID] = m.Name
+		}
+	}
+	seen := make(map[string]bool, 8)
+	for id := parentOf[string(unitID)]; id != "" && !seen[id]; id = parentOf[id] {
+		seen[id] = true
+		if name, ok := moduleName[id]; ok {
+			return name
 		}
 	}
 	return ""
@@ -445,27 +641,65 @@ func (b *Backend) moduleNameFor(unitID model.ID) string {
 // documentation, ExportLevel, the typed NewType element, and a StoredValue
 // holding the default. The attribute's GUID is added by the encoder via the
 // registered DomainModels$Attribute defaults.
-func attributeToGen(a *domainmodel.Attribute) *genDm.Attribute {
+func attributeToGen(a *domainmodel.Attribute, isExternal bool) *genDm.Attribute {
 	out := genDm.NewAttribute()
 	out.SetName(a.Name)
 	out.SetDocumentation(a.Documentation)
-	out.SetExportLevel("Hidden")
+	out.SetExportLevel(orDefault(a.ExportLevel, "Hidden"))
 	out.SetType(attributeTypeToGen(a.Type))
 
-	// View-entity attributes carry an OqlViewValue referencing the OQL column
-	// (not a StoredValue) — emitting StoredValue triggers CE6770 "View Entity out
-	// of sync". Otherwise Studio Pro always serializes StoredValue.DefaultValue
-	// (empty string when no explicit default), so set it unconditionally.
-	if a.Value != nil && a.Value.ViewReference != "" {
+	def := ""
+	if a.Value != nil {
+		def = a.Value.DefaultValue
+	}
+	switch {
+	case a.Value != nil && a.Value.ViewReference != "":
+		// View-entity attributes carry an OqlViewValue referencing the OQL column
+		// (not a StoredValue) — emitting StoredValue triggers CE6770 "View Entity
+		// out of sync".
 		vv := genDm.NewOqlViewValue()
 		vv.SetReference(a.Value.ViewReference)
 		out.SetValue(vv)
-	} else {
+	case a.Value != nil && a.Value.Type == "CalculatedValue":
+		// Calculated attribute: the value is computed by a microflow, not stored.
+		// Without this arm the attribute fell through to the default StoredValue
+		// below, so `calculated by` parsed, validated and reported success while
+		// the binding never reached the model — an attribute that stays empty at
+		// runtime, in a project that builds at 0 errors (#917). The legacy
+		// serializer had the arm; the default engine did not.
+		//
+		// Microflow is a ByNameReference (gen binds the "Microflow" key to the
+		// qualified name), and PassEntity says whether the microflow takes the
+		// owning entity as its parameter.
+		cv := genDm.NewCalculatedValue()
+		cv.SetMicroflowQualifiedName(a.Value.MicroflowName)
+		cv.SetPassEntity(a.Value.PassEntity)
+		out.SetValue(cv)
+	case isExternal && a.IsPrimitiveCollection:
+		// The single attribute of a primitive-collection NPE (e.g. TripTag.Tag) is
+		// backed by a Rest$ODataMappedPrimitiveCollectionValue (issue #718).
+		mv := genRest.NewODataMappedPrimitiveCollectionValue()
+		mv.SetDefaultValueDesignTime(def)
+		mv.SetRemoteName(a.RemoteName)
+		mv.SetRemoteType(a.RemoteType)
+		out.SetValue(mv)
+	case isExternal && a.RemoteName != "":
+		// External-entity attribute backed by an OData property → Rest$ODataMappedValue
+		// instead of DomainModels$StoredValue (issue #718).
+		mv := genRest.NewODataMappedValue()
+		mv.SetCreatable(a.Creatable)
+		mv.SetDefaultValueDesignTime(def)
+		mv.SetFilterable(a.Filterable)
+		mv.SetRemoteName(a.RemoteName)
+		mv.SetRemoteType(a.RemoteType)
+		mv.SetRepresentsStream(false)
+		mv.SetSortable(a.Sortable)
+		mv.SetUpdatable(a.Updatable)
+		out.SetValue(mv)
+	default:
+		// Regular entity attribute — Studio Pro always serializes a StoredValue
+		// (empty DefaultValue when none), so set it unconditionally.
 		sv := genDm.NewStoredValue()
-		def := ""
-		if a.Value != nil {
-			def = a.Value.DefaultValue
-		}
 		sv.SetDefaultValue(def)
 		out.SetValue(sv)
 	}
@@ -483,9 +717,11 @@ func attributeTypeToGen(t domainmodel.AttributeType) element.Element {
 	switch at := t.(type) {
 	case *domainmodel.StringAttributeType:
 		g := genDm.NewStringAttributeType()
-		if at.Length > 0 {
-			g.SetLength(int32(at.Length))
-		}
+		// Always emit Length — including 0 (= unlimited) — to match the legacy
+		// serializer. If Length is omitted, Studio Pro falls back to its own UI
+		// default of 200, which for external (OData) attributes without a MaxLength
+		// contradicts the service's "unlimited" type and raises CE6621.
+		g.SetLength(int32(at.Length))
 		return g
 	case *domainmodel.IntegerAttributeType:
 		return genDm.NewIntegerAttributeType()
@@ -495,8 +731,23 @@ func attributeTypeToGen(t domainmodel.AttributeType) element.Element {
 		return genDm.NewDecimalAttributeType()
 	case *domainmodel.BooleanAttributeType:
 		return genDm.NewBooleanAttributeType()
-	case *domainmodel.DateTimeAttributeType, *domainmodel.DateAttributeType:
-		return genDm.NewDateTimeAttributeType()
+	case *domainmodel.DateTimeAttributeType:
+		// Always written: a domain-model write re-serializes every entity in the
+		// unit, so leaving it out dropped a Studio Pro-authored LocalizeDate on
+		// every rewrite (#743). Producers that do not know it set true, Mendix's
+		// default and what an absent property meant before.
+		g := genDm.NewDateTimeAttributeType()
+		g.SetLocalizeDate(at.LocalizeDate)
+		return g
+	case *domainmodel.DateAttributeType:
+		// Mendix has no date-only type. The key is written, never omitted: an
+		// absent LocalizeDate is not what Studio Pro writes and trips Mendix's
+		// merge/diff (mendixlabs/mxcli#1373). True is what the absent key was
+		// always read as (storedLocalizeDate), so the stored meaning is
+		// unchanged; `DateTime not localized` is the spelling for false.
+		g := genDm.NewDateTimeAttributeType()
+		g.SetLocalizeDate(true)
+		return g
 	case *domainmodel.AutoNumberAttributeType:
 		return genDm.NewAutoNumberAttributeType()
 	case *domainmodel.BinaryAttributeType:
@@ -510,6 +761,124 @@ func attributeTypeToGen(t domainmodel.AttributeType) element.Element {
 	default:
 		return genDm.NewStringAttributeType()
 	}
+}
+
+// externalEntitySourceToGen builds the Rest$OData* entity source element for an
+// external (OData remote) entity, mirroring the legacy serializer
+// (sdk/mpr/writer_domainmodel.go). Nested key elements get fresh IDs here because
+// assignEntityIDs only stamps the top-level source object (issue #718).
+func externalEntitySourceToGen(e *domainmodel.Entity) element.Element {
+	switch e.Source {
+	case "Rest$ODataRemoteEntitySource":
+		// Top-level external entity (has an entity set): CRUD + paging capabilities.
+		src := genRest.NewODataRemoteEntitySource()
+		src.SetCountable(e.Countable)
+		src.SetCreatable(e.Creatable)
+		src.SetCreateChangeLocally(e.CreateChangeLocally)
+		src.SetDeletable(e.Deletable)
+		src.SetEntitySet(e.RemoteEntitySet)
+		if key := odataKeyToGen(e.RemoteKeyParts); key != nil {
+			src.SetKey(key)
+		}
+		src.SetRemoteName(e.RemoteEntityName)
+		src.SetSkipSupported(e.SkipSupported)
+		src.SetSourceDocumentQualifiedName(e.RemoteServiceName)
+		src.SetTopSupported(e.TopSupported)
+		return src
+	case "Rest$ODataEntityTypeSource":
+		// Derived/abstract/contained type (no entity set): type name + key only.
+		src := genRest.NewODataEntityTypeSource()
+		src.SetEntityTypeName(e.RemoteEntityName)
+		src.SetIsOpen(e.IsOpen)
+		if key := odataKeyToGen(e.RemoteKeyParts); key != nil {
+			src.SetKey(key)
+		}
+		src.SetSourceDocumentQualifiedName(e.RemoteServiceName)
+		return src
+	case "Rest$ODataPrimitiveCollectionEntitySource":
+		// Primitive-collection NPE (e.g. TripTag for Trip.Tags = Collection(Edm.String)).
+		src := genRest.NewODataPrimitiveCollectionEntitySource()
+		src.SetSourceDocumentQualifiedName(e.RemoteServiceName)
+		return src
+	}
+	return nil
+}
+
+func init() {
+	// An external entity's Rest$ODataKey Parts list is marker 2 in Studio Pro's
+	// BSON (measured on ako/TestApp, Clients.Orders); the default 3 rewrote the
+	// key on every domain-model write (#743).
+	codec.RegisterListMarker("Rest$ODataKeyPart", 2)
+}
+
+// odataKeyToGen builds a Rest$ODataKey from the entity's remote key parts, or nil
+// when there are none.
+func odataKeyToGen(parts []*domainmodel.RemoteKeyPart) element.Element {
+	if len(parts) == 0 {
+		return nil
+	}
+	key := genRest.NewODataKey()
+	for _, kp := range parts {
+		key.AddParts(odataKeyPartToGen(kp))
+	}
+	assignID(key)
+	return key
+}
+
+func odataKeyPartToGen(kp *domainmodel.RemoteKeyPart) element.Element {
+	part := genRest.NewODataKeyPart()
+	part.SetEntityKeyPartName(kp.Name)
+	part.SetName(kp.RemoteName)
+	part.SetFilterable(true)
+	part.SetRemoteType(kp.RemoteType)
+	t := attributeTypeToGen(kp.Type)
+	assignID(t)
+	part.SetType(t)
+	assignID(part)
+	return part
+}
+
+// externalAssociationSourceToGen builds the Rest$OData* association source for an
+// association between external entities, or nil for a plain association (issue
+// #718). The source object gets a fresh ID here (assignAssociationIDs stamps only
+// the association and its delete behavior).
+func externalAssociationSourceToGen(a *domainmodel.Association) element.Element {
+	switch a.Source {
+	case "Rest$ODataRemoteAssociationSource":
+		nav := a.Navigability2
+		if nav == "" {
+			nav = "ParentToChild"
+		}
+		src := genRest.NewODataRemoteAssociationSource()
+		src.SetCreatableFromChild(a.CreatableFromChild)
+		src.SetCreatableFromParent(a.CreatableFromParent)
+		src.SetNavigability2(nav)
+		src.SetRemoteChildNavigationProperty(a.RemoteChildNavigationProperty)
+		src.SetRemoteParentNavigationProperty(a.RemoteParentNavigationProperty)
+		src.SetUpdatableFromChild(a.UpdatableFromChild)
+		src.SetUpdatableFromParent(a.UpdatableFromParent)
+		assignID(src)
+		return src
+	case "Rest$ODataPrimitiveCollectionAssociationSource":
+		// Marker source pairing with Rest$ODataPrimitiveCollectionEntitySource on
+		// the child — no extra fields.
+		src := genRest.NewODataPrimitiveCollectionAssociationSource()
+		assignID(src)
+		return src
+	case domainmodel.OqlViewAssociationSource:
+		return oqlViewAssociationSourceToGen(a.ViewSourceReference)
+	}
+	return nil
+}
+
+// oqlViewAssociationSourceToGen builds it. `Reference` is the OQL select alias;
+// gen binds that exact storage name (checked against initOqlViewAssociationSource
+// and against a real document), so no STORAGE-NAME OVERRIDE is needed here.
+func oqlViewAssociationSourceToGen(reference string) element.Element {
+	src := genDm.NewOqlViewAssociationSource()
+	src.SetReference(reference)
+	assignID(src)
+	return src
 }
 
 // assignEntityIDs gives the entity, its generalization, and each attribute
@@ -572,4 +941,62 @@ func assignID(elem element.Element) {
 		return
 	}
 	ider.SetID(element.ID(mmpr.GenerateID()))
+}
+
+// deleteErrorText is the message element a restrict behaviour must carry.
+//
+// An omitted message becomes an empty en_US translation rather than a null: null
+// is the shape that stops the runtime starting, and Studio Pro's dialog lets the
+// box be left empty, so an empty text is the closest thing to "no message" that
+// still boots.
+//
+// The translation is keyed by db.ErrorMessageLanguage — the project's default
+// language, set by the executor — and falls back to model.AuthoringLanguage
+// (en_US until a project's settings are read) only when no language was given. Hardcoding en_US left a nl_NL app with no message in its own
+// language when a delete was refused, with mx check reporting nothing
+// (mendixlabs/mxcli#1344, the delete-message instance of #970).
+//
+// NOTE: the empty case is INFERRED, not measured. The reference document
+// (ako/TestApp) captures a message that was filled in; nobody has yet saved a
+// restrict association with the box cleared, so what Studio Pro writes then is
+// unverified. If this ever misbehaves, that is the line to check first.
+func deleteErrorText(db *domainmodel.DeleteBehavior) *model.Text {
+	msg := ""
+	if db != nil {
+		msg = db.ErrorMessage
+	}
+	return &model.Text{Translations: map[string]string{deleteErrorLanguage(db): msg}}
+}
+
+// copyAssignedIDs writes the identities minted on a gen entity back onto the
+// semantic entity the caller passed in.
+//
+// Attributes are matched BY NAME rather than by position: entityToGen may add,
+// skip or reorder elements (an audit pseudo-type becomes a System-module
+// generalization, not an attribute), so an index-based copy would hand the
+// caller another attribute's identity — a worse failure than the empty ID it
+// replaces, because it looks like it worked.
+func copyAssignedIDs(dst *domainmodel.Entity, src *genDm.Entity) {
+	if dst == nil || src == nil {
+		return
+	}
+	if dst.ID == "" {
+		dst.ID = model.ID(src.ID())
+	}
+	byName := map[string]element.ID{}
+	for _, el := range src.AttributesItems() {
+		a, ok := el.(*genDm.Attribute)
+		if !ok {
+			continue
+		}
+		byName[a.Name()] = a.ID()
+	}
+	for _, attr := range dst.Attributes {
+		if attr == nil || attr.ID != "" {
+			continue
+		}
+		if id, ok := byName[attr.Name]; ok {
+			attr.ID = model.ID(id)
+		}
+	}
 }

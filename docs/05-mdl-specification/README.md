@@ -30,7 +30,7 @@ describe entity Module.EntityName;
 create persistent entity Module.Name (
   AttrName: type [not null] [unique] [default value]
 );
-alter entity Module.Name add (NewAttr: string(200));
+alter entity Module.Name add attribute NewAttr: string(200);
 drop entity Module.Name;
 
 -- Microflows
@@ -42,7 +42,7 @@ create page Module.Name (title: 'Title', layout: Module.Layout) { ... };
 alter page Module.Name { set caption = 'New' on btnSave; };
 
 -- Security
-grant Module.Role on Module.Entity (create, delete, read *, write *);
+grant create, delete, read *, write * on entity Module.Entity to Module.Role;
 grant execute on microflow Module.Name to Module.Role;
 
 -- External SQL

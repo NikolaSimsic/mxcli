@@ -1,10 +1,14 @@
 # Widget Types
 
-MDL supports a comprehensive set of widget types for building Mendix pages. Each widget is declared with a type keyword, a unique name, properties in parentheses, and optional child widgets in braces.
+A widget is declared with a type keyword, a unique name, properties in parentheses, and optional child widgets in braces.
 
 ```sql
 WIDGET_TYPE widgetName (Property: value, ...) [{ children }]
 ```
+
+**Each built-in widget takes its own properties.** A property the widget does not take — `Caption:` on a `TEXTBOX` (an input's label is `Label:`), `Label:` on an `ACTIONBUTTON`, `Visible:` on a `SNIPPETCALL` (Mendix stores no visibility for one), a misspelt key — is refused under `mdl 1;` by `check` and by `exec`, with nothing written (MDL-WIDGET52). Without the header it is dropped as before and warned about (MDL-V1-WIDGETPROP). The message lists the properties that widget takes.
+
+**The list below is not the boundary.** The built-in Mendix widgets are documented here because they have fixed, hand-written property sets. Every **pluggable or custom widget** installed in the project is also written by its own name, with a body derived from the widget's definition — see [Any installed widget](#any-installed-widget) below. If a widget is in `widgets/`, MDL can name it.
 
 ## Widget Categories
 
@@ -12,7 +16,7 @@ WIDGET_TYPE widgetName (Property: value, ...) [{ children }]
 |----------|---------|
 | Layout | `LAYOUTGRID`, `ROW`, `COLUMN`, `CONTAINER`, `CUSTOMCONTAINER` |
 | Data | `DATAVIEW`, `LISTVIEW`, `DATAGRID`, `GALLERY` |
-| Input | `TEXTBOX`, `TEXTAREA`, `CHECKBOX`, `RADIOBUTTONS`, `DATEPICKER`, `COMBOBOX` |
+| Input | `TEXTBOX`, `TEXTAREA`, `CHECKBOX`, `RADIOBUTTONS`, `DATEPICKER`, `COMBOBOX`, `FILEMANAGER` |
 | Display | `DYNAMICTEXT`, `IMAGE`, `STATICIMAGE`, `DYNAMICIMAGE` |
 | Action | `ACTIONBUTTON`, `LINKBUTTON` |
 | Navigation | `NAVIGATIONLIST` |
@@ -26,16 +30,16 @@ Creates a responsive grid with rows and columns. The primary layout mechanism fo
 
 ```sql
 LAYOUTGRID grid1 {
-  ROW row1 {
-    COLUMN col1 {
+  ROW {
+    COLUMN {
       TEXTBOX txtName (Label: 'Name', Attribute: Name)
     }
-    COLUMN col2 {
+    COLUMN {
       TEXTBOX txtEmail (Label: 'Email', Attribute: Email)
     }
   }
-  ROW row2 {
-    COLUMN colFull {
+  ROW {
+    COLUMN {
       TEXTAREA txtNotes (Label: 'Notes', Attribute: Notes)
     }
   }
@@ -67,11 +71,44 @@ CONTAINER cCard (Class: 'card mx-spacing-top-large') {
 |----------|-------------|---------|
 | `Class` | CSS class names | `Class: 'card p-3'` |
 | `Style` | Inline CSS styles | `Style: 'padding: 16px;'` |
-| `DesignProperties` | Design property values | `DesignProperties: ['Spacing top': 'Large']` |
+| `DynamicClasses` | Runtime-computed CSS classes (expression; stacks on `Class`) | `DynamicClasses: if $currentObject/IsActive then 'is-active' else ''` |
+| `DesignProperties` | Design property values | `DesignProperties: ('Spacing top': 'Large')` |
 
 ### CUSTOMCONTAINER
 
 Similar to `CONTAINER` but used for custom-styled containers.
+
+### TABCONTAINER / TABPAGE
+
+A tab container holds tab pages; each tab page holds widgets.
+
+```sql
+CREATE PAGE MyModule.Task_Tabs (
+  Title: 'Tasks',
+  Layout: Atlas_Core.Atlas_Default,
+  Params: ($Panel: MyModule.Panel)
+) {
+  DATAVIEW dvPanel (DataSource: $Panel) {
+    TABCONTAINER tcMain {
+      TABPAGE tpOpen (Caption: 'Open', Badge: '{1}', BadgeParams: ({1} = OpenCount)) {
+        DYNAMICTEXT txtOpen (Content: 'Open tasks')
+      }
+      TABPAGE tpDone (Caption: 'Done') {
+        DYNAMICTEXT txtDone (Content: 'Done tasks')
+      }
+    }
+  }
+};
+```
+
+| Property (tab page) | Description | Example |
+|---|---|---|
+| `Caption` | Tab caption, plain text (no parameters) | `Caption: 'Open'` |
+| `Badge` | Text shown beside the caption, a text template like a dynamic text's `Content` | `Badge: '{1}'` |
+| `BadgeParams` | The badge template's parameters, resolved against the enclosing data container | `BadgeParams: ({1} = OpenCount)` |
+| `Visible` | Visibility condition | `Visible: $Panel/ShowDone` |
+
+A tab page has no `Class`, `Style` or `CaptionParams`: Mendix stores none for it. A `BadgeParams` without a `Badge`, or a `Badge` that is not a quoted template, is refused (MDL-WIDGET51); `Badge` on any other widget is not stored, and is refused (MDL-WIDGET52).
 
 ## Data Widgets
 
@@ -84,9 +121,9 @@ DATAVIEW dvCustomer (DataSource: $Customer) {
   TEXTBOX txtName (Label: 'Name', Attribute: Name)
   TEXTBOX txtEmail (Label: 'Email', Attribute: Email)
   COMBOBOX cbStatus (Label: 'Status', Attribute: Status)
-  FOOTER footer1 {
-    ACTIONBUTTON btnSave (Caption: 'Save', Action: SAVE_CHANGES, ButtonStyle: Primary)
-    ACTIONBUTTON btnCancel (Caption: 'Cancel', Action: CANCEL_CHANGES)
+  FOOTER {
+    ACTIONBUTTON btnSave (Caption: 'Save', Action: SAVE CHANGES, ButtonStyle: Primary)
+    ACTIONBUTTON btnCancel (Caption: 'Cancel', Action: CANCEL CHANGES)
   }
 }
 ```
@@ -104,12 +141,12 @@ Displays a list of objects in a tabular format with columns, sorting, and pagina
 
 ```sql
 DATAGRID dgOrders (DataSource: DATABASE Sales.Order, PageSize: 20) {
-  COLUMN colId (Attribute: OrderId, Caption: 'Order #')
-  COLUMN colDate (Attribute: OrderDate, Caption: 'Date')
-  COLUMN colAmount (Attribute: Amount, Caption: 'Amount', Alignment: right)
-  COLUMN colStatus (Attribute: Status, Caption: 'Status')
-  CONTROLBAR bar1 {
-    ACTIONBUTTON btnNew (Caption: 'New', Action: MICROFLOW Sales.ACT_CreateOrder, ButtonStyle: Primary)
+  COLUMN (Attribute: OrderId, Caption: 'Order #')
+  COLUMN (Attribute: OrderDate, Caption: 'Date')
+  COLUMN (Attribute: Amount, Caption: 'Amount', Alignment: right)
+  COLUMN (Attribute: Status, Caption: 'Status')
+  CONTROLBAR {
+    ACTIONBUTTON btnNew (Caption: 'New', Action: CALL MICROFLOW Sales.ACT_CreateOrder, ButtonStyle: Primary)
   }
 }
 ```
@@ -123,12 +160,40 @@ DATAGRID dgOrders (DataSource: DATABASE Sales.Order, PageSize: 20) {
 | `Pagination` | Pagination mode | `Pagination: virtualScrolling` |
 | `PagingPosition` | Position of paging controls | `PagingPosition: both` |
 | `ShowPagingButtons` | When to show paging buttons | `ShowPagingButtons: auto` |
+| `Selection` | Row selection: `None`, `Single` or `Multi` (also on a GALLERY). The widget key `itemSelection:` is the same property; two different values for it are refused (MDL-WIDGET50) | `Selection: Single` |
+
+**Any other Data grid 2 setting** can be set by its widget key — the name the
+widget's own definition gives it (`DESCRIBE WIDGET TYPE datagrid` lists them with
+their types, defaults and allowed values). The grid's personalization, for
+example, is stored in the browser or in an attribute of the surrounding object:
+
+```sql
+-- in the browser's local storage
+DATAGRID dgLocal (DataSource: DATABASE Sales.Order,
+                  configurationStorageType: localStorage,
+                  storeFiltersInPersonalization: true)
+
+-- in an attribute of the data view the grid sits in
+DATAVIEW dvPref (DataSource: $Pref) {
+  DATAGRID dgAttr (DataSource: DATABASE Sales.Order,
+                   configurationStorageType: attribute,
+                   configurationAttribute: Config)
+}
+```
+
+`DESCRIBE PAGE` prints every such setting whose stored value differs from the
+widget's default, under the same key, so describing a page and executing the
+description gives back the page it started from. A setting it cannot spell
+(an attribute reached over an association) is named in a `-- NOT re-executable`
+comment instead of being dropped without a word. Column settings with no keyword
+of their own (`minWidth`, `minWidthLimit`, `allowEventPropagation`, …) are
+written and described the same way, and so are a Gallery's.
 
 **Column properties:**
 
 | Property | Values | Default | Description |
 |----------|--------|---------|-------------|
-| `Attribute` | attribute name | (required) | The attribute to display |
+| `Attribute` | attribute name, or association path `Assoc/Attr` | (required) | The attribute to display. Use an association path to show an attribute over a reference — e.g. `Attribute: Order_Customer/Name` shows the associated Customer's Name. Association names are bare (resolved against the grid's entity module); multi-hop paths (`A/B/Attr`) are supported. |
 | `Caption` | string | attribute name | Column header text |
 | `Alignment` | `left`, `center`, `right` | `left` | Text alignment |
 | `WrapText` | `true`, `false` | `false` | Allow text wrapping |
@@ -154,6 +219,73 @@ LISTVIEW lvProducts (DataSource: DATABASE MyModule.Product) {
   }
 }
 ```
+
+#### Database source over an association
+
+Inside a data container, a list view can retrieve **from the database** the
+objects an association of the context object points to. Studio Pro calls it a
+Database source with an entity path; it keeps an XPath constraint, a sort order
+and a search bar:
+
+```sql
+create snippet MyModule.TaskAssignees (Params: ($Task: System.WorkflowUserTask)) {
+  listview lvAssignees (
+    DataSource: database from $Task/System.WorkflowUserTask_Assignees/Administration.Account
+      where [Active = true()] sort by FullName asc search by FullName
+  ) {
+    dynamictext txtName (Content: '{1}', ContentParams: ({1} = FullName))
+  }
+};
+```
+
+The path pairs each association with the entity it arrives at. Name the entity:
+it may be a specialization of the association's own end (here
+`Administration.Account` for `System.User`), and `DESCRIBE` always prints it. A
+trailing association with no entity gets the end opposite the context.
+
+It is a different source from `$Task/System.WorkflowUserTask_Assignees` — an
+**association** source, which follows the association in memory and has no
+XPath, sort or search.
+
+A gallery, a data grid and any other pluggable widget take the same form for
+their "Database" source, with its XPath and sort (`search by` stays a list view
+search bar). Widgets with a source of their own, such as a chart series or a
+dynamic image, refuse it.
+
+#### Specialization templates
+
+When the list view's entity is a **generalization**, it can render a different
+body per specialization. A template is identified by the entity it renders — it
+has no name, hence `TEMPLATE FOR <entity>`:
+
+```sql
+LISTVIEW vehicleListView (DataSource: DATABASE Pages.Vehicle) {
+  -- the default body, used for an object no template matches
+  DYNAMICTEXT defaultVehicle (Content: '{1} {2}', ContentParams: ({1} = Brand, {2} = Model))
+
+  TEMPLATE FOR Pages.Bus {
+    DYNAMICTEXT busLabel (Content: 'Bus, capacity {1}', ContentParams: ({1} = PassengerCapacity))
+  }
+  TEMPLATE FOR Pages.Truck {
+    DYNAMICTEXT truckLabel (Content: 'Truck, max load {1} kg', ContentParams: ({1} = MaxLoadKg))
+  }
+}
+```
+
+Widgets written directly in the list view body are the default rendering.
+Templates keep their **source order**: Mendix stores and matches in that order,
+so it is authored rather than derived, and `DESCRIBE PAGE` emits them as stored.
+
+Inside a template the context object is the specialization, so an attribute only
+that specialization has still resolves — `PassengerCapacity` above exists on
+`Pages.Bus`, not on `Pages.Vehicle`.
+
+The entity must be the list view's entity or a specialization of it, and there
+may be at most one template per entity; both are refused rather than written,
+because a template that cannot match never renders.
+
+> A Gallery's `TEMPLATE <name>` is a different construct — a named content slot,
+> not a per-specialization body.
 
 ### GALLERY
 
@@ -192,10 +324,39 @@ All input widgets share common properties:
 
 | Property | Description | Example |
 |----------|-------------|---------|
-| `Label` | Field label text | `Label: 'Customer Name'` |
+| `Label` | Field label text — not `Caption:`, which is a button's (MDL-WIDGET52) | `Label: 'Customer Name'` |
 | `Attribute` | Entity attribute to bind to | `Attribute: Name` |
-| `Editable` | Editability mode | `Editable: ReadOnly` |
+| `Editable` | Editability: `Always`, `Never`, `true`/`false`, or a condition expression (bare or quoted) | `Editable: Never` |
 | `Visible` | Visibility expression | `Visible: '$showField'` |
+
+Each input widget takes only some attribute types. Measured with mxbuild 11.14.0,
+every other pairing is CE2421 ("Only attributes of type … are allowed here."):
+
+| Widget | Attribute types |
+|--------|-----------------|
+| `TEXTBOX` | String, Integer, Long, Decimal, AutoNumber (and Hashed string) |
+| `TEXTAREA` | String |
+| `DATEPICKER` | DateTime |
+| `CHECKBOX` | Boolean |
+| `RADIOBUTTONS` | Boolean, Enumeration |
+| `DROPDOWN` | Enumeration |
+
+With `-p`, `check --references` reports a mismatch as **MDL-WIDGET39**, judging the
+attribute at the end of an association path and on the generalization that declares
+it. It also reports a bare association bound where an attribute belongs
+(`Attribute: Order_Customer`), which mxbuild answers with CE1613 and which stops
+`mx check` from reporting anything else. An enumeration takes `RADIOBUTTONS` or
+`COMBOBOX`.
+
+The classic drop-down (`DROPDOWN`, stored as `Forms$DropDown`) is not supported by
+the React client: on a project whose Web UI setting is `OptimizedClient: Yes`
+(`show settings`), mxbuild reports CE0582 and `check --references` reports
+**MDL-WIDGET40**. Use `COMBOBOX` over the same attribute. Under `No` and
+`MigrationMode` the drop-down builds, and nothing is reported. A drop-down the
+project already holds is reported by `mxcli lint` as **MPR012**, together with
+the other built-in widgets that are CE0582 under the React client: the static and
+dynamic image, the legacy data grid and the reference selector (measured on
+11.16; the template grid and the reference set selectors are not yet measured).
 
 ### TEXTBOX
 
@@ -248,11 +409,11 @@ COMBOBOX cbStatus (Label: 'Status', Attribute: Status)
 
 ### REFERENCESELECTOR
 
-Dropdown for selecting an associated object via a reference association:
-
-```sql
-REFERENCESELECTOR rsCategory (Label: 'Category', Attribute: Category)
-```
+The classic reference selector (`Forms$ReferenceSelector`) is a built-in Forms
+widget mxcli has no writer for. The keyword parses, and `check` refuses it as
+**MDL-WIDGET38** rather than letting `exec` stop at the page. Select an
+associated object with a `COMBOBOX` over the association instead; it needs its
+own `datasource:` (CE0642 without one) and a caption attribute.
 
 ## Display Widgets
 
@@ -293,8 +454,8 @@ IMAGE imgBanner (Width: 800, Height: 200)
 A button that triggers an action. The primary interactive element:
 
 ```sql
-ACTIONBUTTON btnSave (Caption: 'Save', Action: SAVE_CHANGES, ButtonStyle: Primary)
-ACTIONBUTTON btnCancel (Caption: 'Cancel', Action: CANCEL_CHANGES)
+ACTIONBUTTON btnSave (Caption: 'Save', Action: SAVE CHANGES, ButtonStyle: Primary)
+ACTIONBUTTON btnCancel (Caption: 'Cancel', Action: CANCEL CHANGES)
 ACTIONBUTTON btnDelete (Caption: 'Delete', Action: DELETE, ButtonStyle: Danger)
 ```
 
@@ -302,13 +463,39 @@ ACTIONBUTTON btnDelete (Caption: 'Delete', Action: DELETE, ButtonStyle: Danger)
 
 | Action | Description |
 |--------|-------------|
-| `SAVE_CHANGES` | Commit and close the page |
-| `CANCEL_CHANGES` | Roll back and close the page |
+| `SAVE CHANGES` | Commit and close the page |
+| `CANCEL CHANGES` | Roll back and close the page |
 | `DELETE` | Delete the current object |
-| `CLOSE_PAGE` | Close the page without saving |
-| `MICROFLOW Module.MF_Name` | Call a microflow |
-| `NANOFLOW Module.NF_Name` | Call a nanoflow |
-| `PAGE Module.PageName` | Open a page |
+| `CLOSE PAGE` | Close the page without saving |
+| `CALL MICROFLOW Module.MF_Name` | Call a microflow |
+| `CALL NANOFLOW Module.NF_Name` | Call a nanoflow |
+| `SHOW PAGE Module.PageName` | Open a page |
+| `CREATE OBJECT Module.Entity THEN SHOW PAGE Module.PageName` | Create an object and open a page for it |
+| `OPEN LINK 'https://…'` | Open a web address |
+| `SIGN OUT` | Sign the user out |
+| `COMPLETE TASK 'Outcome'` | Complete a workflow user task |
+| `OPEN USER TASK` | Open the user task's page (Studio Pro's "Show user task page") |
+| `OPEN WORKFLOW with (DefaultPage: Module.Page)` | Open the workflow's admin page, or `DefaultPage` when the workflow overrides none ("Show workflow admin page") |
+| `CALL WORKFLOW Module.Workflow` | Start a workflow with the data container's object as its context |
+
+The snake-case spellings (`SAVE_CHANGES`, `SHOW_PAGE`, …) and `MICROFLOW …` without `CALL` are deprecated aliases (MDL-DEPR020).
+
+The workflow events take their own settings in the `with ( … )` list:
+`complete task` takes `ClosePage` and `Commit` (both default `true`), `call
+workflow` takes `ClosePage` (default `true`) and a `Confirmation`, `open user
+task` takes `AssignOnOpen` (Studio Pro's "Auto-assign", default `true`) and
+`OpenWhenAssigned` (`true` is "Who can open: Users with access", default
+`false`), and `open workflow` requires `DefaultPage` (without it Mendix reports
+CE1834). `show page` takes `NumberOfPagesToClose`, the pages to close as it opens
+(a whole number, default none). `open user task` must sit inside a data container of
+`System.WorkflowUserTask` and `open workflow` inside one of `System.Workflow`, or
+mx check reports CE1843. A task inbox opens each task from its row:
+
+```sql
+DATAGRID dgTasks (DataSource: DATABASE FROM System.WorkflowUserTask, onClick: OPEN USER TASK) {
+  COLUMN (Attribute: Name, Caption: 'Task')
+}
+```
 
 **Button styles:**
 
@@ -326,17 +513,28 @@ ACTIONBUTTON btnDelete (Caption: 'Delete', Action: DELETE, ButtonStyle: Danger)
 ```sql
 ACTIONBUTTON btnProcess (
   Caption: 'Process',
-  Action: MICROFLOW Sales.ACT_ProcessOrder(Order: $Order),
+  Action: CALL MICROFLOW Sales.ACT_ProcessOrder(Order = $Order),
   ButtonStyle: Primary
 )
 ```
 
+**Icon** — `Icon: 'Module.IconCollection.IconName'` gives the button an icon from
+an icon collection (the modern Atlas icon set). The name must exist in the
+collection, or MxBuild rejects it (CE1613):
+
+```sql
+ACTIONBUTTON btnEdit (Caption: 'Edit', Action: PAGE App.Edit,
+  Icon: 'Atlas_Core.Atlas_Filled.pencil')
+```
+
 ### LINKBUTTON
 
-Renders as a hyperlink instead of a button. Same action types as `ACTIONBUTTON`:
+Renders as a hyperlink instead of a button. Same action types, styles, and
+`Icon:` as `ACTIONBUTTON`:
 
 ```sql
 LINKBUTTON lnkDetails (Caption: 'View Details', Action: PAGE MyModule.Customer_Detail)
+LINKBUTTON lnkEdit (Caption: 'Edit', Action: PAGE App.Edit, Icon: 'Atlas_Core.Atlas_Filled.pencil')
 ```
 
 ## Structure Widgets
@@ -351,18 +549,19 @@ DATAVIEW dvOrder (DataSource: $Order) {
     DYNAMICTEXT txtOrderTitle (Content: 'Order #{1}', Attribute: OrderId)
   }
   TEXTBOX txtStatus (Label: 'Status', Attribute: Status)
-  FOOTER ftr1 { ... }
+  FOOTER { ... }
 }
 ```
 
 ### FOOTER
 
-Footer section of a DataView. Typically contains save/cancel buttons:
+Footer section of a DataView. Typically contains save/cancel buttons. It
+stores no name of its own; `ALTER PAGE` addresses it as `<dataview>.footer`:
 
 ```sql
-FOOTER footer1 {
-  ACTIONBUTTON btnSave (Caption: 'Save', Action: SAVE_CHANGES, ButtonStyle: Primary)
-  ACTIONBUTTON btnCancel (Caption: 'Cancel', Action: CANCEL_CHANGES)
+FOOTER {
+  ACTIONBUTTON btnSave (Caption: 'Save', Action: SAVE CHANGES, ButtonStyle: Primary)
+  ACTIONBUTTON btnCancel (Caption: 'Cancel', Action: CANCEL CHANGES)
 }
 ```
 
@@ -372,7 +571,7 @@ Control bar for DataGrid widgets. Contains action buttons for the grid:
 
 ```sql
 CONTROLBAR bar1 {
-  ACTIONBUTTON btnNew (Caption: 'New', Action: MICROFLOW Module.ACT_Create, ButtonStyle: Primary)
+  ACTIONBUTTON btnNew (Caption: 'New', Action: CALL MICROFLOW Module.ACT_Create, ButtonStyle: Primary)
   ACTIONBUTTON btnEdit (Caption: 'Edit', Action: PAGE Module.Entity_Edit)
   ACTIONBUTTON btnDelete (Caption: 'Delete', Action: DELETE, ButtonStyle: Danger)
 }
@@ -384,6 +583,20 @@ Embeds a snippet (reusable page fragment) into the page:
 
 ```sql
 SNIPPETCALL scNav (Snippet: MyModule.NavigationMenu)
+```
+
+**A snippet call renders no element of its own** — the snippet's widgets are
+inlined into the parent. So `Class`, `Style`, `DynamicClasses` and
+`DesignProperties` on a `snippetcall` never reach the page: valid, `mx check`
+clean, and silently useless (measured on Mendix 11.15). `mxcli check` warns
+**MDL-WIDGET48** (also for `alter page … { set (Class: …) on <snippetcall> }` and
+`alter styling` on one) and `mxcli lint` reports existing ones as **MPR013**.
+Style a container instead — inside the snippet, or around the call:
+
+```sql
+container cNav (class: 'sidebar') {
+  snippetcall scNav (snippet: MyModule.NavigationMenu)
+}
 ```
 
 ## Navigation Widgets
@@ -398,6 +611,130 @@ NAVIGATIONLIST navMain {
 }
 ```
 
+## Any installed widget
+
+Everything above is a **built-in** widget: its keyword and properties are fixed
+by Mendix and by mxcli. A **pluggable or custom widget** — DataGrid 2, Combo box,
+Gallery, HTML Element, the charts, anything from the Marketplace, anything your
+team built — is named the same way, by its own MDL name:
+
+```sql
+htmlelement frame (tagName: 'div', tagContentMode: 'container') {
+  attribute a1 (attributeName: 'data-testid', attributeValueType: 'expression')
+  tagcontentcontainer body {
+    dynamictext caption (Content: 'Inside the element')
+  }
+}
+```
+
+Three things there come from the widget's own definition rather than from any
+list in mxcli:
+
+- **The keyword** `htmlelement` — the widget's MDL name, which is the last
+  segment of its widget id.
+- **The properties** `tagName`, `tagContentMode` — written with the widget's own
+  spelling, exactly as `DESCRIBE WIDGET` reports them.
+- **The body containers** `attribute` (an object list, one entry per repetition)
+  and `tagcontentcontainer` (a child slot, holding widgets).
+
+A property whose type in the widget's definition is **Expression** — an HTML
+element attribute's `attributeValueExpression`, a chart series'
+`dynamicBarColor` — takes a Mendix expression written as-is:
+
+```sql
+attribute a1 (attributeName: 'data-hot', attributeValueType: 'expression',
+              attributeValueExpression: if $currentObject/Hot then 'hot' else 'cold')
+```
+
+The same unquoted expression on a property of any other type (a text template,
+a plain value) is refused by `check` as **MDL-WIDGET42** rather than written
+empty.
+
+### Finding the names
+
+Ask the widget:
+
+```sql
+DESCRIBE WIDGET TYPE htmlelement;
+```
+
+It lists every property with its type, default and enumeration members, every
+body container and whether MDL can express it, and a complete example that
+parses and checks as written. See
+[DESCRIBE WIDGET](../reference/query/describe-widget.md).
+
+### The explicit form
+
+A widget can also be named by its full id. This is the fallback, not the norm —
+use it when two installed packages ship the same MDL name, or when you have the
+id in hand and not the name:
+
+```sql
+pluggablewidget 'com.mendix.widget.web.htmlelement.HTMLElement' frame (
+  tagName: 'div'
+)
+```
+
+`DESCRIBE PAGE` emits the short form wherever it round-trips, and falls back to
+the id form when the name would be ambiguous.
+
+### When a widget is not found
+
+A name that resolves to no installed definition is an error, not a silently
+accepted widget — MDL-WIDGET25, with the nearest known names suggested. A
+container keyword the parent widget does not declare is MDL-WIDGET26. Both need
+a project open (`-p`), since without one mxcli knows only its embedded widgets.
+
+A third, MDL-WIDGET29, needs no project: `statictext` writes `Forms$Text`, and
+Mendix has no such type. That is not a build error but a **load** error — `mx
+check` and Studio Pro both stop at `TypeCacheUnknownTypeException` before any
+validation runs, so the page cannot even be opened to repair it. Use
+`DYNAMICTEXT` with a literal `Content:`.
+
+If a widget you have installed is not found, its definition has not been
+extracted yet:
+
+```bash
+mxcli widget init -p app.mpr     # extract definitions for every widget in widgets/
+```
+
+### Binding a text-template property
+
+Many pluggable widgets expose **text-template** properties — an Image's
+`ImageUrl` and `AlternativeText`, a TreeNode's `headerCaption`, a Timeline's
+`title` / `description` / `timeIndication`. They take *text*, so a bare value is
+stored as a literal and renders the same string on every row, with `check`,
+`exec` and `mx check` all clean.
+
+Bind one with the property's own `<Name>Params` companion:
+
+```sql
+image cardImage (
+  ImageType: imageUrl,
+  ImageUrl: '{1}',        ImageUrlParams: ({1} = PictureUrl),
+  AlternativeText: '{1}', AlternativeTextParams: ({1} = Name)
+)
+```
+
+The companion is the property's own name + `Params`, in whichever spelling the
+template itself was written. It takes the same per-parameter `format (...)`
+block a `dynamictext` does, and `DESCRIBE PAGE` emits both the template and its
+companion — for the Image and for every other pluggable widget — so describe →
+exec keeps the binding. Before ako/mxcli#575 the generic describe path read
+attribute references and primitives only, so a TreeNode's `headerCaption` and a
+Timeline's `title` were missing from its output altogether.
+
+Two shorter spellings remain:
+
+| Spelling | Use it for |
+|----------|-----------|
+| `'{AttrName}'` | one attribute, no formatting block |
+| `contentparams: (...)` | a widget with a **single** text template — it is one list shared by every template on the widget |
+
+Every `{N}` needs a matching parameter (Mendix rejects a shortfall with
+`CE0720`), and parameters with no `{N}` to fill are reported as MDL-WIDGET21
+rather than dropped in silence.
+
 ## Common Widget Properties
 
 These properties are shared across many widget types:
@@ -406,9 +743,10 @@ These properties are shared across many widget types:
 |----------|-------------|---------|
 | `Class` | CSS class names | `Class: 'card p-3'` |
 | `Style` | Inline CSS styles | `Style: 'margin-top: 8px;'` |
-| `DesignProperties` | Atlas design properties | `DesignProperties: ['Spacing top': 'Large', 'Full width': ON]` |
+| `DynamicClasses` | Runtime-computed CSS classes (expression; stacks on `Class`) | `DynamicClasses: if $currentObject/IsActive then 'is-active' else ''` |
+| `DesignProperties` | Atlas design properties | `DesignProperties: ('Spacing top': 'Large', 'Full width': ON)` |
 | `Visible` | Visibility expression | `Visible: '$showSection'` |
-| `Editable` | Editability mode | `Editable: ReadOnly` |
+| `Editable` | Editability: `Always`, `Never`, `true`/`false`, or a condition expression (bare or quoted) | `Editable: Never` |
 
 ## See Also
 
@@ -416,3 +754,5 @@ These properties are shared across many widget types:
 - [Page Structure](./page-structure.md) -- layout selection and data sources
 - [Data Binding](./data-binding.md) -- connecting widgets to attributes
 - [ALTER PAGE](./alter-page.md) -- modifying widgets in existing pages
+- [DESCRIBE WIDGET](../reference/query/describe-widget.md) -- inspect any installed widget's properties and body containers
+- [Pluggable Widgets Across Versions](../guides/pluggable-widgets.md) -- how mxcli keeps widget definitions version-correct

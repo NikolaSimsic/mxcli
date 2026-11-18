@@ -1,3 +1,4 @@
+mdl 1;
 -- ============================================================================
 -- Published REST Service Examples
 -- ============================================================================
@@ -21,7 +22,6 @@ begin
   declare $Result string = '[]';
   return $Result;
 end;
-/
 
 create microflow PrsTest.PRS_GetOrderById ($httpResponse: System.HttpResponse, $id: string)
 returns string as $Result
@@ -29,7 +29,6 @@ begin
   declare $Result string = '{}';
   return $Result;
 end;
-/
 
 create microflow PrsTest.PRS_CreateOrder ($httpResponse: System.HttpResponse)
 returns string as $Result
@@ -37,7 +36,6 @@ begin
   declare $Result string = '{"status": "created"}';
   return $Result;
 end;
-/
 
 create microflow PrsTest.PRS_DeleteOrder ($httpResponse: System.HttpResponse, $id: string)
 returns string as $Result
@@ -45,7 +43,6 @@ begin
   declare $Result string = '{"status": "deleted"}';
   return $Result;
 end;
-/
 
 create microflow PrsTest.PRS_GetCustomers ($httpResponse: System.HttpResponse)
 returns string as $Result
@@ -53,8 +50,13 @@ begin
   declare $Result string = '[]';
   return $Result;
 end;
-/
 
+-- mxcli writes published REST services from Mendix 10.0 (the
+-- published_rest_service floor in sdk/versions/mendix-10.yaml) and refuses them
+-- below it. Everything from here on creates, alters or grants on one, so the
+-- section runs to the end of the file; the backing microflows above run on
+-- every version.
+-- @version: 10.0+
 -- ############################################################################
 -- PART 2: SIMPLE PUBLISHED REST SERVICE
 -- ############################################################################
@@ -123,8 +125,8 @@ describe published rest service PrsTest.CrmAPI;
 -- PART 5: SHOW AND LIST
 -- ############################################################################
 
-show published rest services;
-show published rest services in PrsTest;
+list published rest services;
+list published rest services in PrsTest;
 
 -- ############################################################################
 -- PART 6: GRANT / REVOKE ACCESS
@@ -161,12 +163,48 @@ describe published rest service PrsTest.OrderAPI;
 alter published rest service PrsTest.OrderAPI drop resource 'shipments';
 
 -- ############################################################################
+-- PART 7b: AUTHENTICATION (mendixlabs/mxcli#1331)
+-- ############################################################################
+--
+-- The methods are stored in the order written. `none` is "Requires
+-- authentication: No"; leaving the property out keeps the stored setting.
+-- With authentication on, at least one role must be granted (CE0338).
+-- `microflow Module.Name` (custom) also needs app security on (CE6600), which
+-- this script does not switch on.
+
+create published rest service PrsTest.SecureAPI (
+  Path: 'rest/secure/v1',
+  Version: '1.0.0',
+  ServiceName: 'Secure API',
+  Authentication: (session, basic)
+)
+{
+  resource 'orders' {
+    get '' microflow PrsTest.PRS_GetAllOrders;
+  }
+};
+
+grant access on published rest service PrsTest.SecureAPI to PrsTest.user;
+
+describe published rest service PrsTest.SecureAPI;
+
+alter published rest service PrsTest.SecureAPI set (Version: '1.1.0');
+
+alter published rest service PrsTest.SecureAPI set (Authentication: (basic));
+
+describe published rest service PrsTest.SecureAPI;
+
+alter published rest service PrsTest.SecureAPI set (Authentication: none);
+
+drop published rest service PrsTest.SecureAPI;
+
+-- ############################################################################
 -- PART 8: DROP
 -- ############################################################################
 
 drop published rest service PrsTest.OrderAPI;
 
-show published rest services in PrsTest;
+list published rest services in PrsTest;
 
 -- ============================================================================
 -- END OF PUBLISHED REST SERVICE EXAMPLES

@@ -8,6 +8,7 @@ import (
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
 	"github.com/mendixlabs/mxcli/mdl/backend/mock"
+	mdltypes "github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 )
 
@@ -86,7 +87,9 @@ func TestDescribeImportMapping_Mock(t *testing.T) {
 
 	ctx, buf := newMockCtx(t, withBackend(mb), withHierarchy(h))
 	assertNoError(t, describeImportMapping(ctx, ast.QualifiedName{Module: "Integration", Name: "ImportOrders"}))
-	assertContainsStr(t, buf.String(), "create import mapping")
+	// DESCRIBE emits a re-runnable header: the bare `create` form failed with
+	// "import mapping already exists" against the project it was read from (#915).
+	assertContainsStr(t, buf.String(), "create or modify import mapping")
 }
 
 func TestDescribeImportMapping_NotFound(t *testing.T) {
@@ -126,6 +129,12 @@ func TestCreateImportMapping_OrModify_PreservesID(t *testing.T) {
 			updatedID = im.ID
 			return nil
 		},
+		// The mapping names a schema source, so the backend has to KNOW it:
+		// an unresolvable source is refused rather than written through (#259),
+		// and a mock with no structures reads as a project with none.
+		GetJsonStructureByQualifiedNameFunc: func(_, name string) (*mdltypes.JsonStructure, error) {
+			return &mdltypes.JsonStructure{Name: name}, nil
+		},
 	}
 
 	ctx, buf := newMockCtx(t, withBackend(mb), withHierarchy(h))
@@ -163,4 +172,30 @@ func TestCreateImportMapping_AlreadyExists_NoOrModify(t *testing.T) {
 		Name: ast.QualifiedName{Module: "Integration", Name: "ImportOrders"},
 	})
 	assertError(t, err)
+}
+
+// On Mendix 11.15 a mapping's message-definition source is in
+// MessageDefinition2 (Module.MessageName) and the MessageDefinition key is gone
+// (ako/mxcli#987). DESCRIBE read only MessageDefinition, so it printed no
+// source and describe -> exec rebuilt the mapping bound to nothing.
+func TestDescribeImportMapping_MessageDefinition2Source(t *testing.T) {
+	mod := mkModule("MsgTest")
+	src := "MsgTest.OrderMessage"
+	im := &model.ImportMapping{
+		BaseElement:        model.BaseElement{ID: nextID("im")},
+		ContainerID:        mod.ID,
+		Name:               "IMM_Order",
+		MessageDefinition2: &src,
+	}
+	h := mkHierarchy(mod)
+	withContainer(h, im.ContainerID, mod.ID)
+	mb := &mock.MockBackend{
+		IsConnectedFunc: func() bool { return true },
+		GetImportMappingByQualifiedNameFunc: func(string, string) (*model.ImportMapping, error) {
+			return im, nil
+		},
+	}
+	ctx, buf := newMockCtx(t, withBackend(mb), withHierarchy(h))
+	assertNoError(t, describeImportMapping(ctx, ast.QualifiedName{Module: "MsgTest", Name: "IMM_Order"}))
+	assertContainsStr(t, buf.String(), "with message definition MsgTest.OrderMessage")
 }

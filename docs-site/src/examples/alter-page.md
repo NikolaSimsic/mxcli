@@ -6,7 +6,7 @@
 
 ```sql
 ALTER PAGE CRM.Customer_Edit {
-  SET (Caption = 'Save & Close', ButtonStyle = Success) ON btnSave
+  SET (Caption: 'Save & Close', ButtonStyle: Success) ON btnSave
 };
 ```
 
@@ -20,11 +20,23 @@ ALTER PAGE CRM.Customer_Edit {
 };
 ```
 
+## Add a Widget Into a Container
+
+Use `INSERT INTO` to append a widget as a container's last child — the only way to fill an empty container.
+
+```sql
+ALTER PAGE CRM.Customer_Overview {
+  INSERT INTO ctnToolbar {
+    ACTIONBUTTON btnNew (Caption: 'New Customer', Action: NOTHING, ButtonStyle: Primary)
+  }
+};
+```
+
 ## Remove Widgets
 
 ```sql
 ALTER PAGE CRM.Customer_Edit {
-  DROP WIDGET txtLegacyField, lblOldNote
+  DROP txtLegacyField, lblOldNote
 };
 ```
 
@@ -32,11 +44,11 @@ ALTER PAGE CRM.Customer_Edit {
 
 ```sql
 ALTER PAGE CRM.Customer_Edit {
-  REPLACE footer1 WITH {
-    FOOTER newFooter {
-      ACTIONBUTTON btnSave (Caption: 'Save', Action: SAVE_CHANGES, ButtonStyle: Success)
+  REPLACE dvMain.footer WITH {
+    FOOTER {
+      ACTIONBUTTON btnSave (Caption: 'Save', Action: SAVE CHANGES, ButtonStyle: Success)
       ACTIONBUTTON btnDelete (Caption: 'Delete', Action: DELETE, ButtonStyle: Danger)
-      ACTIONBUTTON btnCancel (Caption: 'Cancel', Action: CANCEL_CHANGES)
+      ACTIONBUTTON btnCancel (Caption: 'Cancel', Action: CANCEL CHANGES)
     }
   }
 };
@@ -46,12 +58,12 @@ ALTER PAGE CRM.Customer_Edit {
 
 ```sql
 ALTER PAGE CRM.Customer_Edit {
-  SET Title = 'Edit Customer Details';
-  SET Label = 'Email Address' ON txtEmail;
+  SET (Title: 'Edit Customer Details');
+  SET (Label: 'Email Address') ON txtEmail;
   INSERT AFTER txtPhone {
     TEXTBOX txtWebsite (Label: 'Website', Attribute: Website)
   };
-  DROP WIDGET lblInternalRef
+  DROP lblInternalRef
 };
 ```
 
@@ -59,7 +71,19 @@ ALTER PAGE CRM.Customer_Edit {
 
 ```sql
 ALTER PAGE CRM.ProductOverview {
-  ADD Variables $showStockColumn: Boolean = 'if (3 < 4) then true else false'
+  ADD Variables $showStockColumn: Boolean = if (3 < 4) then true else false
+};
+```
+
+## Add a Page Parameter
+
+Add a parameter to an existing page without rewriting it. The page has a URL,
+so the new parameter gets a segment in the same statement:
+
+```sql
+ALTER PAGE CRM.Customer_Edit {
+  SET (Url: 'customer-edit/{Customer}/{Order}');
+  ADD Parameters $Order: CRM.Order
 };
 ```
 
@@ -87,6 +111,7 @@ ALTER PAGE CRM.Customer_Edit {
 Target columns using dotted notation `gridName.columnName`:
 
 ```sql
+mdl 1;
 -- Add a column
 ALTER PAGE CRM.Customer_List {
   INSERT AFTER dgCustomers.Email {
@@ -96,12 +121,12 @@ ALTER PAGE CRM.Customer_List {
 
 -- Remove a column
 ALTER PAGE CRM.Customer_List {
-  DROP WIDGET dgCustomers.OldNotes
+  DROP dgCustomers.OldNotes
 };
 
 -- Rename a column header
 ALTER PAGE CRM.Customer_List {
-  SET Caption = 'E-mail Address' ON dgCustomers.Email
+  SET (Caption: 'E-mail Address') ON dgCustomers.Email
 };
 ```
 
@@ -111,11 +136,11 @@ Use `DESCRIBE PAGE CRM.Customer_List` to discover column names.
 
 ```sql
 ALTER SNIPPET CRM.NavigationMenu {
-  SET Caption = 'Dashboard' ON btnHome;
+  SET (Caption: 'Dashboard') ON btnHome;
   INSERT AFTER btnHome {
     ACTIONBUTTON btnReports (
       Caption: 'Reports',
-      Action: SHOW_PAGE CRM.Reports_Overview
+      Action: SHOW PAGE CRM.Reports_Overview
     )
   }
 };

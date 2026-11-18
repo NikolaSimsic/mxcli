@@ -93,6 +93,17 @@ func (m *MockBackend) MoveExportMapping(em *model.ExportMapping) error {
 	return nil
 }
 
+// ListXmlSchemas errors when unconfigured, per the backend-mock convention.
+// That is also the SAFE default here: resolveXmlSchemaSource treats a backend
+// that cannot list as "take the name at face value", so a test that does not
+// care about XML schemas keeps working rather than having its mapping refused.
+func (m *MockBackend) ListXmlSchemas() ([]*types.XmlSchema, error) {
+	if m.ListXmlSchemasFunc != nil {
+		return m.ListXmlSchemasFunc()
+	}
+	return nil, fmt.Errorf("MockBackend.ListXmlSchemas not configured")
+}
+
 func (m *MockBackend) ListJsonStructures() ([]*types.JsonStructure, error) {
 	if m.ListJsonStructuresFunc != nil {
 		return m.ListJsonStructuresFunc()
@@ -126,4 +137,63 @@ func (m *MockBackend) DeleteJsonStructure(id string) error {
 		return m.DeleteJsonStructureFunc(id)
 	}
 	return nil
+}
+
+// ListMessageDefinitionCollections returns the configured collections.
+func (m *MockBackend) CreateMessageDefinitionCollection(c *model.MessageDefinitionCollection) error {
+	if m.CreateMessageDefinitionCollectionFunc != nil {
+		return m.CreateMessageDefinitionCollectionFunc(c)
+	}
+	return fmt.Errorf("MockBackend.CreateMessageDefinitionCollection not configured")
+}
+
+func (m *MockBackend) UpdateMessageDefinitionCollection(c *model.MessageDefinitionCollection) error {
+	if m.UpdateMessageDefinitionCollectionFunc != nil {
+		return m.UpdateMessageDefinitionCollectionFunc(c)
+	}
+	return fmt.Errorf("MockBackend.UpdateMessageDefinitionCollection not configured")
+}
+
+func (m *MockBackend) DeleteMessageDefinitionCollection(id string) error {
+	if m.DeleteMessageDefinitionCollectionFunc != nil {
+		return m.DeleteMessageDefinitionCollectionFunc(id)
+	}
+	return fmt.Errorf("MockBackend.DeleteMessageDefinitionCollection not configured")
+}
+
+func (m *MockBackend) ListMessageDefinitionCollections() ([]*model.MessageDefinitionCollection, error) {
+	if m.ListMessageDefinitionCollectionsFunc != nil {
+		return m.ListMessageDefinitionCollectionsFunc()
+	}
+	return nil, fmt.Errorf("MockBackend.ListMessageDefinitionCollections not configured")
+}
+
+// ListMessageDefinitionDocuments returns the configured MessageDefinition2
+// documents; none when unconfigured.
+func (m *MockBackend) ListMessageDefinitionDocuments() ([]*model.MessageDefinitionDocument, error) {
+	if m.ListMessageDefinitionDocumentsFunc != nil {
+		return m.ListMessageDefinitionDocumentsFunc()
+	}
+	return nil, nil
+}
+
+func (m *MockBackend) CreateMessageDefinitionDocument(d *model.MessageDefinitionDocument) error {
+	if m.CreateMessageDefinitionDocumentFunc != nil {
+		return m.CreateMessageDefinitionDocumentFunc(d)
+	}
+	return fmt.Errorf("MockBackend.CreateMessageDefinitionDocument not configured")
+}
+
+func (m *MockBackend) UpdateMessageDefinitionDocument(d *model.MessageDefinitionDocument) error {
+	if m.UpdateMessageDefinitionDocumentFunc != nil {
+		return m.UpdateMessageDefinitionDocumentFunc(d)
+	}
+	return fmt.Errorf("MockBackend.UpdateMessageDefinitionDocument not configured")
+}
+
+func (m *MockBackend) DeleteMessageDefinitionDocument(id string) error {
+	if m.DeleteMessageDefinitionDocumentFunc != nil {
+		return m.DeleteMessageDefinitionDocumentFunc(id)
+	}
+	return fmt.Errorf("MockBackend.DeleteMessageDefinitionDocument not configured")
 }

@@ -5,8 +5,11 @@ package executor
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
+	"github.com/mendixlabs/mxcli/mdl/types"
+	"github.com/mendixlabs/mxcli/mdl/visitor"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 )
 
@@ -42,17 +45,36 @@ func outputEntityAccessGrants(ctx *ExecContext, entity *domainmodel.Entity, modu
 			continue
 		}
 
-		grantLine := fmt.Sprintf("\ngrant %s on %s.%s (%s)",
-			strings.Join(roleStrs, ", "), moduleName, entityName, rightsStr)
-
-		if rule.XPathConstraint != "" {
-			escaped := strings.ReplaceAll(rule.XPathConstraint, "'", "''")
-			grantLine += fmt.Sprintf(" where '%s'", escaped)
-		}
-		grantLine += ";"
-
-		fmt.Fprintln(ctx.Output, grantLine)
+		fmt.Fprintln(ctx.Output, "\n"+entityGrantMDL(ctx, rightsStr, moduleName+"."+entityName, roleStrs, rule.XPathConstraint))
 	}
+}
+
+// entityGrantMDL is one access rule as the canonical grant (R5, ako/mxcli#753):
+// rights first, the roles after `to`, and the XPath constraint in [ ] as
+// stored, so no quote inside it is doubled; under mdl 0 a backslash in a
+// string is (describeXPath, ako/mxcli#825).
+//
+// A long constraint is stored broken across lines so it can be read in Studio
+// Pro's editor (upstream #979); MDL keeps that layout on one line, and the
+// executor re-derives it on write. A layout its author gave it is written as
+// stored, which is what re-executing the grant stores (mendixlabs/mxcli#1542).
+//
+// A stored constraint the bracketed grammar does not read (one Studio Pro
+// stored without brackets, or with syntax the XPath rules do not cover) is
+// written in the deprecated quoted form instead, which carries any string:
+// describe must stay re-executable over whatever a project holds, and a
+// deprecation warning is better than output that does not parse.
+func entityGrantMDL(ctx *ExecContext, rights, entity string, roles []string, xpath string) string {
+	x := visitor.DescribeXPathConstraintLayout(xpath)
+	if x == "" || visitor.IsBracketedXPath(x) {
+		line := fmt.Sprintf("grant %s on entity %s to %s", rights, entity, strings.Join(roles, ", "))
+		if x != "" {
+			line += " where " + describeXPath(ctx, x)
+		}
+		return line + ";"
+	}
+	return fmt.Sprintf("grant %s on %s (%s) where %s;",
+		strings.Join(roles, ", "), entity, rights, mdlQuote(ctx, x))
 }
 
 // resolveEntityMemberAccess determines per-member READ/WRITE access.
@@ -156,23 +178,42 @@ func formatAccessRuleRights(ctx *ExecContext, rule *domainmodel.AccessRule, attr
 		if readMembers == nil {
 			rights = append(rights, "read *")
 		} else {
-			rights = append(rights, fmt.Sprintf("read (%s)", strings.Join(readMembers, ", ")))
+			rights = append(rights, fmt.Sprintf("read (%s)", strings.Join(quoteMembers(readMembers), ", ")))
 		}
 	}
 	if hasWrite {
 		if writeMembers == nil {
 			rights = append(rights, "write *")
 		} else if len(writeMembers) > 0 {
-			rights = append(rights, fmt.Sprintf("write (%s)", strings.Join(writeMembers, ", ")))
+			rights = append(rights, fmt.Sprintf("write (%s)", strings.Join(quoteMembers(writeMembers), ", ")))
 		}
 	}
 
 	return strings.Join(rights, ", ")
 }
 
+// quoteMembers quotes any member name that is a reserved word (or otherwise does
+// not lex as a bare identifier) so the emitted READ/WRITE list re-parses. The
+// grammar accepts a QUOTED_IDENTIFIER in member positions.
+func quoteMembers(members []string) []string {
+	out := make([]string, len(members))
+	for i, m := range members {
+		out[i] = mdlIdent(m)
+	}
+	return out
+}
+
+// With anyXPath false (GRANT) the rule is the one the backend upserted: exactly
+// roleNames as a set, and the same xpath — Mendix allows one rule per constraint,
+// and several rules may name one role. Matching on any overlap reported a shared
+// rule (FabUser, Coordinator, Engineer) after a GRANT that wrote a separate rule
+// for Coordinator alone. anyXPath takes the first rule naming any of the roles,
+// whatever its constraint, which is what REVOKE wants since it narrows every rule
+// the roles appear in.
+//
 // formatAccessRuleResult re-reads the entity and formats the resulting access state
 // for the given roles. Returns a string like "  Result: CREATE, READ (Name, Price)\n".
-func formatAccessRuleResult(ctx *ExecContext, moduleName, entityName string, roleNames []string) string {
+func formatAccessRuleResult(ctx *ExecContext, moduleName, entityName string, roleNames []string, xpath string, anyXPath bool) string {
 	invalidateDomainModelsCache(ctx)
 
 	module, err := findModule(ctx, moduleName)
@@ -212,6 +253,12 @@ func formatAccessRuleResult(ctx *ExecContext, moduleName, entityName string, rol
 		if matchCount == 0 {
 			continue
 		}
+		// A role may hold one rule per XPath constraint (#936), and the backend
+		// keys the rule by role set plus constraint — echoing any other match
+		// would report a different rule's rights back to the user.
+		if !anyXPath && (!types.SameXPathConstraint(rule.XPathConstraint, xpath) || !sameRoleSet(rule.ModuleRoleNames, roleNames)) {
+			continue
+		}
 		// Found a matching rule
 		rightsStr := formatAccessRuleRights(ctx, rule, attrNames)
 		if rightsStr == "" {
@@ -221,6 +268,17 @@ func formatAccessRuleResult(ctx *ExecContext, moduleName, entityName string, rol
 	}
 
 	return "  Result: (no access)\n"
+}
+
+// sameRoleSet reports whether a and b hold the same role names, order-insensitive.
+// It is the comparison AddEntityAccessRule upserts by (sameStringSet in
+// mdl/backend/modelsdk), so the GRANT echo finds the rule that was written.
+func sameRoleSet(a, b []string) bool {
+	ac := slices.Clone(a)
+	bc := slices.Clone(b)
+	slices.Sort(ac)
+	slices.Sort(bc)
+	return slices.Equal(ac, bc)
 }
 
 // --- Executor method wrappers for callers not yet migrated ---

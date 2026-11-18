@@ -6,8 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/mendixlabs/mxcli/mdl/backend"
 	"github.com/mendixlabs/mxcli/mdl/backend/bsonnav"
@@ -204,6 +203,227 @@ func TestSetWidgetProperty_Name(t *testing.T) {
 	}
 }
 
+// TestSetWidgetProperty_DynamicClasses locks in the DynamicClasses ALTER fix: `alter page ... set
+// DynamicClasses` writes the expression into the widget's Forms$Appearance
+// (previously it fell through to the pluggable-property setter and hard-errored
+// "widget has no pluggable Object" on core widgets).
+func TestSetWidgetProperty_DynamicClasses(t *testing.T) {
+	rawData := makeRawPage(makeStyleableWidget("ctn1"))
+	m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+
+	expr := "if $currentObject/Name = 'x' then 'c--x' else ''"
+	if err := m.SetWidgetProperty("ctn1", "DynamicClasses", expr); err != nil {
+		t.Fatalf("SetWidgetProperty(DynamicClasses) failed: %v", err)
+	}
+
+	result := findBsonWidget(rawData, "ctn1")
+	if result == nil {
+		t.Fatal("widget 'ctn1' not found")
+	}
+	app := bsonnav.DGetDoc(result.widget, "Appearance")
+	if app == nil {
+		t.Fatal("widget 'ctn1' has no Appearance")
+	}
+	if got := bsonnav.DGetString(app, "DynamicClasses"); got != expr {
+		t.Errorf("Appearance.DynamicClasses = %q, want %q", got, expr)
+	}
+}
+
+// TestSetWidgetProperty_LowercaseFirstClassProps locks in the fix for `alter page
+// … set class/dynamicclasses on <builtin>`: property names arrive from MDL in
+// whatever case the author typed, and `create page` reads them case-insensitively,
+// so the ALTER path must too. Previously a lowercase name fell through to the
+// pluggable-property setter and hard-errored "widget has no pluggable Object" on
+// every built-in widget.
+func TestSetWidgetProperty_LowercaseFirstClassProps(t *testing.T) {
+	t.Run("class", func(t *testing.T) {
+		rawData := makeRawPage(makeStyleableWidget("ctn1"))
+		m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+		if err := m.SetWidgetProperty("ctn1", "class", "fl-topbar"); err != nil {
+			t.Fatalf("SetWidgetProperty(class) failed: %v", err)
+		}
+		app := bsonnav.DGetDoc(findBsonWidget(rawData, "ctn1").widget, "Appearance")
+		if got := bsonnav.DGetString(app, "Class"); got != "fl-topbar" {
+			t.Errorf("Appearance.Class = %q, want %q", got, "fl-topbar")
+		}
+	})
+
+	t.Run("dynamicclasses", func(t *testing.T) {
+		rawData := makeRawPage(makeStyleableWidget("ctn1"))
+		m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+		expr := "'c--' + $currentObject/Name"
+		if err := m.SetWidgetProperty("ctn1", "dynamicclasses", expr); err != nil {
+			t.Fatalf("SetWidgetProperty(dynamicclasses) failed: %v", err)
+		}
+		app := bsonnav.DGetDoc(findBsonWidget(rawData, "ctn1").widget, "Appearance")
+		if got := bsonnav.DGetString(app, "DynamicClasses"); got != expr {
+			t.Errorf("Appearance.DynamicClasses = %q, want %q", got, expr)
+		}
+	})
+
+	t.Run("caption on built-in", func(t *testing.T) {
+		w := bson.D{
+			{Key: "$Type", Value: "Pages$ActionButton"},
+			{Key: "Name", Value: "btnKeys"},
+			// A Caption stored as a Texts$Text — the shape a tab page and the
+			// legacy widgets use. (This test used to build a `Translations` list
+			// no Mendix document has, and asserted nothing, so it passed while the
+			// setter wrote nothing for the real shape.)
+			{Key: "Caption", Value: bson.D{
+				{Key: "$Type", Value: "Texts$Text"},
+				{Key: "Items", Value: bson.A{int32(3)}},
+			}},
+		}
+		rawData := makeRawPage(w)
+		m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+		if err := m.SetWidgetProperty("btnKeys", "caption", "Keys"); err != nil {
+			t.Fatalf("SetWidgetProperty(caption) failed: %v", err)
+		}
+		caption := bsonnav.DGetDoc(findBsonWidget(rawData, "btnKeys").widget, "Caption")
+		items := bsonnav.DGetArrayElements(bsonnav.DGet(caption, "Items"))
+		if len(items) != 1 || bsonnav.DGetString(items[0].(bson.D), "Text") != "Keys" {
+			t.Fatalf("Caption.Items = %v, want one translation reading Keys", items)
+		}
+	})
+}
+
+// makeVisibilityWidget builds a widget with a null ConditionalVisibilitySettings
+// slot (as Studio Pro writes it when unset), matching the widgets that support
+// conditional visibility.
+func makeVisibilityWidget(name string) bson.D {
+	return bson.D{
+		{Key: "$Type", Value: "Pages$DivContainer"},
+		{Key: "Name", Value: name},
+		{Key: "ConditionalVisibilitySettings", Value: nil},
+	}
+}
+
+// TestSetWidgetProperty_VisibleExpression locks in the fix for the silently
+// dropped string/boolean `Visible` form: `alter page ... set Visible = "<expr>"`
+// (and `= false`) writes a ConditionalVisibilitySettings node rather than a bare
+// (ignored) "Visible" string; `= true` clears it.
+func TestSetWidgetProperty_VisibleExpression(t *testing.T) {
+	t.Run("expression string", func(t *testing.T) {
+		rawData := makeRawPage(makeVisibilityWidget("ctn1"))
+		m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+		expr := "$currentObject/Name = 'Astute'"
+		if err := m.SetWidgetProperty("ctn1", "Visible", expr); err != nil {
+			t.Fatalf("SetWidgetProperty(Visible) failed: %v", err)
+		}
+		cvs := bsonnav.DGetDoc(findBsonWidget(rawData, "ctn1").widget, "ConditionalVisibilitySettings")
+		if cvs == nil {
+			t.Fatal("expected ConditionalVisibilitySettings node")
+		}
+		if got := bsonnav.DGetString(cvs, "Expression"); got != expr {
+			t.Errorf("Expression = %q, want %q", got, expr)
+		}
+		// The bare (wrong) Visible field must not be written.
+		if v := bsonnav.DGet(findBsonWidget(rawData, "ctn1").widget, "Visible"); v != nil {
+			t.Errorf("unexpected bare Visible field: %v", v)
+		}
+	})
+
+	t.Run("static false hides", func(t *testing.T) {
+		rawData := makeRawPage(makeVisibilityWidget("ctn1"))
+		m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+		if err := m.SetWidgetProperty("ctn1", "Visible", false); err != nil {
+			t.Fatalf("SetWidgetProperty(Visible=false) failed: %v", err)
+		}
+		cvs := bsonnav.DGetDoc(findBsonWidget(rawData, "ctn1").widget, "ConditionalVisibilitySettings")
+		if cvs == nil || bsonnav.DGetString(cvs, "Expression") != "false" {
+			t.Errorf("expected ConditionalVisibilitySettings Expression=false, got %v", cvs)
+		}
+	})
+
+	t.Run("static true clears", func(t *testing.T) {
+		w := makeVisibilityWidget("ctn1")
+		// Pre-populate a settings node, then set Visible=true to clear it.
+		bsonnav.DSet(w, "ConditionalVisibilitySettings", bson.D{{Key: "Expression", Value: "false"}})
+		rawData := makeRawPage(w)
+		m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+		if err := m.SetWidgetProperty("ctn1", "Visible", true); err != nil {
+			t.Fatalf("SetWidgetProperty(Visible=true) failed: %v", err)
+		}
+		if cvs := bsonnav.DGet(findBsonWidget(rawData, "ctn1").widget, "ConditionalVisibilitySettings"); cvs != nil {
+			t.Errorf("expected ConditionalVisibilitySettings cleared to nil, got %v", cvs)
+		}
+	})
+}
+
+// lookupBsonKey reports a key's value AND whether the key is present, which
+// bsonnav.DGet cannot distinguish (an absent key and a stored null both read
+// back as nil). Presence is the thing under test here: Mendix fills an omitted
+// optional property on load, so "absent" and "null" fail differently.
+func lookupBsonKey(doc bson.D, key string) (any, bool) {
+	for _, e := range doc {
+		if e.Key == key {
+			return e.Value, true
+		}
+	}
+	return nil, false
+}
+
+// makeEditabilityWidget builds an input widget with null conditional
+// visibility/editability slots (as Studio Pro writes them when unset).
+func makeEditabilityWidget(name string) bson.D {
+	return bson.D{
+		{Key: "$Type", Value: "Forms$TextBox"},
+		{Key: "Name", Value: name},
+		{Key: "ConditionalVisibilitySettings", Value: nil},
+		{Key: "ConditionalEditabilitySettings", Value: nil},
+	}
+}
+
+// TestSetWidgetConditionalSetting_AttributeIsEmptyString locks in the fix for
+// issue #851: `alter page … set Editable = [expr]` produced a project Studio Pro
+// refused to load with StorageLoadException "Conditional editability settings has
+// an invalid value ” for property Attribute".
+//
+// Attribute is a BY_NAME AttributeIdentifier, so the absent value is the empty
+// string, not null — the CREATE path already encodes it that way via the
+// Forms$Conditional{Visibility,Editability}Settings TypeDefaults
+// (EmptyStringFields: Attribute, see mdl/backend/modelsdk/widget_write.go). The
+// ALTER path built the node by hand and wrote nil, so the same widget authored
+// through ALTER instead of CREATE was unloadable.
+func TestSetWidgetConditionalSetting_AttributeIsEmptyString(t *testing.T) {
+	cases := []struct {
+		prop  string // MDL property as the visitor delivers the [expr] form
+		field string // BSON slot it lands in
+	}{
+		{"EditableIf", "ConditionalEditabilitySettings"},
+		{"VisibleIf", "ConditionalVisibilitySettings"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.prop, func(t *testing.T) {
+			rawData := makeRawPage(makeEditabilityWidget("b1"))
+			m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+			expr := "$currentObject/Slug != ''"
+			if err := m.SetWidgetProperty("b1", tc.prop, expr); err != nil {
+				t.Fatalf("SetWidgetProperty(%s) failed: %v", tc.prop, err)
+			}
+			node := bsonnav.DGetDoc(findBsonWidget(rawData, "b1").widget, tc.field)
+			if node == nil {
+				t.Fatalf("expected a %s node", tc.field)
+			}
+			if got := bsonnav.DGetString(node, "Expression"); got != expr {
+				t.Errorf("Expression = %q, want %q", got, expr)
+			}
+			attr, ok := lookupBsonKey(node, "Attribute")
+			if !ok {
+				t.Fatal("Attribute key missing — Studio Pro requires the slot to be present")
+			}
+			if attr != any("") {
+				t.Errorf("Attribute = %#v, want %#v — a null here is not a valid "+
+					"AttributeIdentifier and Studio Pro refuses to load the page", attr, "")
+			}
+			// SourceVariable is a BY_ID reference and stays null when unset.
+			if sv, ok := lookupBsonKey(node, "SourceVariable"); !ok || sv != nil {
+				t.Errorf("SourceVariable = %#v (present=%v), want nil", sv, ok)
+			}
+		})
+	}
+}
+
 func TestSetWidgetProperty_ButtonStyle(t *testing.T) {
 	w1 := bson.D{
 		{Key: "$Type", Value: "Pages$ActionButton"},
@@ -238,7 +458,7 @@ func TestSetWidgetProperty_WidgetNotFound(t *testing.T) {
 }
 
 func TestSetWidgetProperty_PluggableWidget(t *testing.T) {
-	propTypeID := primitive.Binary{Subtype: 0x04, Data: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}}
+	propTypeID := bson.Binary{Subtype: 0x04, Data: []byte{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10}}
 	w1 := bson.D{
 		{Key: "$Type", Value: "CustomWidgets$CustomWidget"},
 		{Key: "Name", Value: "cb1"},
@@ -260,7 +480,7 @@ func TestSetWidgetProperty_PluggableWidget(t *testing.T) {
 				bson.D{
 					{Key: "TypePointer", Value: propTypeID},
 					{Key: "Value", Value: bson.D{
-						{Key: "PrimitiveValue", Value: "yes"},
+						{Key: "PrimitiveValue", Value: "true"},
 					}},
 				},
 			}},
@@ -281,8 +501,10 @@ func TestSetWidgetProperty_PluggableWidget(t *testing.T) {
 	props := bsonnav.DGetArrayElements(bsonnav.DGet(obj, "Properties"))
 	propDoc := props[0].(bson.D)
 	valDoc := bsonnav.DGetDoc(propDoc, "Value")
-	if bsonnav.DGetString(valDoc, "PrimitiveValue") != "no" {
-		t.Errorf("Expected PrimitiveValue='no', got %v", bsonnav.DGet(valDoc, "PrimitiveValue"))
+	// "false", not "no": this assertion used to pin the yes/no spelling that
+	// mendixlabs/mxcli#1454 showed the client reads as false either way.
+	if bsonnav.DGetString(valDoc, "PrimitiveValue") != "false" {
+		t.Errorf("Expected PrimitiveValue='false', got %v", bsonnav.DGet(valDoc, "PrimitiveValue"))
 	}
 }
 
@@ -304,18 +526,59 @@ func TestDSetArray_PreservesMarker(t *testing.T) {
 	}
 }
 
-func TestDSetArray_NoMarker(t *testing.T) {
+// A Mendix array's first entry is its typed-array marker. With no marker to
+// preserve, writing the elements bare produces a list whose first ENTRY the
+// reader takes as the marker — measured on mxbuild 11.13, a DesignProperties
+// array written that way makes the project fail to load ("Type
+// OptionDesignPropertyValue does not contain a constructor with a parameter of
+// type Appearance") and create-module-package die with "Unknown export error".
+// So DSetArray refuses instead of writing, and says so (upstream #931).
+func TestDSetArray_NoMarker_Refuses(t *testing.T) {
 	parent := bson.D{
 		{Key: "Widgets", Value: bson.A{"a", "b"}},
 	}
-	bsonnav.DSetArray(parent, "Widgets", []any{"x"})
+	if bsonnav.DSetArray(parent, "Widgets", []any{"x"}) {
+		t.Error("DSetArray reported success with no marker to write")
+	}
 
 	result := bsonnav.ToBsonA(bsonnav.DGet(parent, "Widgets"))
-	if len(result) != 1 {
-		t.Fatalf("Expected 1 element, got %d", len(result))
+	if len(result) != 2 || result[0] != "a" || result[1] != "b" {
+		t.Errorf("refused write must leave the value untouched, got %v", result)
 	}
-	if result[0] != "x" {
-		t.Errorf("Expected [x], got %v", result)
+}
+
+// DSetArrayIn is the caller-supplies-the-marker form, and the one that can CREATE
+// the property: DSet cannot add a key to a bson.D held by value, so the grown
+// child has to be written back into its parent.
+func TestDSetArrayIn_CreatesWithMarker(t *testing.T) {
+	widget := bson.D{
+		{Key: "Appearance", Value: bson.D{{Key: "Class", Value: ""}}},
+	}
+	if !bsonnav.DSetArrayIn(widget, "Appearance", "DesignProperties", []any{"entry"}, 3) {
+		t.Fatal("DSetArrayIn reported failure on a widget that has an Appearance")
+	}
+
+	appearance := bsonnav.DGetDoc(widget, "Appearance")
+	result := bsonnav.ToBsonA(bsonnav.DGet(appearance, "DesignProperties"))
+	if len(result) != 2 || result[0] != int32(3) || result[1] != "entry" {
+		t.Errorf("got %v, want [3 entry]", result)
+	}
+}
+
+// An existing marker wins over the caller's default: the stored document is the
+// authority on how its own list is versioned.
+func TestDSetArrayIn_PreservesExistingMarker(t *testing.T) {
+	widget := bson.D{
+		{Key: "Appearance", Value: bson.D{{Key: "DesignProperties", Value: bson.A{int32(2)}}}},
+	}
+	if !bsonnav.DSetArrayIn(widget, "Appearance", "DesignProperties", []any{"entry"}, 3) {
+		t.Fatal("DSetArrayIn reported failure")
+	}
+
+	appearance := bsonnav.DGetDoc(widget, "Appearance")
+	result := bsonnav.ToBsonA(bsonnav.DGet(appearance, "DesignProperties"))
+	if len(result) != 2 || result[0] != int32(2) {
+		t.Errorf("got %v, want the stored marker 2 preserved", result)
 	}
 }
 
@@ -501,7 +764,7 @@ func TestFindBsonWidget_DataViewFooter(t *testing.T) {
 // Page context tree tests
 // ============================================================================
 
-func makeWidgetWithID(name string, typeName string, id primitive.Binary) bson.D {
+func makeWidgetWithID(name string, typeName string, id bson.Binary) bson.D {
 	return bson.D{
 		{Key: "$ID", Value: id},
 		{Key: "$Type", Value: typeName},
@@ -509,10 +772,10 @@ func makeWidgetWithID(name string, typeName string, id primitive.Binary) bson.D 
 	}
 }
 
-func makeBsonID(b byte) primitive.Binary {
+func makeBsonID(b byte) bson.Binary {
 	data := make([]byte, 16)
 	data[0] = b
-	return primitive.Binary{Subtype: 0x04, Data: data}
+	return bson.Binary{Subtype: 0x04, Data: data}
 }
 
 func TestExtractPageParamsFromBSON_EntityParams(t *testing.T) {
@@ -735,13 +998,13 @@ func makePageWithLayout(layoutQN string, params ...string) bson.D {
 	args := bson.A{int32(3)}
 	for _, p := range params {
 		args = append(args, bson.D{
-			{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+			{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 			{Key: "$Type", Value: "Pages$FormCallArgument"},
 			{Key: "Parameter", Value: layoutQN + "." + p},
 		})
 	}
 	return bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: "Pages$FormCall"},
 		{Key: "FormCall", Value: bson.D{
 			{Key: "Form", Value: layoutQN},
@@ -835,7 +1098,7 @@ func TestSetLayout_Snippet_Error(t *testing.T) {
 
 func TestSetLayout_NoFormCall_Error(t *testing.T) {
 	page := bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: "Pages$Page"},
 	}
 	m := makePageMutator(page)
@@ -865,10 +1128,10 @@ func TestSetLayout_EmptyForm_Error(t *testing.T) {
 // deriveColumnNameBson / sanitizeColumnName regression tests (issue #116)
 // ============================================================================
 
-func makePropTypeID116(b byte) primitive.Binary {
+func makePropTypeID116(b byte) bson.Binary {
 	data := make([]byte, 16)
 	data[0] = b
-	return primitive.Binary{Subtype: 0x04, Data: data}
+	return bson.Binary{Subtype: 0x04, Data: data}
 }
 
 func TestDeriveColumnNameBson_AttributeBinding(t *testing.T) {
@@ -977,5 +1240,515 @@ func TestSanitizeColumnName(t *testing.T) {
 		if got != c.want {
 			t.Errorf("sanitizeColumnName(%q) = %q, want %q", c.input, got, c.want)
 		}
+	}
+}
+
+// --- Page-level pop-up dimension SET (issue #661) -------------------------
+
+func TestSetPageLevel_PopupWidth(t *testing.T) {
+	rawData := makeRawPage()
+	m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+
+	// Integer literals arrive from the visitor as Go int.
+	if err := m.SetWidgetProperty("", "PopupWidth", 800); err != nil {
+		t.Fatalf("SetWidgetProperty PopupWidth failed: %v", err)
+	}
+	got := bsonnav.DGet(m.rawData, "PopupWidth")
+	if got != int64(800) {
+		t.Errorf("PopupWidth = %v (%T), want int64(800)", got, got)
+	}
+}
+
+func TestSetPageLevel_PopupHeight(t *testing.T) {
+	rawData := makeRawPage()
+	m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+
+	if err := m.SetWidgetProperty("", "PopupHeight", 480); err != nil {
+		t.Fatalf("SetWidgetProperty PopupHeight failed: %v", err)
+	}
+	if got := bsonnav.DGet(m.rawData, "PopupHeight"); got != int64(480) {
+		t.Errorf("PopupHeight = %v (%T), want int64(480)", got, got)
+	}
+}
+
+// Issue #714 — page-level SET Class/Style writes the page's Forms$Appearance.
+func TestSetPageLevel_ClassAndStyle(t *testing.T) {
+	// No Appearance present yet → one is created.
+	m := &Mutator{rawData: makeRawPage(), widgetFinder: findBsonWidget}
+	if err := m.SetWidgetProperty("", "Class", "my-page"); err != nil {
+		t.Fatalf("SET Class: %v", err)
+	}
+	if err := m.SetWidgetProperty("", "Style", "padding: 10px"); err != nil {
+		t.Fatalf("SET Style: %v", err)
+	}
+	ap := bsonnav.DGetDoc(m.rawData, "Appearance")
+	if ap == nil {
+		t.Fatal("Appearance not created")
+	}
+	if got := bsonnav.DGet(ap, "Class"); got != "my-page" {
+		t.Errorf("Appearance.Class = %v, want my-page", got)
+	}
+	if got := bsonnav.DGet(ap, "Style"); got != "padding: 10px" {
+		t.Errorf("Appearance.Style = %v, want 'padding: 10px'", got)
+	}
+
+	// Existing Appearance with a Class → updated in place.
+	raw := makeRawPage()
+	raw = append(raw, bson.E{Key: "Appearance", Value: bson.D{
+		{Key: "$Type", Value: "Forms$Appearance"}, {Key: "Class", Value: "old"}, {Key: "Style", Value: ""},
+	}})
+	m2 := &Mutator{rawData: raw, widgetFinder: findBsonWidget}
+	if err := m2.SetWidgetProperty("", "Class", "new"); err != nil {
+		t.Fatalf("SET Class (update): %v", err)
+	}
+	if got := bsonnav.DGet(bsonnav.DGetDoc(m2.rawData, "Appearance"), "Class"); got != "new" {
+		t.Errorf("updated Appearance.Class = %v, want new", got)
+	}
+
+	// A non-string value is rejected.
+	m3 := &Mutator{rawData: makeRawPage(), widgetFinder: findBsonWidget}
+	if err := m3.SetWidgetProperty("", "Class", 42); err == nil {
+		t.Error("non-string Class should be rejected")
+	}
+}
+
+func TestSetPageLevel_PopupWidth_Float(t *testing.T) {
+	rawData := makeRawPage()
+	m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+
+	// A value written with a decimal point arrives as float64; whole values coerce.
+	if err := m.SetWidgetProperty("", "PopupWidth", float64(640)); err != nil {
+		t.Fatalf("SetWidgetProperty PopupWidth float failed: %v", err)
+	}
+	if got := bsonnav.DGet(m.rawData, "PopupWidth"); got != int64(640) {
+		t.Errorf("PopupWidth = %v (%T), want int64(640)", got, got)
+	}
+}
+
+func TestSetPageLevel_PopupResizable(t *testing.T) {
+	rawData := makeRawPage()
+	m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+
+	if err := m.SetWidgetProperty("", "PopupResizable", true); err != nil {
+		t.Fatalf("SetWidgetProperty PopupResizable failed: %v", err)
+	}
+	if got := bsonnav.DGet(m.rawData, "PopupResizable"); got != true {
+		t.Errorf("PopupResizable = %v, want true", got)
+	}
+}
+
+// SET PopupWidth = 0 is valid — 0 is Studio Pro's default (auto-size) and must be
+// stored verbatim, not rejected (issue #713).
+func TestSetPageLevel_PopupWidth_Zero(t *testing.T) {
+	rawData := makeRawPage()
+	m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+	if err := m.SetWidgetProperty("", "PopupWidth", 0); err != nil {
+		t.Fatalf("SET PopupWidth = 0 should be accepted, got: %v", err)
+	}
+	if got := bsonnav.DGet(m.rawData, "PopupWidth"); got != int64(0) {
+		t.Errorf("PopupWidth = %v (%T), want int64(0)", got, got)
+	}
+}
+
+func TestSetPageLevel_Popup_Invalid(t *testing.T) {
+	cases := []struct {
+		name  string
+		prop  string
+		value any
+	}{
+		{"negative width", "PopupWidth", -1},
+		{"negative height", "PopupHeight", -10},
+		{"non-whole float", "PopupWidth", 12.5},
+		{"non-number width", "PopupWidth", "wide"},
+		{"non-bool resizable", "PopupResizable", "yes"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rawData := makeRawPage()
+			m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+			if err := m.SetWidgetProperty("", c.prop, c.value); err == nil {
+				t.Errorf("expected error for %s = %v, got nil", c.prop, c.value)
+			}
+		})
+	}
+}
+
+func TestSetPageLevel_UnsupportedProperty(t *testing.T) {
+	rawData := makeRawPage()
+	m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+	if err := m.SetWidgetProperty("", "NotARealProperty", 1); err == nil {
+		t.Fatal("expected error for unsupported page-level property, got nil")
+	}
+}
+
+// Issue #627 — SET VisibleIf builds a ConditionalVisibilitySettings node carrying
+// the expression, replacing the null slot. Editable on a widget without the slot
+// is rejected.
+func TestSetWidgetProperty_VisibleIf(t *testing.T) {
+	w := bson.D{
+		{Key: "$Type", Value: "Forms$DivContainer"},
+		{Key: "Name", Value: "ctn"},
+		{Key: "ConditionalVisibilitySettings", Value: nil},
+	}
+	rawData := makeRawPage(w)
+	m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+
+	if err := m.SetWidgetProperty("ctn", "VisibleIf", "$currentObject/Name != ''"); err != nil {
+		t.Fatalf("SetWidgetProperty VisibleIf: %v", err)
+	}
+	res := findBsonWidget(rawData, "ctn")
+	cvs, ok := bsonnav.DGet(res.widget, "ConditionalVisibilitySettings").(bson.D)
+	if !ok {
+		t.Fatalf("ConditionalVisibilitySettings not a doc: %T", bsonnav.DGet(res.widget, "ConditionalVisibilitySettings"))
+	}
+	if got := bsonnav.DGetString(cvs, "Expression"); got != "$currentObject/Name != ''" {
+		t.Errorf("Expression = %q", got)
+	}
+	if bsonnav.DGetString(cvs, "$Type") != "Forms$ConditionalVisibilitySettings" {
+		t.Errorf("wrong $Type: %v", bsonnav.DGet(cvs, "$Type"))
+	}
+}
+
+// mendixlabs/mxcli#1460: Studio Pro stores "Visible for module roles" on the
+// same node as the condition, so SET Visible rebuilt the node and dropped the
+// role restriction. The roles are a separate setting and must survive a SET of
+// the condition — including `Visible = true`, which clears only the condition.
+func TestSetWidgetProperty_VisibleKeepsModuleRoles(t *testing.T) {
+	for _, tc := range []struct {
+		prop     string
+		value    any
+		wantExpr string
+	}{
+		{"VisibleIf", "$currentObject/Name != ''", "$currentObject/Name != ''"},
+		{"Visible", false, "false"},
+		{"Visible", true, ""},
+	} {
+		w := bson.D{
+			{Key: "$Type", Value: "Forms$DivContainer"},
+			{Key: "Name", Value: "ctn"},
+			{Key: "ConditionalVisibilitySettings", Value: bson.D{
+				{Key: "$ID", Value: "x"},
+				{Key: "$Type", Value: "Forms$ConditionalVisibilitySettings"},
+				{Key: "Attribute", Value: ""},
+				{Key: "Conditions", Value: bson.A{int32(2)}},
+				{Key: "Expression", Value: "old"},
+				{Key: "IgnoreSecurity", Value: false},
+				{Key: "ModuleRoles", Value: bson.A{int32(1), "M.Admin"}},
+				{Key: "SourceVariable", Value: nil},
+			}},
+		}
+		rawData := makeRawPage(w)
+		m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+		if err := m.SetWidgetProperty("ctn", tc.prop, tc.value); err != nil {
+			t.Fatalf("%s = %v: %v", tc.prop, tc.value, err)
+		}
+		cvs, ok := bsonnav.DGet(findBsonWidget(rawData, "ctn").widget, "ConditionalVisibilitySettings").(bson.D)
+		if !ok {
+			t.Fatalf("%s = %v: settings node removed — the role restriction was dropped", tc.prop, tc.value)
+		}
+		if got := bsonnav.DGetString(cvs, "Expression"); got != tc.wantExpr {
+			t.Errorf("%s = %v: Expression = %q, want %q", tc.prop, tc.value, got, tc.wantExpr)
+		}
+		roles, _ := bsonnav.DGet(cvs, "ModuleRoles").(bson.A)
+		if len(roles) != 2 || roles[1] != "M.Admin" {
+			t.Errorf("%s = %v: ModuleRoles = %v, want [1 M.Admin]", tc.prop, tc.value, roles)
+		}
+	}
+}
+
+func TestSetWidgetProperty_EditableIf_Unsupported(t *testing.T) {
+	// A container has no ConditionalEditabilitySettings slot → reject.
+	w := bson.D{
+		{Key: "$Type", Value: "Forms$DivContainer"},
+		{Key: "Name", Value: "ctn"},
+		{Key: "ConditionalVisibilitySettings", Value: nil},
+	}
+	rawData := makeRawPage(w)
+	m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+	if err := m.SetWidgetProperty("ctn", "EditableIf", "$currentObject/Active"); err == nil {
+		t.Fatal("expected error setting EditableIf on a container, got nil")
+	}
+}
+
+// makeAssociationListView builds a ListView bound to an association source
+// (Forms$AssociationSource → IndirectEntityRef → EntityRefStep) whose
+// destination entity is destEntity, containing the given children. This mirrors
+// the BSON that serializeAssociationSource emits for `from association`.
+func makeAssociationListView(name, assoc, destEntity string, children ...bson.D) bson.D {
+	childArr := bson.A{int32(2)}
+	for _, c := range children {
+		childArr = append(childArr, c)
+	}
+	return bson.D{
+		{Key: "$Type", Value: "Forms$ListView"},
+		{Key: "Name", Value: name},
+		{Key: "Widgets", Value: childArr},
+		{Key: "DataSource", Value: bson.D{
+			{Key: "$Type", Value: "Forms$AssociationSource"},
+			{Key: "EntityRef", Value: bson.D{
+				{Key: "$Type", Value: "DomainModels$IndirectEntityRef"},
+				{Key: "Steps", Value: bson.A{
+					int32(2),
+					bson.D{
+						{Key: "$Type", Value: "DomainModels$EntityRefStep"},
+						{Key: "Association", Value: assoc},
+						{Key: "DestinationEntity", Value: destEntity},
+					},
+				}},
+			}},
+		}},
+	}
+}
+
+// TestEnclosingEntity_AssociationSource is the regression for FINDINGS #55:
+// ALTER PAGE INSERT/REPLACE into a list bound `from association` dropped the
+// inserted widget's attribute binding because the enclosing entity was read
+// from DataSource.EntityRef.Entity, which is empty for an association source
+// (the destination lives on the last EntityRefStep). The bare attribute then
+// resolved against the wrong (outer) entity — CE1613 at build.
+func TestEnclosingEntity_AssociationSource(t *testing.T) {
+	inner := makeWidget("wrTotal", "Forms$DynamicText")
+	lv := makeAssociationListView("lvRows", "MyFirstModule.WeekRow_Week", "MyFirstModule.WeekRow", inner)
+	// Nest the association list inside a DataView bound to the outer entity so
+	// the walker has a wrong candidate (Week) to fall through to on failure.
+	dvChildren := bson.A{int32(2), lv}
+	dv := bson.D{
+		{Key: "$Type", Value: "Forms$DataView"},
+		{Key: "Name", Value: "dvWeek"},
+		{Key: "Widgets", Value: dvChildren},
+		{Key: "DataSource", Value: bson.D{
+			{Key: "$Type", Value: "Forms$DataViewSource"},
+			{Key: "EntityRef", Value: bson.D{
+				{Key: "$Type", Value: "DomainModels$DirectEntityRef"},
+				{Key: "Entity", Value: "MyFirstModule.Week"},
+			}},
+		}},
+	}
+	rawData := makeRawPage(dv)
+	m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+
+	// Sibling insert after wrTotal → context is wrTotal's enclosing entity,
+	// which must be the association destination WeekRow, NOT the outer Week.
+	if got := m.EnclosingEntity("wrTotal"); got != "MyFirstModule.WeekRow" {
+		t.Errorf("EnclosingEntity(wrTotal) = %q, want MyFirstModule.WeekRow", got)
+	}
+	// INSERT INTO the list → children also take the association destination.
+	if got := m.EnclosingEntityForChildren("lvRows"); got != "MyFirstModule.WeekRow" {
+		t.Errorf("EnclosingEntityForChildren(lvRows) = %q, want MyFirstModule.WeekRow", got)
+	}
+}
+
+// makeMicroflowListView builds a ListView bound to a microflow datasource
+// (Forms$MicroflowSource → MicroflowSettings.Microflow), mirroring what the
+// writer emits for `datasource: microflow …`.
+func makeMicroflowListView(name, microflowQN string, children ...bson.D) bson.D {
+	childArr := bson.A{int32(2)}
+	for _, c := range children {
+		childArr = append(childArr, c)
+	}
+	return bson.D{
+		{Key: "$Type", Value: "Forms$ListView"},
+		{Key: "Name", Value: name},
+		{Key: "Widgets", Value: childArr},
+		{Key: "DataSource", Value: bson.D{
+			{Key: "$Type", Value: "Forms$MicroflowSource"},
+			{Key: "MicroflowSettings", Value: bson.D{
+				{Key: "$Type", Value: "Forms$MicroflowSettings"},
+				{Key: "Microflow", Value: microflowQN},
+			}},
+		}},
+	}
+}
+
+// TestEnclosingDataSourceFlow guards the microflow-datasource half of FINDINGS
+// #55: a widget inside a list bound to a microflow datasource must report that
+// microflow's qualified name (so the executor can resolve its return entity),
+// and a nearer NON-flow (association/database) source must shadow an outer flow.
+func TestEnclosingDataSourceFlow(t *testing.T) {
+	// Flat: microflow-sourced list at page top level.
+	inner := makeWidget("wrTotal", "Forms$DynamicText")
+	lv := makeMicroflowListView("lvRows", "MyFirstModule.DS_Rows", inner)
+	m := &Mutator{rawData: makeRawPage(lv), widgetFinder: findBsonWidget}
+
+	// Sibling insert after wrTotal → nearest enclosing datasource is the microflow.
+	if mf, nf := m.EnclosingDataSourceFlow("wrTotal", false); mf != "MyFirstModule.DS_Rows" || nf != "" {
+		t.Errorf("EnclosingDataSourceFlow(wrTotal) = (%q,%q), want (MyFirstModule.DS_Rows, )", mf, nf)
+	}
+	// INSERT INTO the list → the list's OWN datasource is the microflow.
+	if mf, _ := m.EnclosingDataSourceFlow("lvRows", true); mf != "MyFirstModule.DS_Rows" {
+		t.Errorf("EnclosingDataSourceFlow(lvRows, forChildren) = %q, want MyFirstModule.DS_Rows", mf)
+	}
+
+	// A nearer association source must SHADOW an outer microflow: microflow list
+	// contains an association-bound list; a widget in the inner list reports NO
+	// flow (its nearest source is the association).
+	innerAssoc := makeWidget("leaf", "Forms$DynamicText")
+	assocLV := makeAssociationListView("lvInner", "MyFirstModule.A_B", "MyFirstModule.B", innerAssoc)
+	outerMf := makeMicroflowListView("lvOuter", "MyFirstModule.DS_Rows", assocLV)
+	m2 := &Mutator{rawData: makeRawPage(outerMf), widgetFinder: findBsonWidget}
+	if mf, nf := m2.EnclosingDataSourceFlow("leaf", false); mf != "" || nf != "" {
+		t.Errorf("nearer association source should shadow outer microflow: got (%q,%q), want empty", mf, nf)
+	}
+}
+
+// makeGridWithCustomContentColumn builds the shape issue #834 is about: a
+// pluggable DataGrid2 whose column renders `customContent`, with a widget
+// nested inside that column's content.
+//
+// The nesting is two levels deeper than a plain pluggable property:
+//
+//	CustomWidget.Object → Properties[columns].Value.Objects[i]   ← the column
+//	                    → Properties[content].Value.Widgets[]    ← its content
+//
+// findInWidgetChildren searched the first level and matched columns by derived
+// name, but never descended into a column's own content.
+func makeGridWithCustomContentColumn(gridName, childName string) bson.D {
+	columnsTypeID := bson.Binary{Subtype: 0x04, Data: []byte{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}}
+	contentTypeID := bson.Binary{Subtype: 0x04, Data: []byte{2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2}}
+	captionTypeID := bson.Binary{Subtype: 0x04, Data: []byte{3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3}}
+
+	return bson.D{
+		{Key: "$Type", Value: "CustomWidgets$CustomWidget"},
+		{Key: "Name", Value: gridName},
+		{Key: "Type", Value: bson.D{
+			{Key: "$Type", Value: "CustomWidgets$CustomWidgetType"},
+			{Key: "ObjectType", Value: bson.D{
+				{Key: "PropertyTypes", Value: bson.A{
+					int32(2),
+					bson.D{
+						{Key: "$ID", Value: columnsTypeID},
+						{Key: "PropertyKey", Value: "columns"},
+						// The column's own property types hang off the columns
+						// property type as ValueType.ObjectType.PropertyTypes
+						// (see buildColumnPropKeyMap).
+						{Key: "ValueType", Value: bson.D{
+							{Key: "ObjectType", Value: bson.D{
+								{Key: "PropertyTypes", Value: bson.A{
+									int32(2),
+									bson.D{
+										{Key: "$ID", Value: contentTypeID},
+										{Key: "PropertyKey", Value: "content"},
+									},
+									bson.D{
+										{Key: "$ID", Value: captionTypeID},
+										{Key: "PropertyKey", Value: "header"},
+									},
+								}},
+							}},
+						}},
+					},
+				}},
+			}},
+		}},
+		{Key: "Object", Value: bson.D{
+			{Key: "Properties", Value: bson.A{
+				int32(2),
+				bson.D{
+					{Key: "TypePointer", Value: columnsTypeID},
+					{Key: "Value", Value: bson.D{
+						{Key: "Objects", Value: bson.A{
+							int32(2),
+							bson.D{ // the column
+								{Key: "Properties", Value: bson.A{
+									int32(2),
+									bson.D{
+										{Key: "TypePointer", Value: captionTypeID},
+										{Key: "Value", Value: bson.D{
+											{Key: "TextTemplate", Value: bson.D{
+												{Key: "Template", Value: bson.D{
+													{Key: "Items", Value: bson.A{
+														int32(2),
+														bson.D{{Key: "Text", Value: "Act"}},
+													}},
+												}},
+											}},
+										}},
+									},
+									bson.D{
+										{Key: "TypePointer", Value: contentTypeID},
+										{Key: "Value", Value: bson.D{
+											{Key: "Widgets", Value: bson.A{
+												int32(2),
+												bson.D{
+													{Key: "$Type", Value: "Forms$ActionButton"},
+													{Key: "Name", Value: childName},
+													// Real shape: an ActionButton's caption is a
+													// Forms$ClientTemplate, not a plain Caption doc.
+													{Key: "CaptionTemplate", Value: bson.D{
+														{Key: "$Type", Value: "Forms$ClientTemplate"},
+														{Key: "Template", Value: bson.D{
+															{Key: "$Type", Value: "Texts$Text"},
+															{Key: "Items", Value: bson.A{
+																int32(3),
+																bson.D{
+																	{Key: "$Type", Value: "Texts$Translation"},
+																	{Key: "LanguageCode", Value: "en_US"},
+																	{Key: "Text", Value: "Edit"},
+																},
+															}},
+														}},
+													}},
+												},
+											}},
+										}},
+									},
+								}},
+							},
+						}},
+					}},
+				},
+			}},
+		}},
+	}
+}
+
+// TestFindBsonWidget_InsideCustomContentColumn covers issue #834: `alter page …
+// set Caption = '…' on btnEdit` reported "widget not found" when btnEdit lived
+// inside a datagrid column rendered as customContent, so the only way to touch
+// it was rewriting the whole page with CREATE OR REPLACE.
+//
+// Addressing is by the CHILD widget's own name. A `grid.column.widget` path was
+// considered and rejected: DataGrid2 columns carry no stored name in the MPR
+// (see findBsonColumn), so the column segment could only be a derived name —
+// which changes when the caption changes, making such a path silently stale.
+// The nested widget's name is real and stable.
+func TestFindBsonWidget_InsideCustomContentColumn(t *testing.T) {
+	rawData := makeRawPage(makeGridWithCustomContentColumn("dgcc", "btnEdit"))
+
+	result := findBsonWidget(rawData, "btnEdit")
+	if result == nil {
+		t.Fatal("widget nested in a customContent column was not found")
+	}
+	if got := bsonnav.DGetString(result.widget, "Name"); got != "btnEdit" {
+		t.Fatalf("found %q, want btnEdit", got)
+	}
+
+	// And it must be mutable through the normal path, not merely findable.
+	m := &Mutator{rawData: rawData, widgetFinder: findBsonWidget}
+	if err := m.SetWidgetProperty("btnEdit", "Caption", "Changed"); err != nil {
+		t.Fatalf("SetWidgetProperty on the nested widget failed: %v", err)
+	}
+	again := findBsonWidget(rawData, "btnEdit")
+	tmpl := bsonnav.DGetDoc(again.widget, "CaptionTemplate")
+	template := bsonnav.DGetDoc(tmpl, "Template")
+	items := bsonnav.DGetArrayElements(bsonnav.DGet(template, "Items"))
+	if len(items) == 0 {
+		t.Fatal("CaptionTemplate lost its Items")
+	}
+	if got := bsonnav.DGetString(items[0].(bson.D), "Text"); got != "Changed" {
+		t.Errorf("caption text = %q, want Changed", got)
+	}
+}
+
+// The column itself must still resolve by its derived name — descending into
+// column content must not shadow the existing column addressing.
+func TestFindBsonWidget_ColumnStillResolvesByDerivedName(t *testing.T) {
+	rawData := makeRawPage(makeGridWithCustomContentColumn("dgcc", "btnEdit"))
+	result := findBsonWidget(rawData, "Act")
+	if result == nil {
+		t.Fatal("column 'Act' no longer resolves by its derived name")
+	}
+	if len(result.colPropKeys) == 0 {
+		t.Error("expected a column result (colPropKeys populated), got a plain widget")
 	}
 }

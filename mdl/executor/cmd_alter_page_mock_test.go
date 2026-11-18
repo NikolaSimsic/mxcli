@@ -3,6 +3,7 @@
 package executor
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/mendixlabs/mxcli/mdl/backend/mock"
 	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
+	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 	"github.com/mendixlabs/mxcli/sdk/pages"
 )
 
@@ -100,6 +102,56 @@ func TestAlterPage_SetProperty_Success(t *testing.T) {
 	}
 	assertContainsStr(t, buf.String(), "Altered page")
 	assertContainsStr(t, buf.String(), "MyModule.TestPage")
+}
+
+// Issue #661 — page-level SET of pop-up dimensions routes to the mutator with an
+// empty widget ref (page-level), not a widget target.
+func TestAlterPage_SetPopupDimensions_Issue661(t *testing.T) {
+	mod := mkModule("MyModule")
+	pg := mkPage(mod.ID, "TestPage")
+	saved := false
+	gotProps := map[string]any{}
+	mb := &mock.MockBackend{
+		IsConnectedFunc: func() bool { return true },
+		ListModulesFunc: func() ([]*model.Module, error) { return []*model.Module{mod}, nil },
+		ListFoldersFunc: func() ([]*types.FolderInfo, error) { return nil, nil },
+		ListPagesFunc:   func() ([]*pages.Page, error) { return []*pages.Page{pg}, nil },
+		OpenPageForMutationFunc: func(unitID model.ID) (backend.PageMutator, error) {
+			return &mock.MockPageMutator{
+				SetWidgetPropertyFunc: func(widgetRef string, prop string, value any) error {
+					if widgetRef != "" {
+						t.Errorf("expected page-level set (empty widgetRef), got %q", widgetRef)
+					}
+					gotProps[prop] = value
+					return nil
+				},
+				SaveFunc: func() error { saved = true; return nil },
+			}, nil
+		},
+	}
+	h := mkHierarchy(mod)
+	withContainer(h, pg.ContainerID, mod.ID)
+	ctx, buf := newMockCtx(t, withBackend(mb), withHierarchy(h))
+	assertNoError(t, execAlterPage(ctx, &ast.AlterPageStmt{
+		PageName: ast.QualifiedName{Module: "MyModule", Name: "TestPage"},
+		Operations: []ast.AlterPageOperation{
+			&ast.SetPropertyOp{
+				Target: ast.WidgetRef{Widget: ""},
+				Properties: map[string]any{
+					"PopupWidth":     800,
+					"PopupHeight":    480,
+					"PopupResizable": true,
+				},
+			},
+		},
+	}))
+	if !saved {
+		t.Error("expected Save to be called")
+	}
+	if gotProps["PopupWidth"] != 800 || gotProps["PopupHeight"] != 480 || gotProps["PopupResizable"] != true {
+		t.Errorf("unexpected props passed to mutator: %#v", gotProps)
+	}
+	assertContainsStr(t, buf.String(), "Altered page")
 }
 
 // ---------------------------------------------------------------------------
@@ -386,7 +438,7 @@ func TestApplyReplaceWidgetMutator_SameNameAllowed(t *testing.T) {
 	}
 	ctx, _ := newMockCtx(t, withBackend(mb))
 
-	err := applyReplaceWidgetMutator(ctx, mutator, op, "MyModule", model.ID("mod-id"))
+	err := applyReplaceWidgetMutator(ctx, mutator, op, "MyModule", model.ID("mod-id"), nil)
 	if err != nil {
 		t.Errorf("same-name replacement should be allowed, got: %v", err)
 	}
@@ -468,5 +520,197 @@ func TestAlterPage_InsertCustomContentColumn(t *testing.T) {
 	}
 	if insertWidgetCalled {
 		t.Error("InsertWidget must NOT be called for column INSERT")
+	}
+}
+
+// ALTER PAGE writes a text into the project's default language
+// (pagemutator.setTextsTextTranslation reads model.AuthoringLanguage), so the
+// language must be resolved before the first mutation — not left at whatever
+// an earlier statement or the en_US default put there. A de_DE project whose
+// tab caption had only en_US got its `set Caption` written to en_US, leaving
+// the CE4899 it was meant to fix.
+func TestAlterPage_ResolvesAuthoringLanguageBeforeWriting(t *testing.T) {
+	prev := model.AuthoringLanguage()
+	model.SetAuthoringLanguage("en_US")
+	t.Cleanup(func() { model.SetAuthoringLanguage(prev) })
+
+	mod := mkModule("MyModule")
+	pg := mkPage(mod.ID, "TestPage")
+	var langAtWrite string
+	mb := &mock.MockBackend{
+		IsConnectedFunc: func() bool { return true },
+		ListModulesFunc: func() ([]*model.Module, error) { return []*model.Module{mod}, nil },
+		ListFoldersFunc: func() ([]*types.FolderInfo, error) { return nil, nil },
+		ListPagesFunc:   func() ([]*pages.Page, error) { return []*pages.Page{pg}, nil },
+		GetProjectSettingsFunc: func() (*model.ProjectSettings, error) {
+			return &model.ProjectSettings{Language: &model.LanguageSettings{DefaultLanguageCode: "de_DE"}}, nil
+		},
+		OpenPageForMutationFunc: func(unitID model.ID) (backend.PageMutator, error) {
+			return &mock.MockPageMutator{
+				SetWidgetPropertyFunc: func(string, string, any) error {
+					langAtWrite = model.AuthoringLanguage()
+					return nil
+				},
+				SaveFunc: func() error { return nil },
+			}, nil
+		},
+	}
+	h := mkHierarchy(mod)
+	withContainer(h, pg.ContainerID, mod.ID)
+	ctx, _ := newMockCtx(t, withBackend(mb), withHierarchy(h))
+	assertNoError(t, execAlterPage(ctx, &ast.AlterPageStmt{
+		PageName: ast.QualifiedName{Module: "MyModule", Name: "TestPage"},
+		Operations: []ast.AlterPageOperation{
+			&ast.SetPropertyOp{
+				Target:     ast.WidgetRef{Widget: "tabPage2"},
+				Properties: map[string]any{"Caption": "Benutzer"},
+			},
+		},
+	}))
+	if langAtWrite != "de_DE" {
+		t.Fatalf("authoring language during the write = %q, want the project's de_DE", langAtWrite)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ADD / DROP PARAMETERS (mendixlabs/mxcli#1234)
+// ---------------------------------------------------------------------------
+
+// alterParamsBackend is a project with MyModule.Customer, one page and one
+// snippet, whose mutator records the parameter it is asked to add.
+func alterParamsBackend(t *testing.T, added *[]backend.PageParameterSpec) (*ExecContext, *bytes.Buffer) {
+	return alterParamsBackendURL(t, added, "")
+}
+
+func alterParamsBackendURL(t *testing.T, added *[]backend.PageParameterSpec, url string) (*ExecContext, *bytes.Buffer) {
+	t.Helper()
+	mod := mkModule("MyModule")
+	pg := mkPage(mod.ID, "TestPage")
+	pg.URL = url
+	snp := mkSnippet(mod.ID, "TestSnippet")
+	ent := &domainmodel.Entity{BaseElement: model.BaseElement{ID: nextID("ent")}, Name: "Customer"}
+	dm := &domainmodel.DomainModel{
+		BaseElement: model.BaseElement{ID: nextID("dm")},
+		ContainerID: mod.ID,
+		Entities:    []*domainmodel.Entity{ent},
+	}
+	mb := &mock.MockBackend{
+		IsConnectedFunc:      func() bool { return true },
+		ListModulesFunc:      func() ([]*model.Module, error) { return []*model.Module{mod}, nil },
+		ListFoldersFunc:      func() ([]*types.FolderInfo, error) { return nil, nil },
+		ListPagesFunc:        func() ([]*pages.Page, error) { return []*pages.Page{pg}, nil },
+		ListSnippetsFunc:     func() ([]*pages.Snippet, error) { return []*pages.Snippet{snp}, nil },
+		ListDomainModelsFunc: func() ([]*domainmodel.DomainModel, error) { return []*domainmodel.DomainModel{dm}, nil },
+		OpenPageForMutationFunc: func(unitID model.ID) (backend.PageMutator, error) {
+			return &mock.MockPageMutator{
+				AddParameterFunc: func(p backend.PageParameterSpec) error {
+					*added = append(*added, p)
+					return nil
+				},
+				SaveFunc: func() error { return nil },
+			}, nil
+		},
+	}
+	h := mkHierarchy(mod)
+	withContainer(h, pg.ContainerID, mod.ID)
+	withContainer(h, snp.ContainerID, mod.ID)
+	withContainer(h, dm.ID, mod.ID)
+	return newMockCtx(t, withBackend(mb), withHierarchy(h))
+}
+
+func TestAlterPage_AddParameters_ResolvesTypes(t *testing.T) {
+	var added []backend.PageParameterSpec
+	ctx, buf := alterParamsBackend(t, &added)
+	assertNoError(t, execAlterPage(ctx, &ast.AlterPageStmt{
+		PageName: ast.QualifiedName{Module: "MyModule", Name: "TestPage"},
+		Operations: []ast.AlterPageOperation{
+			&ast.AddParameterOp{Parameter: ast.PageParameter{
+				Name:       "Customer",
+				EntityType: ast.QualifiedName{Module: "MyModule", Name: "Customer"},
+				Type:       ast.DataType{Kind: ast.TypeEntity},
+			}},
+			&ast.AddParameterOp{Parameter: ast.PageParameter{Name: "Count", Type: ast.DataType{Kind: ast.TypeLong}}},
+		},
+	}))
+	want := []backend.PageParameterSpec{
+		{Name: "Customer", EntityName: "MyModule.Customer"},
+		// Storage has no LongType; Integer/Long is one type (pageParamBSONType).
+		{Name: "Count", PrimitiveType: "DataTypes$IntegerType"},
+	}
+	if len(added) != len(want) || added[0] != want[0] || added[1] != want[1] {
+		t.Fatalf("added %+v, want %+v", added, want)
+	}
+	assertContainsStr(t, buf.String(), "Altered page")
+}
+
+func TestAlterPage_AddParameters_UnknownEntityRefused(t *testing.T) {
+	var added []backend.PageParameterSpec
+	ctx, _ := alterParamsBackend(t, &added)
+	err := execAlterPage(ctx, &ast.AlterPageStmt{
+		PageName: ast.QualifiedName{Module: "MyModule", Name: "TestPage"},
+		Operations: []ast.AlterPageOperation{
+			&ast.AddParameterOp{Parameter: ast.PageParameter{
+				Name:       "Order",
+				EntityType: ast.QualifiedName{Module: "MyModule", Name: "Order"},
+				Type:       ast.DataType{Kind: ast.TypeEntity},
+			}},
+		},
+	})
+	assertError(t, err)
+	assertContainsStr(t, err.Error(), "MyModule.Order")
+	if len(added) != 0 {
+		t.Errorf("a parameter of an unknown entity reached the mutator: %+v", added)
+	}
+}
+
+// A snippet parameter must be an entity (CE0046), as on CREATE SNIPPET.
+func TestAlterSnippet_AddPrimitiveParameterRefused(t *testing.T) {
+	var added []backend.PageParameterSpec
+	ctx, _ := alterParamsBackend(t, &added)
+	err := execAlterPage(ctx, &ast.AlterPageStmt{
+		ContainerType: "snippet",
+		PageName:      ast.QualifiedName{Module: "MyModule", Name: "TestSnippet"},
+		Operations: []ast.AlterPageOperation{
+			&ast.AddParameterOp{Parameter: ast.PageParameter{Name: "Label", Type: ast.DataType{Kind: ast.TypeString}}},
+		},
+	})
+	assertError(t, err)
+	assertContainsStr(t, err.Error(), "CE0046")
+	if len(added) != 0 {
+		t.Errorf("a primitive snippet parameter reached the mutator: %+v", added)
+	}
+}
+
+// A page with a URL needs a `{Name}` segment per parameter or mxbuild fails it
+// with CE5601 (measured on 11.12.1 with this exact add). The URL the statement
+// ends with is what counts.
+func TestAlterPage_AddParameters_URLSegment(t *testing.T) {
+	addCount := &ast.AddParameterOp{Parameter: ast.PageParameter{Name: "Count", Type: ast.DataType{Kind: ast.TypeInteger}}}
+
+	var added []backend.PageParameterSpec
+	ctx, _ := alterParamsBackendURL(t, &added, "test/{Customer}")
+	err := execAlterPage(ctx, &ast.AlterPageStmt{
+		PageName:   ast.QualifiedName{Module: "MyModule", Name: "TestPage"},
+		Operations: []ast.AlterPageOperation{addCount},
+	})
+	assertError(t, err)
+	assertContainsStr(t, err.Error(), "CE5601")
+	assertContainsStr(t, err.Error(), "test/{Customer}/{Count}")
+	if len(added) != 0 {
+		t.Errorf("refused statement still reached the mutator: %+v", added)
+	}
+
+	// Control: the same add with the URL extended in the same statement.
+	added = nil
+	ctx, _ = alterParamsBackendURL(t, &added, "test/{Customer}")
+	assertNoError(t, execAlterPage(ctx, &ast.AlterPageStmt{
+		PageName: ast.QualifiedName{Module: "MyModule", Name: "TestPage"},
+		Operations: []ast.AlterPageOperation{
+			&ast.SetPropertyOp{Properties: map[string]any{"Url": "test/{Customer}/{Count}"}},
+			addCount,
+		},
+	}))
+	if len(added) != 1 {
+		t.Errorf("added %+v, want the Count parameter", added)
 	}
 }

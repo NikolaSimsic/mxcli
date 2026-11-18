@@ -21,8 +21,28 @@ type PageBackend interface {
 	ListLayouts() ([]*pages.Layout, error)
 	GetLayout(id model.ID) (*pages.Layout, error)
 	CreateLayout(layout *pages.Layout) error
+	// UpdateLayout rewrites an existing layout's unit IN PLACE, keeping its unit
+	// id and its row (so a foldered layout stays in its folder).
+	//
+	// CREATE OR REPLACE LAYOUT used to be a delete followed by a create, which
+	// replaced the unit under a fresh GUID on every run — the .mxunit was
+	// renamed each time and the tree never came back clean (ako/mxcli#600).
+	// An update reaches canon.Reconcile, so an identical rewrite is elided.
 	UpdateLayout(layout *pages.Layout) error
 	DeleteLayout(id model.ID) error
+
+	// PageLayoutName returns the qualified name of the layout a page renders
+	// inside ("Atlas_Core.Atlas_Default"), or "" when the page has none.
+	//
+	// ListPages is deliberately shallow — it does not decode the layout call —
+	// so this is the semantic read for "which layout is this page on", the
+	// question both the bulk repoint and `mxcli new` have to answer.
+	PageLayoutName(id model.ID) (string, error)
+
+	// LayoutPlaceholders returns the placeholder names a layout declares, in
+	// document order. A page binds to one as Module.Layout.<Name>, so these are
+	// the only valid targets for a repoint — see PageMutator.BoundPlaceholders.
+	LayoutPlaceholders(id model.ID) ([]string, error)
 
 	// Snippets — no GetSnippet: snippets are resolved by qualified name via ListSnippets.
 	ListSnippets() ([]*pages.Snippet, error)

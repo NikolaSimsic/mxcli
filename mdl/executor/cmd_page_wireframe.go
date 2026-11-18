@@ -132,16 +132,7 @@ func PageWireframeJSON(ctx *ExecContext, name string) error {
 	qualifiedName := modName + "." + foundPage.Name
 
 	// Extract page metadata
-	title := ""
-	if foundPage.Title != nil {
-		title = foundPage.Title.GetTranslation("en_US")
-		if title == "" {
-			for _, text := range foundPage.Title.Translations {
-				title = text
-				break
-			}
-		}
-	}
+	title := pickTextTranslation(foundPage.Title, describeDefaultLanguage(ctx))
 
 	layoutName := ""
 	rawData, _ := ctx.Backend.GetRawUnit(foundPage.ID)
@@ -378,7 +369,6 @@ func rawWidgetToWireframe(w rawWidget, counter *wireframeCounter) wireframeNode 
 	case "NavigationListItem":
 		node.Widget = "navigationlistitem"
 		node.Action = w.Action
-		node.ButtonStyle = w.ButtonStyle
 		for _, child := range w.Children {
 			node.Children = append(node.Children, rawWidgetToWireframe(child, counter))
 		}

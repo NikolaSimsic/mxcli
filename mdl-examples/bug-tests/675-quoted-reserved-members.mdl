@@ -1,0 +1,43 @@
+mdl 1;
+-- Bug #675: quoted identifiers must be accepted in entity-access member lists
+-- and validation-rule attribute references.
+--
+-- POSITIVE TEST — this script is EXPECTED to PASS `mxcli check`.
+--
+-- Symptom: a member (attribute/association) or validation-rule attribute whose
+-- name is a reserved word (e.g. Order, Status) could not be referenced — the
+-- READ/WRITE list and the validation-rule attribute position accepted only a
+-- bare IDENTIFIER, so there was no way to escape the reserved word.
+--
+-- Fix: those positions now accept a QUOTED_IDENTIFIER, matching how qualified
+-- names, page params and widget names already work. DESCRIBE re-emits such
+-- members quoted so the roundtrip stays clean.
+
+-- The validation-rule half was written against the pre-2026-08 statement shape
+-- (`create validation rule <name> for <entity> required <attr> feedback '…'`),
+-- which was replaced when CREATE VALIDATION RULE gained an implementation: the
+-- rule is anonymous in Mendix, so the statement now names the ATTRIBUTE, and
+-- Required moved to the attribute constraint that already expressed it. Both
+-- replacements below still put a quoted reserved word in the position #675 is
+-- about.
+
+create entity MyMod.SalesOrder (
+  "Order": String(20) not null error message 'Order number is required',
+  "Status": String(20)
+);
+
+-- The GRANT sits after the entity it names. It used to sit at the top of this
+-- file, which MDL-ORDER01 now reports (#955): `exec` resolves a grant's entity
+-- when it applies the grant, so the original order failed partway through a run
+-- even though every statement in it was individually valid. The quoted reserved
+-- word this test is about is unaffected by the position.
+grant read ("Order", "Status", LineTotal),
+  write ("Order") on entity MyMod.SalesOrder to MyMod.Administrator;
+
+create regular expression MyMod.OrderNumber (
+  Expression: '^[0-9]+$'
+);
+
+create validation rule for MyMod.SalesOrder."Order"
+  regex MyMod.OrderNumber
+  error message 'Order number must be numeric';

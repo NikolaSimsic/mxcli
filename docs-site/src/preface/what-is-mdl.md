@@ -15,6 +15,8 @@ MDL addresses these problems by providing a syntax that is both human-readable a
 
 ## Characteristics of MDL
 
+MDL draws on three well-understood languages: **SQL** for its `CREATE`/`ALTER`/`DROP`/`SHOW` verbs and set-oriented queries, and **Ada** and **PL/SQL** for its readable, block-structured statement bodies. The result is a syntax that is immediately recognisable to anyone who has written database or procedural code.
+
 - **SQL-like syntax** -- uses familiar keywords like `CREATE`, `ALTER`, `DROP`, `SHOW`, `DESCRIBE`, `GRANT`.
 - **Declarative** -- you describe what the model should look like, not how to construct it step by step.
 - **Complete** -- covers domain models, microflows, pages, security, navigation, workflows, and business events.
@@ -76,7 +78,7 @@ MDL provides statements for the following areas of a Mendix project:
 | Navigation | `ALTER NAVIGATION` |
 | Workflows | `CREATE WORKFLOW` |
 | Business events | `CREATE BUSINESS EVENT SERVICE` |
-| Project queries | `SHOW MODULES`, `DESCRIBE ENTITY`, `SEARCH` |
+| Project queries | `LIST MODULES`, `DESCRIBE ENTITY`, `SEARCH` |
 | Catalog | `REFRESH CATALOG`, `SELECT FROM CATALOG` |
 
 See Part II (The MDL Language) for a complete guide, or Part VI (MDL Statement Reference) for detailed syntax of each statement.

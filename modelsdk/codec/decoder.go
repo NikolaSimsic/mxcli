@@ -85,12 +85,23 @@ func decodeTypeName(raw bson.Raw) string {
 // Both directions are needed: Studio Pro writes "NewType" (so looking up "Type"
 // falls back to "NewType"), and the mxcli legacy write path wrote "Type" (so
 // looking up "NewType" must fall back to "Type").
+//
+// A SequenceFlow's branch case is likewise stored under "NewCaseValue" (the
+// storage name) while the gen property is "CaseValue" (see
+// sdk/mpr/parser_microflow.go:165 — legacy reads CaseValues, then NewCaseValue).
+// Without this alias the case is never decoded, so an enumeration/boolean split
+// reads as case-less and DESCRIBE MICROFLOW renders "if cond then end if;",
+// dropping the entire then/when body.
 var fieldAliases = map[string]string{
 	"LayoutCall":   "FormCall",
 	"PageSettings": "FormSettings",
 	"Layout":       "Form",
 	"Type":         "NewType",
 	"NewType":      "Type",
+	"CaseValue":    "NewCaseValue",
+	// gen now binds the case under its storage name (mendixlabs/mxcli#1410);
+	// a document holding the SDK name still reads.
+	"NewCaseValue": "CaseValue",
 }
 
 // DecodeChild decodes a single embedded document child from raw BSON by key.
@@ -146,6 +157,9 @@ func DecodeChildren(raw bson.Raw, key string) ([]element.Element, error) {
 }
 
 // decodeID extracts the $ID field, accepting either a UUID binary or a plain string.
+// PeekID is the element ID Decode would give raw, read without decoding it.
+func PeekID(raw bson.Raw) element.ID { return decodeID(raw) }
+
 func decodeID(raw bson.Raw) element.ID {
 	val, err := raw.LookupErr("$ID")
 	if err != nil {

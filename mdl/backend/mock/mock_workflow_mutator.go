@@ -17,6 +17,8 @@ type MockWorkflowMutator struct {
 	SetPropertyWithEntityFunc func(prop string, value string, entity string) error
 	SetActivityPropertyFunc   func(activityRef string, atPos int, prop string, value string) error
 	InsertAfterActivityFunc   func(activityRef string, atPos int, activities []workflows.WorkflowActivity) error
+	InsertBeforeActivityFunc  func(activityRef string, atPos int, activities []workflows.WorkflowActivity) error
+	ResolveAlterTargetFunc    func(t backend.AlterTarget) (backend.AlterTargetMatch, error)
 	DropActivityFunc          func(activityRef string, atPos int) error
 	ReplaceActivityFunc       func(activityRef string, atPos int, activities []workflows.WorkflowActivity) error
 	InsertOutcomeFunc         func(activityRef string, atPos int, outcomeName string, activities []workflows.WorkflowActivity) error
@@ -25,8 +27,9 @@ type MockWorkflowMutator struct {
 	DropPathFunc              func(activityRef string, atPos int, pathCaption string) error
 	InsertBranchFunc          func(activityRef string, atPos int, condition string, activities []workflows.WorkflowActivity) error
 	DropBranchFunc            func(activityRef string, atPos int, branchName string) error
-	InsertBoundaryEventFunc   func(activityRef string, atPos int, eventType string, delay string, activities []workflows.WorkflowActivity) error
-	DropBoundaryEventFunc     func(activityRef string, atPos int) error
+	SetTemplateParametersFunc func(activityRef string, atPos int, prop string, params []string) error
+	InsertBoundaryEventFunc   func(activityRef string, atPos int, eventType string, delay string, caption string, recurrence *workflows.Recurrence, activities []workflows.WorkflowActivity) error
+	DropBoundaryEventFunc     func(activityRef string, atPos int, index int) error
 	SaveFunc                  func() error
 }
 
@@ -56,6 +59,23 @@ func (m *MockWorkflowMutator) InsertAfterActivity(activityRef string, atPos int,
 		return m.InsertAfterActivityFunc(activityRef, atPos, activities)
 	}
 	return nil
+}
+
+func (m *MockWorkflowMutator) InsertBeforeActivity(activityRef string, atPos int, activities []workflows.WorkflowActivity) error {
+	if m.InsertBeforeActivityFunc != nil {
+		return m.InsertBeforeActivityFunc(activityRef, atPos, activities)
+	}
+	return nil
+}
+
+// ResolveAlterTarget resolves every target unless ResolveAlterTargetFunc says
+// otherwise, so a test that does not care about resolution exercises the
+// operation behind it.
+func (m *MockWorkflowMutator) ResolveAlterTarget(t backend.AlterTarget) (backend.AlterTargetMatch, error) {
+	if m.ResolveAlterTargetFunc != nil {
+		return m.ResolveAlterTargetFunc(t)
+	}
+	return backend.AlterTargetMatch{Kind: "activity", Name: t.String()}, nil
 }
 
 func (m *MockWorkflowMutator) DropActivity(activityRef string, atPos int) error {
@@ -114,16 +134,16 @@ func (m *MockWorkflowMutator) DropBranch(activityRef string, atPos int, branchNa
 	return nil
 }
 
-func (m *MockWorkflowMutator) InsertBoundaryEvent(activityRef string, atPos int, eventType string, delay string, activities []workflows.WorkflowActivity) error {
+func (m *MockWorkflowMutator) InsertBoundaryEvent(activityRef string, atPos int, eventType string, delay string, caption string, recurrence *workflows.Recurrence, activities []workflows.WorkflowActivity) error {
 	if m.InsertBoundaryEventFunc != nil {
-		return m.InsertBoundaryEventFunc(activityRef, atPos, eventType, delay, activities)
+		return m.InsertBoundaryEventFunc(activityRef, atPos, eventType, delay, caption, recurrence, activities)
 	}
 	return nil
 }
 
-func (m *MockWorkflowMutator) DropBoundaryEvent(activityRef string, atPos int) error {
+func (m *MockWorkflowMutator) DropBoundaryEvent(activityRef string, atPos int, index int) error {
 	if m.DropBoundaryEventFunc != nil {
-		return m.DropBoundaryEventFunc(activityRef, atPos)
+		return m.DropBoundaryEventFunc(activityRef, atPos, index)
 	}
 	return nil
 }
@@ -131,6 +151,13 @@ func (m *MockWorkflowMutator) DropBoundaryEvent(activityRef string, atPos int) e
 func (m *MockWorkflowMutator) Save() error {
 	if m.SaveFunc != nil {
 		return m.SaveFunc()
+	}
+	return nil
+}
+
+func (m *MockWorkflowMutator) SetTemplateParameters(activityRef string, atPos int, prop string, params []string) error {
+	if m.SetTemplateParametersFunc != nil {
+		return m.SetTemplateParametersFunc(activityRef, atPos, prop, params)
 	}
 	return nil
 }

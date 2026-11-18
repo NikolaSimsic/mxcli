@@ -1,0 +1,137 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package executor
+
+import (
+	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/model"
+	"github.com/mendixlabs/mxcli/sdk/microflows"
+	"github.com/mendixlabs/mxcli/sdk/pages"
+)
+
+// Excluded documents ("Exclude from project" in Studio Pro) make a document
+// name non-unique. Mendix allows two documents in one module to share a name as
+// long as at most one of them is active: mxbuild reports CE0122 "Duplicate
+// document name" only for the active ones. Measured on 11.13.0 — two microflows
+// named MyFirstModule.Calc with one Excluded build at 0 errors; the same pair
+// with both active is 1 error, CE0122.
+//
+// Two consequences for every by-name lookup and every rewrite:
+//
+//  1. A name is not a unique key, so picking the first match is order-dependent.
+//     It can resolve to a document the app does not contain — DESCRIBE then
+//     shows the wrong body, and CREATE OR REPLACE edits the wrong document
+//     while the live one silently keeps its old behaviour.
+//  2. Excluded belongs to the model, not to the MDL script. A rebuild that does
+//     not carry it forward turns an excluded document active, which makes a
+//     valid project fail CE0122 (guard-don't-drop, ADR-0005) — a build broken by
+//     a statement that never mentioned exclusion.
+//
+// pickLive addresses (1). preserveExcluded (each call site, one line next to the
+// ID/roles it already preserves) addresses (2).
+//
+// Issue #914.
+
+// pickLive returns the document the running app uses: the active (non-excluded)
+// match when there is one, otherwise the first match so that a lookup against an
+// all-excluded set still resolves rather than reporting "not found".
+//
+// matches selects the candidates (typically name + module); excluded reports a
+// candidate's Excluded flag. The bool result is false only when nothing matched.
+func pickLive[T any](items []T, matches func(T) bool, excluded func(T) bool) (T, bool) {
+	var first T
+	found := false
+	for _, it := range items {
+		if !matches(it) {
+			continue
+		}
+		if !excluded(it) {
+			return it, true
+		}
+		if !found {
+			first, found = it, true
+		}
+	}
+	return first, found
+}
+
+// pickLiveIndex is pickLive for call sites that need the position rather than
+// the element (slice mutation in place, or a parallel slice).
+func pickLiveIndex[T any](items []T, matches func(T) bool, excluded func(T) bool) int {
+	first := -1
+	for i, it := range items {
+		if !matches(it) {
+			continue
+		}
+		if !excluded(it) {
+			return i
+		}
+		if first < 0 {
+			first = i
+		}
+	}
+	return first
+}
+
+// pickDescribed is pickLive for a DESCRIBE: when ctx pins a document by ID (the
+// catalog's source build, which walks documents rather than names) it returns
+// that document, so an excluded twin is described as itself — `@excluded` and
+// its own body — rather than as a second copy of the live one (#1185). Without
+// a pin, or when the pinned ID is not among the matches, it is pickLive.
+func pickDescribed[T any](ctx *ExecContext, items []T, idOf func(T) model.ID, matches func(T) bool, excluded func(T) bool) (T, bool) {
+	if ctx != nil && ctx.describeID != "" {
+		for _, it := range items {
+			if matches(it) && idOf(it) == ctx.describeID {
+				return it, true
+			}
+		}
+	}
+	return pickLive(items, matches, excluded)
+}
+
+// describedMapping resolves the mapping a DESCRIBE renders: the pinned document
+// when the catalog's source build set one (#1185), otherwise the backend's
+// by-name lookup, which prefers the live twin.
+func describedMapping[T any](ctx *ExecContext, name ast.QualifiedName,
+	byName func(module, name string) (T, error), list func() ([]T, error), idOf func(T) model.ID) (T, error) {
+	if ctx.describeID != "" {
+		all, err := list()
+		if err != nil {
+			var zero T
+			return zero, err
+		}
+		for _, m := range all {
+			if idOf(m) == ctx.describeID {
+				return m, nil
+			}
+		}
+	}
+	return byName(name.Module, name.Name)
+}
+
+// liveFirst returns items with every non-excluded element ahead of every
+// excluded one, each group in its original order. A first-match loop over the
+// result resolves exactly what pickLive would — the live document when there is
+// one, otherwise the first excluded match — so a by-name command whose loop body
+// acts on the match (SHOW ACCESS, GRANT/REVOKE, DROP, ALTER PAGE) lands on the
+// same copy DESCRIBE shows (mendixlabs/mxcli#1469). Before it, those loops took
+// the first match in list order: GRANT VIEW edited an excluded twin while the
+// live page kept its old roles, and DROP PAGE could delete the live page.
+func liveFirst[T any](items []T, excluded func(T) bool) []T {
+	out := make([]T, 0, len(items))
+	for _, it := range items {
+		if !excluded(it) {
+			out = append(out, it)
+		}
+	}
+	for _, it := range items {
+		if excluded(it) {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
+func pageExcluded(p *pages.Page) bool                { return p.Excluded }
+func microflowExcluded(m *microflows.Microflow) bool { return m.Excluded }
+func nanoflowExcluded(n *microflows.Nanoflow) bool   { return n.Excluded }

@@ -67,6 +67,13 @@ func (m *MockBackend) UpdateProjectSettings(ps *model.ProjectSettings) error {
 	return nil
 }
 
+func (m *MockBackend) ParseProjectSettingsFromRaw(raw map[string]any) (*model.ProjectSettings, error) {
+	if m.ParseProjectSettingsFromRawFunc != nil {
+		return m.ParseProjectSettingsFromRawFunc(raw)
+	}
+	return nil, fmt.Errorf("MockBackend.ParseProjectSettingsFromRaw not configured")
+}
+
 // ---------------------------------------------------------------------------
 // ImageBackend
 // ---------------------------------------------------------------------------
@@ -74,6 +81,13 @@ func (m *MockBackend) UpdateProjectSettings(ps *model.ProjectSettings) error {
 func (m *MockBackend) ListImageCollections() ([]*types.ImageCollection, error) {
 	if m.ListImageCollectionsFunc != nil {
 		return m.ListImageCollectionsFunc()
+	}
+	return nil, nil
+}
+
+func (m *MockBackend) ListIconCollections() ([]*types.IconCollection, error) {
+	if m.ListIconCollectionsFunc != nil {
+		return m.ListIconCollectionsFunc()
 	}
 	return nil, nil
 }
@@ -115,4 +129,29 @@ func (m *MockBackend) GetScheduledEvent(id model.ID) (*model.ScheduledEvent, err
 		return m.GetScheduledEventFunc(id)
 	}
 	return nil, nil
+}
+
+// The write methods default to a descriptive error rather than nil so a test
+// that forgets to configure one fails on the missing stub instead of silently
+// reporting a write that never happened.
+
+func (m *MockBackend) CreateScheduledEvent(ev *model.ScheduledEvent) error {
+	if m.CreateScheduledEventFunc != nil {
+		return m.CreateScheduledEventFunc(ev)
+	}
+	return fmt.Errorf("MockBackend.CreateScheduledEvent not configured")
+}
+
+func (m *MockBackend) UpdateScheduledEvent(ev *model.ScheduledEvent) error {
+	if m.UpdateScheduledEventFunc != nil {
+		return m.UpdateScheduledEventFunc(ev)
+	}
+	return fmt.Errorf("MockBackend.UpdateScheduledEvent not configured")
+}
+
+func (m *MockBackend) DeleteScheduledEvent(id string) error {
+	if m.DeleteScheduledEventFunc != nil {
+		return m.DeleteScheduledEventFunc(id)
+	}
+	return fmt.Errorf("MockBackend.DeleteScheduledEvent not configured")
 }

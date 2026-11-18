@@ -49,7 +49,7 @@ var widgetInitCmd = &cobra.Command{
 	Use:   "init",
 	Short: "Extract definitions for all project widgets",
 	Long: `Scan the project's widgets/ directory, extract .def.json for each .mpk,
-and generate skill documentation in .claude/skills/widgets/.
+and generate a widget skill in .ai-context/skills/widgets/ and .claude/skills/widgets/.
 
 This enables CREATE PAGE to use any project widget via the pluggable engine.
 
@@ -68,8 +68,12 @@ Requires --project (-p) to locate the project's widgets/ directory.`,
 var widgetDocsCmd = &cobra.Command{
 	Use:   "docs",
 	Short: "Generate widget skill documentation",
-	Long:  `Generate per-widget markdown documentation in .claude/skills/widgets/ from .mpk definitions.`,
-	RunE:  runWidgetDocs,
+	Long: "Generate a widget skill from the project's .mpk definitions.\n\n" +
+		"Writes SKILL.md — the index, with Agent Skills frontmatter naming the widgets\n" +
+		"found — plus one file per widget carrying its full property table, enumeration\n" +
+		"values, nested object properties, child slots and object lists. Written to\n" +
+		".ai-context/skills/widgets/ and .claude/skills/widgets/, whichever exist.",
+	RunE: runWidgetDocs,
 }
 
 func init() {
@@ -97,8 +101,8 @@ func runWidgetExtract(cmd *cobra.Command, args []string) error {
 	outputDir, _ := cmd.Flags().GetString("output")
 	mdlNameOverride, _ := cmd.Flags().GetString("mdl-name")
 
-	// Parse .mpk
-	mpkDef, err := mpk.ParseMPK(mpkPath)
+	// Parse .mpk — a single package can bundle many widgets (e.g. Charts.mpk).
+	mpkDefs, err := mpk.ParseMPKAll(mpkPath)
 	if err != nil {
 		return fmt.Errorf("failed to parse .mpk: %w", err)
 	}
@@ -111,34 +115,37 @@ func runWidgetExtract(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create output directory: %w", err)
 	}
 
-	// Determine MDL name
-	mdlName := mdlNameOverride
-	if mdlName == "" {
-		mdlName = executor.DeriveMDLName(mpkDef.ID)
+	// The --mdl-name override only makes sense for a single-widget package.
+	if mdlNameOverride != "" && len(mpkDefs) > 1 {
+		return fmt.Errorf("--mdl-name cannot be used with a bundled .mpk that contains %d widgets", len(mpkDefs))
 	}
 
-	// Generate .def.json
-	defJSON := executor.GenerateDefJSON(mpkDef, mdlName)
+	for _, mpkDef := range mpkDefs {
+		mdlName := mdlNameOverride
+		if mdlName == "" {
+			mdlName = executor.DeriveMDLName(mpkDef.ID)
+		}
 
-	// Determine output filename
-	filename := strings.ToLower(mdlName) + ".def.json"
-	outPath := filepath.Join(outputDir, filename)
+		defJSON := executor.GenerateDefJSON(mpkDef, mdlName)
+		filename := strings.ToLower(mdlName) + ".def.json"
+		outPath := filepath.Join(outputDir, filename)
 
-	data, err := json.MarshalIndent(defJSON, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal definition: %w", err)
+		data, err := json.MarshalIndent(defJSON, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to marshal definition for %s: %w", mpkDef.ID, err)
+		}
+		data = append(data, '\n')
+
+		if err := os.WriteFile(outPath, data, 0644); err != nil {
+			return fmt.Errorf("failed to write %s: %w", outPath, err)
+		}
+
+		fmt.Printf("Extracted widget definition:\n")
+		fmt.Printf("  Widget ID:  %s\n", mpkDef.ID)
+		fmt.Printf("  MDL name:   %s\n", mdlName)
+		fmt.Printf("  Properties: %d\n", len(mpkDef.Properties))
+		fmt.Printf("  Output:     %s\n", outPath)
 	}
-	data = append(data, '\n')
-
-	if err := os.WriteFile(outPath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write %s: %w", outPath, err)
-	}
-
-	fmt.Printf("Extracted widget definition:\n")
-	fmt.Printf("  Widget ID:  %s\n", mpkDef.ID)
-	fmt.Printf("  MDL name:   %s\n", mdlName)
-	fmt.Printf("  Properties: %d\n", len(mpkDef.Properties))
-	fmt.Printf("  Output:     %s\n", outPath)
 
 	return nil
 }
@@ -210,12 +217,9 @@ func generateWidgetDocs(projectPath string) error {
 		return err
 	}
 	if generated > 0 {
-		projectDir := filepath.Dir(projectPath)
-		docsDir := filepath.Join(projectDir, ".claude", "skills", "widgets")
-		if _, statErr := os.Stat(filepath.Join(projectDir, ".ai-context")); statErr == nil {
-			docsDir = filepath.Join(projectDir, ".ai-context", "skills", "widgets")
+		for _, dir := range executor.WidgetDocsDirs(filepath.Dir(projectPath)) {
+			fmt.Printf("Generated %d widget docs in %s\n", generated, dir)
 		}
-		fmt.Printf("Generated %d widget docs in %s\n", generated, docsDir)
 	}
 	return nil
 }
@@ -226,12 +230,12 @@ func runWidgetList(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create widget registry: %w", err)
 	}
 
-	// Load user definitions if project path available
+	// Load the project's widgets, generating their definitions from the
+	// installed .mpk first — `.mxcli/` is gitignored, so a fresh clone has none
+	// (ako/mxcli#663).
 	projectPath, _ := cmd.Flags().GetString("project")
-	if projectPath != "" {
-		if err := registry.LoadUserDefinitions(projectPath); err != nil {
-			log.Printf("warning: loading user widget definitions: %v", err)
-		}
+	if err := executor.LoadProjectWidgetDefinitions(registry, projectPath); err != nil {
+		log.Printf("warning: loading user widget definitions: %v", err)
 	}
 
 	defs := registry.All()

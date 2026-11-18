@@ -9,10 +9,19 @@ import (
 	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/mendixlabs/mxcli/mdl/types"
+	"github.com/mendixlabs/mxcli/model"
 )
 
 // PatchNavigationProfile applies a navigation profile patch to raw BSON bytes,
 // returning the new bytes. Pure BSON manipulation — no database access required.
+// Typed-array markers for the lists this writer emits. Mirrors
+// sdk/mpr/writer_navigation.go's navMarker* constants -- see the rationale there.
+const (
+	navpMarkerItems             = int32(3)
+	navpMarkerParameterMappings = int32(2)
+	navpMarkerHomeItems         = int32(2)
+)
+
 func PatchNavigationProfile(rawBytes []byte, profileName string, spec types.NavigationProfileSpec) ([]byte, error) {
 	var doc bson.D
 	if err := bson.Unmarshal(rawBytes, &doc); err != nil {
@@ -110,7 +119,7 @@ func navpPatchWebProfile(doc bson.D, spec types.NavigationProfileSpec) bson.D {
 	}
 
 	// --- HomeItems (role-based homes) ---
-	homeItems := bson.A{int32(1)}
+	homeItems := bson.A{navpMarkerHomeItems}
 	for _, rh := range roleHomes {
 		homeItems = append(homeItems, navpBuildRoleBasedHomeBson(rh))
 	}
@@ -127,7 +136,20 @@ func navpPatchWebProfile(doc bson.D, spec types.NavigationProfileSpec) bson.D {
 	if spec.NotFoundPage != "" {
 		doc = navpSetBsonField(doc, "NotFoundHomepage", bson.D{
 			{Key: "$ID", Value: idToBsonBinary(generateUUID())},
-			{Key: "$Type", Value: "Navigation$HomePage"},
+			// Studio Pro's "Fallback page". The $Type is
+			// Navigation$NotFoundHomePage, not the Navigation$HomePage the home
+			// page slot takes -- measured on ako/TestApp, whose fallback page
+			// Studio Pro stored as Navigation$NotFoundHomePage/Page.
+			//
+			// The wrong $Type here is not cosmetic: Mendix cannot LOAD the
+			// project. Both `mx check` and `mxbuild --target=deploy` exit 1 with
+			// "Object of type '...Navigation.HomePage' cannot be converted to
+			// type '...Navigation.NotFoundHomePage'" (measured on 11.13, against
+			// a build of this file emitting the old spelling). Nothing caught it
+			// because nothing ever BUILT a project with a fallback page set --
+			// the automated mx-check coverage runs doctype-tests/ only, and no
+			// script there sets one.
+			{Key: "$Type", Value: "Navigation$NotFoundHomePage"},
 			{Key: "Microflow", Value: ""},
 			{Key: "Page", Value: spec.NotFoundPage},
 		})
@@ -138,7 +160,7 @@ func navpPatchWebProfile(doc bson.D, spec types.NavigationProfileSpec) bson.D {
 
 	// --- Menu ---
 	if spec.HasMenu {
-		menuItems := bson.A{int32(1)}
+		menuItems := bson.A{navpMarkerItems}
 		for _, mi := range spec.MenuItems {
 			menuItems = append(menuItems, navpBuildMenuItemBson(mi))
 		}
@@ -182,7 +204,7 @@ func navpPatchNativeProfile(doc bson.D, spec types.NavigationProfileSpec) bson.D
 	}
 
 	// Role-based native home pages
-	roleItems := bson.A{int32(1)}
+	roleItems := bson.A{navpMarkerHomeItems}
 	for _, rh := range roleHomes {
 		page := ""
 		nanoflow := ""
@@ -245,8 +267,10 @@ func navpBuildFormSettingsBson(formName string) bson.D {
 		{Key: "$ID", Value: idToBsonBinary(generateUUID())},
 		{Key: "$Type", Value: "Forms$FormSettings"},
 		{Key: "Form", Value: formName},
-		{Key: "ParameterMappings", Value: bson.A{int32(1)}},
-		{Key: "TitleOverride", Value: navpEmptyTextTemplate()},
+		{Key: "ParameterMappings", Value: bson.A{navpMarkerParameterMappings}},
+		// No override is an explicit null. An empty template overrides the page
+		// title with "" and produces CW0263 for every authored menu item (#812).
+		{Key: "TitleOverride", Value: nil},
 	}
 }
 
@@ -262,7 +286,7 @@ func navpBuildMenuItemBson(mi types.NavMenuItemSpec) bson.D {
 	}
 
 	// Sub-items
-	subItems := bson.A{int32(1)}
+	subItems := bson.A{navpMarkerItems}
 	for _, sub := range mi.Items {
 		subItems = append(subItems, navpBuildMenuItemBson(sub))
 	}
@@ -277,11 +301,11 @@ func navpBuildCaptionBson(text string) bson.D {
 		{Key: "$ID", Value: idToBsonBinary(generateUUID())},
 		{Key: "$Type", Value: "Texts$Text"},
 		{Key: "Items", Value: bson.A{
-			int32(1),
+			navpMarkerItems,
 			bson.D{
 				{Key: "$ID", Value: idToBsonBinary(generateUUID())},
 				{Key: "$Type", Value: "Texts$Translation"},
-				{Key: "LanguageCode", Value: "en_US"},
+				{Key: "LanguageCode", Value: model.AuthoringLanguage()},
 				{Key: "Text", Value: text},
 			},
 		}},
@@ -297,7 +321,7 @@ func navpBuildMenuAction(mi types.NavMenuItemSpec) bson.D {
 			{Key: "DisabledDuringExecution", Value: false},
 			{Key: "FormSettings", Value: navpBuildFormSettingsBson(mi.Page)},
 			{Key: "NumberOfPagesToClose2", Value: ""},
-			{Key: "PagesForSpecializations", Value: bson.A{int32(1)}},
+			{Key: "PagesForSpecializations", Value: bson.A{navpMarkerParameterMappings}},
 		}
 	}
 	if mi.Microflow != "" {
@@ -316,21 +340,6 @@ func navpBuildMenuAction(mi types.NavMenuItemSpec) bson.D {
 	return bson.D{
 		{Key: "$ID", Value: idToBsonBinary(generateUUID())},
 		{Key: "$Type", Value: "Forms$NoAction"},
-	}
-}
-
-// navpEmptyTextTemplate returns an empty Microflows$TextTemplate embedded BSON document.
-// Used for TitleOverride on Forms$FormSettings.
-func navpEmptyTextTemplate() bson.D {
-	return bson.D{
-		{Key: "$ID", Value: idToBsonBinary(generateUUID())},
-		{Key: "$Type", Value: "Microflows$TextTemplate"},
-		{Key: "Parameters", Value: bson.A{int32(2)}},
-		{Key: "Text", Value: bson.D{
-			{Key: "$ID", Value: idToBsonBinary(generateUUID())},
-			{Key: "$Type", Value: "Texts$Text"},
-			{Key: "Items", Value: bson.A{int32(2)}},
-		}},
 	}
 }
 

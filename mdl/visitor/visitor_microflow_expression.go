@@ -144,7 +144,49 @@ func buildComparisonExpression(ctx parser.IComparisonExpressionContext) ast.Expr
 		}
 	}
 
+	// LIKE / BETWEEN / IN / MATCH are OQL; the rule admits them because the
+	// expression grammar is shared with OQL, but neither a Mendix expression nor
+	// an XPath constraint has them. Returning only `left` here dropped the
+	// operator and its operands without a word: `where Name like 'A-%'` was
+	// stored as `[Name]` and failed the build with CE0161 while check passed
+	// (mendixlabs/mxcli#1686). Keep the operator so the check can refuse it —
+	// see oqlOnlyComparisons. The comparison is kept as written: Right is the
+	// first operand after the operator (the pattern, or BETWEEN's low bound) and
+	// nil for IN, so the source is what any writer stores.
+	if op := oqlOnlyComparisonOperator(compCtx); op != "" {
+		var right ast.Expression
+		if len(addExprs) >= 2 {
+			right = buildAdditiveExpression(addExprs[1])
+		}
+		var cmp ast.Expression = &ast.BinaryExpr{Left: left, Operator: op, Right: right}
+		if src := strings.TrimSpace(extractExpressionText(compCtx)); src != "" {
+			cmp = &ast.SourceExpr{Expression: cmp, Source: src}
+		}
+		return cmp
+	}
+
 	return left
+}
+
+// oqlOnlyComparisonOperator names the OQL comparison a comparisonExpression
+// carries — "like", "not like", "between", "not between", "in" or "match" —
+// or "" when it carries none of them.
+func oqlOnlyComparisonOperator(c *parser.ComparisonExpressionContext) string {
+	not := ""
+	if c.NOT() != nil {
+		not = "not "
+	}
+	switch {
+	case c.LIKE() != nil:
+		return not + "like"
+	case c.BETWEEN() != nil:
+		return not + "between"
+	case c.IN() != nil:
+		return "in"
+	case c.MATCH() != nil:
+		return "match"
+	}
+	return ""
 }
 
 // buildAdditiveExpression handles + and - expressions.
@@ -162,21 +204,29 @@ func buildAdditiveExpression(ctx parser.IAdditiveExpressionContext) ast.Expressi
 	// Build first operand
 	result := buildMultiplicativeExpression(multExprs[0])
 
-	// Get operators (PLUS and MINUS tokens)
-	plusTokens := addCtx.AllPLUS()
-	minusTokens := addCtx.AllMINUS()
-
-	// Reconstruct the sequence of operators
-	// This is a simplified approach - for complex expressions we'd need to track token positions
-	opIndex := 0
-	for i := 1; i < len(multExprs); i++ {
-		op := "+"
-		if opIndex < len(plusTokens) {
-			op = "+"
-		} else if opIndex-len(plusTokens) < len(minusTokens) {
-			op = "-"
+	// Get operators from children in order, exactly as buildMultiplicativeExpression
+	// does below. Reading AllPLUS() and AllMINUS() as two separate lists loses the
+	// order they were written in: every `+` floats ahead of every `-`, so
+	// `$A - $B + 1` is REBUILT as `$A + $B - 1` and stored that way. The app then
+	// computes the swapped value while mxcli check, mx check and the build all stay
+	// green, because the corrupted expression is perfectly valid. (ledger #105)
+	var operators []string
+	for _, child := range addCtx.GetChildren() {
+		if term, ok := child.(antlr.TerminalNode); ok {
+			switch term.GetSymbol().GetTokenType() {
+			case parser.MDLParserPLUS:
+				operators = append(operators, "+")
+			case parser.MDLParserMINUS:
+				operators = append(operators, "-")
+			}
 		}
-		opIndex++
+	}
+
+	for i := 1; i < len(multExprs); i++ {
+		op := "+" // default
+		if i-1 < len(operators) {
+			op = operators[i-1]
+		}
 
 		result = &ast.BinaryExpr{
 			Left:     result,
@@ -248,6 +298,9 @@ func buildMultiplicativeExpression(ctx parser.IMultiplicativeExpressionContext) 
 				result = pathExpr
 				continue
 			}
+			if attachPathToLastOperand(result, right) {
+				continue
+			}
 		}
 
 		result = &ast.BinaryExpr{
@@ -258,6 +311,32 @@ func buildMultiplicativeExpression(ctx parser.IMultiplicativeExpressionContext) 
 	}
 
 	return result
+}
+
+// attachPathToLastOperand makes `/ Member` a member step of the operand it
+// belongs to when a multiplicative operator came first. `/` shares a precedence
+// level with `*`, `div` and `mod`, so `$a/X * $b/Y` is parsed left to right as
+// `(($a/X) * $b) / Y`: by the time the `/` is seen, `$b` is already the right
+// operand of the product, and tryBuildAttributePath (which looks at the whole left
+// side) cannot reach it. Mendix has no `/` division — it is always navigation
+// when a member name follows — so the step moves onto `$b`, giving
+// `$a/X * ($b/Y)`, the tree the source means. Reports whether the step was
+// attached.
+func attachPathToLastOperand(left ast.Expression, right ast.Expression) bool {
+	bin, ok := left.(*ast.BinaryExpr)
+	if !ok {
+		return false
+	}
+	switch bin.Operator {
+	case "*", "div", "mod", "%", ":":
+	default:
+		return false
+	}
+	if pathExpr := tryBuildAttributePath(bin.Right, right); pathExpr != nil {
+		bin.Right = pathExpr
+		return true
+	}
+	return false
 }
 
 // tryBuildAttributePath attempts to build an AttributePathExpr from a left expression
@@ -453,9 +532,9 @@ func buildListOperationAsFunction(ctx parser.IListOperationContext) ast.Expressi
 		sortCtx := sortSpecs.(*parser.SortSpecListContext)
 		for _, spec := range sortCtx.AllSortSpec() {
 			specCtx := spec.(*parser.SortSpecContext)
-			if id := specCtx.IDENTIFIER(); id != nil {
+			attrName := identifierOrKeywordText(specCtx.IdentifierOrKeyword())
+			if attrName != "" {
 				// Create a sort spec representation
-				attrName := id.GetText()
 				ascending := true
 				if specCtx.DESC() != nil {
 					ascending = false
@@ -519,6 +598,13 @@ func buildListAggregateAsFunction(ctx parser.IListAggregateOperationContext) ast
 			varName := strings.TrimPrefix(pathText, "$")
 			funcExpr.Arguments = append(funcExpr.Arguments, &ast.VariableExpr{Name: varName})
 		}
+	}
+
+	// The per-item expression of `sum($List, $currentObject/Price * 0.21)`.
+	// Without it the call reads as a one-argument aggregate, and whoever
+	// consumes it builds an aggregate with nothing to aggregate — CE0015.
+	if exprCtx := aggrCtx.Expression(); exprCtx != nil {
+		funcExpr.Arguments = append(funcExpr.Arguments, buildSourceExpression(exprCtx))
 	}
 
 	return funcExpr
@@ -686,7 +772,7 @@ func buildLiteralExpression(ctx parser.ILiteralContext) *ast.LiteralExpr {
 	// String literal
 	if str := litCtx.STRING_LITERAL(); str != nil {
 		return &ast.LiteralExpr{
-			Value: unquoteString(str.GetText()),
+			Value: unquoteStringLit(str),
 			Kind:  ast.LiteralString,
 		}
 	}

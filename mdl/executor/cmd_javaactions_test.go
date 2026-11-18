@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/javaactions"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
 )
@@ -339,13 +340,16 @@ func TestMicroflowActionInfo_Fields(t *testing.T) {
 	info := &javaactions.MicroflowActionInfo{
 		Caption:  "My Action",
 		Category: "My Category",
-		Icon:     "icon.png",
+		IconData: []byte{0x1, 0x2, 0x3},
 	}
 	if info.Caption != "My Action" {
 		t.Errorf("got %q", info.Caption)
 	}
 	if info.Category != "My Category" {
 		t.Errorf("got %q", info.Category)
+	}
+	if len(info.IconData) != 3 {
+		t.Errorf("IconData len = %d, want 3", len(info.IconData))
 	}
 }
 
@@ -355,5 +359,84 @@ func TestEntityTypeCodeActionParameterValue_Fields(t *testing.T) {
 	}
 	if v.Entity != "MyModule.Customer" {
 		t.Errorf("got %q", v.Entity)
+	}
+}
+
+// A callback parameter is printed by DESCRIBE as the bare word `Microflow`
+// (`Nanoflow` for JavaScript actions). The parser cannot tell a bare name from an
+// entity, so re-executing that output used to create an entity-typed parameter
+// with an empty module — DESCRIBE then printed `.Microflow` and the round-trip
+// was lost. mxcli-chat FINDINGS §36.
+func TestAstDataTypeToJavaActionParamType_BareMicroflowAndNanoflow(t *testing.T) {
+	bare := func(name string) ast.DataType {
+		return ast.DataType{Kind: ast.TypeEnumeration, EnumRef: &ast.QualifiedName{Name: name}}
+	}
+
+	if got := astDataTypeToJavaActionParamType(bare("Microflow")); !isType[*javaactions.MicroflowType](got) {
+		t.Errorf("Microflow -> %T, want *MicroflowType", got)
+	}
+	if got := astDataTypeToJavaActionParamType(bare("Nanoflow")); !isType[*javaactions.NanoflowType](got) {
+		t.Errorf("Nanoflow -> %T, want *NanoflowType", got)
+	}
+
+	// A qualified entity that happens to be named Microflow is still an entity —
+	// the special case is only for the unqualified word.
+	qualified := ast.DataType{
+		Kind:      ast.TypeEntity,
+		EntityRef: &ast.QualifiedName{Module: "MyModule", Name: "Microflow"},
+	}
+	ent, ok := astDataTypeToJavaActionParamType(qualified).(*javaactions.EntityType)
+	if !ok || ent.Entity != "MyModule.Microflow" {
+		t.Errorf("MyModule.Microflow -> %#v, want EntityType{MyModule.Microflow}",
+			astDataTypeToJavaActionParamType(qualified))
+	}
+}
+
+func isType[T any](v any) bool {
+	_, ok := v.(T)
+	return ok
+}
+
+// A type parameter may carry a primitive's name (#1183). DESCRIBE must quote it
+// wherever the bare name would re-parse as something else: `returns String` is
+// the primitive, `returns "String"` the type parameter.
+func TestFormatJavaActionTypes_TypeParameterNamedAfterPrimitive(t *testing.T) {
+	cases := []struct {
+		got, want string
+	}{
+		{formatJavaActionReturnType(&javaactions.TypeParameter{TypeParameter: "String"}), `"String"`},
+		{formatJavaActionType(&javaactions.TypeParameter{TypeParameter: "String"}), `"String"`},
+		{formatJavaActionType(&javaactions.EntityTypeParameterType{TypeParameterName: "String"}), `entity <"String">`},
+		{formatJavaActionReturnType(&javaactions.ListType{TypeParameter: "String"}), `List of "String"`},
+		{formatJavaActionType(&javaactions.ListType{TypeParameter: "String"}), `List of "String"`},
+		// Controls: an ordinary name stays bare, and the primitive is untouched.
+		{formatJavaActionReturnType(&javaactions.TypeParameter{TypeParameter: "pEntity"}), `pEntity`},
+		{formatJavaActionReturnType(&javaactions.ListType{TypeParameter: "pEntity"}), `List of pEntity`},
+		{formatJavaActionReturnType(&javaactions.StringType{}), `String`},
+		{formatJavaActionReturnType(&javaactions.ListType{Entity: "Mod.Ent"}), `List of Mod.Ent`},
+	}
+	for _, c := range cases {
+		if c.got != c.want {
+			t.Errorf("got %s, want %s", c.got, c.want)
+		}
+	}
+}
+
+// `returns list of pEntity` for a declared type parameter pEntity became a list
+// of the entity `.pEntity` — an empty module — instead of a list of the type
+// parameter (#1183).
+func TestListOfTypeParameter_BindsToTheTypeParameter(t *testing.T) {
+	ids := map[string]model.ID{"pEntity": "tp-1"}
+	dt := ast.DataType{Kind: ast.TypeListOf, EntityRef: &ast.QualifiedName{Name: "pEntity"}}
+	l := listOfTypeParameter(dt, ids)
+	if l == nil || l.TypeParameterID != "tp-1" || l.TypeParameter != "pEntity" || l.Entity != "" {
+		t.Fatalf("got %+v, want a list of type parameter pEntity", l)
+	}
+	// Controls: a qualified entity and an undeclared name are not type parameters.
+	if l := listOfTypeParameter(ast.DataType{Kind: ast.TypeListOf, EntityRef: &ast.QualifiedName{Module: "Mod", Name: "pEntity"}}, ids); l != nil {
+		t.Errorf("qualified entity bound as type parameter: %+v", l)
+	}
+	if l := listOfTypeParameter(ast.DataType{Kind: ast.TypeListOf, EntityRef: &ast.QualifiedName{Name: "Other"}}, ids); l != nil {
+		t.Errorf("undeclared name bound as type parameter: %+v", l)
 	}
 }

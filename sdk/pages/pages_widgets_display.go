@@ -3,6 +3,8 @@
 package pages
 
 import (
+	"strings"
+
 	"github.com/mendixlabs/mxcli/model"
 )
 
@@ -29,6 +31,37 @@ const (
 	TextRenderModeParagraph TextRenderMode = "Paragraph"
 )
 
+// NativeTextStyle is a dynamic text's style on a native page (Mendix 8.0+), the
+// native counterpart of TextRenderMode.
+type NativeTextStyle string
+
+const (
+	NativeTextStyleText     NativeTextStyle = "Text"
+	NativeTextStyleHeading1 NativeTextStyle = "Heading1"
+	NativeTextStyleHeading2 NativeTextStyle = "Heading2"
+	NativeTextStyleHeading3 NativeTextStyle = "Heading3"
+	NativeTextStyleHeading4 NativeTextStyle = "Heading4"
+	NativeTextStyleHeading5 NativeTextStyle = "Heading5"
+	NativeTextStyleHeading6 NativeTextStyle = "Heading6"
+)
+
+// NativeTextStyles lists every NativeTextStyle in the metamodel's order.
+var NativeTextStyles = []NativeTextStyle{
+	NativeTextStyleText, NativeTextStyleHeading1, NativeTextStyleHeading2, NativeTextStyleHeading3,
+	NativeTextStyleHeading4, NativeTextStyleHeading5, NativeTextStyleHeading6,
+}
+
+// CanonicalNativeTextStyle matches s case-insensitively against the
+// NativeTextStyle enumeration and returns its canonical spelling.
+func CanonicalNativeTextStyle(s string) (NativeTextStyle, bool) {
+	for _, v := range NativeTextStyles {
+		if strings.EqualFold(strings.TrimSpace(s), string(v)) {
+			return v, true
+		}
+	}
+	return "", false
+}
+
 // ClientTemplate represents a text template with parameters.
 // Used for dynamic text content in widgets like DynamicText and ActionButton captions.
 type ClientTemplate struct {
@@ -38,15 +71,30 @@ type ClientTemplate struct {
 	Fallback   *model.Text                `json:"fallback,omitempty"`
 }
 
+// AttributeRefStep is one hop of an association-navigated attribute reference
+// (DomainModels$EntityRefStep). A ClientTemplateParameter that binds an
+// attribute *over* an association (e.g. {1} = Order_Customer/Name) carries one
+// step per association hop; the final attribute lives in AttributeRef.
+type AttributeRefStep struct {
+	Association       string `json:"association,omitempty"`       // qualified association name, e.g. "Sales.Order_Customer"
+	DestinationEntity string `json:"destinationEntity,omitempty"` // qualified entity reached by this hop, e.g. "Sales.Customer"
+}
+
 // ClientTemplateParameter represents a parameter in a client template.
 // Used to substitute values for placeholders like {1}, {2} in template text.
 type ClientTemplateParameter struct {
 	model.BaseElement
-	AttributeRef       string          `json:"attributeRef,omitempty"`       // Qualified attribute path like "Module.Entity.Attribute"
-	Expression         string          `json:"expression,omitempty"`         // Literal expression like "'Hello'"
-	SourceVariable     string          `json:"sourceVariable,omitempty"`     // Variable name (no $ prefix)
-	SourceVariableKind string          `json:"sourceVariableKind,omitempty"` // "" (default = page parameter), "local" (page-level Variables entry), or "snippet"
-	FormattingInfo     *FormattingInfo `json:"formattingInfo,omitempty"`
+	AttributeRef       string             `json:"attributeRef,omitempty"`       // Qualified attribute path like "Module.Entity.Attribute"
+	AttributeRefSteps  []AttributeRefStep `json:"attributeRefSteps,omitempty"`  // association hops when the attribute is navigated over associations (AttributeRef.EntityRef)
+	Expression         string             `json:"expression,omitempty"`         // Literal expression like "'Hello'"
+	SourceVariable     string             `json:"sourceVariable,omitempty"`     // Variable name (no $ prefix)
+	SourceVariableKind string             `json:"sourceVariableKind,omitempty"` // "" (default = page parameter), "local" (page-level Variables entry), or "snippet"
+	// SourceWidget names the data view whose object the parameter reads
+	// (`{1} = $dataView1.Name`): the Widget slot of the Forms$PageVariable.
+	// SourceVariable/SourceVariableKind then hold that data view's own variable,
+	// which Studio Pro stores beside it (ako/mxcli#826).
+	SourceWidget   string          `json:"sourceWidget,omitempty"`
+	FormattingInfo *FormattingInfo `json:"formattingInfo,omitempty"`
 }
 
 // DynamicText represents dynamic text based on an attribute.
@@ -55,6 +103,9 @@ type DynamicText struct {
 	AttributePath string          `json:"attributePath,omitempty"`
 	Content       *ClientTemplate `json:"content,omitempty"`
 	RenderMode    TextRenderMode  `json:"renderMode,omitempty"`
+	// NativeTextStyle is the text's style on a native page, where RenderMode
+	// does not apply. Empty means not authored; the writer stores Text.
+	NativeTextStyle NativeTextStyle `json:"nativeTextStyle,omitempty"`
 }
 
 // Label represents a label widget.
@@ -73,21 +124,48 @@ type Title struct {
 // DynamicImage represents a dynamic image widget.
 type DynamicImage struct {
 	BaseWidget
-	DefaultImage  model.ID     `json:"defaultImage,omitempty"`
-	Width         int          `json:"width,omitempty"`
-	WidthUnit     WidthUnit    `json:"widthUnit,omitempty"`
-	Height        int          `json:"height,omitempty"`
-	Responsive    bool         `json:"responsive"`
-	OnClickAction ClientAction `json:"onClickAction,omitempty"`
+	// DataSource is the entity holding the image, stored as the EntityRef of a
+	// Forms$ImageViewerSource. Without it mxbuild refuses the widget outright —
+	// CE0489 "Select an entity for the data source of this dynamic image" — so
+	// this is the one field the widget cannot be written without.
+	DataSource DataSource `json:"dataSource,omitempty"`
+	// DefaultImageName is the fallback image shown when the object has none, as
+	// the three-part qualified name of an image-collection entry
+	// (Module.Collection.Image). Forms$ImageViewer.DefaultImage is a by-name
+	// reference to Images$Image, so a NAME is what Mendix stores — the
+	// DefaultImage (model.ID) field that used to stand here was never filled by
+	// anything and named the wrong thing.
+	DefaultImageName string    `json:"defaultImageName,omitempty"`
+	Width            int       `json:"width,omitempty"`
+	WidthUnit        WidthUnit `json:"widthUnit,omitempty"`
+	Height           int       `json:"height,omitempty"`
+	// HeightUnit is the sibling of WidthUnit, which had no field while the
+	// writer hardcoded both to "Auto". Empty means Auto (Mendix's default).
+	HeightUnit WidthUnit `json:"heightUnit,omitempty"`
+	// ShowAsThumbnail and OnClickEnlarge were both hardcoded false by the
+	// writer, so neither was reachable from MDL.
+	ShowAsThumbnail bool         `json:"showAsThumbnail,omitempty"`
+	OnClickEnlarge  bool         `json:"onClickEnlarge,omitempty"`
+	Responsive      bool         `json:"responsive"`
+	OnClickAction   ClientAction `json:"onClickAction,omitempty"`
 }
 
 // StaticImage represents a static image widget.
 type StaticImage struct {
 	BaseWidget
-	ImageID       model.ID     `json:"imageId,omitempty"`
-	Width         int          `json:"width,omitempty"`
-	WidthUnit     WidthUnit    `json:"widthUnit,omitempty"`
-	Height        int          `json:"height,omitempty"`
+	// ImageName is the image this widget shows, as the three-part qualified
+	// name of an entry in an image collection (Module.Collection.Image).
+	// Forms$StaticImageViewer.Image is a by-name reference to Images$Image, so
+	// a NAME is what Mendix stores — the ImageID (model.ID) field that used to
+	// stand here was never filled by anything and named the wrong thing
+	// (mendixlabs/mxcli#1057).
+	ImageName string    `json:"imageName,omitempty"`
+	Width     int       `json:"width,omitempty"`
+	WidthUnit WidthUnit `json:"widthUnit,omitempty"`
+	Height    int       `json:"height,omitempty"`
+	// HeightUnit is the sibling of WidthUnit, which had no field while the
+	// writer hardcoded both to "Auto". Empty means Auto (Studio Pro's default).
+	HeightUnit    WidthUnit    `json:"heightUnit,omitempty"`
 	Responsive    bool         `json:"responsive"`
 	OnClickAction ClientAction `json:"onClickAction,omitempty"`
 }

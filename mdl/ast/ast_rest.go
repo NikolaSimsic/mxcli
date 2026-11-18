@@ -8,17 +8,71 @@ package ast
 
 // CreateRestClientStmt represents: CREATE REST CLIENT Module.Name BASE URL '...' AUTHENTICATION ... BEGIN ... END
 type CreateRestClientStmt struct {
-	Name           QualifiedName
-	BaseUrl        string
-	Authentication *RestAuthDef // nil = AUTHENTICATION NONE
-	Operations     []*RestOperationDef
-	Documentation  string
-	Folder         string // Folder path within module
-	CreateOrModify bool   // True if CREATE OR MODIFY was used
-	OpenApiPath    string // Non-empty = spec-driven; operations come from spec not OPERATION blocks
+	CreateGuard      // `create … if not exists` (ako/mxcli#731)
+	Name             QualifiedName
+	BaseUrl          string
+	Authentication   *RestAuthDef // nil = AUTHENTICATION NONE
+	Operations       []*RestOperationDef
+	Documentation    string
+	DocumentationSet bool   // see mendixlabs/mxcli#1018: absent preserves, empty clears
+	Folder           string // Folder path within module
+	CreateOrModify   bool   // True if CREATE OR MODIFY was used
+	OpenApiPath      string // Non-empty = spec-driven; operations come from spec not OPERATION blocks
 }
 
 func (s *CreateRestClientStmt) isStatement() {}
+
+// AlterRestClientStmt represents:
+//
+//	ALTER CONSUMED REST SERVICE Module.Name <action> [, <action> ...]
+//
+// It edits the stored service in place: an operation no action names is
+// written back exactly as stored (mendixlabs/mxcli#1608).
+type AlterRestClientStmt struct {
+	Name    QualifiedName
+	Actions []RestClientAlterAction
+}
+
+func (s *AlterRestClientStmt) isStatement() {}
+
+// RestClientAlterAction is one action of an ALTER CONSUMED REST SERVICE.
+type RestClientAlterAction interface {
+	isRestClientAlterAction()
+}
+
+// RestClientSetAction represents SET ( BaseUrl: '…', Authentication: … ).
+// A property the list does not state keeps its stored value.
+type RestClientSetAction struct {
+	BaseUrl           string
+	BaseUrlSet        bool
+	Authentication    *RestAuthDef // nil with AuthenticationSet = Authentication: none
+	AuthenticationSet bool
+}
+
+func (a *RestClientSetAction) isRestClientAlterAction() {}
+
+// RestClientAddOperationAction represents ADD OPERATION Name ( … ).
+type RestClientAddOperationAction struct {
+	Operation *RestOperationDef
+}
+
+func (a *RestClientAddOperationAction) isRestClientAlterAction() {}
+
+// RestClientModifyOperationAction represents MODIFY OPERATION Name ( … ):
+// the keys in Operation.Keys are written, every other one keeps its stored
+// value.
+type RestClientModifyOperationAction struct {
+	Operation *RestOperationDef
+}
+
+func (a *RestClientModifyOperationAction) isRestClientAlterAction() {}
+
+// RestClientDropOperationAction represents DROP OPERATION Name.
+type RestClientDropOperationAction struct {
+	Name string
+}
+
+func (a *RestClientDropOperationAction) isRestClientAlterAction() {}
 
 // RestAuthDef represents authentication configuration in a CREATE REST CLIENT statement.
 type RestAuthDef struct {
@@ -43,6 +97,10 @@ type RestOperationDef struct {
 	ResponseVariable string          // e.g. "$CreatedItem"
 	ResponseMapping  *RestMappingDef // for MAPPING response
 	Timeout          int
+	// Keys are the properties the statement wrote, as their canonical names
+	// (Method, Path, Parameters, Query, Headers, Body, Timeout, Response) —
+	// what MODIFY OPERATION rewrites, leaving the others as stored.
+	Keys []string
 }
 
 // RestMappingDef represents an inline import/export mapping in a REST operation.
@@ -72,15 +130,18 @@ type RestParamDef struct {
 }
 
 // RestHeaderDef represents an HTTP header definition.
+//
+// Value is the stored value template: `{Name}` in it is replaced by the
+// operation parameter Name when the request is sent, as in the path. The old
+// spelling `'Bearer ' + $Token` builds the value `Bearer {Token}` (ako/mxcli#707).
 type RestHeaderDef struct {
-	Name     string // header name, e.g. "Accept"
-	Value    string // static value, e.g. "application/json" (may be empty if Variable is set)
-	Variable string // dynamic variable, e.g. "$Token" (may be empty if Value is set)
-	Prefix   string // concatenation prefix, e.g. "Bearer " (used with Variable)
+	Name  string // header name, e.g. "Authorization"
+	Value string // value template, e.g. "application/json" or "Bearer {Token}"
 }
 
 // DropRestClientStmt represents: DROP REST CLIENT Module.Name
 type DropRestClientStmt struct {
+	DropGuard
 	Name QualifiedName
 }
 
@@ -102,13 +163,48 @@ func (s *DescribeContractFromOpenAPIStmt) isStatement() {}
 //
 //	CREATE PUBLISHED REST SERVICE Module.Name (Path: '...', Version: '...') { RESOURCE ... };
 type CreatePublishedRestServiceStmt struct {
-	Name           QualifiedName
-	Path           string
-	Version        string
-	ServiceName    string
-	Folder         string
+	CreateGuard // `create … if not exists` (ako/mxcli#731)
+	Name        QualifiedName
+	Path        string
+	Version     string
+	ServiceName string
+	Folder      string
+	// Authentication is nil when the statement does not state it, which keeps
+	// the stored setting on create or modify.
+	Authentication *PublishedRestAuthentication
 	Resources      []*PublishedRestResourceDef
 	CreateOrModify bool
+	// Documentation is the `/** … */` doc comment before the statement
+	// (mendixlabs/mxcli#1510). DocumentationSet says one was written: absent
+	// keeps the stored documentation on a rewrite, empty clears it (#1018).
+	Documentation    string
+	DocumentationSet bool
+}
+
+// PublishedRestAuthentication is `Authentication: none | ( method, … )`.
+// Methods holds the stored spellings ("Basic", "Session", "Microflow") in the
+// order written, which is the order Studio Pro stores them; empty is `none`.
+// Microflow is the custom-authentication microflow, set exactly when Methods
+// holds "Microflow".
+type PublishedRestAuthentication struct {
+	Methods   []string
+	Microflow string
+	// Parameters is the optional list after the microflow,
+	// `microflow M.F ($Token: header 'X-Api-Token', …)`, in the order written
+	// (mendixlabs/mxcli#1417). An auth-microflow parameter it does not list is
+	// a query parameter under its own name.
+	Parameters []*PublishedRestAuthParameter
+}
+
+// PublishedRestAuthParameter is one `$Name: kind ['httpName'] [description '…']`
+// entry. Name is the authentication microflow's parameter, without the `$`;
+// Kind is lowercased as written ("query" and "header" are valid); HTTPName is
+// "" when it is the parameter's own name.
+type PublishedRestAuthParameter struct {
+	Name        string
+	Kind        string
+	HTTPName    string
+	Description string
 }
 
 func (s *CreatePublishedRestServiceStmt) isStatement() {}
@@ -130,6 +226,7 @@ type PublishedRestOperationDef struct {
 
 // DropPublishedRestServiceStmt represents: DROP PUBLISHED REST SERVICE Module.Name
 type DropPublishedRestServiceStmt struct {
+	DropGuard
 	Name QualifiedName
 }
 
@@ -153,9 +250,11 @@ type PublishedRestAlterAction interface {
 	isPublishedRestAlterAction()
 }
 
-// PublishedRestSetAction represents: SET key = 'value' [, ...]
+// PublishedRestSetAction represents: SET key = 'value' [, ...] or
+// SET ( Key: value, ... ). Authentication is nil unless the list states it.
 type PublishedRestSetAction struct {
-	Changes map[string]string
+	Changes        map[string]string
+	Authentication *PublishedRestAuthentication
 }
 
 func (a *PublishedRestSetAction) isPublishedRestAlterAction() {}

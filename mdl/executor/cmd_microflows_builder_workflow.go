@@ -7,6 +7,7 @@ import (
 	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
+	"strings"
 )
 
 // wrapAction wraps a MicroflowAction in an ActionActivity with standard positioning.
@@ -32,9 +33,27 @@ func (fb *flowBuilder) wrapAction(action microflows.MicroflowAction, errorHandli
 
 func (fb *flowBuilder) addCallWorkflowAction(s *ast.CallWorkflowStmt) model.ID {
 	wfQN := s.Workflow.Module + "." + s.Workflow.Name
-	ctxVar := ""
+	ctxVar := s.ContextVariable
 	if len(s.Arguments) > 0 {
-		ctxVar = fb.exprToString(s.Arguments[0].Value)
+		// TRIM FIRST. A workflow's context is stored as a variable NAME, not as an
+		// expression — but the argument arrives as an expression source, and the
+		// visitor deliberately preserves an expression's trailing whitespace so a
+		// multi-line expression round-trips byte-for-byte
+		// (appendExpressionListTrailingWhitespace, and the tests that pin it).
+		//
+		// So a mapping written across two lines
+		//
+		//	call workflow M.WF (
+		//	  Context = $Request
+		//	);
+		//
+		// produced the name "Request\n  " and the build failed CE0109 "Undefined
+		// variable 'Request\n  '". One-line calls were fine, and CALL MICROFLOW was
+		// fine at any width — its arguments stay expressions, where the whitespace
+		// is harmless. That asymmetry is why the fix belongs here, on the
+		// name, rather than in the visitor: trimming there would break the
+		// round-trip the whitespace exists for. (ako/mxcli-maintenance-2)
+		ctxVar = strings.TrimSpace(fb.exprToString(s.Arguments[0].Value))
 		// Strip leading $ if present
 		if len(ctxVar) > 0 && ctxVar[0] == '$' {
 			ctxVar = ctxVar[1:]
@@ -87,9 +106,22 @@ func (fb *flowBuilder) addWorkflowOperationAction(s *ast.WorkflowOperationStmt) 
 	var op microflows.WorkflowOperation
 	switch s.OperationType {
 	case "abort":
+		// The reason lands in a Microflows$StringTemplate's Text, which holds
+		// LITERAL text rather than an MDL expression. Dumping the expression
+		// string put the surrounding quotes into the model, so Mendix rendered
+		// them at runtime and DESCRIBE re-quoted what it read back: each round
+		// trip doubled the quoting, without bound. Unwrap a plain string literal
+		// to its value; any other expression goes through unchanged.
 		reason := ""
 		if s.Reason != nil {
-			reason = fb.exprToString(s.Reason)
+			if lit, ok := s.Reason.(*ast.LiteralExpr); ok && lit.Kind == ast.LiteralString {
+				if v, ok := lit.Value.(string); ok {
+					reason = v
+				}
+			}
+			if reason == "" {
+				reason = fb.exprToString(s.Reason)
+			}
 		}
 		op = &microflows.AbortOperation{
 			BaseElement:      model.BaseElement{ID: model.ID(types.GenerateID())},
@@ -157,6 +189,9 @@ func (fb *flowBuilder) addNotifyWorkflowAction(s *ast.NotifyWorkflowStmt) model.
 		OutputVariableName: s.OutputVariable,
 		WorkflowVariable:   s.WorkflowVariable,
 	}
+	if s.Target != "" {
+		fb.setNotifyTarget(action, s.Target)
+	}
 	return fb.wrapAction(action, s.ErrorHandling)
 }
 
@@ -175,6 +210,7 @@ func (fb *flowBuilder) addLockWorkflowAction(s *ast.LockWorkflowStmt) model.ID {
 		ErrorHandlingType: convertErrorHandlingType(s.ErrorHandling),
 		PauseAllWorkflows: s.PauseAllWorkflows,
 		WorkflowVariable:  s.WorkflowVariable,
+		Workflow:          s.Workflow,
 	}
 	return fb.wrapAction(action, s.ErrorHandling)
 }
@@ -185,6 +221,7 @@ func (fb *flowBuilder) addUnlockWorkflowAction(s *ast.UnlockWorkflowStmt) model.
 		ErrorHandlingType:        convertErrorHandlingType(s.ErrorHandling),
 		ResumeAllPausedWorkflows: s.ResumeAllPausedWorkflows,
 		WorkflowVariable:         s.WorkflowVariable,
+		Workflow:                 s.Workflow,
 	}
 	return fb.wrapAction(action, s.ErrorHandling)
 }

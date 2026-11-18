@@ -5,6 +5,7 @@
 package executor
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -12,7 +13,6 @@ import (
 // TestRoundtripWorkflow_Comprehensive tests all workflow MDL syntax in a single roundtrip.
 //
 // Activity types covered:
-//   - ANNOTATION
 //   - USER TASK (PAGE, TARGETING MICROFLOW, DUE DATE, OUTCOMES with nested, BOUNDARY EVENT x2)
 //   - MULTI USER TASK (PAGE, TARGETING MICROFLOW, OUTCOMES)
 //   - CALL MICROFLOW (WITH params, OUTCOMES TRUE/FALSE)
@@ -22,6 +22,43 @@ import (
 //   - WAIT FOR NOTIFICATION (with BOUNDARY EVENT NON INTERRUPTING TIMER)
 //   - JUMP TO (inside DECISION outcome)
 //   - CALL WORKFLOW (sub-workflow with parameter expression)
+//
+// createTaskPages creates the pages a user task's `page` clause points at.
+//
+// These tests used to name pages they never created. `check --references` and
+// exec now resolve a workflow's page references (issue #943), so the missing
+// page is reported rather than written into the model — which is the point of
+// that check: Mendix rejects the same workflow with CE1613.
+//
+// And the page must take the task. These pages took no parameters, which
+// mxbuild refuses as CE7410 (measured on 11.13.0); exec now checks the task
+// page's signature and refused them, so the fixture is a valid task page.
+func createTaskPages(t *testing.T, env *testEnv, mod string, names ...string) {
+	t.Helper()
+	// A user task's page must take $WorkflowUserTask or exec refuses it (CE7410
+	// on 11.13, which is why db61b949 added the parameter), and CREATE PAGE
+	// cannot write a parameter below 11.0 (mendixlabs/mxcli#294). The two
+	// requirements are mutually exclusive, so these fixtures cannot exist on
+	// Mendix 10 at all -- the nightly's 10.24 leg failed here for two days.
+	// The gate lives with the fixture rather than at the four call sites so a
+	// fifth caller cannot forget it.
+	env.requireMinVersion(t, 11, 0)
+	for _, name := range names {
+		mdl := `create page ` + mod + `.` + name + ` (
+			Title: '` + name + `',
+			Layout: Atlas_Core.Atlas_Default,
+			Params: { $WorkflowUserTask: System.WorkflowUserTask }
+		) {
+			layoutgrid g { row r { column c (DesktopWidth: 12) {
+				dynamictext dt (Content: '` + name + `')
+			} } }
+		}`
+		if err := env.executeMDL(mdl); err != nil {
+			t.Fatalf("create page %s.%s: %v", mod, name, err)
+		}
+	}
+}
+
 func TestRoundtripWorkflow_Comprehensive(t *testing.T) {
 	env := setupTestEnv(t)
 	defer env.teardown()
@@ -38,13 +75,26 @@ func TestRoundtripWorkflow_Comprehensive(t *testing.T) {
 		t.Fatalf("create WfCtxEntity: %v", err)
 	}
 
+	// Targeting microflows take exactly System.Workflow and the workflow's
+	// context entity and return the candidate users. These took no parameters
+	// and returned a String, which mxbuild refuses as CE6677 (measured on
+	// 11.13.0), and exec now checks the signature.
+	targeting := func(name string) string {
+		return `create microflow ` + mod + `.` + name + ` ($Workflow: System.Workflow, $Context: ` + mod + `.WfCtxEntity)
+returns List of System.User as $Reviewers
+begin
+  retrieve $Reviewers from System.User;
+  return $Reviewers;
+end;`
+	}
+
 	// Microflow: single-user targeting
-	if err := env.executeMDL(`create microflow ` + mod + `.GetSingleReviewer () returns String begin end;`); err != nil {
+	if err := env.executeMDL(targeting("GetSingleReviewer")); err != nil {
 		t.Fatalf("create GetSingleReviewer: %v", err)
 	}
 
 	// Microflow: multi-user targeting
-	if err := env.executeMDL(`create microflow ` + mod + `.GetMultiReviewers () returns String begin end;`); err != nil {
+	if err := env.executeMDL(targeting("GetMultiReviewers")); err != nil {
 		t.Fatalf("create GetMultiReviewers: %v", err)
 	}
 
@@ -52,6 +102,9 @@ func TestRoundtripWorkflow_Comprehensive(t *testing.T) {
 	if err := env.executeMDL(`create microflow ` + mod + `.ScoreCalc (Score: Integer) returns Boolean begin end;`); err != nil {
 		t.Fatalf("create ScoreCalc: %v", err)
 	}
+
+	// Task pages named by the user tasks below.
+	createTaskPages(t, env, mod, "SubPage", "ReviewPage", "MultiReviewPage", "ApprovePage")
 
 	// Sub-workflow for CALL WORKFLOW
 	if err := env.executeMDL(`create workflow ` + mod + `.SubApprovalFlow
@@ -69,8 +122,10 @@ end workflow;`); err != nil {
   parameter $WorkflowContext: ` + mod + `.WfCtxEntity
 begin
 
-  annotation 'Comprehensive workflow covering all MDL syntax';
-
+  -- NB: no standalone annotation here. Mendix places it in the activity flow,
+  -- which accepts only flow elements, and the resulting .mpr cannot be LOADED
+  -- (issuetracker #15) — mxcli refuses it, so it cannot appear in a round-trip
+  -- test. See TestCreateWorkflow_StandaloneAnnotationRefused.
   user task ReviewTask 'Review Request'
     page ` + mod + `.ReviewPage
     targeting microflow ` + mod + `.GetSingleReviewer
@@ -90,7 +145,7 @@ begin
       true -> { }
       false -> { };
 
-  decision '$WorkflowContext/IsApproved'
+  decision $WorkflowContext/IsApproved
     outcomes
       true -> {
         wait for timer '${PT2H}';
@@ -111,8 +166,6 @@ begin
 
   wait for notification;
 
-  annotation 'End of flow';
-
 end workflow;`
 
 	if err := env.executeMDL(createMDL); err != nil {
@@ -130,17 +183,17 @@ end workflow;`
 		label   string
 		keyword string
 	}{
-		{"annotation activity", "annotation 'Comprehensive workflow"},
 		{"user task", "user task ReviewTask"},
 		{"outcome approve", "'Approve'"},
 		{"outcome reject", "'Reject'"},
 		{"boundary interrupting", "boundary event interrupting timer '${PT24H}'"},
 		{"boundary non interrupting", "boundary event non interrupting timer '${PT1H}'"},
 		{"multi user task", "multi user task MultiReviewTask"},
-		{"call microflow with", "call microflow " + mod + ".ScoreCalc with (Score ="},
+		{"call microflow args", "call microflow " + mod + ".ScoreCalc(Score = $WorkflowContext/Score)"},
 		{"outcomes true", "true ->"},
 		{"outcomes false", "false ->"},
-		{"decision", "decision '$WorkflowContext/IsApproved'"},
+		// R5 (#753): describe writes a decision's condition bare.
+		{"decision", "decision $WorkflowContext/IsApproved"},
 		{"wait for timer", "wait for timer '${PT2H}'"},
 		{"jump to", "jump to ReviewTask"},
 		{"parallel split", "parallel split"},
@@ -148,7 +201,6 @@ end workflow;`
 		{"path 2", "path 2"},
 		{"call workflow", "call workflow " + mod + ".SubApprovalFlow"},
 		{"wait for notification", "wait for notification"},
-		{"trailing annotation", "annotation 'End of flow'"},
 		{"parameter", "parameter $WorkflowContext: " + mod + ".WfCtxEntity"},
 	}
 
@@ -164,8 +216,20 @@ end workflow;`
 	}
 }
 
+// Run on BOTH engines. setupTestEnv defaults to legacy, and legacy could always
+// read boundary events — which is exactly why the default (modelsdk) engine
+// having no boundary-event reader at all stayed invisible: DESCRIBE emitted
+// nothing on the engine users actually run, so describe → exec silently dropped
+// the timer and its handler flow, while this test stayed green (issue #948).
+// Same shape as the TableMappings gap in roundtrip_dbconnection_test.go.
 func TestRoundtripWorkflow_BoundaryEventInterrupting(t *testing.T) {
-	env := setupTestEnv(t)
+	for _, eng := range gateEngines {
+		t.Run(eng.name, func(t *testing.T) { testRoundtripWorkflowBoundaryInterrupting(t, eng) })
+	}
+}
+
+func testRoundtripWorkflowBoundaryInterrupting(t *testing.T, eng gateEngine) {
+	env := setupTestEnvWithBackend(t, eng.factory)
 	defer env.teardown()
 
 	createMDL := `create workflow ` + testModule + `.WfBoundaryInt
@@ -181,6 +245,7 @@ end workflow;`
 	if err := env.executeMDL(`create or modify persistent entity ` + testModule + `.TestEntitySimple (Name: String(100));`); err != nil {
 		t.Fatalf("Failed to create entity: %v", err)
 	}
+	createTaskPages(t, env, testModule, "ReviewPage")
 
 	if err := env.executeMDL(createMDL); err != nil {
 		t.Fatalf("Failed to create workflow: %v", err)
@@ -196,8 +261,15 @@ end workflow;`
 	}
 }
 
+// Both engines, for the reason on the interrupting variant above.
 func TestRoundtripWorkflow_BoundaryEventNonInterrupting(t *testing.T) {
-	env := setupTestEnv(t)
+	for _, eng := range gateEngines {
+		t.Run(eng.name, func(t *testing.T) { testRoundtripWorkflowBoundaryNonInterrupting(t, eng) })
+	}
+}
+
+func testRoundtripWorkflowBoundaryNonInterrupting(t *testing.T, eng gateEngine) {
+	env := setupTestEnvWithBackend(t, eng.factory)
 	defer env.teardown()
 
 	createMDL := `create workflow ` + testModule + `.WfBoundaryNonInt
@@ -213,6 +285,7 @@ end workflow;`
 	if err := env.executeMDL(`create or modify persistent entity ` + testModule + `.TestEntitySimple2 (Name: String(100));`); err != nil {
 		t.Fatalf("Failed to create entity: %v", err)
 	}
+	createTaskPages(t, env, testModule, "ReviewPage")
 
 	if err := env.executeMDL(createMDL); err != nil {
 		t.Fatalf("Failed to create workflow: %v", err)
@@ -244,6 +317,7 @@ end workflow;`
 	if err := env.executeMDL(`create or modify persistent entity ` + testModule + `.TestEntityMulti (Name: String(100));`); err != nil {
 		t.Fatalf("Failed to create entity: %v", err)
 	}
+	createTaskPages(t, env, testModule, "ReviewPage")
 
 	if err := env.executeMDL(createMDL); err != nil {
 		t.Fatalf("Failed to create workflow: %v", err)
@@ -259,92 +333,63 @@ end workflow;`
 	}
 }
 
-func TestRoundtripWorkflow_AnnotationActivity(t *testing.T) {
+// TestCreateWorkflow_StandaloneAnnotationRefused replaces the two round-trip
+// tests that used to assert a standalone `annotation` survives write → read →
+// describe → re-execute.
+//
+// It does survive that loop — mxcli's own reader is tolerant — but the loop
+// never loaded the project in Mendix, so it proved nothing about validity. It
+// does not: mxcli writes the annotation into the workflow's activity flow, and
+// Mendix constructs every child of that list with a Flow parent, which no
+// annotation type accepts. The .mpr cannot be LOADED at all — `mx check` dies
+// at "Loading the mpr file" with
+//
+//	System.InvalidOperationException: Type Mendix.Modeler.Workflows.Model.Annotation
+//	does not contain a constructor with a parameter of type
+//	...Workflows.Model.Flow
+//
+// (reproduced on mxbuild 11.12.1 with the guard stubbed out). The old tests
+// were pinning that defect in place. mxcli now refuses the construct, so the
+// behaviour to lock in is the refusal. (issuetracker #15)
+func TestCreateWorkflow_StandaloneAnnotationRefused(t *testing.T) {
 	env := setupTestEnv(t)
 	defer env.teardown()
-
-	createMDL := `create workflow ` + testModule + `.WfAnnotation
-  parameter $WorkflowContext: ` + testModule + `.TestEntityAnnot
-begin
-  annotation 'This is a workflow note';
-end workflow;`
 
 	if err := env.executeMDL(`create or modify persistent entity ` + testModule + `.TestEntityAnnot (Name: String(100));`); err != nil {
 		t.Fatalf("Failed to create entity: %v", err)
 	}
 
-	if err := env.executeMDL(createMDL); err != nil {
-		t.Fatalf("Failed to create workflow: %v", err)
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "annotation alone in the body",
+			body: "  annotation 'This is a workflow note';",
+		},
+		{
+			name: "annotation preceding an activity",
+			body: "  annotation 'I am a note';\n  wait for timer 'addDays([%CurrentDateTime%], 1)' comment 'Timer';",
+		},
 	}
 
-	output, err := env.describeMDL(`describe workflow ` + testModule + `.WfAnnotation;`)
-	if err != nil {
-		t.Fatalf("Failed to describe workflow: %v", err)
-	}
-
-	if !strings.Contains(output, "annotation 'This is a workflow note'") {
-		t.Errorf("Expected describe output to contain \"annotation 'This is a workflow note'\", got:\n%s", output)
-	}
-
-	// Full round-trip: DESCRIBE output must be re-executable (annotation must survive re-create)
-	describeOutput := output
-	// Replace WORKFLOW with CREATE OR REPLACE WORKFLOW for round-trip execution
-	createFromDescribe := strings.Replace(describeOutput, "\nworkflow ", "\ncreate or replace workflow ", 1)
-	// Strip comment header lines (-- ...) before the CREATE OR REPLACE WORKFLOW
-	var mdlLines []string
-	inBody := false
-	for _, line := range strings.Split(createFromDescribe, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "create or replace workflow") {
-			inBody = true
-		}
-		if inBody {
-			mdlLines = append(mdlLines, line)
-		}
-	}
-	roundTripMDL := strings.Join(mdlLines, "\n")
-	if err := env.executeMDL(roundTripMDL); err != nil {
-		t.Errorf("Round-trip execution failed (describe output is not re-executable): %v\nMDL:\n%s", err, roundTripMDL)
-	}
-}
-
-// TestRoundtripWorkflow_AnnotationBeforeActivity tests that a workflow activity's
-// embedded annotation (BaseWorkflowActivity.Annotation) is preserved in DESCRIBE output
-// as a parseable ANNOTATION statement rather than a SQL comment.
-func TestRoundtripWorkflow_AnnotationBeforeActivity(t *testing.T) {
-	env := setupTestEnv(t)
-	defer env.teardown()
-
-	// Create a workflow with an ANNOTATION before a WAIT FOR TIMER.
-	// This mimics the pattern from Studio Pro where an annotation is attached to an activity.
-	createMDL := `create workflow ` + testModule + `.WfAnnotBeforeTimer
-  parameter $WorkflowContext: ` + testModule + `.TestEntityAnnotTimer
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			name := fmt.Sprintf("%s.WfAnnotRefused%d", testModule, i)
+			err := env.executeMDL(`create workflow ` + name + `
+  parameter $WorkflowContext: ` + testModule + `.TestEntityAnnot
 begin
-  annotation 'I am a note';
-  wait for timer 'addDays([%CurrentDateTime%], 1)' comment 'Timer';
-end workflow;`
-
-	if err := env.executeMDL(`create or modify persistent entity ` + testModule + `.TestEntityAnnotTimer (Name: String(100));`); err != nil {
-		t.Fatalf("Failed to create entity: %v", err)
-	}
-
-	if err := env.executeMDL(createMDL); err != nil {
-		t.Fatalf("Failed to create workflow: %v", err)
-	}
-
-	output, err := env.describeMDL(`describe workflow ` + testModule + `.WfAnnotBeforeTimer;`)
-	if err != nil {
-		t.Fatalf("Failed to describe workflow: %v", err)
-	}
-
-	// The annotation must appear as a parseable ANNOTATION statement, not as a SQL comment.
-	if !strings.Contains(output, "annotation 'I am a note'") {
-		t.Errorf("Expected describe to emit annotation statement, got:\n%s", output)
-	}
-	if strings.Contains(output, "-- I am a note") {
-		t.Errorf("describe must not emit annotation as sql comment (not round-trippable), got:\n%s", output)
-	}
-	if !strings.Contains(output, "wait for timer") {
-		t.Errorf("Expected describe to contain wait for timer, got:\n%s", output)
+` + tc.body + `
+end workflow;`)
+			if err == nil {
+				t.Fatal("standalone annotation was accepted — it writes an .mpr Mendix cannot load")
+			}
+			for _, want := range []string{"MDL-WF04", "cannot load"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("refusal should mention %q, got: %v", want, err)
+				}
+			}
+		})
 	}
 }
 
@@ -376,7 +421,53 @@ end workflow;`
 		t.Fatalf("Failed to describe workflow: %v", err)
 	}
 
-	if !strings.Contains(output, "with (") {
-		t.Errorf("Expected describe output to contain 'with (', got:\n%s", output)
+	if !strings.Contains(output, "SomeMicroflow(Amount = $WorkflowContext/Amount)") {
+		t.Errorf("Expected describe output to bind the argument in R4's form, got:\n%s", output)
+	}
+}
+
+// Issue ako/mxcli#1722. A task targeted with `groups xpath` described without
+// its targeting clause, so replaying the description removed the targeting.
+// The users-xpath task is the control: it always described.
+func TestRoundtripWorkflow_XPathTargeting(t *testing.T) {
+	env := setupTestEnv(t)
+	defer env.teardown()
+
+	if err := env.executeMDL(`create or modify persistent entity ` + testModule + `.WfTargetCtx (Name: String(100));`); err != nil {
+		t.Fatalf("create entity: %v", err)
+	}
+	createTaskPages(t, env, testModule, "TargetPage")
+
+	if err := env.executeMDL(`create workflow ` + testModule + `.WfXPathTargeting
+  parameter $WorkflowContext: ` + testModule + `.WfTargetCtx
+begin
+  user task ByUsers 'By users' page ` + testModule + `.TargetPage targeting users xpath [Active = true()] outcomes 'Done' { };
+  user task ByGroups 'By groups' page ` + testModule + `.TargetPage targeting groups xpath [Name = 'Reviewers'] outcomes 'Done' { };
+end workflow;`); err != nil {
+		t.Fatalf("create workflow: %v", err)
+	}
+
+	describe := func() string {
+		t.Helper()
+		out, err := env.describeMDL(`describe workflow ` + testModule + `.WfXPathTargeting;`)
+		if err != nil {
+			t.Fatalf("describe workflow: %v", err)
+		}
+		return out
+	}
+	want := []string{"targeting users xpath [Active = true()]", "targeting groups xpath [Name = 'Reviewers']"}
+	first := describe()
+	for _, w := range want {
+		if !strings.Contains(first, w) {
+			t.Errorf("describe lost %q:\n%s", w, first)
+		}
+	}
+
+	// Replaying the description (it is `create or modify`) must keep both.
+	if err := env.executeMDL(first); err != nil {
+		t.Fatalf("replay describe output: %v\n%s", err, first)
+	}
+	if second := describe(); second != first {
+		t.Errorf("describe -> create or modify changed the workflow:\nbefore:\n%s\nafter:\n%s", first, second)
 	}
 }

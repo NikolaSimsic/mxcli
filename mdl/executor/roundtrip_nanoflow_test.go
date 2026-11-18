@@ -239,12 +239,16 @@ end;`
 	nfName := testModule + ".RT_NF_ErrorHandling"
 	createMDL := `create nanoflow ` + nfName + ` () returns Boolean
 begin
-  $Result = call microflow ` + mfName + ` () on error continue;
+  $Result = call microflow ` + mfName + ` () on error without rollback begin
+    log error node 'RT' 'call failed';
+  end error;
   return $Result;
 end;`
 
+	// A call in a nanoflow takes only a handler without rollback; `on error
+	// continue` there is CE6035 and refused (mendixlabs/mxcli#591).
 	assertNanoflowContains(t, env, nfName, createMDL,
-		[]string{"nanoflow", "call microflow", "on error continue", "return"},
+		[]string{"nanoflow", "call microflow", "on error without rollback", "return"},
 		nil,
 	)
 }
@@ -353,7 +357,10 @@ func TestNanoflow_GrantRevoke(t *testing.T) {
 	defer env.teardown()
 
 	nfName := testModule + ".RT_NF_Security"
-	createMDL := `create nanoflow ` + nfName + ` () returns Void
+	// A new nanoflow gets no role and none is created for it (#1474): the
+	// role a grant names is the script's own.
+	createMDL := `create or modify module role ` + testModule + `.User;
+create nanoflow ` + nfName + ` () returns Void
 begin
 end;`
 	if err := env.executeMDL(createMDL); err != nil {
@@ -397,7 +404,10 @@ func TestNanoflow_GrantIdempotent(t *testing.T) {
 	defer env.teardown()
 
 	nfName := testModule + ".RT_NF_GrantIdem"
-	createMDL := `create nanoflow ` + nfName + ` () returns Void
+	// A new nanoflow gets no role and none is created for it (#1474): the
+	// role a grant names is the script's own.
+	createMDL := `create or modify module role ` + testModule + `.User;
+create nanoflow ` + nfName + ` () returns Void
 begin
 end;`
 	if err := env.executeMDL(createMDL); err != nil {
@@ -852,16 +862,16 @@ func TestRoundtripNanoflow_CallJavaScriptAction(t *testing.T) {
 	env := setupTestEnv(t)
 	defer env.teardown()
 
-	// First, verify a JavaScript action exists in the test module.
-	// If none exist, skip—this test requires a pre-provisioned JS action.
-	jsActions, err := env.describeMDL(fmt.Sprintf("show javascript actions in %s;", testModule))
-	if err != nil || jsActions == "" || strings.Contains(jsActions, "0 javascript actions") {
-		t.Skip("No JavaScript actions available in test module — skipping roundtrip test")
+	// Provision the JavaScript action to call — CREATE JAVASCRIPT ACTION now
+	// exists, so this test brings its own action into being instead of skipping
+	// when none is pre-provisioned (issue #593).
+	jsActionName := testModule + ".RT_JSA_Echo"
+	if err := env.executeMDL(`create javascript action ` + jsActionName + ` () returns String
+as $$
+  return Promise.resolve('ok');
+$$;`); err != nil {
+		t.Fatalf("create javascript action: %v", err)
 	}
-
-	// Extract first available JS action name from SHOW output for the test.
-	// Fallback: use a known action name if the test project provisions one.
-	jsActionName := testModule + ".MyJSAction"
 
 	nfName := testModule + ".RT_NF_CallJSAction"
 	createMDL := `create nanoflow ` + nfName + ` () returns String

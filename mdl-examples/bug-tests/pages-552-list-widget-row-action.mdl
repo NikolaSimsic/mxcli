@@ -1,0 +1,53 @@
+mdl 1;
+-- ako/mxcli#552 — MDL-PAGEARG01 refused a list widget's OWN row action.
+--
+-- `onClick` on a data grid, list view or gallery fires per row, so the row the
+-- widget renders IS the context object. The #1029 guard judged every widget's
+-- own action in the context its PARENT supplies, so each statement below was
+-- refused at `check` — and, since exec refuses a script whose check errors,
+-- could not be applied at all. mxbuild accepts the stored pages at 0 errors.
+--
+-- On a list view the refusal contradicted itself: "widget `lvCars` is not
+-- inside a data view, list view or grid row".
+--
+-- This file is a CHECK-time regression: `mxcli check` must report 0 errors.
+-- The control lives beside it — 1029-showpage-arg-without-context.fail.mdl is
+-- the contextless page-level button, which must STILL be refused.
+
+create module Mod;
+
+create entity Mod.Car (
+  Name: String(100)
+);
+
+create page Mod.Detail (Title: 'Car', Layout: Atlas_Core.Atlas_Default, Params: ( $Car: Mod.Car )) {
+  dataview dvCar (DataSource: $Car) {
+    textbox tbName (Label: 'Name', Attribute: Name)
+  }
+};
+
+-- A data grid's own onClick: the clicked row is the context object.
+create page Mod.Grid (Title: 'Cars', Layout: Atlas_Core.Atlas_Default) {
+  datagrid dgCars (
+    DataSource: DATABASE Mod.Car,
+    onClick: SHOW PAGE Mod.Detail(Car = $currentObject)
+  ) {
+    column (Caption: 'Name', Attribute: Name)
+  }
+};
+
+-- A list view's own onClick, same rule.
+create page Mod.List (Title: 'Cars', Layout: Atlas_Core.Atlas_Default) {
+  listview lvCars (
+    DataSource: DATABASE Mod.Car,
+    onClick: SHOW PAGE Mod.Detail(Car = $currentObject)
+  ) {
+    dynamictext dtName (Content: '{1}', ContentParams: ({1} = Name))
+  }
+};
+
+-- NOT a case for this file: the bare-entity shorthand `DataSource: Mod.Car` on a
+-- data grid was SILENTLY DROPPED until ako/mxcli#576 (mxbuild 11.14.0 reported
+-- CE0488 and then a real CE1571). It now binds as DATABASE Mod.Car, so the row
+-- context is known; mdl-examples/bug-tests/576-datasource-bare-entity-shorthand.mdl
+-- covers it.

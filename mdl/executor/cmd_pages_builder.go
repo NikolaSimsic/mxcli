@@ -4,6 +4,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/mendixlabs/mxcli/mdl/ast"
 	"github.com/mendixlabs/mxcli/mdl/backend"
 	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
+	"github.com/mendixlabs/mxcli/mdl/folderpath"
 	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
@@ -22,8 +24,17 @@ import (
 // Page Builder
 // ============================================================================
 
+// danglingRefOK reports whether a failed reference resolution may be kept by
+// name: only for an excluded document, and only when the name resolved to
+// nothing (a backend failure is never swallowed). See tolerateDanglingRefs.
+func (pb *pageBuilder) danglingRefOK(err error) bool {
+	var nf *mdlerrors.NotFoundError
+	return pb.tolerateDanglingRefs && errors.As(err, &nf)
+}
+
 // pageBuilder constructs pages from AST.
 type pageBuilder struct {
+	ctx              *ExecContext // execution context (for building-block expansion, etc.)
 	backend          backend.FullBackend
 	moduleID         model.ID
 	moduleName       string
@@ -35,6 +46,11 @@ type pageBuilder struct {
 	fragments        map[string]*ast.DefineFragmentStmt // Fragment registry from executor
 	themeRegistry    *ThemeRegistry                     // Theme design property definitions (may be nil)
 	widgetBackend    backend.WidgetBuilderBackend       // Backend for pluggable widget construction
+
+	// dataViewVariables: enclosing data view name -> the Forms$PageVariable a
+	// binding read through it (`$dataView1.Attr`) stores. Holds only the data
+	// views around the widget being built (ako/mxcli#826).
+	dataViewVariables map[string]pages.WidgetVariable
 
 	// Pluggable widget engine (lazily initialized)
 	widgetRegistry     *WidgetRegistry
@@ -49,12 +65,72 @@ type pageBuilder struct {
 
 	// Entity context for resolving short attribute names inside DataViews
 	entityContext string // Qualified entity name (e.g., "Module.Entity")
+	// outerEntityContexts are the entities of the data containers enclosing the
+	// current one, outermost first: a snippet parameter a call omits is taken
+	// from any of them, not only the nearest (ako/mxcli#2055).
+	outerEntityContexts []string
 
-	// Local page/snippet variables (Variables: { $name: Type = 'default' }).
+	// What this point of the walk knows about the object a SHOW_PAGE widget
+	// action would bind its argument to: whether it is knowable at all, whether
+	// there is one, and what it is called. Used to tell an argument that names
+	// the context object from one that names something else — and from one
+	// written where no context object exists at all, which mxcli cannot store
+	// either. See cmd_pages_showpage_args.go.
+	argCtx pageArgContext
+
+	// Name of the widget currently being built, so a refusal names the control
+	// the author has to go and fix. The check-time mirror gets it from the AST
+	// node it is looking at; the builder's action path is several calls deep and
+	// would otherwise say only "this widget".
+	currentWidget string
+
+	// tolerateDanglingRefs is set when the document being built is EXCLUDED
+	// (by @excluded, or carried from the stored document). Mendix does not
+	// validate an excluded document, and one may name flows, pages or snippets
+	// the project does not contain — Feedback v4.0.2 ships such an example
+	// page. The writer stores an ACTION's or snippet call's target BY NAME, so
+	// an unresolved one is kept as written instead of failing the build.
+	//
+	// A data-source FLOW is kept by name too, but it is what puts an entity in
+	// scope: without it a bare attribute binding inside the container cannot
+	// be qualified, and one written bare made `mx check` fail to LOAD the
+	// project (ArgumentNullException setting 'Attribute', Mendix 11.13.0).
+	// DESCRIBE writes those bindings qualified there, the check refuses a bare
+	// one (unscopedBindings), and the writer refuses any bare attribute
+	// reference as a last line, ALTER included (canon.BareAttributeRefError).
+	tolerateDanglingRefs bool
+
+	// Local page/snippet variables (Variables: ( $name: Type = <default expression> )).
 	// Used to distinguish a $localVar reference from a page parameter when
 	// resolving TextTemplate parameters — local variables must be stored as
 	// Forms$PageVariable.LocalVariable in BSON, not as a literal Expression.
 	localVariables map[string]bool
+
+	// primitiveParams are the page's primitive-typed parameters (String,
+	// Integer, …). paramScope holds only the entity-typed ones, so without this
+	// a bare `{1} = $IpAddress` template parameter was stored as the attribute
+	// path "$IpAddress", bound nothing, and mxbuild reported CE0402 "No value
+	// specified." (ako/mxcli#2132). Snippets cannot declare one (CE0046).
+	primitiveParams map[string]bool
+
+	// isDocumentWidget reports whether a name is a widget of the document being
+	// built. A flow argument `$name` naming one passes that widget's selection,
+	// which Studio Pro binds through the PageVariable's Widget slot
+	// (ako/mxcli#1560). nil where the document's widgets are not known: nothing
+	// is then a widget, and the argument binds as it always did.
+	isDocumentWidget func(name string) bool
+
+	// storedPluggables are the pluggable widgets of the stored document a
+	// `create or replace`/`create or modify` rewrites; nil for a new document.
+	// A widget the statement did not change keeps its stored Type and Object
+	// (ako/mxcli#721 L4, see cmd_pages_pluggable_passthrough.go); one it did
+	// change keeps the properties it did not (ako/mxcli#832,
+	// cmd_pages_pluggable_patch.go).
+	storedPluggables *pluggablePassthrough
+
+	// shadowBuild is set while that patch builds the widget describe prints
+	// for the stored one: its child widgets are stubbed (shadowChild).
+	shadowBuild bool
 }
 
 // initPluggableEngine lazily initializes the pluggable widget engine.
@@ -110,13 +186,11 @@ func (pb *pageBuilder) registerWidgetName(name string, id model.ID) error {
 
 // getModules returns cached modules or loads them.
 func (pb *pageBuilder) getModules() []*model.Module {
-	if pb.execCache != nil && pb.execCache.modules != nil {
-		return pb.execCache.modules
+	if pb.execCache == nil {
+		modules, _ := pb.backend.ListModules()
+		return modules
 	}
-	modules, _ := pb.backend.ListModules()
-	if pb.execCache != nil {
-		pb.execCache.modules = modules
-	}
+	modules, _ := pb.execCache.cachedModules(pb.backend.ListModules)
 	return modules
 }
 
@@ -220,6 +294,20 @@ func (pb *pageBuilder) resolveLayout(layoutName string) (model.ID, error) {
 	return "", mdlerrors.NewNotFound("layout", layoutName)
 }
 
+// layoutIsNative reports whether the layout with this ID is a native one.
+func (pb *pageBuilder) layoutIsNative(id model.ID) bool {
+	layouts, err := pb.getLayouts()
+	if err != nil {
+		return false
+	}
+	for _, l := range layouts {
+		if l.ID == id {
+			return l.Native
+		}
+	}
+	return false
+}
+
 // resolveEntity finds an entity by qualified name.
 func (pb *pageBuilder) resolveEntity(entityRef ast.QualifiedName) (model.ID, error) {
 	// Get domain models which contain entities
@@ -301,14 +389,9 @@ func (pb *pageBuilder) resolveFolder(folderPath string) (model.ID, error) {
 		return "", mdlerrors.NewBackend("list folders", err)
 	}
 
-	// Split path into parts
-	parts := strings.Split(folderPath, "/")
 	currentContainerID := pb.moduleID
 
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
+	for _, part := range folderpath.Split(folderPath) {
 
 		// Find folder with this name under current container
 		var foundFolder *types.FolderInfo
@@ -343,22 +426,10 @@ func (pb *pageBuilder) resolveFolder(folderPath string) (model.ID, error) {
 	return currentContainerID, nil
 }
 
-// createFolder creates a new folder in the project.
+// createFolder creates a new folder in the project through the executor's one
+// folder creator, which also keeps the cached hierarchy in step (ako/mxcli#1486).
 func (pb *pageBuilder) createFolder(name string, containerID model.ID) (model.ID, error) {
-	folder := &model.Folder{
-		BaseElement: model.BaseElement{
-			ID:       model.ID(types.GenerateID()),
-			TypeName: "Projects$Folder",
-		},
-		ContainerID: containerID,
-		Name:        name,
-	}
-
-	if err := pb.backend.CreateFolder(folder); err != nil {
-		return "", err
-	}
-
-	return folder.ID, nil
+	return createFolder(pb.ctx, name, containerID)
 }
 
 // execDropPage handles DROP PAGE statement.
@@ -372,7 +443,7 @@ func execDropPage(ctx *ExecContext, s *ast.DropPageStmt) error {
 		return mdlerrors.NewBackend("list pages", err)
 	}
 
-	for _, p := range pages {
+	for _, p := range liveFirst(pages, pageExcluded) {
 		modID := getModuleID(ctx, p.ContainerID)
 		modName := getModuleName(ctx, modID)
 		if modName == s.Name.Module && p.Name == s.Name.Name {
@@ -380,6 +451,8 @@ func execDropPage(ctx *ExecContext, s *ast.DropPageStmt) error {
 				return mdlerrors.NewBackend("delete page", err)
 			}
 			fmt.Fprintf(ctx.Output, "Dropped page %s\n", s.Name.String())
+			writeDroppedGrantsNote(ctx.Output, "page", "view", s.Name.String(), p.AllowedRoles, false)
+
 			return nil
 		}
 	}
@@ -416,3 +489,7 @@ func execDropSnippet(ctx *ExecContext, s *ast.DropSnippetStmt) error {
 func (e *Executor) getModuleName(moduleID model.ID) string {
 	return getModuleName(e.newExecContext(context.Background()), moduleID)
 }
+
+// textLang is the language a bare caption/title/content string from this page's
+// MDL is stored under (mendixlabs/mxcli#970). See authoringLanguage.
+func (pb *pageBuilder) textLang() string { return authoringLanguage(pb.ctx) }

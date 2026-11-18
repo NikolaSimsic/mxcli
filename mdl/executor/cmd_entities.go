@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/dmlayout"
 	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
 	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
@@ -29,6 +30,9 @@ func buildEventHandlers(ctx *ExecContext, defs []ast.EventHandlerDef) ([]*domain
 		if err != nil {
 			return nil, mdlerrors.NewNotFound("microflow", mfQN)
 		}
+		if err := checkBeforeCreateHandlerHasNoParameters(ctx, d, mfQN, mfID); err != nil {
+			return nil, err
+		}
 		handlers = append(handlers, &domainmodel.EventHandler{
 			BaseElement: model.BaseElement{
 				ID:       model.ID(types.GenerateID()),
@@ -45,9 +49,114 @@ func buildEventHandlers(ctx *ExecContext, defs []ast.EventHandlerDef) ([]*domain
 	return handlers, nil
 }
 
+// matchEventHandlers returns the indexes of the entity's handlers for moment and
+// event, narrowed to those calling mfQN when it is non-empty. An entity may carry
+// several handlers for one event (mendixlabs/mxcli#1540), so (moment, event) alone
+// is not an identity — the microflow is part of it.
+func matchEventHandlers(ctx *ExecContext, entity *domainmodel.Entity, moment, event, mfQN string) []int {
+	var out []int
+	for i, eh := range entity.EventHandlers {
+		if eh.Moment != domainmodel.EventMoment(moment) || eh.Event != domainmodel.EventType(event) {
+			continue
+		}
+		if mfQN != "" && storedHandlerMicroflow(ctx, eh) != mfQN {
+			continue
+		}
+		out = append(out, i)
+	}
+	return out
+}
+
+// storedHandlerMicroflow is the qualified name of the microflow a stored handler
+// calls. The read path fills MicroflowName; the ID is the fallback, as in describe.
+func storedHandlerMicroflow(ctx *ExecContext, eh *domainmodel.EventHandler) string {
+	if eh.MicroflowName == "" && eh.MicroflowID != "" {
+		return lookupMicroflowName(ctx, eh.MicroflowID)
+	}
+	return eh.MicroflowName
+}
+
+// checkBeforeCreateHandlerHasNoParameters refuses to wire a microflow that takes
+// parameters to a BEFORE CREATE event handler.
+//
+// Mendix passes no object to a before-create handler — the object does not exist
+// yet — so the build fails with
+//
+//	[CE7247] "Microflow should not have parameters" at Event handler of entity …
+//
+// which `mxcli check` had no way to see. The handler a defaulting microflow
+// actually wants is AFTER CREATE, which does receive the object.
+// (mxcli-todo findings #14a)
+func checkBeforeCreateHandlerHasNoParameters(ctx *ExecContext, d ast.EventHandlerDef, mfQN string, mfID model.ID) error {
+	if !strings.EqualFold(d.Moment, "Before") || !strings.EqualFold(d.Event, "Create") {
+		return nil
+	}
+	mf, err := ctx.Backend.GetMicroflow(mfID)
+	// A microflow created earlier in this same script is not readable back yet;
+	// skip rather than guess. mxbuild still catches it, and refusing on a failed
+	// read would break a legitimate script.
+	if err != nil || mf == nil {
+		return nil
+	}
+	if len(mf.Parameters) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(mf.Parameters))
+	for _, p := range mf.Parameters {
+		names = append(names, "$"+p.Name)
+	}
+	return mdlerrors.NewValidationf(
+		"microflow %s takes %d parameter(s) (%s), but a BEFORE CREATE event handler is called with none — "+
+			"Mendix has no object to pass yet, so this builds as CE7247 \"Microflow should not have parameters\"\n"+
+			"hint: use ON AFTER CREATE, which does receive the object, or remove the parameters",
+		mfQN, len(mf.Parameters), strings.Join(names, ", "))
+}
+
 func execCreateEntity(ctx *ExecContext, s *ast.CreateEntityStmt) error {
 	if !ctx.Connected() {
 		return mdlerrors.NewNotConnected()
+	}
+	if err := checkVersionGates(ctx, s); err != nil {
+		return err
+	}
+
+	// An unqualified EXTENDS target is refused here as well as at check time:
+	// `exec --no-check` skips the pre-flight, and this is the case that writes a
+	// file Mendix cannot open rather than one it merely reports on. It needs no
+	// project state, so it runs before anything is looked up or created — the
+	// module below is AUTO-CREATED, and a statement that can never be valid must
+	// not leave one behind.
+	//
+	// A qualified target that resolves to nothing is left to check: the
+	// generalization is resolved lazily, so a parent created later in the same
+	// script is legitimate and a per-statement guard would refuse it.
+	if s.Generalization != nil {
+		if err := checkGeneralizationQualified(s.Name, *s.Generalization); err != nil {
+			return err
+		}
+		// An Auto* system member on a specialization has nowhere to be stored:
+		// say it is inherited, or refuse it, rather than drop it silently.
+		// Before the module is auto-created, so a refusal leaves nothing behind.
+		warnings, err := checkSpecializationSystemMembers(ctx, s.Name.String(), s.Generalization.String(), s.Attributes, false)
+		for _, w := range warnings {
+			fmt.Fprintf(ctx.Output, "⚠ %s\n", w)
+		}
+		if err != nil {
+			return err
+		}
+		// A stated persistability the chain's root contradicts would be
+		// dropped the same way (ako/mxcli#2005).
+		if err := checkSpecializationPersistability(ctx, nil, s); err != nil {
+			return err
+		}
+	}
+
+	// A member name must be unique along the generalization chain — up to the
+	// root, System entities included, and down through the specializations
+	// (CE0069, ako/mxcli#1645). The verdict check gives; before the module is
+	// auto-created, so a refusal leaves nothing behind.
+	if err := refuseMemberNameClash(ctx, s); err != nil {
+		return err
 	}
 
 	// Find or auto-create module
@@ -71,9 +180,25 @@ func execCreateEntity(ctx *ExecContext, s *ast.CreateEntityStmt) error {
 		}
 	}
 
-	// If entity exists and not using CREATE OR MODIFY, return error
+	// If entity exists and not using CREATE OR MODIFY, return error. Note the
+	// suggested fixes: `alter entity` for an incremental change (safe — it edits
+	// the members it names and leaves the rest alone), and `create or modify` only
+	// when the intent is to replace the whole definition — that path rebuilds the
+	// entity from the statement and DROPS any attribute the statement omits, so it
+	// is destructive if used for a partial update. (findings #24)
+	if existingEntity != nil && s.IfNotExists {
+		// IF NOT EXISTS is the safe half of re-runnability: it leaves the stored
+		// definition alone entirely, where CREATE OR MODIFY rebuilds it from the
+		// statement. (sudoku findings #10)
+		fmt.Fprintf(ctx.Output, "Entity %s.%s already exists — skipped\n", s.Name.Module, s.Name.Name)
+		return nil
+	}
 	if existingEntity != nil && !s.CreateOrModify {
-		return mdlerrors.NewAlreadyExistsMsg("entity", s.Name.Module+"."+s.Name.Name, fmt.Sprintf("entity already exists: %s.%s (use create or modify to update)", s.Name.Module, s.Name.Name))
+		return mdlerrors.NewAlreadyExistsMsg("entity", s.Name.Module+"."+s.Name.Name,
+			fmt.Sprintf("entity already exists: %s.%s — to add or change a member use 'alter entity %s.%s add attribute ...' (leaves the rest intact); "+
+				"to make the script re-runnable use 'create entity if not exists' (leaves an existing entity untouched); "+
+				"use 'create or modify entity' only to replace the whole definition (it drops any attribute this statement omits)",
+				s.Name.Module, s.Name.Name, s.Name.Module, s.Name.Name))
 	}
 
 	// Calculate position
@@ -82,10 +207,10 @@ func execCreateEntity(ctx *ExecContext, s *ast.CreateEntityStmt) error {
 		location = model.Point{X: s.Position.X, Y: s.Position.Y}
 	} else if existingEntity != nil {
 		location = existingEntity.Location
-	} else {
-		// Auto-position based on existing entities
-		location = model.Point{X: 100 + len(dm.Entities)*150, Y: 100}
 	}
+	// No @Position and no stored entity: auto-placed once the entity's members
+	// are known (dmlayout.Place, below) — the free slot depends on its height.
+	autoPlace := s.Position == nil && existingEntity == nil
 
 	// Determine persistable based on entity kind
 	persistable := s.Kind != ast.EntityNonPersistent
@@ -102,36 +227,37 @@ func execCreateEntity(ctx *ExecContext, s *ast.CreateEntityStmt) error {
 	// Mendix rejects names like Owner/Type/Context/Id at runtime regardless of
 	// entity kind — catching here avoids writing a project that Studio Pro will
 	// refuse to open. Issue #552.
-	if vs := ValidateEntity(s); len(vs) > 0 {
-		v := vs[0]
+	// Only ERROR-severity violations block the write. ValidateEntity also emits
+	// warnings (MDL022 AutoX rename, MDL071 OQL reserved name) and those must not
+	// refuse a script that `mxcli check` reports as passing.
+	if v := firstBlockingViolation(ValidateEntity(s)); v != nil {
 		return mdlerrors.NewValidationf("%s — %s", v.Message, v.Suggestion)
 	}
 
 	// Validate TypeEnumeration attribute refs before writing anything.
-	// The visitor uses TypeEnumeration for both enum and entity type references
-	// (TypeEnumeration vs TypeEntity ambiguity). Accept the ref when it resolves
-	// to either a known enumeration or a known entity; reject unknown names fast
-	// so typos don't silently produce corrupt models.
 	for _, a := range s.Attributes {
-		if a.Type.Kind != ast.TypeEnumeration || a.Type.EnumRef == nil {
-			continue
+		if err := validateAttributeTypeRef(ctx, a.Name, a.Type); err != nil {
+			return err
 		}
-		refModule := a.Type.EnumRef.Module
-		refName := a.Type.EnumRef.Name
-		if findEnumeration(ctx, refModule, refName) != nil {
-			continue
-		}
-		if _, err := findEntity(ctx, refModule, refName); err == nil {
-			continue
-		}
-		return mdlerrors.NewValidationf(
-			"attribute '%s': unknown type '%s' — not a primitive, enumeration, or entity",
-			a.Name, a.Type.EnumRef.String())
 	}
 
 	// Create attributes and build name-to-ID map for validation rules and indexes
 	// Also detect pseudo-types (AutoOwner, AutoChangedBy, etc.) and set entity flags
 	var storeOwner, storeChangedBy, storeCreatedDate, storeChangedDate bool
+
+	// On CREATE OR MODIFY of an existing entity, reuse each retained attribute's
+	// existing ID rather than minting a fresh one. Attribute identity is what
+	// Mendix's DB synchronizer keys off: a new ID for an unchanged attribute reads
+	// as "old attribute departed, new attribute added", so it DROPS and re-adds the
+	// column — wiping the stored data. Reusing the ID by name makes an identical
+	// re-run truly idempotent (no spurious sync, no data loss). Genuinely new
+	// attributes still get a fresh ID. (findings #13)
+	existingAttrIDByName := make(map[string]model.ID)
+	if s.CreateOrModify && existingEntity != nil {
+		for _, ea := range existingEntity.Attributes {
+			existingAttrIDByName[ea.Name] = ea.ID
+		}
+	}
 
 	var attrs []*domainmodel.Attribute
 	attrNameToID := make(map[string]model.ID)
@@ -163,29 +289,28 @@ func execCreateEntity(ctx *ExecContext, s *ast.CreateEntityStmt) error {
 			doc = a.Comment
 		}
 
-		// Generate ID for the attribute so we can reference it in validation rules/indexes
+		// Generate ID for the attribute so we can reference it in validation rules/indexes.
+		// On CREATE OR MODIFY, reuse the existing attribute's ID (by name) to preserve
+		// identity and avoid a destructive DB column drop/re-add. (findings #13)
 		attrID := model.ID(types.GenerateID())
+		if id, ok := existingAttrIDByName[a.Name]; ok {
+			attrID = id
+		}
 		attrNameToID[a.Name] = attrID
 
 		attr := &domainmodel.Attribute{
 			Name:          a.Name,
 			Documentation: doc,
 			Type:          convertDataType(a.Type),
+			ExportLevel:   authoredExportLevel(a.ExportLevel),
 		}
 		attr.ID = attrID
 
 		// Value type: CALCULATED or DEFAULT
 		if a.Calculated {
-			attrValue := &domainmodel.AttributeValue{
-				Type: "CalculatedValue",
-			}
-			if a.CalculatedMicroflow != nil {
-				mfID, err := resolveMicroflowByName(ctx, a.CalculatedMicroflow.String())
-				if err != nil {
-					return mdlerrors.NewBackend(fmt.Sprintf("attribute '%s'", a.Name), err)
-				}
-				attrValue.MicroflowID = mfID
-				attrValue.MicroflowName = a.CalculatedMicroflow.String()
+			attrValue, err := resolveCalculatedValue(ctx, a.CalculatedMicroflow, s.Name.String(), a.Name, a.Type)
+			if err != nil {
+				return err
 			}
 			attr.Value = attrValue
 		} else if a.HasDefault {
@@ -221,7 +346,7 @@ func execCreateEntity(ctx *ExecContext, s *ast.CreateEntityStmt) error {
 			vr.ID = model.ID(types.GenerateID())
 			if a.NotNullError != "" {
 				vr.ErrorMessage = &model.Text{
-					Translations: map[string]string{"en_US": a.NotNullError},
+					Translations: map[string]string{authoringLanguage(ctx): a.NotNullError},
 				}
 				vr.ErrorMessage.ID = model.ID(types.GenerateID())
 			}
@@ -237,7 +362,7 @@ func execCreateEntity(ctx *ExecContext, s *ast.CreateEntityStmt) error {
 			vr.ID = model.ID(types.GenerateID())
 			if a.UniqueError != "" {
 				vr.ErrorMessage = &model.Text{
-					Translations: map[string]string{"en_US": a.UniqueError},
+					Translations: map[string]string{authoringLanguage(ctx): a.UniqueError},
 				}
 				vr.ErrorMessage.ID = model.ID(types.GenerateID())
 			}
@@ -251,6 +376,10 @@ func execCreateEntity(ctx *ExecContext, s *ast.CreateEntityStmt) error {
 		idxID := model.ID(types.GenerateID())
 		var indexAttrs []*domainmodel.IndexAttribute
 		for _, col := range idx.Columns {
+			if typ := systemIndexMemberType(col.Name, storeCreatedDate, storeChangedDate); typ != "" {
+				indexAttrs = append(indexAttrs, newSystemIndexSegment(typ, col.Descending))
+				continue
+			}
 			if attrID, ok := attrNameToID[col.Name]; ok {
 				iaID := model.ID(types.GenerateID())
 				ia := &domainmodel.IndexAttribute{
@@ -290,9 +419,18 @@ func execCreateEntity(ctx *ExecContext, s *ast.CreateEntityStmt) error {
 		HasChangedBy:    storeChangedBy,
 		HasCreatedDate:  storeCreatedDate,
 		HasChangedDate:  storeChangedDate,
+		ExportLevel:     authoredExportLevel(s.ExportLevel),
+	}
+	if autoPlace {
+		// The next grid slot whose box clears everything already in the module.
+		// A bare GridSlot let an entity with ~17+ attributes overlap the one
+		// below it (#1479); `mxcli layout` computes a real layout.
+		entity.Location = dmlayout.Place(dm, entity)
 	}
 
-	// Set generalization (inheritance) if specified
+	// Set generalization (inheritance) if specified. A bare, unqualified target
+	// was already refused at the top of this function — it is stored as-is and
+	// produces a project Mendix cannot open.
 	if s.Generalization != nil {
 		entity.GeneralizationRef = s.Generalization.String()
 	}
@@ -307,6 +445,55 @@ func execCreateEntity(ctx *ExecContext, s *ast.CreateEntityStmt) error {
 				return mdlerrors.NewBackend("delete orphaned view entity source document", err)
 			}
 		}
+		// Warn (non-blocking) about members this CREATE OR MODIFY drops. The
+		// path rebuilds the entity from the statement alone and replaces the
+		// stored one, so any existing attribute the statement omits is silently
+		// deleted — which, when a widget or microflow still binds it, surfaces
+		// much later as CE1613. The user asked to modify, so we still apply it,
+		// but list what is being removed so accidental data loss is visible
+		// rather than silent. (findings #24)
+		if dropped := droppedEntityMembers(existingEntity, entity); len(dropped) > 0 {
+			fmt.Fprintf(ctx.Output,
+				"⚠ create or modify entity %s drops %d existing member(s) not listed in this statement: %s\n",
+				s.Name, len(dropped), strings.Join(dropped, ", "))
+			fmt.Fprintf(ctx.Output,
+				"  They are removed from the entity; anything still bound to them (widgets, microflows) will fail the build with CE1613.\n")
+			fmt.Fprintf(ctx.Output,
+				"  To add attributes without disturbing the rest, use: alter entity %s add attribute <name>: <type>;\n", s.Name)
+		}
+		// Carry forward (and prune) indexes so a dropped indexed attribute doesn't
+		// leave an orphaned index that crashes `mx check` (finding #39).
+		// MODIFY IN PLACE rather than replace. `create or modify` declares the
+		// entity's ATTRIBUTE SET — omitting one removes it, warned about above —
+		// but that is a statement about attributes and not a licence to discard
+		// everything else the entity holds. The code used to rebuild the whole
+		// entity from the AST and swap the object in, so every field the syntax
+		// has no words for went with it.
+		//
+		// That is how the access rules went: `create or modify persistent entity`
+		// on an existing entity deleted every grant on it, with `Modified entity:`
+		// as the only output (ako/mxcli-rest). Measured on a real project, 174
+		// access rules to 132 by re-running one domain-model script over eight
+		// entities — and a byte-identical re-run lost them just as completely,
+		// because the rebuild genuinely differs and so is not elided.
+		//
+		// Preserving by construction rather than by a carry list is the point.
+		// The list was already at documentation and indexes, each added after its
+		// own defect report; access rules would have been the third, and the
+		// external-source and OData fields the next. Starting from what is stored
+		// and overwriting only what the statement declares has no such tail.
+		// Recorded before the merge, which may reuse the stored attributes:
+		// the views over a changed attribute are resynced after the write.
+		storedSignatures := attributeSignatures(existingEntity)
+		entity = mergeDeclaredOntoStoredEntity(existingEntity, entity, s)
+		if droppedIdx := reconcileDroppedIndexes(entity, existingEntity); droppedIdx > 0 {
+			fmt.Fprintf(ctx.Output,
+				"  Dropped %d index(es) that referenced removed attribute(s).\n", droppedIdx)
+		}
+		// An attribute the statement dropped must lose its member access too, or
+		// the carried rule dangles — the same class reconcileDroppedIndexes
+		// exists to prevent, one member over.
+		pruneMemberAccessesForDroppedAttributes(entity, existingEntity)
 		// Update existing entity
 		entity.ID = existingEntity.ID
 		if err := ctx.Backend.UpdateEntity(dm.ID, entity); err != nil {
@@ -315,7 +502,9 @@ func execCreateEntity(ctx *ExecContext, s *ast.CreateEntityStmt) error {
 		// Invalidate caches so updated entity is visible
 		invalidateHierarchy(ctx)
 		invalidateDomainModelsCache(ctx)
-		fmt.Fprintf(ctx.Output, "Modified entity: %s\n", s.Name)
+		ctx.ReportMutation("Modified", "entity: %s", s.Name)
+		noteKeptNotLocalized(ctx, s.Name.String(), keptNotLocalized(entity.Attributes, statedLocalize(s.Attributes)))
+		resyncViewsOverSource(ctx, s.Name.String(), changedAttributes(storedSignatures, entity))
 	} else {
 		// Create new entity
 		if err := ctx.Backend.CreateEntity(dm.ID, entity); err != nil {
@@ -331,6 +520,510 @@ func execCreateEntity(ctx *ExecContext, s *ast.CreateEntityStmt) error {
 	return nil
 }
 
+// mergeDeclaredOntoStoredEntity returns the stored entity with the fields this
+// statement actually declares overwritten from the rebuilt one.
+//
+// The split is what the MDL syntax can express. Everything in the first group
+// below has a spelling in `create or modify entity`, so the statement is
+// authoritative about it — including the attribute set, where an omission is a
+// removal (warned about by droppedEntityMembers). Everything else — access
+// rules, the view/external source fields, the OData remote properties — has no
+// spelling at all, so an omission carries no meaning and the stored value stands.
+//
+// Documentation is declared-but-optional and is distinguished by its own AST
+// flag rather than by an empty value: a rewrite that says nothing about it
+// preserves what is stored, while an explicitly empty `/** */` clears it
+// (mendixlabs/mxcli#1018).
+//
+// entityFieldsDeclaredByStatement lists the first group by name, and
+// TestMergeDeclaredOntoStoredEntity_EveryFieldHasADecision fails on any Entity
+// field missing from it — so adding one to the struct forces the choice rather
+// than defaulting to whichever branch happens to be the safe one here.
+func mergeDeclaredOntoStoredEntity(stored, declared *domainmodel.Entity, s *ast.CreateEntityStmt) *domainmodel.Entity {
+	if stored == nil {
+		return declared
+	}
+	merged := *stored
+	merged.Name = declared.Name
+	merged.Persistable = declared.Persistable
+	merged.Location = declared.Location
+	merged.Attributes = declared.Attributes
+	carryStoredAttributeState(stored, merged.Attributes, statedLocalize(s.Attributes))
+	merged.ValidationRules = mergeValidationRules(stored, declared)
+	merged.Indexes = declared.Indexes
+	merged.EventHandlers = declared.EventHandlers
+	merged.HasOwner = declared.HasOwner
+	merged.HasChangedBy = declared.HasChangedBy
+	merged.HasCreatedDate = declared.HasCreatedDate
+	merged.HasChangedDate = declared.HasChangedDate
+	// An omitted EXTENDS still removes the generalization — there is no "extends
+	// nothing" spelling, so preserving it would make an inheritance impossible to
+	// remove. It is reported by droppedEntityMembers instead, which is the same
+	// treatment an omitted attribute gets.
+	//
+	// Generalization and GeneralizationID are the READ-side spellings of the same
+	// thing, which the executor never fills. Both writers key off
+	// GeneralizationRef alone, so carrying the stored pair would be inert today —
+	// they are overwritten anyway, because a stale parent left beside a changed
+	// ref is a trap for whichever writer reads them first.
+	merged.GeneralizationRef = declared.GeneralizationRef
+	merged.Generalization = declared.Generalization
+	merged.GeneralizationID = declared.GeneralizationID
+	if s != nil && !s.DocumentationSet {
+		merged.Documentation = stored.Documentation
+	} else {
+		merged.Documentation = declared.Documentation
+	}
+	// EXPORT LEVEL likewise: an absent clause ("" on the rebuilt entity) keeps
+	// the stored level (mendixlabs/mxcli#1498).
+	if declared.ExportLevel != "" {
+		merged.ExportLevel = declared.ExportLevel
+	}
+	return &merged
+}
+
+// carryStoredAttributeState carries, by attribute name, what the entity body
+// has no spelling for onto the attributes the statement rebuilt: an external
+// entity attribute's OData mapping (without it the writer emits a plain
+// StoredValue and the attribute is no longer mapped to the remote property), and
+// a DateTime's LocalizeDate. The attribute set and each declared type stay the
+// statement's; LocalizeDate carries only onto a DateTime that stays one (#743),
+// and only when the statement did not state `localized` / `not localized`
+// itself (stated, by attribute name) — a stated one wins (#1373).
+func carryStoredAttributeState(stored *domainmodel.Entity, declared []*domainmodel.Attribute, stated map[string]bool) {
+	byName := make(map[string]*domainmodel.Attribute, len(stored.Attributes))
+	for _, a := range stored.Attributes {
+		if a != nil {
+			byName[a.Name] = a
+		}
+	}
+	for _, a := range declared {
+		if a == nil {
+			continue
+		}
+		old, ok := byName[a.Name]
+		if !ok {
+			continue
+		}
+		if old.RemoteName != "" || old.IsPrimitiveCollection {
+			a.RemoteName = old.RemoteName
+			a.RemoteType = old.RemoteType
+			a.Filterable = old.Filterable
+			a.Sortable = old.Sortable
+			a.Creatable = old.Creatable
+			a.Updatable = old.Updatable
+			a.IsPrimitiveCollection = old.IsPrimitiveCollection
+			// A mapped attribute's design-time default has no spelling in the
+			// `from odata client` form, so an undeclared one keeps the stored.
+			if a.Value == nil && old.Value != nil {
+				v := *old.Value
+				a.Value = &v
+			}
+		}
+		if !stated[a.Name] {
+			carryStoredLocalizeDate(old.Type, a.Type)
+		}
+		if a.ExportLevel == "" {
+			a.ExportLevel = old.ExportLevel // no EXPORT LEVEL clause: keep it (#1498)
+		}
+	}
+}
+
+// carryStoredLocalizeDate copies a stored DateTime's LocalizeDate onto a rebuilt
+// type that is still a DateTime. A type change is the statement's to decide, so
+// nothing carries onto (or from) another type. It reports whether that kept a
+// stored `not localized` — the case noteKeptNotLocalized tells the user about.
+func carryStoredLocalizeDate(stored, rebuilt domainmodel.AttributeType) bool {
+	dt, ok := rebuilt.(*domainmodel.DateTimeAttributeType)
+	if !ok {
+		return false
+	}
+	if odt, ok := stored.(*domainmodel.DateTimeAttributeType); ok {
+		dt.LocalizeDate = odt.LocalizeDate
+		return !odt.LocalizeDate
+	}
+	return false
+}
+
+// keptNotLocalized names the attributes a rewrite left `not localized` without
+// the statement saying so: an unstated `localized` on a DateTime defaults to
+// localized for a new attribute, so a written false on an unstated one can only
+// be the carried stored value.
+func keptNotLocalized(attrs []*domainmodel.Attribute, stated map[string]bool) []string {
+	var names []string
+	for _, a := range attrs {
+		if a == nil || stated[a.Name] {
+			continue
+		}
+		if dt, ok := a.Type.(*domainmodel.DateTimeAttributeType); ok && !dt.LocalizeDate {
+			names = append(names, a.Name)
+		}
+	}
+	return names
+}
+
+// noteKeptNotLocalized says when an unstated `localized` kept a stored `not
+// localized` (mendixlabs/mxcli#1521). The carry is deliberate — a rewrite must
+// not flip a Studio Pro choice it has no words for (#743) — but it is invisible
+// in the statement, and the reporter's script that meant the default left a
+// DateTime in UTC with no trace. Stated values and stored-localized attributes
+// are never noted.
+func noteKeptNotLocalized(ctx *ExecContext, entity string, names []string) {
+	for _, n := range names {
+		fmt.Fprintf(ctx.Output,
+			"  Note: %s.%s keeps its stored `not localized` (the statement does not say); "+
+				"write `%s: DateTime localized` to change it.\n", entity, n, n)
+	}
+}
+
+// statedLocalize names the attributes whose definition states `localized` or
+// `not localized` — the ones whose LocalizeDate is the statement's, not the
+// stored value's.
+func statedLocalize(attrs []ast.Attribute) map[string]bool {
+	var stated map[string]bool
+	for _, a := range attrs {
+		if a.Type.Localize != ast.LocalizeUnstated {
+			if stated == nil {
+				stated = make(map[string]bool)
+			}
+			stated[a.Name] = true
+		}
+	}
+	return stated
+}
+
+// entityFieldsDeclaredByStatement names the domainmodel.Entity fields that
+// `create or modify entity` is authoritative about — the ones
+// mergeDeclaredOntoStoredEntity takes from the rebuilt entity. Every other field
+// is preserved from what is stored. It is a package-level var rather than a
+// literal in the test because the test's job is to fail when the struct grows a
+// field this list does not mention.
+var entityFieldsDeclaredByStatement = map[string]bool{
+	"Name":              true,
+	"Documentation":     true, // via s.DocumentationSet; see above
+	"Location":          true,
+	"Persistable":       true,
+	"Attributes":        true,
+	"Indexes":           true,
+	"EventHandlers":     true,
+	"HasOwner":          true,
+	"HasChangedBy":      true,
+	"HasCreatedDate":    true,
+	"HasChangedDate":    true,
+	"GeneralizationRef": true,
+	"Generalization":    true,
+	"GeneralizationID":  true,
+	"ExportLevel":       true, // when stated: "" keeps the stored level (#1498)
+	// ContainerID and the embedded BaseElement identify the stored element, so
+	// they are preserved. `entity.ID = existingEntity.ID` at the call site says
+	// the same thing about the ID; the merge is where it now comes from.
+	//
+	// ValidationRules is in neither group — see entityFieldsMergedWithStored.
+}
+
+// entityFieldsMergedWithStored names the fields the statement is authoritative
+// about only IN PART, so neither "take the declared value" nor "keep the stored
+// one" is right and the merge has to decide per element.
+//
+// There is exactly one, and it earned its place: the entity body can spell
+// `not null` and `unique` and nothing else, so it declares Required and Unique
+// rules and says nothing at all about RegEx, Range, MaxLength or EqualsTo —
+// which are authored by `create validation rule`, a separate statement.
+// Overwriting the whole list deleted those on every rewrite (ako/mxcli#556).
+//
+// A field listed here is exempt from the value check in
+// TestMergeDeclaredOntoStoredEntity_EveryFieldHasADecision, so adding one means
+// writing the tests for its semantics by hand.
+var entityFieldsMergedWithStored = map[string]bool{
+	"ValidationRules": true,
+}
+
+// mergeValidationRules keeps the rules the entity body cannot express and lets
+// the statement own the ones it can.
+//
+// `create [or modify] entity` authors exactly two rule types — Required from
+// `not null` and Unique from `unique` — so for those an omission is a removal,
+// the same contract an omitted attribute has. Every other type (RegEx, Range,
+// and the MaxLength/EqualsTo that do not survive the read at all) has no
+// spelling in the statement, so an omission carries no meaning and the stored
+// rule stands.
+//
+// Dropping them was not merely lossy, it churned: the following
+// `create validation rule` statement put an identically-shaped rule back under
+// four fresh element identities, so an idempotent script reported
+// `Modified entity: …` forever and the unit never came back byte-identical
+// (ako/mxcli#556, measured at 62 differing bytes in a 1,368-byte unit).
+//
+// Carrying a MaxLength or EqualsTo rule matters for a second reason: the model
+// carries no payload for either, so it is UpdateEntity's refusal — not this
+// function — that must see it. Dropping it here skipped the guard entirely and
+// turned "mxcli will not rewrite this entity" into a silent loss of the
+// constraint that no build reports (guard-don't-drop, ADR-0005).
+//
+// Stored order is kept, with a re-declared Required/Unique rule taking the
+// stored one's position, so the rewrite is a minimal diff rather than a
+// reshuffle.
+func mergeValidationRules(stored, declared *domainmodel.Entity) []*domainmodel.ValidationRule {
+	attrNameByID := make(map[model.ID]string, len(declared.Attributes))
+	declaredAttrNames := make(map[string]bool, len(declared.Attributes))
+	for _, a := range declared.Attributes {
+		if a == nil {
+			continue
+		}
+		attrNameByID[a.ID] = a.Name
+		declaredAttrNames[a.Name] = true
+	}
+	storedAttrNames := make(map[string]bool, len(stored.Attributes))
+	for _, a := range stored.Attributes {
+		if a != nil {
+			storedAttrNames[a.Name] = true
+		}
+	}
+
+	declaredBySlot := make(map[string]*domainmodel.ValidationRule, len(declared.ValidationRules))
+	for _, vr := range declared.ValidationRules {
+		if vr == nil {
+			continue
+		}
+		declaredBySlot[validationRuleSlot(vr, attrNameByID)] = vr
+	}
+
+	out := make([]*domainmodel.ValidationRule, 0, len(stored.ValidationRules)+len(declared.ValidationRules))
+	taken := make(map[*domainmodel.ValidationRule]bool, len(declared.ValidationRules))
+	for _, vr := range stored.ValidationRules {
+		if vr == nil {
+			continue
+		}
+		// A rule may only be dropped on POSITIVE evidence that this rewrite
+		// removed its attribute: the stored entity owned one of that name and the
+		// rebuilt one does not. "Not among the declared attributes" is the wrong
+		// predicate and wrong in the direction that loses data — an entity's rules
+		// can name INHERITED members, which never appear in its own Attributes
+		// list, and an entity that owns no attributes at all would lose every rule.
+		// (The same trap cost a day in pruneMemberAccessesForDroppedAttributes.)
+		name := validationRuleAttributeName(vr, attrNameByID)
+		if storedAttrNames[name] && !declaredAttrNames[name] {
+			continue
+		}
+		if !entityBodyDeclaresRuleType(vr.Type) {
+			out = append(out, vr)
+			continue
+		}
+		if d, ok := declaredBySlot[validationRuleSlot(vr, attrNameByID)]; ok && !taken[d] {
+			taken[d] = true
+			out = append(out, d)
+		}
+	}
+	for _, vr := range declared.ValidationRules {
+		if vr == nil || taken[vr] {
+			continue
+		}
+		out = append(out, vr)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// entityBodyDeclaresRuleType reports whether `create [or modify] entity` has a
+// spelling for this rule type, and so is authoritative about its presence.
+//
+// The empty string is Required: a rule whose RuleInfo the reader could not name
+// is written back as RequiredRuleInfo (ruleInfoToGen's `case "Required", ""`),
+// so treating it as anything else here would let the same rule be both carried
+// and re-declared.
+func entityBodyDeclaresRuleType(t string) bool {
+	return t == "Required" || t == "Unique" || t == ""
+}
+
+// validationRuleSlot identifies the (attribute, rule type) pair a rule occupies.
+// Mendix allows one rule of a type per attribute, so this is what decides that a
+// declared rule REPLACES a stored one rather than joining it.
+func validationRuleSlot(vr *domainmodel.ValidationRule, attrNameByID map[model.ID]string) string {
+	t := vr.Type
+	if t == "" {
+		t = "Required"
+	}
+	return validationRuleAttributeName(vr, attrNameByID) + "\x00" + t
+}
+
+// validationRuleAttributeName resolves the attribute a rule constrains, across
+// the two spellings the field carries.
+//
+// The modelsdk reader puts a QUALIFIED NAME in AttributeID (validationRuleFromGen
+// — the writer accepts either and this is the lossless one), while a rule the
+// executor just built from the statement holds a real attribute ID. Reading only
+// one would make this function a no-op on half its inputs.
+func validationRuleAttributeName(vr *domainmodel.ValidationRule, attrNameByID map[model.ID]string) string {
+	s := string(vr.AttributeID)
+	if i := strings.LastIndex(s, "."); i >= 0 {
+		return s[i+1:]
+	}
+	if n, ok := attrNameByID[vr.AttributeID]; ok {
+		return n
+	}
+	return s
+}
+
+// pruneMemberAccessesForDroppedAttributes removes the member entries of the
+// preserved access rules whose attribute this rewrite removed.
+//
+// Attributes the rewrite ADDS need nothing here: each engine extends a rule with
+// the missing members at the rule's default rights on write (syncMemberAccesses,
+// ReconcileMemberAccesses). Only removal has to be handled, and only here.
+func pruneMemberAccessesForDroppedAttributes(entity, stored *domainmodel.Entity) {
+	if stored == nil || len(entity.AccessRules) == 0 {
+		return
+	}
+	// A member is pruned only on POSITIVE evidence that this rewrite removed its
+	// attribute: the STORED entity owned it and the rebuilt one does not. The
+	// obvious predicate — "not among the rebuilt entity's attributes" — is wrong,
+	// and wrong in the direction that breaks security. An entity's access rules
+	// also govern its INHERITED members, and those never appear in its own
+	// Attributes list: CapTrack.ExportDocument extends System.FileDocument and
+	// owns no attributes at all, so that predicate emptied all five of its rules
+	// and mxbuild reported CE0066 "Entity access is out of date" — a regression
+	// an earlier version of this fix introduced, and which only a specialisation
+	// exposes.
+	kept := make(map[string]bool, len(entity.Attributes))
+	for _, a := range entity.Attributes {
+		kept[strings.ToLower(a.Name)] = true
+	}
+	removed := make(map[string]bool)
+	for _, a := range stored.Attributes {
+		if !kept[strings.ToLower(a.Name)] {
+			removed[strings.ToLower(a.Name)] = true
+			if a.ID != "" {
+				removed[string(a.ID)] = true
+			}
+		}
+	}
+	if len(removed) == 0 {
+		return
+	}
+	survives := func(ma *domainmodel.MemberAccess) bool {
+		// Both fields are consulted because the two engines fill different ones:
+		// the modelsdk reader populates only AttributeName (memberAccessFromGen),
+		// the legacy one an AttributeID. The DROP ATTRIBUTE cleanup this mirrors
+		// checks both for the same reason.
+		if ma.AttributeID != "" && removed[string(ma.AttributeID)] {
+			return false
+		}
+		if ma.AttributeName == "" {
+			return true
+		}
+		name := ma.AttributeName
+		if i := strings.LastIndex(name, "."); i >= 0 {
+			name = name[i+1:]
+		}
+		return !removed[strings.ToLower(name)]
+	}
+	for _, rule := range entity.AccessRules {
+		if rule == nil {
+			continue
+		}
+		var members []*domainmodel.MemberAccess
+		for _, ma := range rule.MemberAccesses {
+			if survives(ma) {
+				members = append(members, ma)
+			}
+		}
+		rule.MemberAccesses = members
+	}
+}
+
+// reconcileDroppedIndexes fixes ledger finding #39: when CREATE OR MODIFY drops
+// an indexed attribute, the entity's index for it is left orphaned (its column
+// references a GUID that no longer exists), which crashes `mx check` with an
+// unhandled AggregateException. When the statement lists NO index clause of its
+// own (so `entity.Indexes` is empty), carry the existing entity's indexes forward
+// but prune any column referencing an attribute the new entity no longer has, and
+// drop indexes left with no columns. A statement that DOES list indexes replaces
+// wholesale (unchanged). Attribute IDs survive by name across CREATE OR MODIFY
+// (findings #13), so a surviving attribute keeps the ID its index references.
+// Returns the number of indexes dropped, for the drop warning.
+func reconcileDroppedIndexes(entity, existing *domainmodel.Entity) int {
+	if entity == nil || existing == nil || len(entity.Indexes) > 0 {
+		return 0
+	}
+	valid := make(map[model.ID]bool, len(entity.Attributes))
+	for _, a := range entity.Attributes {
+		valid[a.ID] = true
+	}
+	var kept []*domainmodel.Index
+	dropped := 0
+	for _, idx := range existing.Indexes {
+		var attrs []*domainmodel.IndexAttribute
+		for _, ia := range idx.Attributes {
+			if valid[ia.AttributeID] || systemIndexSegmentStored(entity, ia) {
+				attrs = append(attrs, ia)
+			}
+		}
+		var ids []model.ID
+		for _, id := range idx.AttributeIDs {
+			if valid[id] {
+				ids = append(ids, id)
+			}
+		}
+		if len(attrs) > 0 || len(ids) > 0 {
+			idx.Attributes = attrs
+			idx.AttributeIDs = ids
+			kept = append(kept, idx)
+		} else {
+			dropped++
+		}
+	}
+	entity.Indexes = kept
+	return dropped
+}
+
+// isViewEntity reports whether an entity is an OQL view entity. View entities
+// cannot participate in associations (CE6771) and behave differently from
+// persistent entities in several checks. The canonical marker is the
+// DomainModels$OqlViewEntitySource source type; OqlQuery / SourceDocumentRef are
+// belt-and-suspenders fallbacks for read paths that populate one but not the other.
+func isViewEntity(e *domainmodel.Entity) bool {
+	if e == nil {
+		return false
+	}
+	return e.Source == "DomainModels$OqlViewEntitySource" ||
+		e.OqlQuery != "" || e.SourceDocumentRef != ""
+}
+
+// viewEntityAttributeSetRefusal refuses an ALTER ENTITY that adds or drops an
+// attribute of a view entity. A view entity's attributes are the columns of its
+// OQL query, each an OqlViewValue bound to a select alias, so changing the set
+// on its own leaves the entity out of sync with the query: ADD wrote a
+// StoredValue attribute with no column behind it and DROP left a column with no
+// attribute, both CE6770 "View Entity is out of sync with the OQL Query." on
+// 11.12.1 (mendixlabs/mxcli#1173). The query is the declaration, so the change
+// belongs in the statement that carries it. RENAME is not refused: the column is
+// bound by the value's Reference, not the attribute name, and it builds clean.
+func viewEntityAttributeSetRefusal(entityQN, verb, attrName string) error {
+	return mdlerrors.NewValidationf(
+		"cannot %s attribute '%s' on %s: it is a view entity, whose attributes are the "+
+			"columns of its OQL query — changing them on their own gives CE6770 "+
+			"\"View Entity is out of sync with the OQL Query.\"\n"+
+			"    Change the query and the attribute list together with "+
+			"'create or modify view entity %s (…) as (select …)'; "+
+			"'describe entity %s' prints the current definition to start from",
+		verb, attrName, entityQN, entityQN, entityQN)
+}
+
+// droppedEntityMembers reports the members present on existing but absent from
+// replacement — i.e. what a CREATE OR MODIFY replace would delete. Named
+// attributes are compared case-insensitively; the four audit system fields and
+// the generalization are reported when existing carries one and replacement does
+// not. Used to surface accidental data loss (findings #24).
+//
+// The comparison itself lives in droppedMembers, shared with the check-time
+// MDL087 pass (ako/mxcli#562). Two hand-written diffs at two layers is how the
+// audit fields came to be covered by one and not the other.
+func droppedEntityMembers(existing, replacement *domainmodel.Entity) []string {
+	return droppedMembers(memberSetFromEntity(existing), memberSetFromEntity(replacement))
+}
+
 // execCreateViewEntity handles CREATE VIEW ENTITY statements.
 func execCreateViewEntity(ctx *ExecContext, s *ast.CreateViewEntityStmt) error {
 	if !ctx.Connected() {
@@ -338,9 +1031,7 @@ func execCreateViewEntity(ctx *ExecContext, s *ast.CreateViewEntityStmt) error {
 	}
 
 	// Version pre-check
-	if err := checkFeature(ctx, "domain_model", "view_entities",
-		"create view entity",
-		"upgrade your project to 10.18+ or use a regular entity with a microflow data source"); err != nil {
+	if err := checkVersionGates(ctx, s); err != nil {
 		return err
 	}
 
@@ -355,6 +1046,20 @@ func execCreateViewEntity(ctx *ExecContext, s *ast.CreateViewEntityStmt) error {
 			return mdlerrors.NewValidationf("invalid OQL in view entity '%s':\n  - %s",
 				s.Name.String(), strings.Join(msgs, "\n  - "))
 		}
+	}
+
+	// An attribute that tries to hold an object is refused here as well as by
+	// check, because `exec --no-check` otherwise writes it — as an enumeration
+	// type naming an entity, which fails the build or stops mx check from
+	// loading the project (FINDINGS §4).
+	var objErrors []string
+	for _, v := range ValidateViewAttributeDeclarations(s.Query.RawQuery, s.Attributes) {
+		objErrors = append(objErrors, v.Message+". "+v.Suggestion)
+	}
+	objErrors = append(objErrors, viewAttributeEntityTypeErrors(ctx, s.Query.RawQuery, s.Attributes, nil)...)
+	if len(objErrors) > 0 {
+		return mdlerrors.NewValidationf("view entity '%s':\n  - %s",
+			s.Name.String(), strings.Join(objErrors, "\n  - "))
 	}
 
 	// Find module
@@ -381,6 +1086,15 @@ func execCreateViewEntity(ctx *ExecContext, s *ast.CreateViewEntityStmt) error {
 	// If entity exists: REPLACE drops and recreates, MODIFY updates in place
 	if existingEntity != nil && !s.CreateOrModify && !s.CreateOrReplace {
 		return mdlerrors.NewAlreadyExistsMsg("entity", s.Name.Module+"."+s.Name.Name, fmt.Sprintf("entity already exists: %s.%s (use create or modify to update, or create or replace to drop and recreate)", s.Name.Module, s.Name.Name))
+	}
+
+	// The query to store. A statement whose query is what the stored one
+	// describes to keeps the stored bytes: describe cannot carry whitespace or
+	// comments outside the query's tokens, and replaying it re-indented the
+	// stored OQL (mendixlabs/mxcli#1627).
+	query := s.Query.RawQuery
+	if existingEntity != nil {
+		query = carriedViewQuery(query, existingEntity.OqlQuery)
 	}
 
 	// CREATE OR REPLACE: delete existing entity and source doc, then recreate
@@ -411,27 +1125,26 @@ func execCreateViewEntity(ctx *ExecContext, s *ast.CreateViewEntityStmt) error {
 		location = model.Point{X: s.Position.X, Y: s.Position.Y}
 	} else if existingEntity != nil {
 		location = existingEntity.Location
-	} else {
-		location = model.Point{X: 100 + len(dm.Entities)*150, Y: 100}
 	}
+	autoPlace := s.Position == nil && existingEntity == nil
 
-	// Create or update ViewEntitySourceDocument (separate document for OQL query)
+	// Create or update ViewEntitySourceDocument (separate document for OQL query).
+	// Written IN PLACE: this used to delete the stored document and insert a fresh
+	// one every time, which replaced the unit under a new GUID on every run and
+	// made `exec` report `Unchanged view entity` for a statement that had just
+	// rewritten the OQL — an insert is not a counted write, so the elision check
+	// saw only the (genuinely unchanged) domain-model unit (ako/mxcli#583).
+	// Duplicate documents, which the delete existed to clear, are still removed.
 	sourceDocRef := s.Name.Module + "." + s.Name.Name
-	// Always delete any existing ViewEntitySourceDocument before creating a new one.
-	// This prevents duplicate OQL documents from accumulating (e.g., from re-running
-	// scripts or after a previous DROP that didn't clean up properly).
-	if err := ctx.Backend.DeleteViewEntitySourceDocumentByName(s.Name.Module, s.Name.Name); err != nil {
-		return mdlerrors.NewBackend("delete existing ViewEntitySourceDocument", err)
-	}
-	_, err = ctx.Backend.CreateViewEntitySourceDocument(
+	_, err = ctx.Backend.WriteViewEntitySourceDocument(
 		module.ID,
 		s.Name.Module,
 		s.Name.Name,
-		s.Query.RawQuery,
+		query,
 		s.Documentation,
 	)
 	if err != nil {
-		return mdlerrors.NewBackend("create ViewEntitySourceDocument", err)
+		return mdlerrors.NewBackend("write ViewEntitySourceDocument", err)
 	}
 
 	// Create view attributes with OqlViewValue references.
@@ -442,6 +1155,9 @@ func execCreateViewEntity(ctx *ExecContext, s *ast.CreateViewEntityStmt) error {
 			existingAttrsByName[ea.Name] = ea
 		}
 	}
+	// A DateTime column's LocalizeDate is the source attribute's, not Mendix's
+	// default: a mismatch is CE6770 (#1297).
+	localize := viewDateTimeLocalize(ctx, query, s.Attributes)
 	var attrs []*domainmodel.Attribute
 	for _, a := range s.Attributes {
 		attr := &domainmodel.Attribute{
@@ -450,12 +1166,21 @@ func execCreateViewEntity(ctx *ExecContext, s *ast.CreateViewEntityStmt) error {
 			Value: &domainmodel.AttributeValue{
 				ViewReference: a.Name, // OQL column alias matches attribute name
 			},
+			ExportLevel: authoredExportLevel(a.ExportLevel),
+		}
+		if dt, ok := attr.Type.(*domainmodel.DateTimeAttributeType); ok && a.Type.Localize == ast.LocalizeUnstated {
+			if l, ok := localize[a.Name]; ok {
+				dt.LocalizeDate = l
+			}
 		}
 		// Preserve IDs from existing attribute with same name
 		if ea, ok := existingAttrsByName[a.Name]; ok {
 			attr.ID = ea.ID
 			if ea.Value != nil {
 				attr.Value.ID = ea.Value.ID
+			}
+			if attr.ExportLevel == "" {
+				attr.ExportLevel = ea.ExportLevel // no clause: keep it (#1498)
 			}
 		}
 		attrs = append(attrs, attr)
@@ -472,20 +1197,48 @@ func execCreateViewEntity(ctx *ExecContext, s *ast.CreateViewEntityStmt) error {
 		Attributes:        attrs,
 		Source:            "DomainModels$OqlViewEntitySource",
 		SourceDocumentRef: sourceDocRef,
-		OqlQuery:          s.Query.RawQuery,
+		OqlQuery:          query,
+		ExportLevel:       authoredExportLevel(s.ExportLevel),
+	}
+	if autoPlace {
+		entity.Location = dmlayout.Place(dm, entity)
 	}
 
+	created := entity
 	if s.CreateOrModify && existingEntity != nil {
-		// Update existing entity — preserve Source object ID to avoid CE-6770
-		entity.ID = existingEntity.ID
-		entity.SourceObjectID = existingEntity.SourceObjectID
+		// Modify IN PLACE, as a persistent entity is (mergeDeclaredOntoStoredEntity):
+		// start from what is stored and overwrite what the statement declares.
+		// Rebuilding the entity from the statement alone dropped everything
+		// the statement has no words for — its access rules first, so every
+		// re-run wrote the domain model and a following `grant` re-added them,
+		// and a script without that grant silently lost the entity's access
+		// (ako/mxcli#859, rehearsal W1).
+		merged := *existingEntity
+		merged.Name = entity.Name
+		merged.Location = entity.Location
+		merged.Persistable = entity.Persistable
+		merged.Attributes = entity.Attributes
+		merged.Source = entity.Source
+		merged.SourceDocumentRef = entity.SourceDocumentRef
+		merged.OqlQuery = entity.OqlQuery
+		// A rewrite that carried no doc comment keeps the stored one (#1018).
+		merged.Documentation = carriedDocumentation(
+			s.DocumentationSet, s.Documentation, existingEntity.Documentation)
+		if s.ExportLevel != nil { // absent keeps the stored level (#1498)
+			merged.ExportLevel = *s.ExportLevel
+		}
+		// The ID and the Source object ID (CE-6770) are the stored ones.
+		entity = &merged
+		created = entity
+		// An attribute the statement dropped loses its member access too.
+		pruneMemberAccessesForDroppedAttributes(entity, existingEntity)
 		if err := ctx.Backend.UpdateEntity(dm.ID, entity); err != nil {
 			return mdlerrors.NewBackend("update view entity", err)
 		}
 		// Invalidate caches so updated entity is visible
 		invalidateHierarchy(ctx)
 		invalidateDomainModelsCache(ctx)
-		fmt.Fprintf(ctx.Output, "Modified view entity: %s\n", s.Name)
+		ctx.ReportMutation("Modified", "view entity: %s", s.Name)
 	} else {
 		// Create new entity
 		if err := ctx.Backend.CreateEntity(dm.ID, entity); err != nil {
@@ -497,6 +1250,29 @@ func execCreateViewEntity(ctx *ExecContext, s *ast.CreateViewEntityStmt) error {
 		fmt.Fprintf(ctx.Output, "Created view entity: %s\n", s.Name)
 	}
 
+	// An `<alias>.ID` select column gives the view entity an ASSOCIATION to that
+	// entity, and Mendix has no separate declaration for it — the column is the
+	// declaration, so it is created here rather than by a statement of its own.
+	// Without this the OQL and the model disagree and mxbuild reports CE6770
+	// "View Entity is out of sync with the OQL Query" (FINDINGS §1).
+	//
+	// After the write, so the entity has an ID to point the association's FROM
+	// end at, and re-read so a freshly created entity is found by name.
+	if fresh, err := ctx.Backend.GetDomainModel(module.ID); err == nil {
+		if stored := fresh.FindEntityByName(s.Name.Name); stored != nil {
+			created = stored
+		}
+	}
+	if nameErrors := validateViewAssociationNames(ctx, s.Name.Module, s.Name.Name, query, nil); len(nameErrors) > 0 {
+		return mdlerrors.NewValidationf("view entity '%s':\n  - %s",
+			s.Name.String(), strings.Join(nameErrors, "\n  - "))
+	}
+	if err := syncViewEntityAssociations(ctx, module.ID, s.Name.Module, created, query); err != nil {
+		return err
+	}
+	invalidateHierarchy(ctx)
+	invalidateDomainModelsCache(ctx)
+
 	return nil
 }
 
@@ -504,6 +1280,9 @@ func execCreateViewEntity(ctx *ExecContext, s *ast.CreateViewEntityStmt) error {
 func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 	if !ctx.Connected() {
 		return mdlerrors.NewNotConnected()
+	}
+	if err := checkVersionGates(ctx, s); err != nil {
+		return err
 	}
 
 	// Find module
@@ -536,6 +1315,23 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 		if a == nil {
 			return mdlerrors.NewValidation("no attribute definition provided")
 		}
+		if isViewEntity(entity) {
+			return viewEntityAttributeSetRefusal(s.Name.String(), "add", a.Name)
+		}
+		// Not a name another member on the chain has (CE0069, ako/mxcli#1645).
+		if err := refuseMemberNameClash(ctx, s); err != nil {
+			return err
+		}
+		// A specialization cannot store a system member (see
+		// checkSpecializationSystemMembers): setting the flag here would be
+		// dropped by the writer, which stores none on a Generalization.
+		if entity.GeneralizationRef != "" && systemMemberOfPseudoType(a.Type.Kind) != "" {
+			warnings, err := checkSpecializationSystemMembers(ctx, s.Name.String(), entity.GeneralizationRef, []ast.Attribute{*a}, false)
+			for _, w := range warnings {
+				fmt.Fprintf(ctx.Output, "⚠ %s\n", w)
+			}
+			return err
+		}
 		// Pseudo-types: set entity flags instead of adding real attributes
 		switch a.Type.Kind {
 		case ast.TypeAutoOwner:
@@ -560,9 +1356,15 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 			a.HasDefault = true
 			a.DefaultValue = false
 		}
-		// Check for duplicate attribute name
+		// Check for duplicate attribute name. With IF NOT EXISTS, an existing
+		// attribute is a no-op (with a notice) rather than an error, so a domain
+		// script re-runs cleanly (findings #10).
 		for _, existing := range entity.Attributes {
 			if existing.Name == a.Name {
+				if s.IfNotExists {
+					fmt.Fprintf(ctx.Output, "Attribute '%s' already exists on entity %s — skipped\n", a.Name, s.Name)
+					return nil
+				}
 				return mdlerrors.NewAlreadyExistsMsg("attribute", a.Name, fmt.Sprintf("attribute '%s' already exists on entity %s", a.Name, s.Name))
 			}
 		}
@@ -572,19 +1374,13 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 			Name:          a.Name,
 			Documentation: a.Documentation,
 			Type:          convertDataType(a.Type),
+			ExportLevel:   authoredExportLevel(a.ExportLevel),
 		}
 		attr.ID = attrID
 		if a.Calculated {
-			attrValue := &domainmodel.AttributeValue{
-				Type: "CalculatedValue",
-			}
-			if a.CalculatedMicroflow != nil {
-				mfID, err := resolveMicroflowByName(ctx, a.CalculatedMicroflow.String())
-				if err != nil {
-					return mdlerrors.NewBackend(fmt.Sprintf("attribute '%s'", a.Name), err)
-				}
-				attrValue.MicroflowID = mfID
-				attrValue.MicroflowName = a.CalculatedMicroflow.String()
+			attrValue, err := resolveCalculatedValue(ctx, a.CalculatedMicroflow, s.Name.String(), a.Name, a.Type)
+			if err != nil {
+				return err
 			}
 			attr.Value = attrValue
 		} else if a.HasDefault {
@@ -610,7 +1406,7 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 			vr.ID = model.ID(types.GenerateID())
 			if a.NotNullError != "" {
 				vr.ErrorMessage = &model.Text{
-					Translations: map[string]string{"en_US": a.NotNullError},
+					Translations: map[string]string{authoringLanguage(ctx): a.NotNullError},
 				}
 				vr.ErrorMessage.ID = model.ID(types.GenerateID())
 			}
@@ -624,7 +1420,7 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 			vr.ID = model.ID(types.GenerateID())
 			if a.UniqueError != "" {
 				vr.ErrorMessage = &model.Text{
-					Translations: map[string]string{"en_US": a.UniqueError},
+					Translations: map[string]string{authoringLanguage(ctx): a.UniqueError},
 				}
 				vr.ErrorMessage.ID = model.ID(types.GenerateID())
 			}
@@ -637,48 +1433,173 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 		invalidateHierarchy(ctx)
 		invalidateDomainModelsCache(ctx)
 		fmt.Fprintf(ctx.Output, "Added attribute '%s' to entity %s\n", a.Name, s.Name)
+		// The new attribute joins each access rule at that rule's default member
+		// rights, so a rule granted per-member gets it at None and the roles on
+		// that rule cannot see it. Valid model, clean build, blank field
+		// (mendixlabs/mxcli#1067) — say so rather than leaving it to runtime.
+		if w := newMemberAccessWarning(s.Name.String(), a.Name, rolesBlindToNewMembers(entity)); w != "" {
+			fmt.Fprint(ctx.Output, w)
+		}
 
 	case ast.AlterEntityRenameAttribute:
-		found := false
+		var target *domainmodel.Attribute
 		for _, attr := range entity.Attributes {
-			if attr.Name == s.AttributeName {
-				attr.Name = s.NewName
-				found = true
-				break
+			switch attr.Name {
+			case s.AttributeName:
+				target = attr
+			case s.NewName:
+				return mdlerrors.NewValidationf("attribute '%s' already exists on entity %s", s.NewName, s.Name)
 			}
 		}
-		if !found {
+		if target == nil {
 			return mdlerrors.NewNotFoundMsg("attribute", s.AttributeName, fmt.Sprintf("attribute '%s' not found on entity %s", s.AttributeName, s.Name))
 		}
+		// Nor a rename into one (CE0069, ako/mxcli#1645).
+		if err := refuseMemberNameClash(ctx, s); err != nil {
+			return err
+		}
+		target.Name = s.NewName
+		// The entity's own access and validation rules hold the attribute's
+		// qualified name as a string, so they have to move with it *in the model*
+		// — not merely in the BSON the reference scan rewrites afterwards.
+		// Leaving them to the scan produced a duplicate member: UpdateEntity saw
+		// an attribute with no matching MemberAccess and added one, and the scan
+		// then renamed the stale entry into a second copy of it. mxbuild caught
+		// that as CE0066 "Entity access is out of date".
+		renameAttributeInEntityRules(entity, s.Name.String(), s.AttributeName, s.NewName)
 		if err := ctx.Backend.UpdateEntity(dm.ID, entity); err != nil {
 			return mdlerrors.NewBackend("rename attribute", err)
 		}
+
+		// Everything that points at an attribute — a create/change activity's
+		// member, a page's attribute widget, the entity's own validation and
+		// access rules — stores the fully qualified name as a string. Renaming
+		// only the domain model leaves every one of them dangling, which mxbuild
+		// reports as CE1613 "The selected attribute 'Mod.Entity.Old' no longer
+		// exists." (#910). The scan runs *after* UpdateEntity on purpose: it is a
+		// raw-BSON pass over every unit including the domain model, and writing
+		// the model afterwards would re-serialize it from the parsed entity and
+		// undo the scan's edits there.
+		hits, err := ctx.Backend.RenameReferences(
+			s.Name.String()+"."+s.AttributeName,
+			s.Name.String()+"."+s.NewName,
+			false,
+		)
+		if err != nil {
+			return mdlerrors.NewBackend("update attribute references", err)
+		}
+
+		// XPath constraints name the attribute as a bare step, so the scan above
+		// cannot see them. They are resolvable without any type inference — a
+		// constraint's target entity is known structurally and every further hop
+		// is named in the path — so they are rewritten here rather than left for
+		// the user. See mdl/xpathrefs for why the edit is textual and what it
+		// refuses to touch.
+		xres, err := renameAttributeInXPath(ctx, s.Name.String(), string(dm.ID), s.Name.Name, s.AttributeName, s.NewName)
+		if err != nil {
+			return mdlerrors.NewBackend("update attribute references in XPath constraints", err)
+		}
+
 		invalidateHierarchy(ctx)
 		invalidateDomainModelsCache(ctx)
 		fmt.Fprintf(ctx.Output, "Renamed attribute '%s' to '%s' on entity %s\n", s.AttributeName, s.NewName, s.Name)
+		if n := totalRefCount(hits); n > 0 {
+			fmt.Fprintf(ctx.Output, "Updated %d reference(s) in %d document(s)\n", n, len(hits))
+		}
+		reportXPathRename(ctx, xres)
+		// Microflow expressions ($obj/Attr) are the one place left. A bare name
+		// there is only resolvable from the type of what precedes it, which needs
+		// the resolver in PROPOSAL_expression_type_checking; mxbuild reports the
+		// leftovers as CE0117, so say so rather than let a half-done rename look
+		// finished.
+		fmt.Fprintf(ctx.Output,
+			"Note: uses in microflow expressions ($obj/%s) are stored as text and were "+
+				"not rewritten — run 'mxcli docker check' to find them.\n",
+			s.AttributeName)
+
+	case ast.AlterEntityDropDefault:
+		// Clearing a default is its own operation because MODIFY ATTRIBUTE cannot
+		// express it: that form always takes a type, and its type slot accepts a
+		// bare qualified name, so `MODIFY ATTRIBUTE X SET DEFAULT NULL` read SET
+		// as the type and wrote an unloadable project (#910).
+		found := false
+		for _, attr := range entity.Attributes {
+			if attr.Name != s.AttributeName {
+				continue
+			}
+			// Only the stored default goes. A CalculatedValue is not a default —
+			// dropping it would silently turn a calculated attribute into a plain
+			// one, which is a different operation the user did not ask for.
+			if attr.Value != nil && attr.Value.Type == "CalculatedValue" {
+				return mdlerrors.NewValidationf(
+					"attribute '%s' is calculated, not defaulted — DROP DEFAULT does not apply "+
+						"(use MODIFY ATTRIBUTE to change how it is computed)", s.AttributeName)
+			}
+			attr.Value = nil
+			found = true
+			break
+		}
+		if !found {
+			return mdlerrors.NewNotFoundMsg("attribute", s.AttributeName,
+				fmt.Sprintf("attribute '%s' not found on entity %s", s.AttributeName, s.Name))
+		}
+		if err := ctx.Backend.UpdateEntity(dm.ID, entity); err != nil {
+			return mdlerrors.NewBackend("drop default", err)
+		}
+		invalidateHierarchy(ctx)
+		invalidateDomainModelsCache(ctx)
+		fmt.Fprintf(ctx.Output, "Dropped default value on attribute '%s' of entity %s\n", s.AttributeName, s.Name)
 
 	case ast.AlterEntityModifyAttribute:
 		// CALCULATED attributes are only supported on persistent entities
 		if s.Calculated && !entity.Persistable {
 			return mdlerrors.NewValidationf("attribute '%s': calculated attributes are only supported on persistent entities", s.AttributeName)
 		}
+		// Reject a type that resolves to nothing BEFORE touching the attribute.
+		// Writing one produces a .mpr Mendix cannot load at all (#910).
+		if err := validateModifyAttributeTypeRef(ctx, s.AttributeName, s.DataType); err != nil {
+			return err
+		}
 		found := false
+		keptUnlocalized := false
+		storedSignatures := attributeSignatures(entity)
 		for _, attr := range entity.Attributes {
 			if attr.Name == s.AttributeName {
+				storedType := attr.Type
 				attr.Type = convertDataType(s.DataType)
+				// A DateTime that stays one keeps its stored LocalizeDate unless
+				// the statement says `localized` / `not localized` (#1373);
+				// rebuilding the type reset it to true.
+				if s.DataType.Localize == ast.LocalizeUnstated {
+					keptUnlocalized = carryStoredLocalizeDate(storedType, attr.Type)
+				}
 				if s.Calculated {
-					attrValue := &domainmodel.AttributeValue{
-						Type: "CalculatedValue",
-					}
-					if s.CalculatedMicroflow != nil {
-						mfID, err := resolveMicroflowByName(ctx, s.CalculatedMicroflow.String())
-						if err != nil {
-							return mdlerrors.NewBackend(fmt.Sprintf("attribute '%s'", s.AttributeName), err)
-						}
-						attrValue.MicroflowID = mfID
-						attrValue.MicroflowName = s.CalculatedMicroflow.String()
+					attrValue, err := resolveCalculatedValue(ctx, s.CalculatedMicroflow, s.Name.String(), s.AttributeName, s.DataType)
+					if err != nil {
+						return err
 					}
 					attr.Value = attrValue
+				}
+				// Bug 12a: apply the constraints the user specified and preserve
+				// the ones they didn't. NOT NULL / UNIQUE are stored as entity
+				// ValidationRules, not attribute flags, so NULLABLE removes the
+				// "Required" rule and NOT NULL (re)adds it.
+				attrQN := s.Name.String() + "." + attr.Name
+				if s.ModifyNotNull != nil {
+					setAttributeValidationRule(entity, attr, attrQN, "Required", *s.ModifyNotNull, s.ModifyNotNullError, authoringLanguage(ctx))
+				}
+				if s.ModifyUnique != nil {
+					setAttributeValidationRule(entity, attr, attrQN, "Unique", *s.ModifyUnique, s.ModifyUniqueError, authoringLanguage(ctx))
+				}
+				if s.ModifyHasDefault {
+					defaultStr := fmt.Sprintf("%v", s.ModifyDefaultValue)
+					if s.DataType.Kind == ast.TypeEnumeration && s.DataType.EnumRef != nil {
+						defaultStr = strings.TrimPrefix(defaultStr, s.DataType.EnumRef.String()+".")
+					}
+					attr.Value = &domainmodel.AttributeValue{DefaultValue: defaultStr}
+				}
+				if s.ModifyExportLevel != nil {
+					attr.ExportLevel = *s.ModifyExportLevel
 				}
 				found = true
 				break
@@ -692,9 +1613,16 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 		}
 		invalidateHierarchy(ctx)
 		invalidateDomainModelsCache(ctx)
-		fmt.Fprintf(ctx.Output, "Modified attribute '%s' on entity %s\n", s.AttributeName, s.Name)
+		ctx.ReportMutation("Modified", "attribute '%s' on entity %s", s.AttributeName, s.Name)
+		if keptUnlocalized {
+			noteKeptNotLocalized(ctx, s.Name.String(), []string{s.AttributeName})
+		}
+		resyncViewsOverSource(ctx, s.Name.String(), changedAttributes(storedSignatures, entity))
 
 	case ast.AlterEntityDropAttribute:
+		if isViewEntity(entity) {
+			return viewEntityAttributeSetRefusal(s.Name.String(), "drop", s.AttributeName)
+		}
 		// System attribute pseudo-names: drop by clearing entity flags
 		switch strings.ToLower(s.AttributeName) {
 		case "owner":
@@ -727,10 +1655,39 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 			}
 		}
 		if idx < 0 {
+			// With IF EXISTS, an already-absent attribute is a no-op (with a
+			// notice) rather than an error, so a domain script re-runs cleanly
+			// (findings #10).
+			if s.IfExists {
+				fmt.Fprintf(ctx.Output, "Attribute '%s' not found on entity %s — skipped\n", s.AttributeName, s.Name)
+				return nil
+			}
 			return mdlerrors.NewNotFoundMsg("attribute", s.AttributeName, fmt.Sprintf("attribute '%s' not found on entity %s", s.AttributeName, s.Name))
 		}
-		// Clean up entity-level references to the dropped attribute
+		// Clean up entity-level references to the dropped attribute.
+		//
+		// Two reference forms have to be matched, not one. Mendix stores an
+		// index's column as an element ID (AttributePointer) but a validation
+		// rule's Attribute and an access rule's MemberAccess as a BY_NAME
+		// qualified name string. Both come back in the same model.ID field, so
+		// comparing against the element ID alone matched nothing and left the
+		// rules behind — CE1613 "The selected attribute ... no longer exists."
+		// serializeValidationRule documents the same duality on the way out.
 		droppedID := entity.Attributes[idx].ID
+		droppedQName := fmt.Sprintf("%s.%s.%s", module.Name, entity.Name, entity.Attributes[idx].Name)
+		// Which FIELD carries the reference also varies by engine: the legacy
+		// backend fills a MemberAccess's AttributeID and AttributeName both, while
+		// the modelsdk one leaves AttributeID empty and fills only AttributeName
+		// (domainmodel.go: memberAccessFromGen). Both spell it qualified, so check
+		// every field that could hold it rather than picking one.
+		refersToDropped := func(refs ...string) bool {
+			for _, r := range refs {
+				if r != "" && (r == string(droppedID) || r == droppedQName) {
+					return true
+				}
+			}
+			return false
+		}
 
 		// Track what gets cleaned up for reporting
 		origValidationCount := len(entity.ValidationRules)
@@ -739,7 +1696,7 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 		// Remove validation rules that reference this attribute
 		var keepRules []*domainmodel.ValidationRule
 		for _, vr := range entity.ValidationRules {
-			if vr.AttributeID != droppedID {
+			if !refersToDropped(string(vr.AttributeID)) {
 				keepRules = append(keepRules, vr)
 			}
 		}
@@ -750,7 +1707,7 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 		for _, rule := range entity.AccessRules {
 			var keepMembers []*domainmodel.MemberAccess
 			for _, ma := range rule.MemberAccesses {
-				if ma.AttributeID != droppedID {
+				if !refersToDropped(string(ma.AttributeID), ma.AttributeName) {
 					keepMembers = append(keepMembers, ma)
 				} else {
 					removedMemberAccess++
@@ -764,7 +1721,7 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 		for _, idx := range entity.Indexes {
 			var keepAttrs []*domainmodel.IndexAttribute
 			for _, ia := range idx.Attributes {
-				if ia.AttributeID != droppedID {
+				if !refersToDropped(string(ia.AttributeID)) {
 					keepAttrs = append(keepAttrs, ia)
 				}
 			}
@@ -772,7 +1729,7 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 
 			var keepIDs []model.ID
 			for _, id := range idx.AttributeIDs {
-				if id != droppedID {
+				if !refersToDropped(string(id)) {
 					keepIDs = append(keepIDs, id)
 				}
 			}
@@ -824,7 +1781,15 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 			return mdlerrors.NewBackend("set comment", err)
 		}
 		invalidateDomainModelsCache(ctx)
-		fmt.Fprintf(ctx.Output, "Set comment on entity %s\n", s.Name)
+		fmt.Fprintf(ctx.Output, "Set documentation on entity %s\n", s.Name)
+
+	case ast.AlterEntitySetExportLevel:
+		entity.ExportLevel = s.ExportLevel
+		if err := ctx.Backend.UpdateEntity(dm.ID, entity); err != nil {
+			return mdlerrors.NewBackend("set export level", err)
+		}
+		invalidateDomainModelsCache(ctx)
+		ctx.ReportMutation("Set", "export level %s on entity %s", exportLevelKeyword(s.ExportLevel), s.Name)
 
 	case ast.AlterEntitySetPosition:
 		if s.Position == nil {
@@ -846,9 +1811,30 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 		for _, attr := range entity.Attributes {
 			attrNameToID[attr.Name] = attr.ID
 		}
+		// An index already covering these columns, in this order, with these
+		// sort directions IS this index — a Mendix index has no name to tell two
+		// apart. Adding it again used to append a silent duplicate that mxbuild
+		// rejects with CE0072 "Duplicate indexes", so a domain script run twice
+		// produced a model that no longer builds, with nothing in mxcli's output
+		// to say so. Now the bare form errors like ADD ATTRIBUTE does, and
+		// IF NOT EXISTS skips. (sudoku findings #10)
+		if existing := findIndexByColumns(entity, s.Index.Columns); existing != nil {
+			if s.IfNotExists {
+				fmt.Fprintf(ctx.Output, "Index %s already exists on entity %s — skipped\n", indexColumnLabel(s.Index.Columns), s.Name)
+				return nil
+			}
+			return mdlerrors.NewAlreadyExistsMsg("index", indexColumnLabel(s.Index.Columns),
+				fmt.Sprintf("index %s already exists on entity %s — re-running this statement would create a duplicate, which fails the build with CE0072; use 'add index if not exists' to make the script re-runnable",
+					indexColumnLabel(s.Index.Columns), s.Name))
+		}
+
 		idxID := model.ID(types.GenerateID())
 		var indexAttrs []*domainmodel.IndexAttribute
 		for _, col := range s.Index.Columns {
+			if typ := systemIndexMemberType(col.Name, entity.HasCreatedDate, entity.HasChangedDate); typ != "" {
+				indexAttrs = append(indexAttrs, newSystemIndexSegment(typ, col.Descending))
+				continue
+			}
 			if attrID, ok := attrNameToID[col.Name]; ok {
 				ia := &domainmodel.IndexAttribute{
 					AttributeID: attrID,
@@ -869,31 +1855,58 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 			return mdlerrors.NewBackend("add index", err)
 		}
 		invalidateDomainModelsCache(ctx)
-		fmt.Fprintf(ctx.Output, "Added index to entity %s\n", s.Name)
+		fmt.Fprintf(ctx.Output, "Added index %s to entity %s\n", indexColumnLabel(s.Index.Columns), s.Name)
 
 	case ast.AlterEntityDropIndex:
-		// Find and remove the index by position (Mendix indexes don't have user-visible names)
-		if len(entity.Indexes) == 0 {
-			return mdlerrors.NewValidationf("no indexes on entity %s", s.Name)
+		// Two selectors. The column list is the index's real identity — it is
+		// what `describe entity` prints, and a Mendix index stores no name — so
+		// it is the only form that round-trips. The ordinal name ("idx1") is
+		// kept for compatibility, but it names a POSITION that shifts as soon as
+		// an earlier index is dropped, which makes a multi-drop script depend on
+		// its own statement order.
+		label := s.IndexName
+		if s.Index != nil {
+			label = indexColumnLabel(s.Index.Columns)
 		}
-		// For now, drop by ordinal name ("idx1", "idx2", etc.) or drop all
 		idx := -1
-		for i := range entity.Indexes {
-			indexName := fmt.Sprintf("idx%d", i+1)
-			if indexName == s.IndexName {
-				idx = i
-				break
+		switch {
+		case s.Index != nil:
+			for i := range entity.Indexes {
+				if indexMatchesColumns(entity, entity.Indexes[i], s.Index.Columns) {
+					idx = i
+					break
+				}
 			}
+		case s.IndexName != "":
+			for i := range entity.Indexes {
+				if fmt.Sprintf("idx%d", i+1) == s.IndexName {
+					idx = i
+					break
+				}
+			}
+		default:
+			return mdlerrors.NewValidation("no index specified")
 		}
 		if idx < 0 {
-			return mdlerrors.NewNotFoundMsg("index", s.IndexName, fmt.Sprintf("index '%s' not found on entity %s", s.IndexName, s.Name))
+			// IF EXISTS makes a drop re-runnable: the second run finds nothing
+			// and says so instead of halting the script. (sudoku findings #10)
+			if s.IfExists {
+				fmt.Fprintf(ctx.Output, "Index %s not found on entity %s — skipped\n", label, s.Name)
+				return nil
+			}
+			hint := ""
+			if s.Index == nil {
+				hint = " — a Mendix index stores no name, so 'idx1' is a position, not an identity; select it by its columns instead, e.g. drop index (Row, Col)"
+			}
+			return mdlerrors.NewNotFoundMsg("index", label,
+				fmt.Sprintf("index %s not found on entity %s%s", label, s.Name, hint))
 		}
 		entity.Indexes = append(entity.Indexes[:idx], entity.Indexes[idx+1:]...)
 		if err := ctx.Backend.UpdateEntity(dm.ID, entity); err != nil {
 			return mdlerrors.NewBackend("drop index", err)
 		}
 		invalidateDomainModelsCache(ctx)
-		fmt.Fprintf(ctx.Output, "Dropped index '%s' from entity %s\n", s.IndexName, s.Name)
+		fmt.Fprintf(ctx.Output, "Dropped index %s from entity %s\n", label, s.Name)
 
 	case ast.AlterEntityAddEventHandler:
 		if s.EventHandler == nil {
@@ -903,47 +1916,77 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 		if err != nil {
 			return err
 		}
-		// Reject duplicate (same Moment + Event)
-		for _, existing := range entity.EventHandlers {
-			if existing.Moment == ehs[0].Moment && existing.Event == ehs[0].Event {
-				return mdlerrors.NewAlreadyExistsMsg("event handler",
-					fmt.Sprintf("%s %s", s.EventHandler.Moment, s.EventHandler.Event),
-					fmt.Sprintf("event handler already exists for %s %s on %s", s.EventHandler.Moment, s.EventHandler.Event, s.Name))
+		// A handler is identified by its moment, event AND microflow: Studio
+		// Pro allows several handlers for one event, and CREATE OR MODIFY
+		// stores them, so only the same microflow on the same event is a
+		// duplicate (mendixlabs/mxcli#1540). mxbuild accepts even that
+		// (measured 11.12.4, 0 errors); refusing it is what stops a re-run
+		// from wiring the microflow twice, so it would run twice per commit.
+		mfQN := s.EventHandler.Microflow.String()
+		label := fmt.Sprintf("%s %s call %s", s.EventHandler.Moment, s.EventHandler.Event, mfQN)
+		if matches := matchEventHandlers(ctx, entity, s.EventHandler.Moment, s.EventHandler.Event, mfQN); len(matches) > 0 {
+			// An event handler has no other re-run route: a defensive
+			// drop-then-add fails on the drop when it is absent and on the
+			// add when it is present. IF NOT EXISTS makes the script
+			// idempotent, like ADD ATTRIBUTE. (mxcli-todo findings #18)
+			if s.IfNotExists {
+				fmt.Fprintf(ctx.Output, "Event handler %s already exists on %s, skipping\n", label, s.Name)
+				return nil
 			}
+			return mdlerrors.NewAlreadyExistsMsg("event handler", label,
+				fmt.Sprintf("event handler %s already exists on %s (use ADD EVENT HANDLER IF NOT EXISTS to make the script re-runnable)", label, s.Name))
 		}
 		entity.EventHandlers = append(entity.EventHandlers, ehs[0])
 		if err := ctx.Backend.UpdateEntity(dm.ID, entity); err != nil {
 			return mdlerrors.NewBackend("add event handler", err)
 		}
 		invalidateDomainModelsCache(ctx)
-		fmt.Fprintf(ctx.Output, "Added event handler %s %s on %s\n",
-			s.EventHandler.Moment, s.EventHandler.Event, s.Name)
+		fmt.Fprintf(ctx.Output, "Added event handler %s on %s\n", label, s.Name)
 
 	case ast.AlterEntityDropEventHandler:
 		if s.EventHandler == nil {
 			return mdlerrors.NewValidation("missing event handler reference")
 		}
-		moment := domainmodel.EventMoment(s.EventHandler.Moment)
-		event := domainmodel.EventType(s.EventHandler.Event)
-		idx := -1
-		for i, eh := range entity.EventHandlers {
-			if eh.Moment == moment && eh.Event == event {
-				idx = i
-				break
-			}
+		mfQN := ""
+		if s.EventHandler.Microflow.Name != "" {
+			mfQN = s.EventHandler.Microflow.String()
 		}
-		if idx < 0 {
-			return mdlerrors.NewNotFoundMsg("event handler",
-				fmt.Sprintf("%s %s", s.EventHandler.Moment, s.EventHandler.Event),
-				fmt.Sprintf("event handler %s %s not found on %s", s.EventHandler.Moment, s.EventHandler.Event, s.Name))
+		label := fmt.Sprintf("%s %s", s.EventHandler.Moment, s.EventHandler.Event)
+		if mfQN != "" {
+			label += " call " + mfQN
+		}
+		matches := matchEventHandlers(ctx, entity, s.EventHandler.Moment, s.EventHandler.Event, mfQN)
+		if len(matches) == 0 {
+			if s.IfExists {
+				fmt.Fprintf(ctx.Output, "Event handler %s not present on %s, skipping\n", label, s.Name)
+				return nil
+			}
+			return mdlerrors.NewNotFoundMsg("event handler", label,
+				fmt.Sprintf("event handler %s not found on %s (use DROP EVENT HANDLER IF EXISTS to make the script re-runnable)", label, s.Name))
+		}
+		// Without CALL the drop has to be unambiguous. Taking the first match
+		// would remove whichever handler happens to be stored first, which
+		// is not necessarily the one the author meant — and IF EXISTS does
+		// not help, since the question is which, not whether.
+		if len(matches) > 1 {
+			names := make([]string, 0, len(matches))
+			for _, i := range matches {
+				names = append(names, storedHandlerMicroflow(ctx, entity.EventHandlers[i]))
+			}
+			return mdlerrors.NewValidationf("entity %s has %d %s event handlers (%s); name the one to drop: drop event handler on %s %s call %s",
+				s.Name, len(matches), label, strings.Join(names, ", "),
+				strings.ToLower(s.EventHandler.Moment), strings.ToLower(s.EventHandler.Event), names[0])
+		}
+		idx := matches[0]
+		if mfQN == "" {
+			label += " call " + storedHandlerMicroflow(ctx, entity.EventHandlers[idx])
 		}
 		entity.EventHandlers = append(entity.EventHandlers[:idx], entity.EventHandlers[idx+1:]...)
 		if err := ctx.Backend.UpdateEntity(dm.ID, entity); err != nil {
 			return mdlerrors.NewBackend("drop event handler", err)
 		}
 		invalidateDomainModelsCache(ctx)
-		fmt.Fprintf(ctx.Output, "Dropped event handler %s %s from %s\n",
-			s.EventHandler.Moment, s.EventHandler.Event, s.Name)
+		fmt.Fprintf(ctx.Output, "Dropped event handler %s from %s\n", label, s.Name)
 
 	case ast.AlterEntitySetAllowCreateChangeLocally:
 		entity.CreateChangeLocally = s.BoolValue
@@ -959,6 +2002,53 @@ func execAlterEntity(ctx *ExecContext, s *ast.AlterEntityStmt) error {
 
 	ctx.trackModifiedDomainModel(module.ID, module.Name)
 	return nil
+}
+
+// setAttributeValidationRule sets or clears an attribute's "Required" (NOT NULL)
+// or "Unique" validation rule on the entity. NOT NULL and UNIQUE are entity-level
+// ValidationRule entries, not attribute flags — so MODIFY ATTRIBUTE … NULLABLE
+// has to drop the rule and NOT NULL has to (re)add it (Bug 12a). Any existing
+// rule of the same type for the attribute is removed first, so this is
+// idempotent and preserves rules of other types / attributes.
+//
+// The rule's AttributeID is representation-dependent: the read path stores the
+// fully-qualified attribute name (Module.Entity.Attr), while a freshly-created
+// rule may carry the bare UUID — ruleTargetsAttribute handles both. A rule we
+// add is stored as the qualified name, which validationRuleToGen writes verbatim.
+func setAttributeValidationRule(entity *domainmodel.Entity, attr *domainmodel.Attribute, attrQualifiedName, ruleType string, want bool, errMsg, lang string) {
+	kept := entity.ValidationRules[:0]
+	for _, vr := range entity.ValidationRules {
+		if vr != nil && vr.Type == ruleType && ruleTargetsAttribute(string(vr.AttributeID), attr) {
+			continue // drop the existing rule of this type for this attribute
+		}
+		kept = append(kept, vr)
+	}
+	entity.ValidationRules = kept
+	if !want {
+		return
+	}
+	vr := &domainmodel.ValidationRule{AttributeID: model.ID(attrQualifiedName), Type: ruleType}
+	vr.ID = model.ID(types.GenerateID())
+	if errMsg != "" {
+		vr.ErrorMessage = &model.Text{Translations: map[string]string{lang: errMsg}}
+		vr.ErrorMessage.ID = model.ID(types.GenerateID())
+	}
+	entity.ValidationRules = append(entity.ValidationRules, vr)
+}
+
+// ruleTargetsAttribute reports whether a validation rule's AttributeID refers to
+// attr. The ID is either the bare attribute UUID (freshly-created rules) or the
+// fully-qualified attribute name Module.Entity.Attr (read-back rules) — for the
+// latter the final dot-segment is the attribute name. Validation rules are
+// entity-scoped, so a last-segment name match is unambiguous within the entity.
+func ruleTargetsAttribute(ruleAttrID string, attr *domainmodel.Attribute) bool {
+	if ruleAttrID == string(attr.ID) {
+		return true
+	}
+	if i := strings.LastIndex(ruleAttrID, "."); i >= 0 {
+		return ruleAttrID[i+1:] == attr.Name
+	}
+	return ruleAttrID == attr.Name
 }
 
 // execDropEntity handles DROP ENTITY statements.
@@ -980,8 +2070,23 @@ func execDropEntity(ctx *ExecContext, s *ast.DropEntityStmt) error {
 
 	for _, entity := range dm.Entities {
 		if entity.Name == s.Name.Name {
+			// `drop external entity` names the kind: a local entity is refused,
+			// not dropped (R6, ako/mxcli#755).
+			if s.External && !strings.HasPrefix(entity.Source, "Rest$OData") {
+				return mdlerrors.NewValidationf("%s is not an external entity: use `drop entity %s` to drop it", s.Name, s.Name)
+			}
 			// Warn about references before deleting (best-effort)
 			warnEntityReferences(ctx, s.Name.String())
+
+			// DeleteEntity removes every association with this entity at either
+			// end, in other modules too, and their member entries stay behind on
+			// the entity at the other end: CE1613 "The selected association …
+			// no longer exists" (ako/mxcli#1449). Which modules hold those rules
+			// has to be read before the delete, while the associations exist.
+			reconcile, err := associationMemberModules(ctx, module.Name, entity)
+			if err != nil {
+				return err
+			}
 
 			// If this is a view entity, also delete the associated ViewEntitySourceDocument
 			if entity.Source == "DomainModels$OqlViewEntitySource" {
@@ -993,12 +2098,46 @@ func execDropEntity(ctx *ExecContext, s *ast.DropEntityStmt) error {
 				return mdlerrors.NewBackend("delete entity", err)
 			}
 			invalidateDomainModelsCache(ctx)
+			if err := reconcileModulesAccess(ctx, "after dropping the entity", reconcile...); err != nil {
+				return err
+			}
 			fmt.Fprintf(ctx.Output, "Dropped entity: %s\n", s.Name)
 			return nil
 		}
 	}
 
 	return mdlerrors.NewNotFoundMsg("entity", fmt.Sprint(s.Name), fmt.Sprintf("entity not found: %s", s.Name))
+}
+
+// associationMemberModules names every module whose access rules can hold a
+// member entry for an association with entity (of module moduleName) at one end:
+// the entity's own module, which declares the associations it is the FROM end
+// of; the module of each TO end of those that are cross-module, whose entity is
+// a member under OWNER Both; and every module declaring a cross-module
+// association TO the entity, whose FROM entity holds the entry. The last two are
+// why reconciling the dropped entity's module alone is not enough.
+func associationMemberModules(ctx *ExecContext, moduleName string, entity *domainmodel.Entity) ([]string, error) {
+	modules := []string{moduleName}
+	dms, err := ctx.Backend.ListDomainModels()
+	if err != nil {
+		return nil, mdlerrors.NewBackend("list domain models", err)
+	}
+	h, err := getHierarchy(ctx)
+	if err != nil {
+		return nil, mdlerrors.NewBackend("build hierarchy", err)
+	}
+	qn := moduleName + "." + entity.Name
+	for _, dm := range dms {
+		for _, ca := range dm.CrossAssociations {
+			switch {
+			case ca.ParentID == entity.ID:
+				modules = append(modules, qualifiedNameModule(ca.ChildRef))
+			case strings.EqualFold(ca.ChildRef, qn):
+				modules = append(modules, h.GetModuleName(dm.ContainerID))
+			}
+		}
+	}
+	return modules, nil
 }
 
 // warnEntityReferences prints a warning if the entity is referenced by other elements.
@@ -1027,3 +2166,105 @@ func warnEntityReferences(ctx *ExecContext, entityName string) {
 }
 
 // --- Executor method wrappers for callers not yet migrated ---
+
+// indexColumnLabel renders an index's columns the way `describe entity` does,
+// so an error names the index in the spelling the author can act on.
+func indexColumnLabel(cols []ast.IndexColumn) string {
+	parts := make([]string, len(cols))
+	for i, c := range cols {
+		parts[i] = c.Name
+		if c.Descending {
+			parts[i] += " desc"
+		}
+	}
+	return "(" + strings.Join(parts, ", ") + ")"
+}
+
+// indexMatchesColumns reports whether a stored index covers exactly these
+// columns, in this order, with these sort directions.
+//
+// Order and direction are part of the identity, not decoration: Mendix builds a
+// composite database index, and (Row, Col) serves different queries from
+// (Col, Row). Treating them as the same index would make ADD refuse a distinct
+// index and DROP remove the wrong one.
+func indexMatchesColumns(entity *domainmodel.Entity, index *domainmodel.Index, cols []ast.IndexColumn) bool {
+	if len(index.Attributes) != len(cols) {
+		return false
+	}
+	nameByID := make(map[model.ID]string, len(entity.Attributes))
+	for _, attr := range entity.Attributes {
+		nameByID[attr.ID] = attr.Name
+	}
+	for i, ia := range index.Attributes {
+		if !strings.EqualFold(indexSegmentName(ia, nameByID), cols[i].Name) {
+			return false
+		}
+		if ia.Ascending == cols[i].Descending {
+			return false
+		}
+	}
+	return true
+}
+
+// systemIndexMemberType returns the IndexedAttribute Type for an index column
+// that names a system date member the entity stores — "CreatedDate" or
+// "ChangedDate", spelled as describe declares it (`ChangedDate: AutoChangedDate`)
+// — or "" for an ordinary attribute column. Such a column is not an attribute,
+// so it never resolves through the attribute map (mendixlabs/mxcli#1401). The
+// names are platform-reserved for attributes (MDL020), so they cannot collide.
+func systemIndexMemberType(name string, hasCreatedDate, hasChangedDate bool) string {
+	switch {
+	case hasCreatedDate && strings.EqualFold(name, "CreatedDate"):
+		return "CreatedDate"
+	case hasChangedDate && strings.EqualFold(name, "ChangedDate"):
+		return "ChangedDate"
+	}
+	return ""
+}
+
+// unsetIndexAttributePointer is what a system-member segment's AttributePointer
+// holds: no attribute, written as the all-zero GUID Studio Pro uses for an unset
+// reference (as on the segment's AssociationPointer).
+const unsetIndexAttributePointer = model.ID("00000000-0000-0000-0000-000000000000")
+
+func newSystemIndexSegment(typ string, descending bool) *domainmodel.IndexAttribute {
+	ia := &domainmodel.IndexAttribute{
+		AttributeID: unsetIndexAttributePointer,
+		Ascending:   !descending,
+		Type:        typ,
+	}
+	ia.ID = model.ID(types.GenerateID())
+	return ia
+}
+
+// indexSegmentName is the MDL column name of an index segment: the system
+// member's declared name, or the attribute's name ("" when it does not resolve).
+func indexSegmentName(ia *domainmodel.IndexAttribute, attrNameByID map[model.ID]string) string {
+	if ia.IsSystemMember() {
+		return ia.Type
+	}
+	return attrNameByID[ia.AttributeID]
+}
+
+// systemIndexSegmentStored reports whether a system-member segment is still
+// backed by the entity: an index on changedDate survives only while the entity
+// stores changedDate.
+func systemIndexSegmentStored(e *domainmodel.Entity, ia *domainmodel.IndexAttribute) bool {
+	switch ia.Type {
+	case "CreatedDate":
+		return e.HasCreatedDate
+	case "ChangedDate":
+		return e.HasChangedDate
+	}
+	return false
+}
+
+// findIndexByColumns returns the stored index with exactly these columns, or nil.
+func findIndexByColumns(entity *domainmodel.Entity, cols []ast.IndexColumn) *domainmodel.Index {
+	for _, index := range entity.Indexes {
+		if indexMatchesColumns(entity, index, cols) {
+			return index
+		}
+	}
+	return nil
+}

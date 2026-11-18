@@ -40,7 +40,7 @@ func (r *ExclusiveSplitCaptionRule) Check(ctx *linter.LintContext) []linter.Viol
 			continue
 		}
 
-		fullMF, err := reader.GetMicroflow(model.ID(mf.ID))
+		fullMF, err := ctx.FullMicroflow(model.ID(mf.ID))
 		if err != nil || fullMF == nil || fullMF.ObjectCollection == nil {
 			continue
 		}
@@ -65,7 +65,7 @@ func findEmptySplitCaptions(objects []microflows.MicroflowObject, mf linter.Micr
 						mf.ModuleName, mf.Name),
 					Location: linter.Location{
 						Module:       mf.ModuleName,
-						DocumentType: "microflow",
+						DocumentType: mf.DocumentNoun(),
 						DocumentName: mf.Name,
 						DocumentID:   mf.ID,
 					},

@@ -13,6 +13,36 @@ import (
 
 // --- REST Client Roundtrip Tests ---
 
+// restClientHasMendix11Shapes reports whether the test project's Mendix
+// version has the consumed REST shapes that exist from 11.0.0:
+// Rest$RestOperation.QueryParameters and Rest$JsonBody (both measured with
+// `mx convert`; mendixlabs/mxcli#1373). On Mendix 10 a `Query:` operation is
+// refused, since Studio Pro 10 cannot open a document holding the key, and a
+// JSON body is written as the string body Mendix 10 has, which describes as
+// `Body: template`. The nightly runs this suite on 10.24 as well as 11.x.
+func restClientHasMendix11Shapes(env *testEnv) bool {
+	pv := env.executor.Backend().ProjectVersion()
+	return pv == nil || pv.IsAtLeast(11, 0)
+}
+
+// restClientJSONBody is how a `Body: json from $<variable>` operation describes
+// on the test project's version.
+func restClientJSONBody(env *testEnv, variable string) string {
+	if restClientHasMendix11Shapes(env) {
+		return "Body: json from $" + variable
+	}
+	return "Body: template '$" + variable + "'"
+}
+
+// restClientQuery returns an operation's `Query:` line on a version that has
+// query parameters, and nothing on one that refuses them.
+func restClientQuery(env *testEnv, params string) string {
+	if restClientHasMendix11Shapes(env) {
+		return "\n    Query: (" + params + "),"
+	}
+	return ""
+}
+
 func TestRoundtripRestClient_SimpleGet(t *testing.T) {
 	env := setupTestEnv(t)
 	defer env.teardown()
@@ -30,7 +60,7 @@ func TestRoundtripRestClient_SimpleGet(t *testing.T) {
 };`
 
 	env.assertContains(createMDL, []string{
-		"rest client",
+		"consumed rest service",
 		"SimpleAPI",
 		"BaseUrl: 'https://api.example.com'",
 		"Authentication: none",
@@ -53,19 +83,19 @@ func TestRoundtripRestClient_WithJsonResponse(t *testing.T) {
   operation GetPosts {
     Method: get,
     Path: '/posts',
-    Headers: ('Accept' = 'application/json'),
+    Headers: ('Accept': 'application/json'),
     Response: json as $Posts
   }
 };`
 
 	env.assertContains(createMDL, []string{
-		"rest client",
+		"consumed rest service",
 		"JsonAPI",
 		"BaseUrl: 'https://jsonplaceholder.typicode.com'",
 		"operation GetPosts",
 		"Method: get",
 		"Path: '/posts'",
-		"'Accept' = 'application/json'",
+		"'Accept': 'application/json'",
 		"Response: json",
 	})
 }
@@ -112,6 +142,19 @@ func TestRoundtripRestClient_WithQueryParams(t *testing.T) {
   }
 };`
 
+	// Below 11.0 the statement's version gate (version_gates_documents.go)
+	// refuses it before the write is reached.
+	if !restClientHasMendix11Shapes(env) {
+		err := env.executeMDL(createMDL)
+		if err == nil {
+			t.Fatal("a Query: operation was accepted on a Mendix 10 project; want the query-parameter version gate")
+		}
+		if !strings.Contains(err.Error(), "query: ( … ) on a REST operation requires Mendix 11.0.0+") {
+			t.Fatalf("want the query-parameter version gate, got: %v", err)
+		}
+		return
+	}
+
 	env.assertContains(createMDL, []string{
 		"operation SearchItems",
 		"Path: '/search'",
@@ -142,7 +185,7 @@ func TestRoundtripRestClient_PostWithBody(t *testing.T) {
 	env.assertContains(createMDL, []string{
 		"operation CreateItem",
 		"Method: post",
-		"Body: json from $NewItem",
+		restClientJSONBody(env, "NewItem"),
 		"Response: json",
 	})
 }
@@ -164,7 +207,7 @@ func TestRoundtripRestClient_BasicAuth(t *testing.T) {
 };`
 
 	env.assertContains(createMDL, []string{
-		"rest client",
+		"consumed rest service",
 		"AuthAPI",
 		"Authentication: basic",
 		"Username: 'admin'",
@@ -208,9 +251,8 @@ func TestRoundtripRestClient_MultipleOperations(t *testing.T) {
 {
   operation ListPets {
     Method: get,
-    Path: '/pet/findByStatus',
-    Query: ($status: String),
-    Headers: ('Accept' = 'application/json'),
+    Path: '/pet/findByStatus',` + restClientQuery(env, "$status: String") + `
+    Headers: ('Accept': 'application/json'),
     Timeout: 30,
     Response: json as $PetList
   }
@@ -238,21 +280,24 @@ func TestRoundtripRestClient_MultipleOperations(t *testing.T) {
   }
 };`
 
-	env.assertContains(createMDL, []string{
-		"rest client",
+	want := []string{
+		"consumed rest service",
 		"PetStoreAPI",
 		"operation ListPets",
-		"$status: String",
 		"Timeout: 30",
 		"operation GetPet",
 		"$petId: Integer",
 		"operation AddPet",
 		"Method: post",
-		"Body: json from $NewPet",
+		restClientJSONBody(env, "NewPet"),
 		"operation RemovePet",
 		"Method: delete",
 		"Response: none",
-	})
+	}
+	if restClientHasMendix11Shapes(env) {
+		want = append(want, "$status: String")
+	}
+	env.assertContains(createMDL, want)
 }
 
 func TestRoundtripRestClient_DeleteNoResponse(t *testing.T) {
@@ -389,7 +434,7 @@ func TestMxCheck_RestClient_SimpleGet(t *testing.T) {
   operation GetStatus {
     Method: get,
     Path: '/status',
-    Headers: ('Accept' = '*/*'),
+    Headers: ('Accept': '*/*'),
     Response: none
   }
 };`
@@ -424,7 +469,7 @@ func TestMxCheck_RestClient_PostWithBody(t *testing.T) {
     Method: get,
     Path: '/items/{itemId}',
     Parameters: ($itemId: Integer),
-    Headers: ('Accept' = '*/*'),
+    Headers: ('Accept': '*/*'),
     Response: none
   }
 };`
@@ -474,7 +519,7 @@ func TestMxCheck_RestClient_BasicAuth(t *testing.T) {
   operation GetSecureData {
     Method: get,
     Path: '/secure/data',
-    Headers: ('Accept' = '*/*'),
+    Headers: ('Accept': '*/*'),
     Response: none
   }
 };`
@@ -506,9 +551,8 @@ func TestMxCheck_RestClient_MultipleOperations(t *testing.T) {
 {
   operation ListPets {
     Method: get,
-    Path: '/pet/findByStatus',
-    Query: ($status: String),
-    Headers: ('Accept' = 'application/json'),
+    Path: '/pet/findByStatus',` + restClientQuery(env, "$status: String") + `
+    Headers: ('Accept': 'application/json'),
     Timeout: 30,
     Response: none
   }
@@ -517,7 +561,7 @@ func TestMxCheck_RestClient_MultipleOperations(t *testing.T) {
     Method: get,
     Path: '/pet/{petId}',
     Parameters: ($petId: Integer),
-    Headers: ('Accept' = 'application/json'),
+    Headers: ('Accept': 'application/json'),
     Response: none
   }
 
@@ -525,7 +569,7 @@ func TestMxCheck_RestClient_MultipleOperations(t *testing.T) {
     Method: delete,
     Path: '/pet/{petId}',
     Parameters: ($petId: Integer),
-    Headers: ('Accept' = '*/*'),
+    Headers: ('Accept': '*/*'),
     Response: none
   }
 };`

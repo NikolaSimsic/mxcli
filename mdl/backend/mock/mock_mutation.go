@@ -8,7 +8,6 @@ import (
 	"github.com/mendixlabs/mxcli/mdl/backend"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/pages"
-	"github.com/mendixlabs/mxcli/sdk/workflows"
 )
 
 // ---------------------------------------------------------------------------
@@ -34,36 +33,19 @@ func (m *MockBackend) OpenWorkflowForMutation(unitID model.ID) (backend.Workflow
 }
 
 // ---------------------------------------------------------------------------
-// WidgetSerializationBackend
+// MicroflowMutationBackend
 // ---------------------------------------------------------------------------
 
-func (m *MockBackend) SerializeWidget(w pages.Widget) (any, error) {
-	if m.SerializeWidgetFunc != nil {
-		return m.SerializeWidgetFunc(w)
+func (m *MockBackend) OpenMicroflowForMutation(unitID model.ID) (backend.MicroflowMutator, error) {
+	if m.OpenMicroflowForMutationFunc != nil {
+		return m.OpenMicroflowForMutationFunc(unitID)
 	}
-	return nil, nil
+	return nil, fmt.Errorf("MockBackend.OpenMicroflowForMutation not configured")
 }
 
-func (m *MockBackend) SerializeClientAction(a pages.ClientAction) (any, error) {
-	if m.SerializeClientActionFunc != nil {
-		return m.SerializeClientActionFunc(a)
-	}
-	return nil, nil
-}
-
-func (m *MockBackend) SerializeDataSource(ds pages.DataSource) (any, error) {
-	if m.SerializeDataSourceFunc != nil {
-		return m.SerializeDataSourceFunc(ds)
-	}
-	return nil, nil
-}
-
-func (m *MockBackend) SerializeWorkflowActivity(a workflows.WorkflowActivity) (any, error) {
-	if m.SerializeWorkflowActivityFunc != nil {
-		return m.SerializeWorkflowActivityFunc(a)
-	}
-	return nil, nil
-}
+// ---------------------------------------------------------------------------
+// WidgetSerializationBackend
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // WidgetBuilderBackend

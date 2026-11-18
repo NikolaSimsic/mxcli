@@ -3,6 +3,9 @@
 package mock
 
 import (
+	"fmt"
+	"github.com/mendixlabs/mxcli/mdl/types"
+
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 )
@@ -28,11 +31,32 @@ func (m *MockBackend) GetDomainModelByID(id model.ID) (*domainmodel.DomainModel,
 	return nil, nil
 }
 
+func (m *MockBackend) ParseDomainModelFromRaw(raw map[string]any, unitID, containerID model.ID) (*domainmodel.DomainModel, error) {
+	if m.ParseDomainModelFromRawFunc != nil {
+		return m.ParseDomainModelFromRawFunc(raw, unitID, containerID)
+	}
+	return nil, fmt.Errorf("MockBackend.ParseDomainModelFromRaw not configured")
+}
+
 func (m *MockBackend) UpdateDomainModel(dm *domainmodel.DomainModel) error {
 	if m.UpdateDomainModelFunc != nil {
 		return m.UpdateDomainModelFunc(dm)
 	}
 	return nil
+}
+
+func (m *MockBackend) SetDomainModelAnnotations(domainModelID model.ID, annotations []*domainmodel.Annotation) error {
+	if m.SetDomainModelAnnotationsFunc != nil {
+		return m.SetDomainModelAnnotationsFunc(domainModelID, annotations)
+	}
+	return fmt.Errorf("MockBackend.SetDomainModelAnnotations not configured")
+}
+
+func (m *MockBackend) SetDomainModelDocumentation(domainModelID model.ID, documentation string) error {
+	if m.SetDomainModelDocumentationFunc != nil {
+		return m.SetDomainModelDocumentationFunc(domainModelID, documentation)
+	}
+	return fmt.Errorf("MockBackend.SetDomainModelDocumentation not configured")
 }
 
 func (m *MockBackend) CreateEntity(domainModelID model.ID, entity *domainmodel.Entity) error {
@@ -56,7 +80,7 @@ func (m *MockBackend) DeleteEntity(domainModelID model.ID, entityID model.ID) er
 	return nil
 }
 
-func (m *MockBackend) MoveEntity(entity *domainmodel.Entity, sourceDMID, targetDMID model.ID, sourceModuleName, targetModuleName string) ([]string, error) {
+func (m *MockBackend) MoveEntity(entity *domainmodel.Entity, sourceDMID, targetDMID model.ID, sourceModuleName, targetModuleName string) ([]types.MovedAssociation, error) {
 	if m.MoveEntityFunc != nil {
 		return m.MoveEntityFunc(entity, sourceDMID, targetDMID, sourceModuleName, targetModuleName)
 	}
@@ -119,6 +143,17 @@ func (m *MockBackend) CreateViewEntitySourceDocument(moduleID model.ID, moduleNa
 	return "", nil
 }
 
+func (m *MockBackend) WriteViewEntitySourceDocument(moduleID model.ID, moduleName, docName, oqlQuery, documentation string) (model.ID, error) {
+	if m.WriteViewEntitySourceDocumentFunc != nil {
+		return m.WriteViewEntitySourceDocumentFunc(moduleID, moduleName, docName, oqlQuery, documentation)
+	}
+	// Mirrors CreateViewEntitySourceDocument above rather than the checklist's
+	// "not configured" error: a view-entity handler calls this on every write, so
+	// an error default would fail every executor test that does not care where
+	// the OQL document went.
+	return "", nil
+}
+
 func (m *MockBackend) DeleteViewEntitySourceDocument(id model.ID) error {
 	if m.DeleteViewEntitySourceDocumentFunc != nil {
 		return m.DeleteViewEntitySourceDocumentFunc(id)
@@ -129,6 +164,13 @@ func (m *MockBackend) DeleteViewEntitySourceDocument(id model.ID) error {
 func (m *MockBackend) DeleteViewEntitySourceDocumentByName(moduleName, docName string) error {
 	if m.DeleteViewEntitySourceDocumentByNameFunc != nil {
 		return m.DeleteViewEntitySourceDocumentByNameFunc(moduleName, docName)
+	}
+	return nil
+}
+
+func (m *MockBackend) RenameViewEntitySourceDocument(moduleName, oldName, newName string) error {
+	if m.RenameViewEntitySourceDocumentFunc != nil {
+		return m.RenameViewEntitySourceDocumentFunc(moduleName, oldName, newName)
 	}
 	return nil
 }

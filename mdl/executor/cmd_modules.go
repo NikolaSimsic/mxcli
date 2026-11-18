@@ -5,14 +5,19 @@ package executor
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/doccomment"
 	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
 	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
+	"github.com/mendixlabs/mxcli/modelsdk/meta"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
+	"github.com/mendixlabs/mxcli/sdk/security"
 )
 
 // execCreateModule handles CREATE MODULE statements.
@@ -29,6 +34,24 @@ func execCreateModule(ctx *ExecContext, s *ast.CreateModuleStmt) error {
 
 	for _, m := range modules {
 		if m.Name == s.Name {
+			// A plain create of an existing module stays the no-op it always
+			// was; `or modify` applies the documentation the statement states.
+			if s.CreateOrModify {
+				if err := setModuleSettings(ctx, m, s.Settings); err != nil {
+					return err
+				}
+				if s.DocumentationSet {
+					return setModuleDocumentation(ctx, m, s.Documentation)
+				}
+				if !s.Settings.IsEmpty() {
+					return nil
+				}
+			}
+			if s.DocumentationSet || !s.Settings.IsEmpty() {
+				fmt.Fprintf(ctx.Output, "Module '%s' already exists; documentation and settings unchanged "+
+					"(create or modify module sets them)\n", s.Name)
+				return nil
+			}
 			fmt.Fprintf(ctx.Output, "Module '%s' already exists\n", s.Name)
 			return nil
 		}
@@ -47,6 +70,41 @@ func execCreateModule(ctx *ExecContext, s *ast.CreateModuleStmt) error {
 	invalidateModuleCache(ctx)
 
 	fmt.Fprintf(ctx.Output, "Created module: %s\n", s.Name)
+	if !s.Settings.IsEmpty() {
+		// The new module's settings unit holds the defaults; the stated ones
+		// are written onto it, so its PackageId and the rest are kept.
+		if err := setModuleSettings(ctx, module, s.Settings); err != nil {
+			return err
+		}
+	}
+	if s.DocumentationSet && s.Documentation != "" {
+		return setModuleDocumentation(ctx, module, s.Documentation)
+	}
+	return nil
+}
+
+// setModuleDocumentation stores a module's doc comment as its domain model's
+// documentation: a Mendix module has no documentation property, its
+// DomainModels$DomainModel does, and that is what lint reads as
+// modules().domain_model_documentation (mendixlabs/mxcli#1314).
+func setModuleDocumentation(ctx *ExecContext, module *model.Module, doc string) error {
+	dm, err := ctx.Backend.GetDomainModel(module.ID)
+	if err != nil {
+		return mdlerrors.NewBackend(fmt.Sprintf("read domain model of %s", module.Name), err)
+	}
+	if dm == nil {
+		return mdlerrors.NewNotFound("domain model of module", module.Name)
+	}
+	// Storage writes nothing when the text is what is stored (ADR-0008); say
+	// so, rather than report a write a re-run did not make.
+	if dm.Documentation == doc {
+		fmt.Fprintf(ctx.Output, "Documentation of module %s unchanged\n", module.Name)
+		return nil
+	}
+	if err := ctx.Backend.SetDomainModelDocumentation(dm.ID, doc); err != nil {
+		return mdlerrors.NewBackend(fmt.Sprintf("set documentation of %s", module.Name), err)
+	}
+	fmt.Fprintf(ctx.Output, "Set documentation of module: %s\n", module.Name)
 	return nil
 }
 
@@ -80,6 +138,18 @@ func execDropModule(ctx *ExecContext, s *ast.DropModuleStmt) error {
 
 	if targetModule == nil {
 		return mdlerrors.NewNotFound("module", s.Name)
+	}
+
+	// The System module is virtual: it is synthesized from modelsdk/meta, not
+	// stored, so there is nothing here to drop. The cascade below would walk its
+	// synthesized documents and report a "unit not found" warning for each one
+	// (15 of them once the enumerations became visible — #1102) while changing
+	// nothing. Refusing says that in one line instead.
+	if targetModule.Name == "System" {
+		return mdlerrors.NewValidation(
+			"cannot drop module System: it is owned by the Mendix platform and is not stored in the " +
+				"project — its entities, associations, enumerations and Java actions are built in. " +
+				"Every Mendix app has it and no app can remove it.")
 	}
 
 	// Build set of all container IDs belonging to this module (including nested folders)
@@ -420,9 +490,28 @@ func listModules(ctx *ExecContext) error {
 	bizEventCounts := make(map[model.ID]int)
 	extDbCounts := make(map[model.ID]int)
 
-	// Count from units by type prefix (efficient single pass)
+	// Count from the unit types in one pass. Every count but entities is a
+	// count of units of one type, which the unit listing knows without opening
+	// a document; listing each type through its decoder read every page,
+	// snippet, flow, constant and Java action of the project (ako/mxcli#1791).
 	for _, u := range units {
 		modID := h.FindModuleID(u.ContainerID)
+		switch u.Type {
+		case "Enumerations$Enumeration":
+			enumCounts[modID]++
+		case "Forms$Page":
+			pageCounts[modID]++
+		case "Forms$Snippet":
+			snippetCounts[modID]++
+		case "Microflows$Microflow":
+			microflowCounts[modID]++
+		case "Microflows$Nanoflow":
+			nanoflowCounts[modID]++
+		case "Constants$Constant":
+			constantCounts[modID]++
+		case "JavaActions$JavaAction":
+			javaActionCounts[modID]++
+		}
 		switch {
 		case strings.HasPrefix(u.Type, "Rest$PublishedRestService"):
 			pubRestCounts[modID]++
@@ -439,67 +528,21 @@ func listModules(ctx *ExecContext) error {
 		}
 	}
 
-	// Count entities from domain models
+	// The System module's enumerations and Java actions are platform
+	// built-ins with no unit; the backend's listings add them, so count them
+	// the same way.
+	for _, e := range meta.BuildSystemEnumerations() {
+		enumCounts[h.FindModuleID(e.ContainerID)]++
+	}
+	for _, ja := range meta.BuildSystemJavaActions() {
+		javaActionCounts[h.FindModuleID(ja.ContainerID)]++
+	}
+
+	// Count entities from domain models: one unit per module holds them all.
 	if dms, err := ctx.Backend.ListDomainModels(); err == nil {
 		for _, dm := range dms {
 			modID := h.FindModuleID(dm.ContainerID)
 			entityCounts[modID] += len(dm.Entities)
-		}
-	}
-
-	// Count enumerations
-	if enums, err := ctx.Backend.ListEnumerations(); err == nil {
-		for _, enum := range enums {
-			modID := h.FindModuleID(enum.ContainerID)
-			enumCounts[modID]++
-		}
-	}
-
-	// Count pages
-	if pages, err := ctx.Backend.ListPages(); err == nil {
-		for _, p := range pages {
-			modID := h.FindModuleID(p.ContainerID)
-			pageCounts[modID]++
-		}
-	}
-
-	// Count snippets
-	if snippets, err := ctx.Backend.ListSnippets(); err == nil {
-		for _, s := range snippets {
-			modID := h.FindModuleID(s.ContainerID)
-			snippetCounts[modID]++
-		}
-	}
-
-	// Count microflows
-	if mfs, err := ctx.Backend.ListMicroflows(); err == nil {
-		for _, mf := range mfs {
-			modID := h.FindModuleID(mf.ContainerID)
-			microflowCounts[modID]++
-		}
-	}
-
-	// Count nanoflows
-	if nfs, err := ctx.Backend.ListNanoflows(); err == nil {
-		for _, nf := range nfs {
-			modID := h.FindModuleID(nf.ContainerID)
-			nanoflowCounts[modID]++
-		}
-	}
-
-	// Count constants
-	if constants, err := ctx.Backend.ListConstants(); err == nil {
-		for _, c := range constants {
-			modID := h.FindModuleID(c.ContainerID)
-			constantCounts[modID]++
-		}
-	}
-
-	// Count Java actions
-	if jas, err := ctx.Backend.ListJavaActions(); err == nil {
-		for _, ja := range jas {
-			modID := h.FindModuleID(ja.ContainerID)
-			javaActionCounts[modID]++
 		}
 	}
 
@@ -512,6 +555,8 @@ func listModules(ctx *ExecContext) error {
 	type row struct {
 		name        string
 		source      string
+		version     string
+		moduleType  string
 		entities    int
 		enums       int
 		pages       int
@@ -528,6 +573,15 @@ func listModules(ctx *ExecContext) error {
 		extDb       int
 	}
 	var rows []row
+	protections := moduleProtections(ctx)
+	// Version and Type are the General tab of the Module settings dialog
+	// (ako/mxcli#1921).
+	settingsByModule := map[model.ID]*types.ModuleSettings{}
+	if all, err := ctx.Backend.ListModuleSettings(); err == nil {
+		for _, ms := range all {
+			settingsByModule[ms.ContainerID] = ms
+		}
+	}
 
 	for _, m := range modules {
 		// Determine source (AppStore with version or local)
@@ -539,10 +593,39 @@ func listModules(ctx *ExecContext) error {
 				source = "Marketplace"
 			}
 		}
+		if m.PackageFile != "" {
+			// ako/mxcli#1780: held as modules/<Name>.mxmodule, not as units.
+			if source != "" {
+				source += ", "
+			}
+			source += "Packaged"
+		}
+		if kind := protections[string(m.ID)]; kind != "" {
+			// mendixlabs/mxcli#1498: its Hidden elements cannot be referenced
+			// from other modules, which nothing else printed showed.
+			if source != "" {
+				source += ", "
+			}
+			source += "Protected " + kind
+		}
 
+		version, moduleType := "", ""
+		if ms := settingsByModule[m.ID]; ms != nil {
+			version = ms.Version
+			switch moduleTypeOf(ms) {
+			case moduleTypeApp:
+				moduleType = "App"
+			case moduleTypeAddOn:
+				moduleType = "Add-on"
+			default:
+				moduleType = ms.ProtectedModuleType
+			}
+		}
 		r := row{
 			name:        m.Name,
 			source:      source,
+			version:     version,
+			moduleType:  moduleType,
 			entities:    entityCounts[m.ID],
 			enums:       enumCounts[m.ID],
 			pages:       pageCounts[m.ID],
@@ -563,11 +646,11 @@ func listModules(ctx *ExecContext) error {
 
 	// Build TableResult
 	result := &TableResult{
-		Columns: []string{"Module", "Source", "Entities", "Enums", "Pages", "Snippets", "Microflows", "Nanoflows", "Workflows", "Constants", "JavaActions", "PubREST", "PubOData", "ConOData", "BizEvents", "ExtDB"},
+		Columns: []string{"Module", "Source", "Version", "Type", "Entities", "Enums", "Pages", "Snippets", "Microflows", "Nanoflows", "Workflows", "Constants", "JavaActions", "PubREST", "PubOData", "ConOData", "BizEvents", "ExtDB"},
 		Summary: fmt.Sprintf("(%d modules)", len(modules)),
 	}
 	for _, r := range rows {
-		result.Rows = append(result.Rows, []any{r.name, r.source, r.entities, r.enums, r.pages, r.snippets, r.microflows, r.nanoflows, r.workflows, r.constants, r.javaActions, r.pubRest, r.pubOData, r.conOData, r.bizEvents, r.extDb})
+		result.Rows = append(result.Rows, []any{r.name, r.source, r.version, r.moduleType, r.entities, r.enums, r.pages, r.snippets, r.microflows, r.nanoflows, r.workflows, r.constants, r.javaActions, r.pubRest, r.pubOData, r.conOData, r.bizEvents, r.extDb})
 	}
 	return writeResult(ctx, result)
 }
@@ -596,11 +679,47 @@ func describeModule(ctx *ExecContext, moduleName string, withAll bool) error {
 		return mdlerrors.NewNotFound("module", moduleName)
 	}
 
-	// Output basic CREATE MODULE statement
-	fmt.Fprintf(ctx.Output, "create module %s;\n", targetModule.Name)
+	// The module's documentation is its domain model's; print it as the doc
+	// comment that sets it, so the output re-run stores it (mendixlabs/mxcli#1314).
+	if dm, err := ctx.Backend.GetDomainModel(targetModule.ID); err == nil && dm != nil && dm.Documentation != "" {
+		fmt.Fprintf(ctx.Output, "/**\n * %s\n */\n", strings.ReplaceAll(doccomment.Escape(dm.Documentation), "\n", "\n * "))
+	}
+	// Listed rather than got by module: the same read moduleProtection makes.
+	var settings *types.ModuleSettings
+	if all, err := ctx.Backend.ListModuleSettings(); err == nil {
+		for _, ms := range all {
+			if ms.ContainerID == targetModule.ID {
+				settings = ms
+			}
+		}
+	}
+	fmt.Fprintf(ctx.Output, "create or modify module %s%s;\n", targetModule.Name, moduleSettingsMDL(ctx, settings, targetModule.IsThemeModule))
+	if targetModule.PackageFile != "" {
+		fmt.Fprintf(ctx.Output, "-- packaged module: %s — read-only, the project file holds none of its documents\n", targetModule.PackageFile)
+	}
+	// Location has no key yet (PROPOSAL_module_settings.md, "Later: Location").
+	if targetModule.FromAppStore {
+		fmt.Fprintln(ctx.Output, "-- location: Marketplace modules (set in Studio Pro)")
+	}
+	// A Protected (add-on / solution) module hides every element not marked
+	// Usable from the rest of the app (CE1406), which nothing else printed
+	// says (mendixlabs/mxcli#1498). An add-on is `ModuleType: addon` above; a
+	// solution module has no MDL spelling, so it is a comment only.
+	switch kind := moduleProtection(ctx, string(targetModule.ID)); kind {
+	case "":
+	case "AddOn":
+		fmt.Fprintln(ctx.Output, "-- add-on module: elements not marked Usable cannot be referenced from other modules")
+	default:
+		fmt.Fprintf(ctx.Output, "-- export level: Protected (%s module) — set in Studio Pro; elements not marked Usable cannot be referenced from other modules\n", kind)
+	}
+
+	// Module roles live in the module's own Security$ModuleSecurity unit rather
+	// than in any document, so a sweep that describes every document in a module
+	// still never reports them. Emitting them here is what lets a describe-based
+	// comparison see a marketplace update that adds, removes or renames a role.
+	describeModuleRoles(ctx, targetModule)
 
 	if !withAll {
-		fmt.Fprintln(ctx.Output, "/")
 		return nil
 	}
 
@@ -610,202 +729,70 @@ func describeModule(ctx *ExecContext, moduleName string, withAll bool) error {
 	// Output separator
 	fmt.Fprintln(ctx.Output)
 
-	// Output enumerations in this module (no dependencies between enums)
-	if enums, err := ctx.Backend.ListEnumerations(); err == nil {
-		for _, enum := range enums {
-			if moduleContainers[enum.ContainerID] {
-				if err := describeEnumeration(ctx, ast.QualifiedName{Module: moduleName, Name: enum.Name}); err == nil {
-					fmt.Fprintln(ctx.Output)
-				}
+	// Every document of the module, in the registry's dependency order, with
+	// the domain model's entities and associations after enumerations and
+	// constants (mendixlabs/mxcli#1421).
+	run := &moduleDescribeRun{ctx: ctx, module: moduleName, containers: moduleContainers, emitted: map[model.ID]bool{}}
+	run.emitKinds(moduleDocKindsBeforeDomainModel)
+
+	// Entities in dependency order (base entities before derived entities),
+	// then associations once every entity is defined, then the entities'
+	// access rules — a grant names the associations its entity owns, and exec
+	// refuses one naming an association that does not exist yet
+	// (mendixlabs/mxcli#1409).
+	dm, err := ctx.Backend.GetDomainModel(targetModule.ID)
+	if err != nil {
+		run.fail("domain model "+moduleName, err)
+	} else if dm != nil {
+		entities := sortEntitiesByGeneralization(dm.Entities, moduleName)
+		described := make([]*domainmodel.Entity, 0, len(entities))
+		for _, entity := range entities {
+			qn := ast.QualifiedName{Module: moduleName, Name: entity.Name}
+			if err := describeEntityWith(ctx, qn, false); err != nil {
+				run.fail("entity "+qn.String(), err)
+				continue
 			}
+			described = append(described, entity)
+			fmt.Fprintln(ctx.Output)
+		}
+		// Cross-module associations are stored in a separate collection but are
+		// owned by this module (the FROM entity lives here); emit them too.
+		//
+		// A view entity's association is not emitted: its `<alias>.ID as <name>`
+		// OQL column declares it, the view entity's description above carries
+		// that column, and no statement can — a plain one is CE6771, refused by
+		// check and exec alike (mendixlabs/mxcli#1627).
+		var assocNames []string
+		for _, a := range dm.Associations {
+			if !isViewAssociationSource(a.Source) {
+				assocNames = append(assocNames, a.Name)
+			}
+		}
+		for _, ca := range dm.CrossAssociations {
+			if !isViewAssociationSource(ca.Source) {
+				assocNames = append(assocNames, ca.Name)
+			}
+		}
+		for _, name := range assocNames {
+			qn := ast.QualifiedName{Module: moduleName, Name: name}
+			if err := describeAssociation(ctx, qn); err != nil {
+				run.fail("association "+qn.String(), err)
+				continue
+			}
+			fmt.Fprintln(ctx.Output)
+		}
+		for _, entity := range described {
+			if len(entity.AccessRules) == 0 {
+				continue
+			}
+			outputEntityAccessGrants(ctx, entity, moduleName, entity.Name)
+			fmt.Fprintln(ctx.Output)
 		}
 	}
 
-	// Output constants (may reference enumerations)
-	if constants, err := ctx.Backend.ListConstants(); err == nil {
-		for _, c := range constants {
-			if moduleContainers[c.ContainerID] {
-				if err := outputConstantMDL(ctx, c, moduleName); err == nil {
-					fmt.Fprintln(ctx.Output)
-				}
-			}
-		}
-	}
-
-	// Output entities in dependency order (base entities before derived entities)
-	// and associations after all entities
-	if dm, err := ctx.Backend.GetDomainModel(targetModule.ID); err == nil {
-		// Topologically sort entities by generalization (inheritance)
-		sortedEntities := sortEntitiesByGeneralization(dm.Entities, moduleName)
-
-		// Output entities in sorted order
-		for _, entity := range sortedEntities {
-			if err := describeEntity(ctx, ast.QualifiedName{Module: moduleName, Name: entity.Name}); err == nil {
-				fmt.Fprintln(ctx.Output)
-			}
-		}
-
-		// Output associations (after all entities are defined)
-		for _, assoc := range dm.Associations {
-			if err := describeAssociation(ctx, ast.QualifiedName{Module: moduleName, Name: assoc.Name}); err == nil {
-				fmt.Fprintln(ctx.Output)
-			}
-		}
-	}
-
-	// Output microflows
-	if mfs, err := ctx.Backend.ListMicroflows(); err == nil {
-		for _, mf := range mfs {
-			if moduleContainers[mf.ContainerID] {
-				if err := describeMicroflow(ctx, ast.QualifiedName{Module: moduleName, Name: mf.Name}); err == nil {
-					fmt.Fprintln(ctx.Output)
-				}
-			}
-		}
-	}
-
-	// Output java actions
-	if jaList, err := ctx.Backend.ListJavaActions(); err == nil {
-		for _, ja := range jaList {
-			if moduleContainers[ja.ContainerID] {
-				if err := describeJavaAction(ctx, ast.QualifiedName{Module: moduleName, Name: ja.Name}); err == nil {
-					fmt.Fprintln(ctx.Output)
-				}
-			}
-		}
-	}
-
-	// Output pages
-	if pageList, err := ctx.Backend.ListPages(); err == nil {
-		for _, p := range pageList {
-			if moduleContainers[p.ContainerID] {
-				if err := describePage(ctx, ast.QualifiedName{Module: moduleName, Name: p.Name}); err == nil {
-					fmt.Fprintln(ctx.Output)
-				}
-			}
-		}
-	}
-
-	// Output snippets
-	if snippets, err := ctx.Backend.ListSnippets(); err == nil {
-		for _, s := range snippets {
-			if moduleContainers[s.ContainerID] {
-				if err := describeSnippet(ctx, ast.QualifiedName{Module: moduleName, Name: s.Name}); err == nil {
-					fmt.Fprintln(ctx.Output)
-				}
-			}
-		}
-	}
-
-	// Output layouts
-	if layouts, err := ctx.Backend.ListLayouts(); err == nil {
-		for _, l := range layouts {
-			if moduleContainers[l.ContainerID] {
-				if err := describeLayout(ctx, ast.QualifiedName{Module: moduleName, Name: l.Name}); err == nil {
-					fmt.Fprintln(ctx.Output)
-				}
-			}
-		}
-	}
-
-	// Output database connections
-	if conns, err := ctx.Backend.ListDatabaseConnections(); err == nil {
-		for _, conn := range conns {
-			if moduleContainers[conn.ContainerID] {
-				if err := outputDatabaseConnectionMDL(ctx, conn, moduleName); err == nil {
-					fmt.Fprintln(ctx.Output)
-				}
-			}
-		}
-	}
-
-	// Output business event services
-	if services, err := ctx.Backend.ListBusinessEventServices(); err == nil {
-		for _, svc := range services {
-			if moduleContainers[svc.ContainerID] {
-				if err := describeBusinessEventService(ctx, ast.QualifiedName{Module: moduleName, Name: svc.Name}); err == nil {
-					fmt.Fprintln(ctx.Output)
-				}
-			}
-		}
-	}
-
-	// Get hierarchy for folder path resolution (used by OData sections below)
-	h, _ := getHierarchy(ctx)
-
-	// Output consumed OData services (clients)
-	if services, err := ctx.Backend.ListConsumedODataServices(); err == nil {
-		for _, svc := range services {
-			if moduleContainers[svc.ContainerID] {
-				folderPath := ""
-				if h != nil {
-					folderPath = h.BuildFolderPath(svc.ContainerID)
-				}
-				if err := outputConsumedODataServiceMDL(ctx, svc, moduleName, folderPath); err == nil {
-					fmt.Fprintln(ctx.Output)
-				}
-			}
-		}
-	}
-
-	// Output published OData services
-	if services, err := ctx.Backend.ListPublishedODataServices(); err == nil {
-		for _, svc := range services {
-			if moduleContainers[svc.ContainerID] {
-				folderPath := ""
-				if h != nil {
-					folderPath = h.BuildFolderPath(svc.ContainerID)
-				}
-				if err := outputPublishedODataServiceMDL(ctx, svc, moduleName, folderPath); err == nil {
-					fmt.Fprintln(ctx.Output)
-				}
-			}
-		}
-	}
-
-	// Output agent-editor documents. Order matches referential dependencies:
-	// Model / KnowledgeBase / ConsumedMCPService first (leaves), Agent last
-	// (may reference the others via its TOOL / KNOWLEDGE BASE / MCP SERVICE
-	// blocks).
-	if models, err := ctx.Backend.ListAgentEditorModels(); err == nil {
-		for _, m := range models {
-			if moduleContainers[m.ContainerID] {
-				if err := describeAgentEditorModel(ctx, ast.QualifiedName{Module: moduleName, Name: m.Name}); err == nil {
-					fmt.Fprintln(ctx.Output)
-				}
-			}
-		}
-	}
-	if kbs, err := ctx.Backend.ListAgentEditorKnowledgeBases(); err == nil {
-		for _, kb := range kbs {
-			if moduleContainers[kb.ContainerID] {
-				if err := describeAgentEditorKnowledgeBase(ctx, ast.QualifiedName{Module: moduleName, Name: kb.Name}); err == nil {
-					fmt.Fprintln(ctx.Output)
-				}
-			}
-		}
-	}
-	if svcs, err := ctx.Backend.ListAgentEditorConsumedMCPServices(); err == nil {
-		for _, svc := range svcs {
-			if moduleContainers[svc.ContainerID] {
-				if err := describeAgentEditorConsumedMCPService(ctx, ast.QualifiedName{Module: moduleName, Name: svc.Name}); err == nil {
-					fmt.Fprintln(ctx.Output)
-				}
-			}
-		}
-	}
-	if agents, err := ctx.Backend.ListAgentEditorAgents(); err == nil {
-		for _, a := range agents {
-			if moduleContainers[a.ContainerID] {
-				if err := describeAgentEditorAgent(ctx, ast.QualifiedName{Module: moduleName, Name: a.Name}); err == nil {
-					fmt.Fprintln(ctx.Output)
-				}
-			}
-		}
-	}
-
-	fmt.Fprintln(ctx.Output, "/")
-	return nil
+	run.emitKinds(moduleDocKindsAfterDomainModel)
+	run.reportUnemitted()
+	return run.err()
 }
 
 // sortEntitiesByGeneralization returns entities sorted so base entities come before derived entities.
@@ -1040,26 +1027,103 @@ func execAlterModuleJarDep(ctx *ExecContext, s *ast.AlterModuleJarDepStmt) error
 		return fmt.Errorf("failed to read module settings: %w", err)
 	}
 
+	skipped := 0
 	for _, action := range s.Actions {
-		if err := applyJarDepAction(ms, action, s.ModuleName); err != nil {
+		skip, err := applyJarDepAction(ms, action, s.ModuleName)
+		if err != nil {
 			return err
 		}
+		if skip != "" {
+			skipped++
+			fmt.Fprintln(ctx.Output, skip)
+		}
+	}
+
+	// Every action was an IF NOT EXISTS skip: the settings are exactly what is
+	// stored, so there is nothing to offer storage (ako/mxcli#2239).
+	if skipped == len(s.Actions) {
+		reportUnchanged(ctx, fmt.Sprintf("jar dependencies for module '%s'", s.ModuleName))
+		warnUnvendoredJarDependencies(ctx, ms)
+		return nil
 	}
 
 	if err := ctx.Backend.UpdateModuleSettings(ms); err != nil {
 		return mdlerrors.NewBackend("update module settings", err)
 	}
 
-	fmt.Fprintf(ctx.Output, "Updated jar dependencies for module '%s'\n", s.ModuleName)
+	// ReportMutation says Unchanged when storage elided the write (ADR-0008),
+	// e.g. a SET … VERSION restating the stored version.
+	ctx.ReportMutation("Updated", "jar dependencies for module '%s'", s.ModuleName)
+	warnUnvendoredJarDependencies(ctx, ms)
 	return nil
 }
 
-func applyJarDepAction(ms *types.ModuleSettings, action ast.JarDepAction, moduleName string) error {
+// warnUnvendoredJarDependencies says so when a declared dependency has no jar in
+// the project's vendorlib/.
+//
+// Declaring and resolving are separate steps: this writes the coordinate to the
+// model, and `list jar dependencies` will report it, but nothing downloads the
+// jar — and MxBuild does not resolve it either, so the build stays green and the
+// first symptom is a runtime "no driver found" exception from code that looks
+// correctly configured. Studio Pro runs the resolution when you edit Module
+// Settings; headless it has to be asked for. (mxcli-formula1 findings #12.)
+func warnUnvendoredJarDependencies(ctx *ExecContext, ms *types.ModuleSettings) {
+	if ctx == nil || ctx.Backend == nil || ms == nil {
+		return
+	}
+	projectPath := ctx.Backend.Path()
+	if projectPath == "" {
+		return
+	}
+	vendorlib := filepath.Join(filepath.Dir(projectPath), "vendorlib")
+
+	var missing []string
+	for _, d := range ms.JarDependencies {
+		if d == nil || d.ArtifactID == "" || d.Version == "" {
+			continue
+		}
+		jar := filepath.Join(vendorlib, fmt.Sprintf("%s-%s.jar", d.ArtifactID, d.Version))
+		if _, err := os.Stat(jar); err != nil {
+			missing = append(missing, fmt.Sprintf("%s:%s:%s", d.GroupID, d.ArtifactID, d.Version))
+		}
+	}
+	if len(missing) == 0 {
+		return
+	}
+	fmt.Fprintf(ctx.Output,
+		"  Note: %s not in vendorlib/, so %s not on the classpath yet — the build will still succeed and fail at runtime.\n",
+		strings.Join(missing, ", "), pluralItIsTheyAre(len(missing)))
+	fmt.Fprintf(ctx.Output, "  Run: mxcli sync-java-deps -p %s\n", projectPath)
+}
+
+// pluralItIsTheyAre picks the pronoun+verb for a list of n coordinates.
+func pluralItIsTheyAre(n int) string {
+	if n == 1 {
+		return "it is"
+	}
+	return "they are"
+}
+
+// applyJarDepAction applies one action to ms. A non-empty skip is the notice
+// for an ADD … IF NOT EXISTS whose coordinate is already declared: ms is left
+// as it was, and the caller decides whether to print it (exec) or not (check's
+// replay, which calls this same function so the two cannot disagree).
+func applyJarDepAction(ms *types.ModuleSettings, action ast.JarDepAction, moduleName string) (skip string, err error) {
+	err = applyJarDepActionTo(ms, action, moduleName, &skip)
+	return skip, err
+}
+
+func applyJarDepActionTo(ms *types.ModuleSettings, action ast.JarDepAction, moduleName string, skip *string) error {
 	switch a := action.(type) {
 	case *ast.AddJarDepAction:
 		coord := a.Group + ":" + a.Artifact
-		if jarDepByCoord(ms.JarDependencies, coord) != nil {
-			return fmt.Errorf("jar dependency '%s' already exists in module '%s'; use SET to update version", coord, moduleName)
+		if existing := jarDepByCoord(ms.JarDependencies, coord); existing != nil {
+			if a.IfNotExists {
+				*skip = jarDepSkipNotice(existing, a, moduleName)
+				return nil
+			}
+			return fmt.Errorf("jar dependency '%s' already exists in module '%s'; use SET to update version, "+
+				"or 'add jar dependency if not exists' to make the script re-runnable", coord, moduleName)
 		}
 		ms.JarDependencies = append(ms.JarDependencies, &types.JarDependency{
 			GroupID:    a.Group,
@@ -1128,6 +1192,30 @@ func applyJarDepAction(ms *types.ModuleSettings, action ast.JarDepAction, module
 	return nil
 }
 
+// jarDepSkipNotice is the line an ADD … IF NOT EXISTS prints for a coordinate
+// the module already declares. Like every IF NOT EXISTS form it leaves the
+// stored element untouched; when the statement asks for a different version or
+// included flag it says so and names the SET that would change it, because a
+// silent skip would let a version bump in the script never reach the model.
+func jarDepSkipNotice(existing *types.JarDependency, a *ast.AddJarDepAction, moduleName string) string {
+	coord := a.Group + ":" + a.Artifact
+	notice := fmt.Sprintf("Jar dependency '%s' already exists in module '%s' — skipped", coord, moduleName)
+	var diffs, fixes []string
+	if existing.Version != a.Version {
+		diffs = append(diffs, fmt.Sprintf("stored version '%s', this statement says '%s'", existing.Version, a.Version))
+		fixes = append(fixes, fmt.Sprintf("set jar dependency '%s' version '%s'", coord, a.Version))
+	}
+	if existing.IsIncluded != a.Included {
+		diffs = append(diffs, fmt.Sprintf("stored included = %t, this statement says %t", existing.IsIncluded, a.Included))
+		fixes = append(fixes, fmt.Sprintf("set jar dependency '%s' included %t", coord, a.Included))
+	}
+	if len(diffs) == 0 {
+		return notice
+	}
+	return fmt.Sprintf("%s (%s; if not exists leaves it untouched — to change it: alter module %s %s)",
+		notice, strings.Join(diffs, "; "), moduleName, strings.Join(fixes, " "))
+}
+
 func jarDepByCoord(deps []*types.JarDependency, coordinate string) *types.JarDependency {
 	for _, d := range deps {
 		if d.GroupID+":"+d.ArtifactID == coordinate {
@@ -1147,3 +1235,30 @@ func jarDepIdxByCoord(deps []*types.JarDependency, coordinate string) int {
 }
 
 // Executor method wrappers for callers in unmigrated files.
+
+// describeModuleRoles emits the module's roles as re-executable statements.
+//
+// Failures are deliberately silent: DESCRIBE MODULE is useful without the roles,
+// and a backend that cannot read module security (the MCP backend, for one)
+// should not turn a working describe into an error.
+func describeModuleRoles(ctx *ExecContext, mod *model.Module) {
+	ms, err := ctx.Backend.GetModuleSecurity(mod.ID)
+	if err != nil || ms == nil || len(ms.ModuleRoles) == 0 {
+		return
+	}
+	// Sort so the output is stable: a differ comparing two describes must not see
+	// a change because the reader returned roles in a different order.
+	roles := append([]*security.ModuleRole(nil), ms.ModuleRoles...)
+	sort.Slice(roles, func(i, j int) bool { return roles[i].Name < roles[j].Name })
+
+	for _, r := range roles {
+		// Same shape DESCRIBE MODULE ROLE emits, so the two agree.
+		fmt.Fprintf(ctx.Output, "create or modify module role %s.%s", mod.Name, r.Name)
+		if r.Description != "" {
+			// Double embedded quotes; a description containing one would
+			// otherwise terminate the literal and produce unparseable output.
+			fmt.Fprintf(ctx.Output, " description '%s'", strings.ReplaceAll(r.Description, "'", "''"))
+		}
+		fmt.Fprintln(ctx.Output, ";")
+	}
+}

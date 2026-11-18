@@ -12514,7 +12514,8 @@ func (o *GridSortItem) InitFromRaw(raw bson.Raw) {
 	if child, err := codec.DecodeChild(raw, "AttributeRef"); err == nil {
 		o.attributeRef.SetFromDecode(child)
 	}
-	if val, err := raw.LookupErr("SortDirection"); err == nil {
+	// STORAGE-NAME OVERRIDE: see initGridSortItem. Key is "SortOrder".
+	if val, err := raw.LookupErr("SortOrder"); err == nil {
 		if s, ok := val.StringValueOK(); ok {
 			o.sortDirection.SetFromDecode(s)
 		}
@@ -12837,7 +12838,8 @@ func (o *GroupBox) InitFromRaw(raw bson.Raw) {
 	if child, err := codec.DecodeChild(raw, "AccessibilitySettings"); err == nil {
 		o.accessibilitySettings.SetFromDecode(child)
 	}
-	if child, err := codec.DecodeChild(raw, "Caption"); err == nil {
+	// STORAGE-NAME OVERRIDE: see initGroupBox. Key is "CaptionTemplate".
+	if child, err := codec.DecodeChild(raw, "CaptionTemplate"); err == nil {
 		o.caption.SetFromDecode(child)
 	}
 	if val, err := raw.LookupErr("Collapsible"); err == nil {
@@ -15633,7 +15635,8 @@ func (o *ListViewTemplate) RemoveWidgets(index int) {
 
 // InitFromRaw populates lazy-decoded property holders from raw BSON.
 func (o *ListViewTemplate) InitFromRaw(raw bson.Raw) {
-	if val, err := raw.LookupErr("Specialization"); err == nil {
+	// STORAGE-NAME OVERRIDE: see initListViewTemplate. Key is "Entity".
+	if val, err := raw.LookupErr("Entity"); err == nil {
 		if s, ok := val.StringValueOK(); ok {
 			o.specialization.SetFromDecode(s)
 		}
@@ -22230,7 +22233,8 @@ func (o *ScrollContainer) InitFromRaw(raw bson.Raw) {
 		o.appearance.SetFromDecode(child)
 	}
 	o.tabIndex.Init(raw)
-	if child, err := codec.DecodeChild(raw, "Center"); err == nil {
+	// STORAGE-NAME OVERRIDE: see initScrollContainer. Key is "CenterRegion".
+	if child, err := codec.DecodeChild(raw, "CenterRegion"); err == nil {
 		o.center.SetFromDecode(child)
 	}
 	if child, err := codec.DecodeChild(raw, "Left"); err == nil {
@@ -23072,7 +23076,7 @@ func (o *SidebarToggleButton) InitFromRaw(raw bson.Raw) {
 	if child, err := codec.DecodeChild(raw, "AccessibilitySettings"); err == nil {
 		o.accessibilitySettings.SetFromDecode(child)
 	}
-	if child, err := codec.DecodeChild(raw, "Caption"); err == nil {
+	if child, err := codec.DecodeChild(raw, "CaptionTemplate"); err == nil {
 		o.caption.SetFromDecode(child)
 	}
 	if child, err := codec.DecodeChild(raw, "Tooltip"); err == nil {
@@ -24349,7 +24353,8 @@ func (o *TabContainer) InitFromRaw(raw bson.Raw) {
 			o.tabPages.AppendFromDecode(child)
 		}
 	}
-	if val, err := raw.LookupErr("DefaultPage"); err == nil {
+	// STORAGE-NAME OVERRIDE: see initTabContainer. Key is "DefaultPagePointer".
+	if val, err := raw.LookupErr("DefaultPagePointer"); err == nil {
 		if s, ok := val.StringValueOK(); ok {
 			o.defaultPage.SetFromDecode(element.ID(s))
 		} else if _, bdata, bok := val.BinaryOK(); bok {
@@ -27383,7 +27388,8 @@ func (o *WebLayoutContent) InitFromRaw(raw bson.Raw) {
 			o.layoutType.SetFromDecode(s)
 		}
 	}
-	if child, err := codec.DecodeChild(raw, "FormCall"); err == nil {
+	// STORAGE-NAME OVERRIDE (#1411), see initWebLayoutContent.
+	if child, err := codec.DecodeChild(raw, "LayoutCall"); err == nil {
 		o.layoutCall.SetFromDecode(child)
 	}
 	if children, err := codec.DecodeChildren(raw, "Widgets"); err == nil {
@@ -29713,7 +29719,13 @@ func initGridSortItem() *GridSortItem {
 	o.attributePath.Bind(&o.Base, 0)
 	o.attributeRef = property.NewPart[element.Element]("AttributeRef")
 	o.attributeRef.Bind(&o.Base, 1)
-	o.sortDirection = property.NewEnum[string]("SortDirection")
+	// STORAGE-NAME OVERRIDE: BSON key is "SortOrder", not the SDK name
+	// "SortDirection" (verified against a real Studio Pro document —
+	// Administration.Account_Overview stores SortOrder — and against
+	// generated/metamodel, PagesGridSortItem.SortDirection `json:"sortOrder"`).
+	// This one was live: mxcli calls SetSortDirection, so every sort item it
+	// wrote had its direction silently dropped. Permanent fix = supplements.json.
+	o.sortDirection = property.NewEnum[string]("SortOrder")
 	o.sortDirection.Bind(&o.Base, 2)
 	o.SetProperties([]element.Property{o.attributePath, o.attributeRef, o.sortDirection})
 	return o
@@ -29787,7 +29799,13 @@ func initGroupBox() *GroupBox {
 	o.conditionalVisibilitySettings.Bind(&o.Base, 5)
 	o.accessibilitySettings = property.NewPart[element.Element]("AccessibilitySettings")
 	o.accessibilitySettings.Bind(&o.Base, 6)
-	o.caption = property.NewPart[element.Element]("Caption")
+	// STORAGE-NAME OVERRIDE: BSON key is "CaptionTemplate", not the SDK name
+	// "Caption" (generated/metamodel: PagesGroupBox.Caption `json:"captionTemplate"`).
+	// Live — mxcli calls SetCaption on every GroupBox it writes. Evidence is the
+	// metamodel arbiter, not a captured document: no project to hand contains a
+	// GroupBox, so this is weaker than the GridSortItem fix above and should be
+	// confirmed against a Studio Pro-authored one. Permanent fix = supplements.json.
+	o.caption = property.NewPart[element.Element]("CaptionTemplate")
 	o.caption.Bind(&o.Base, 7)
 	o.collapsible = property.NewEnum[string]("Collapsible")
 	o.collapsible.Bind(&o.Base, 8)
@@ -30486,7 +30504,14 @@ func NewListViewSearch() *ListViewSearch {
 func initListViewTemplate() *ListViewTemplate {
 	o := &ListViewTemplate{}
 	o.SetTypeName("Forms$ListViewTemplate")
-	o.specialization = property.NewByNameRef[element.Element]("Specialization", "DomainModels$Entity")
+	// STORAGE-NAME OVERRIDE: BSON key is "Entity", not the SDK name
+	// "Specialization". generated/metamodel agrees —
+	//     Specialization model.QualifiedName `json:"entity"`
+	// where the tag is the storage name — and all four templates in the
+	// Vehicle_Overview page of ako/TestApp (Mendix 10.24, Studio Pro authored)
+	// store {$ID, $Type, Entity, Widgets}. This generator kept only the SDK name.
+	// Must match the InitFromRaw decode key.
+	o.specialization = property.NewByNameRef[element.Element]("Entity", "DomainModels$Entity")
 	o.specialization.Bind(&o.Base, 0)
 	o.widget = property.NewPart[element.Element]("Widget")
 	o.widget.Bind(&o.Base, 1)
@@ -31543,7 +31568,20 @@ func initPage() *Page {
 	o.style.Bind(&o.Base, 10)
 	o.appearance = property.NewPart[element.Element]("Appearance")
 	o.appearance.Bind(&o.Base, 11)
-	o.allowedRoles = property.NewByNameRefListV3[element.Element]("AllowedModuleRoles", "Security$ModuleRole") // STORAGE-NAME OVERRIDE: real BSON key is AllowedModuleRoles
+	// STORAGE-NAME OVERRIDE: real BSON key is AllowedModuleRoles.
+	// LIST-MARKER OVERRIDE: version 1, not 3. Studio Pro writes marker 1 on every
+	// page of a blank 11.13 app (16 of 16, empty lists included), and marker 3 with
+	// a NON-EMPTY role list is what makes `mx create-module-package` abort with
+	// "Unable to cast object of type 'Newtonsoft.Json.Linq.JValue' to type
+	// 'Newtonsoft.Json.Linq.JObject'" in MprDocumentHasher — the marker tells the
+	// reader what the entries are, and the entries here are qualified-name STRINGS.
+	// The empty case never crashed because there was nothing to mis-cast, which is
+	// why only a module with a page carrying a role hit it (upstream #931).
+	// The comment on NewByNameRefListV3 claims marker 1 raises CE0557: measured on
+	// 11.13 at security Off, Prototype AND Production, marker 1 with a role set is
+	// 0 errors and exports; marker 3 is 0 errors and crashes the exporter. The
+	// legacy engine (sdk/mpr/writer_security.go) has always written 1.
+	o.allowedRoles = property.NewByNameRefList[element.Element]("AllowedModuleRoles", "Security$ModuleRole")
 	o.allowedRoles.Bind(&o.Base, 12)
 	o.popupCloseAction = property.NewPrimitive[string]("PopupCloseAction", property.DecodeString)
 	o.popupCloseAction.Bind(&o.Base, 13)
@@ -32452,7 +32490,12 @@ func initScrollContainer() *ScrollContainer {
 	o.appearance.Bind(&o.Base, 3)
 	o.tabIndex = property.NewPrimitive[int32]("TabIndex", property.DecodeInt32)
 	o.tabIndex.Bind(&o.Base, 4)
-	o.center = property.NewPart[element.Element]("Center")
+	// STORAGE-NAME OVERRIDE: BSON key is "CenterRegion", not the SDK name
+	// "Center" (verified against Atlas_Core.Atlas_Default on 11.13.0, whose
+	// ScrollContainer keys are Top/Right/Bottom/Left/CenterRegion — no
+	// "Center"). generated/metamodel agrees: PagesScrollContainer.Center
+	// carries `json:"centerRegion"`. Permanent fix = supplements.json.
+	o.center = property.NewPart[element.Element]("CenterRegion")
 	o.center.Bind(&o.Base, 5)
 	o.left = property.NewPart[element.Element]("Left")
 	o.left.Bind(&o.Base, 6)
@@ -32729,7 +32772,10 @@ func initSidebarToggleButton() *SidebarToggleButton {
 	o.conditionalVisibilitySettings.Bind(&o.Base, 5)
 	o.accessibilitySettings = property.NewPart[element.Element]("AccessibilitySettings")
 	o.accessibilitySettings.Bind(&o.Base, 6)
-	o.caption = property.NewPart[element.Element]("Caption")
+	// STORAGE-NAME OVERRIDE: Studio Pro stores the caption as CaptionTemplate
+	// (Atlas_Core.Atlas_Default, 11.13.0); "Caption" is the SDK name
+	// (mendixlabs/mxcli#1220).
+	o.caption = property.NewPart[element.Element]("CaptionTemplate")
 	o.caption.Bind(&o.Base, 7)
 	o.tooltip = property.NewPart[element.Element]("Tooltip")
 	o.tooltip.Bind(&o.Base, 8)
@@ -33142,7 +33188,11 @@ func initTabContainer() *TabContainer {
 	o.accessibilitySettings.Bind(&o.Base, 6)
 	o.tabPages = property.NewPartList[element.Element]("TabPages")
 	o.tabPages.Bind(&o.Base, 7)
-	o.defaultPage = property.NewByIdRef[element.Element]("DefaultPage")
+	// STORAGE-NAME OVERRIDE: Mendix stores the default tab as "DefaultPagePointer"
+	// (generated/metamodel: defaultPagePointer). Bound as "DefaultPage", the
+	// chosen default tab was written under a key Mendix drops and never read
+	// back from a Studio Pro document (mendixlabs/mxcli#1373).
+	o.defaultPage = property.NewByIdRef[element.Element]("DefaultPagePointer")
 	o.defaultPage.Bind(&o.Base, 8)
 	o.activePageAttributeRef = property.NewPart[element.Element]("ActivePageAttributeRef")
 	o.activePageAttributeRef.Bind(&o.Base, 9)
@@ -33834,7 +33884,12 @@ func initWebLayoutContent() *WebLayoutContent {
 	o.SetTypeName("Forms$WebLayoutContent")
 	o.layoutType = property.NewEnum[string]("LayoutType")
 	o.layoutType.Bind(&o.Base, 0)
-	o.layoutCall = property.NewPart[element.Element]("FormCall")
+	// STORAGE-NAME OVERRIDE: a layout built on another layout keeps its call
+	// under "LayoutCall" — measured on ConversationalUI.Layout_MasterBase
+	// (Studio Pro, 11.12.4), and the key generated/metamodel declares. "FormCall"
+	// is a Forms$Page's key; bound here it never decoded a stored call and wrote
+	// one where no Mendix version reads it (mendixlabs/mxcli#1411).
+	o.layoutCall = property.NewPart[element.Element]("LayoutCall")
 	o.layoutCall.Bind(&o.Base, 1)
 	o.widgets = property.NewPartList[element.Element]("Widgets")
 	o.widgets.Bind(&o.Base, 2)

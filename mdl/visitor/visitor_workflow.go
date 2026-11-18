@@ -3,77 +3,104 @@
 package visitor
 
 import (
+	"fmt"
+	"strconv"
+	"strings"
+
+	"github.com/antlr4-go/antlr/v4"
+
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/deprecation"
 	"github.com/mendixlabs/mxcli/mdl/grammar/parser"
 )
 
 // ExitCreateWorkflowStatement handles CREATE WORKFLOW statements.
 func (b *Builder) ExitCreateWorkflowStatement(ctx *parser.CreateWorkflowStatementContext) {
-	names := ctx.AllQualifiedName()
-	if len(names) == 0 {
+	name := ctx.QualifiedName()
+	if name == nil {
 		return
 	}
 
 	stmt := &ast.CreateWorkflowStmt{
-		Name: buildQualifiedName(names[0]),
+		Name: buildQualifiedName(name),
 	}
 
-	// Parse PARAMETER $Var: Entity
-	if ctx.PARAMETER() != nil && ctx.VARIABLE() != nil {
-		stmt.ParameterVar = ctx.VARIABLE().GetText()
-		// The parameter entity is the second qualified name
-		if len(names) > 1 {
-			stmt.ParameterEntity = buildQualifiedName(names[1])
+	// Header clauses are a SET, not a sequence (ako/mxcli#586): each one is read
+	// off its own clause context, so nothing here depends on the order they were
+	// written in, and no clause's qualified name or string can be mistaken for
+	// another's. The rule this replaces read `names[1]` or `names[2]` for the
+	// overview page depending on whether PARAMETER was present — which is the
+	// shape of reading that made the order load-bearing in the first place.
+	b.checkWorkflowClausesAtMostOnce(ctx)
+	for _, clause := range ctx.AllWorkflowHeaderClause() {
+		hc, ok := clause.(*parser.WorkflowHeaderClauseContext)
+		if !ok {
+			continue
+		}
+		switch {
+		case hc.FOLDER() != nil:
+			if tok := hc.GetFolder(); tok != nil {
+				stmt.Folder = unquoteStringLit(tok)
+			}
+		case hc.PARAMETER() != nil:
+			if v := hc.VARIABLE(); v != nil {
+				stmt.ParameterVar = v.GetText()
+			}
+			if qn := hc.QualifiedName(); qn != nil {
+				stmt.ParameterEntity = buildQualifiedName(qn)
+			}
+		case hc.DISPLAY() != nil:
+			if tok := hc.GetDisplay(); tok != nil {
+				stmt.DisplayName = unquoteStringLit(tok)
+			}
+			stmt.DisplayParams = buildWorkflowTemplateParams(hc.TemplateParams())
+		case hc.DESCRIPTION() != nil:
+			if tok := hc.GetDescription(); tok != nil {
+				stmt.Description = unquoteStringLit(tok)
+			}
+			stmt.DescriptionParams = buildWorkflowTemplateParams(hc.TemplateParams())
+		case hc.EXPORT() != nil && hc.LEVEL() != nil:
+			// HIDDEN_KW is read alongside IDENTIFIER because `Hidden` was an
+			// ordinary identifier here until the microflow header clauses made it
+			// a keyword — at which point this read silently produced "" and three
+			// tests caught it. Any rule taking a bare IDENTIFIER for a fixed
+			// vocabulary has the same fragility.
+			switch {
+			case hc.IDENTIFIER() != nil:
+				stmt.ExportLevel = hc.IDENTIFIER().GetText()
+			case hc.HIDDEN_KW() != nil:
+				stmt.ExportLevel = hc.HIDDEN_KW().GetText()
+			case hc.API() != nil:
+				stmt.ExportLevel = "API"
+			}
+		case hc.OVERVIEW() != nil && hc.PAGE() != nil:
+			if qn := hc.QualifiedName(); qn != nil {
+				stmt.OverviewPage = buildQualifiedName(qn)
+			}
+		case hc.DUE() != nil && hc.DATE_TYPE() != nil:
+			stmt.DueDate = workflowExpressionText(hc.GetDueDate())
+		case hc.ANNOTATION() != nil:
+			if tok := hc.GetAnnotationText(); tok != nil {
+				stmt.Annotation = unquoteStringLit(tok)
+			}
+		case hc.WorkflowEventHandlerClause() != nil:
+			h, ok := hc.WorkflowEventHandlerClause().(*parser.WorkflowEventHandlerClauseContext)
+			if !ok {
+				continue
+			}
+			node := ast.WorkflowEventHandlerNode{AnyEvent: h.ANY() != nil}
+			if qn := h.QualifiedName(); qn != nil {
+				node.Microflow = buildQualifiedName(qn)
+			}
+			for _, id := range h.AllIDENTIFIER() {
+				node.EventTypes = append(node.EventTypes, id.GetText())
+			}
+			if str := h.STRING_LITERAL(); str != nil {
+				node.Description = unquoteStringLit(str)
+			}
+			stmt.EventHandlers = append(stmt.EventHandlers, node)
 		}
 	}
-
-	// Parse DISPLAY, DESCRIPTION, EXPORT LEVEL, DUE DATE using positional STRING_LITERAL indexing
-	allStrings := ctx.AllSTRING_LITERAL()
-	stringIdx := 0
-
-	// DISPLAY 'text'
-	if ctx.DISPLAY() != nil && stringIdx < len(allStrings) {
-		stmt.DisplayName = unquoteString(allStrings[stringIdx].GetText())
-		stringIdx++
-	}
-
-	// DESCRIPTION 'text'
-	if ctx.DESCRIPTION() != nil && stringIdx < len(allStrings) {
-		stmt.Description = unquoteString(allStrings[stringIdx].GetText())
-		stringIdx++
-	}
-
-	// EXPORT LEVEL (Identifier | API)
-	if ctx.EXPORT() != nil && ctx.LEVEL() != nil {
-		if ctx.IDENTIFIER() != nil {
-			stmt.ExportLevel = ctx.IDENTIFIER().GetText()
-		} else if ctx.API() != nil {
-			stmt.ExportLevel = "API"
-		}
-	}
-
-	// Parse OVERVIEW PAGE QualifiedName
-	overviewPageIdx := -1
-	if ctx.OVERVIEW() != nil && ctx.PAGE() != nil {
-		// Find the overview page qualified name
-		// It's either names[1] or names[2] depending on whether PARAMETER was present
-		startIdx := 1
-		if ctx.PARAMETER() != nil {
-			startIdx = 2
-		}
-		if len(names) > startIdx {
-			stmt.OverviewPage = buildQualifiedName(names[startIdx])
-			overviewPageIdx = startIdx
-		}
-	}
-	_ = overviewPageIdx
-
-	// Parse DUE DATE 'expression'
-	if ctx.DUE() != nil && stringIdx < len(allStrings) {
-		stmt.DueDate = unquoteString(allStrings[stringIdx].GetText())
-		stringIdx++
-	}
-	_ = stringIdx
 
 	// Parse CREATE OR MODIFY
 	createStmt := findParentCreateStatement(ctx)
@@ -82,11 +109,14 @@ func (b *Builder) ExitCreateWorkflowStatement(ctx *parser.CreateWorkflowStatemen
 			stmt.CreateOrModify = true
 		}
 	}
-	stmt.Documentation = findDocCommentText(ctx)
+	stmt.Documentation, stmt.DocumentationSet = findDocComment(ctx)
 
 	// Parse body
-	if body := ctx.WorkflowBody(); body != nil {
-		stmt.Activities = buildWorkflowBody(body)
+	if body := ctx.WorkflowMainBody(); body != nil {
+		stmt.Activities = buildWorkflowMainBody(body)
+	}
+	for _, espCtx := range ctx.AllWorkflowEventSubProcess() {
+		stmt.EventSubProcesses = append(stmt.EventSubProcesses, buildWorkflowEventSubProcess(espCtx))
 	}
 
 	b.statements = append(b.statements, stmt)
@@ -103,12 +133,22 @@ func (b *Builder) exitAlterWorkflowStatement(ctx *parser.AlterStatementContext) 
 		Name: buildQualifiedName(qn),
 	}
 
+	// ALTER's INSERT/REPLACE ACTIVITY take a whole workflow activity, user tasks
+	// included, so the at-most-once rule has to be applied here as well.
+	b.checkWorkflowClausesAtMostOnce(ctx)
+
+	// The generic block (ako/mxcli#712), or the old per-action form, whose
+	// every action is a registered alias of a generic operation.
+	for _, opCtx := range ctx.AllAlterWorkflowOperation() {
+		stmt.Operations = append(stmt.Operations, b.buildAlterWorkflowOperation(opCtx.(*parser.AlterWorkflowOperationContext))...)
+	}
 	for _, actionCtx := range ctx.AllAlterWorkflowAction() {
 		op := buildAlterWorkflowAction(actionCtx.(*parser.AlterWorkflowActionContext))
 		if op != nil {
 			stmt.Operations = append(stmt.Operations, op)
 		}
 	}
+	b.recordOldAlterWorkflowActions(ctx)
 
 	b.statements = append(b.statements, stmt)
 }
@@ -140,9 +180,9 @@ func buildAlterWorkflowAction(ctx *parser.AlterWorkflowActionContext) ast.AlterW
 			return nil
 		}
 		return &ast.InsertAfterOp{
-			ActivityRef: ref,
-			AtPosition:  atPos,
-			NewActivity: act,
+			ActivityRef:   ref,
+			AtPosition:    atPos,
+			NewActivities: []ast.WorkflowActivityNode{act},
 		}
 	}
 
@@ -169,9 +209,9 @@ func buildAlterWorkflowAction(ctx *parser.AlterWorkflowActionContext) ast.AlterW
 			return nil
 		}
 		return &ast.ReplaceActivityOp{
-			ActivityRef: ref,
-			AtPosition:  atPos,
-			NewActivity: act,
+			ActivityRef:   ref,
+			AtPosition:    atPos,
+			NewActivities: []ast.WorkflowActivityNode{act},
 		}
 	}
 
@@ -181,7 +221,7 @@ func buildAlterWorkflowAction(ctx *parser.AlterWorkflowActionContext) ast.AlterW
 			return nil
 		}
 		ref, atPos := parseAlterActivityRef(ctx.AlterActivityRef().(*parser.AlterActivityRefContext))
-		outcomeName := unquoteString(ctx.STRING_LITERAL().GetText())
+		outcomeName := unquoteStringLit(ctx.STRING_LITERAL())
 		var activities []ast.WorkflowActivityNode
 		if body := ctx.WorkflowBody(); body != nil {
 			activities = buildWorkflowBody(body)
@@ -217,7 +257,7 @@ func buildAlterWorkflowAction(ctx *parser.AlterWorkflowActionContext) ast.AlterW
 			return nil
 		}
 		ref, atPos := parseAlterActivityRef(ctx.AlterActivityRef().(*parser.AlterActivityRefContext))
-		outcomeName := unquoteString(ctx.STRING_LITERAL().GetText())
+		outcomeName := unquoteStringLit(ctx.STRING_LITERAL())
 		return &ast.DropOutcomeOp{
 			OutcomeName: outcomeName,
 			ActivityRef: ref,
@@ -231,7 +271,7 @@ func buildAlterWorkflowAction(ctx *parser.AlterWorkflowActionContext) ast.AlterW
 			return nil
 		}
 		ref, atPos := parseAlterActivityRef(ctx.AlterActivityRef().(*parser.AlterActivityRefContext))
-		pathCaption := unquoteString(ctx.STRING_LITERAL().GetText())
+		pathCaption := unquoteStringLit(ctx.STRING_LITERAL())
 		return &ast.DropPathOp{
 			PathCaption: pathCaption,
 			ActivityRef: ref,
@@ -273,7 +313,7 @@ func buildAlterWorkflowAction(ctx *parser.AlterWorkflowActionContext) ast.AlterW
 			return nil
 		}
 		ref, atPos := parseAlterActivityRef(ctx.AlterActivityRef().(*parser.AlterActivityRefContext))
-		condition := unquoteString(ctx.STRING_LITERAL().GetText())
+		condition := unquoteStringLit(ctx.STRING_LITERAL())
 		var activities []ast.WorkflowActivityNode
 		if body := ctx.WorkflowBody(); body != nil {
 			activities = buildWorkflowBody(body)
@@ -292,7 +332,7 @@ func buildAlterWorkflowAction(ctx *parser.AlterWorkflowActionContext) ast.AlterW
 			return nil
 		}
 		ref, atPos := parseAlterActivityRef(ctx.AlterActivityRef().(*parser.AlterActivityRefContext))
-		branchName := unquoteString(ctx.STRING_LITERAL().GetText())
+		branchName := unquoteStringLit(ctx.STRING_LITERAL())
 		return &ast.DropBranchOp{
 			BranchName:  branchName,
 			ActivityRef: ref,
@@ -309,20 +349,24 @@ func buildWorkflowSetPropertyOp(ctx *parser.WorkflowSetPropertyContext) *ast.Set
 
 	if ctx.DISPLAY() != nil {
 		op.Property = "display"
-		op.Value = unquoteString(ctx.STRING_LITERAL().GetText())
+		op.Value = unquoteStringLit(ctx.STRING_LITERAL())
 	} else if ctx.DESCRIPTION() != nil {
 		op.Property = "description"
-		op.Value = unquoteString(ctx.STRING_LITERAL().GetText())
+		op.Value = unquoteStringLit(ctx.STRING_LITERAL())
 	} else if ctx.EXPORT() != nil {
 		op.Property = "export_level"
-		if ctx.API() != nil {
+		// HIDDEN_KW alongside IDENTIFIER — see the CREATE side above.
+		switch {
+		case ctx.API() != nil:
 			op.Value = "API"
-		} else if ctx.IDENTIFIER() != nil {
+		case ctx.IDENTIFIER() != nil:
 			op.Value = ctx.IDENTIFIER().GetText()
+		case ctx.HIDDEN_KW() != nil:
+			op.Value = ctx.HIDDEN_KW().GetText()
 		}
 	} else if ctx.DUE() != nil {
 		op.Property = "due_date"
-		op.Value = unquoteString(ctx.STRING_LITERAL().GetText())
+		op.Value = workflowExpressionText(ctx.WorkflowExpression())
 	} else if ctx.OVERVIEW() != nil {
 		op.Property = "overview_page"
 		if qn := ctx.QualifiedName(); qn != nil {
@@ -353,7 +397,7 @@ func buildActivitySetPropertyOp(ctx *parser.ActivitySetPropertyContext, ref stri
 		}
 	} else if ctx.DESCRIPTION() != nil {
 		op.Property = "description"
-		op.Value = unquoteString(ctx.STRING_LITERAL().GetText())
+		op.Value = unquoteStringLit(ctx.STRING_LITERAL())
 	} else if ctx.TARGETING() != nil && ctx.MICROFLOW() != nil {
 		op.Property = "targeting_microflow"
 		if qn := ctx.QualifiedName(); qn != nil {
@@ -361,10 +405,14 @@ func buildActivitySetPropertyOp(ctx *parser.ActivitySetPropertyContext, ref stri
 		}
 	} else if ctx.TARGETING() != nil && ctx.XPATH() != nil {
 		op.Property = "targeting_xpath"
-		op.Value = unquoteString(ctx.STRING_LITERAL().GetText())
+		if groups := ctx.AllXpathConstraint(); len(groups) > 0 {
+			op.Value = bracketedXPathText(groups)
+		} else if lit := ctx.STRING_LITERAL(); lit != nil {
+			op.Value = stripExpressionIdentifierQuotes(unquoteStringLit(lit)) // MDL-DEPR031, recorded by ExitActivitySetProperty; quoted names as in brackets (mendixlabs/mxcli#1243)
+		}
 	} else if ctx.DUE() != nil {
 		op.Property = "due_date"
-		op.Value = unquoteString(ctx.STRING_LITERAL().GetText())
+		op.Value = workflowExpressionText(ctx.WorkflowExpression())
 	}
 
 	return op
@@ -379,7 +427,7 @@ func parseAlterActivityRef(ctx *parser.AlterActivityRefContext) (string, int) {
 	if iok := ctx.IdentifierOrKeyword(); iok != nil {
 		name = identifierOrKeywordText(iok)
 	} else if ctx.STRING_LITERAL() != nil {
-		name = unquoteString(ctx.STRING_LITERAL().GetText())
+		name = unquoteStringLit(ctx.STRING_LITERAL())
 	}
 
 	atPos := 0
@@ -390,22 +438,53 @@ func parseAlterActivityRef(ctx *parser.AlterActivityRefContext) (string, int) {
 	return name, atPos
 }
 
-// buildWorkflowBody converts a workflow body context to activity nodes.
+// buildWorkflowBody builds a brace body — an outcome, a decision branch, a
+// parallel path, a boundary-event path or an ALTER insert — which may contain
+// `end workflow`.
 func buildWorkflowBody(ctx parser.IWorkflowBodyContext) []ast.WorkflowActivityNode {
 	if ctx == nil {
 		return nil
 	}
-	bodyCtx := ctx.(*parser.WorkflowBodyContext)
-	var activities []ast.WorkflowActivityNode
+	return buildWorkflowStatements(ctx.GetChildren())
+}
 
-	for _, actCtx := range bodyCtx.AllWorkflowActivityStmt() {
-		act := buildWorkflowActivityStmt(actCtx)
+// buildWorkflowMainBody builds the top-level body, where `end workflow` is the
+// closer rather than a statement.
+func buildWorkflowMainBody(ctx parser.IWorkflowMainBodyContext) []ast.WorkflowActivityNode {
+	if ctx == nil {
+		return nil
+	}
+	return buildWorkflowStatements(ctx.GetChildren())
+}
+
+// buildWorkflowStatements walks a body's children in source order. A body holds
+// more than one rule since `end workflow` and `return` are not
+// workflowActivityStmt alternatives, and collecting each with its own All…()
+// accessor would move every End to the end of its block.
+func buildWorkflowStatements(children []antlr.Tree) []ast.WorkflowActivityNode {
+	var activities []ast.WorkflowActivityNode
+	for _, child := range children {
+		var act ast.WorkflowActivityNode
+		switch c := child.(type) {
+		case *parser.WorkflowActivityStmtContext:
+			act = buildWorkflowActivityStmt(c)
+		case *parser.WorkflowEndStmtContext:
+			act = buildWorkflowEnd(c)
+		case *parser.WorkflowReturnStmtContext:
+			act = &ast.WorkflowReturnNode{}
+		}
 		if act != nil {
 			activities = append(activities, act)
 		}
 	}
-
 	return activities
+}
+
+// buildWorkflowEnd builds `end workflow [caption '<caption>']`.
+func buildWorkflowEnd(ctx *parser.WorkflowEndStmtContext) *ast.WorkflowEndNode {
+	node := &ast.WorkflowEndNode{}
+	node.Caption = workflowCaptionText(ctx.WorkflowCaption())
+	return node
 }
 
 // buildWorkflowActivityStmt dispatches to the appropriate builder.
@@ -414,7 +493,68 @@ func buildWorkflowActivityStmt(ctx parser.IWorkflowActivityStmtContext) ast.Work
 		return nil
 	}
 	actCtx := ctx.(*parser.WorkflowActivityStmtContext)
+	act := buildWorkflowActivityCore(actCtx)
+	if a, ok := act.(ast.AnnotatedWorkflowActivity); ok {
+		a.SetActivityAnnotation(workflowAttachedAnnotation(actCtx.AllAnnotation()))
+	}
+	return act
+}
 
+// workflowAttachedAnnotation is the text of the `@annotation '…'` before a
+// workflow activity or event sub-process, "" when there is none. The listener
+// ExitWorkflowActivityStmt reports any other annotation.
+func workflowAttachedAnnotation(anns []parser.IAnnotationContext) string {
+	for _, a := range anns {
+		ann, ok := a.(*parser.AnnotationContext)
+		if !ok || !strings.EqualFold(ann.AnnotationName().GetText(), "annotation") {
+			continue
+		}
+		if v := ann.AnnotationValue(); v != nil {
+			return extractAnnotationValueString(v)
+		}
+	}
+	return ""
+}
+
+// checkWorkflowAnnotations reports what a workflow activity cannot carry: an
+// annotation other than one `@annotation '…'`. MDL writes no position for a
+// workflow activity, and Mendix attaches at most one note to it.
+func (b *Builder) checkWorkflowAnnotations(anns []parser.IAnnotationContext) {
+	notes := 0
+	for _, a := range anns {
+		ann, ok := a.(*parser.AnnotationContext)
+		if !ok {
+			continue
+		}
+		line := ann.GetStart().GetLine()
+		name := ann.AnnotationName().GetText()
+		if !strings.EqualFold(name, "annotation") {
+			b.addError(fmt.Errorf("line %d: @%s is not a workflow annotation; a workflow activity takes only @annotation '…'", line, name))
+			continue
+		}
+		if ann.AnnotationValue() == nil || extractAnnotationValueString(ann.AnnotationValue()) == "" {
+			b.addError(fmt.Errorf("line %d: a workflow activity's note is @annotation '<text>'", line))
+			continue
+		}
+		notes++
+		if notes > 1 {
+			b.addError(fmt.Errorf("line %d: a workflow activity has at most one @annotation", line))
+		}
+	}
+}
+
+// ExitWorkflowActivityStmt checks the annotations before an activity.
+func (b *Builder) ExitWorkflowActivityStmt(ctx *parser.WorkflowActivityStmtContext) {
+	b.checkWorkflowAnnotations(ctx.AllAnnotation())
+}
+
+// ExitWorkflowEventSubProcess checks the annotations before an event sub-process.
+func (b *Builder) ExitWorkflowEventSubProcess(ctx *parser.WorkflowEventSubProcessContext) {
+	b.checkWorkflowAnnotations(ctx.AllAnnotation())
+}
+
+// buildWorkflowActivityCore builds the activity itself, without its annotation.
+func buildWorkflowActivityCore(actCtx *parser.WorkflowActivityStmtContext) ast.WorkflowActivityNode {
 	if ut := actCtx.WorkflowUserTaskStmt(); ut != nil {
 		return buildWorkflowUserTask(ut)
 	}
@@ -439,6 +579,9 @@ func buildWorkflowActivityStmt(ctx parser.IWorkflowActivityStmtContext) ast.Work
 	if wn := actCtx.WorkflowWaitForNotificationStmt(); wn != nil {
 		return buildWorkflowWaitForNotification(wn)
 	}
+	if n := actCtx.WorkflowNotificationStmt(); n != nil {
+		return buildWorkflowNotification(n)
+	}
 	if ann := actCtx.WorkflowAnnotationStmt(); ann != nil {
 		return buildWorkflowAnnotation(ann)
 	}
@@ -446,6 +589,12 @@ func buildWorkflowActivityStmt(ctx parser.IWorkflowActivityStmtContext) ast.Work
 }
 
 // buildWorkflowUserTask builds a WorkflowUserTaskNode from the grammar context.
+//
+// Clauses are a SET (ako/mxcli#586), so each is read off its own clause context
+// in source order rather than by counting the statement's qualified names and
+// string literals. The counting version is what made the order load-bearing:
+// `on created microflow` had to sit between the targeting clauses and `entity`
+// or its qualified name landed on a different field.
 func buildWorkflowUserTask(ctx parser.IWorkflowUserTaskStmtContext) *ast.WorkflowUserTaskNode {
 	utCtx := ctx.(*parser.WorkflowUserTaskStmtContext)
 
@@ -463,78 +612,117 @@ func buildWorkflowUserTask(ctx parser.IWorkflowUserTaskStmtContext) *ast.Workflo
 		IsMultiUser: utCtx.MULTI() != nil,
 	}
 
-	// Caption is the first STRING_LITERAL
-	allStrings := utCtx.AllSTRING_LITERAL()
-	if len(allStrings) > 0 {
-		node.Caption = unquoteString(allStrings[0].GetText())
+	// The caption is the statement's own string literal; every other string now
+	// belongs to a clause.
+	if caption := utCtx.STRING_LITERAL(); caption != nil {
+		node.Caption = unquoteStringLit(caption)
 	}
 
-	// Qualified names: PAGE, TARGETING MICROFLOW, ENTITY (in order)
-	names := utCtx.AllQualifiedName()
-	nameIdx := 0
-
-	if utCtx.PAGE() != nil && nameIdx < len(names) {
-		node.Page = buildQualifiedName(names[nameIdx])
-		nameIdx++
+	for _, clause := range utCtx.AllWorkflowUserTaskClause() {
+		applyWorkflowUserTaskClause(node, clause)
+	}
+	for _, clause := range utCtx.AllWorkflowMultiUserTaskClause() {
+		mc, ok := clause.(*parser.WorkflowMultiUserTaskClauseContext)
+		if !ok {
+			continue
+		}
+		switch {
+		case mc.WorkflowUserTaskClause() != nil:
+			applyWorkflowUserTaskClause(node, mc.WorkflowUserTaskClause())
+		case mc.WorkflowParticipantsClause() != nil:
+			if pc, ok := mc.WorkflowParticipantsClause().(*parser.WorkflowParticipantsClauseContext); ok {
+				node.Participants = buildWorkflowParticipants(pc)
+			}
+		case mc.WorkflowCompletionClause() != nil:
+			if cc, ok := mc.WorkflowCompletionClause().(*parser.WorkflowCompletionClauseContext); ok {
+				node.Completion = buildWorkflowCompletionRule(cc)
+			}
+		case mc.AWAIT() != nil:
+			node.AwaitAllUsers = true
+		}
 	}
 
-	// Determine if group targeting (TARGETING GROUPS vs TARGETING [USERS])
-	isGroupTargeting := len(utCtx.AllGROUPS()) > 0
+	return node
+}
 
-	if utCtx.MICROFLOW() != nil && nameIdx < len(names) {
-		if isGroupTargeting {
+// applyWorkflowUserTaskClause folds one clause into the task node. Reading
+// TARGETING's USERS/GROUPS off the clause that carries it — rather than asking
+// whether the whole statement mentions GROUPS anywhere — is what lets the two
+// targeting clauses appear in either order without one borrowing the other's
+// audience.
+func applyWorkflowUserTaskClause(node *ast.WorkflowUserTaskNode, clause parser.IWorkflowUserTaskClauseContext) {
+	c, ok := clause.(*parser.WorkflowUserTaskClauseContext)
+	if !ok {
+		return
+	}
+	switch {
+	case c.PAGE() != nil:
+		if qn := c.QualifiedName(); qn != nil {
+			node.Page = buildQualifiedName(qn)
+		}
+	case c.TARGETING() != nil && c.MICROFLOW() != nil:
+		if c.GROUPS() != nil {
 			node.Targeting.Kind = "group_microflow"
 		} else {
 			node.Targeting.Kind = "microflow"
 		}
-		node.Targeting.Microflow = buildQualifiedName(names[nameIdx])
-		nameIdx++
-	}
-
-	stringIdx := 1 // allStrings[0] is the caption
-	if utCtx.XPATH() != nil && stringIdx < len(allStrings) {
-		if isGroupTargeting {
+		if qn := c.QualifiedName(); qn != nil {
+			node.Targeting.Microflow = buildQualifiedName(qn)
+		}
+	case c.TARGETING() != nil && c.XPATH() != nil:
+		if c.GROUPS() != nil {
 			node.Targeting.Kind = "group_xpath"
 		} else {
 			node.Targeting.Kind = "xpath"
 		}
-		node.Targeting.XPath = unquoteString(allStrings[stringIdx].GetText())
-		stringIdx++
+		if groups := c.AllXpathConstraint(); len(groups) > 0 {
+			node.Targeting.XPath = bracketedXPathText(groups)
+		} else if str := c.STRING_LITERAL(); str != nil {
+			// MDL-DEPR031, recorded by ExitWorkflowUserTaskClause, which also
+			// refuses a quoted value. A quoted name loses its quotes, as in the
+			// bracketed form
+			// (mendixlabs/mxcli#1243, ako/mxcli#566).
+			node.Targeting.XPath = stripExpressionIdentifierQuotes(unquoteStringLit(str))
+		}
+	case c.ON() != nil && c.CREATED() != nil:
+		if qn := c.QualifiedName(); qn != nil {
+			node.OnCreated = buildQualifiedName(qn)
+		}
+	case c.ENTITY() != nil:
+		if qn := c.QualifiedName(); qn != nil {
+			node.Entity = buildQualifiedName(qn)
+		}
+	case c.DUE() != nil && c.DATE_TYPE() != nil:
+		node.DueDate = workflowExpressionText(c.WorkflowExpression())
+	case c.DESCRIPTION() != nil:
+		if str := c.STRING_LITERAL(); str != nil {
+			node.TaskDescription = unquoteStringLit(str)
+		}
+		node.TaskDescriptionParams = buildWorkflowTemplateParams(c.TemplateParams())
+	case c.TASK() != nil:
+		// The word after TASK is checked by ExitWorkflowUserTaskClause.
+		if str := c.STRING_LITERAL(); str != nil {
+			node.TaskName = unquoteStringLit(str)
+		}
+		node.TaskNameParams = buildWorkflowTemplateParams(c.TemplateParams())
+	case c.OUTCOMES() != nil:
+		for _, outcomeCtx := range c.AllWorkflowUserTaskOutcome() {
+			node.Outcomes = append(node.Outcomes, buildWorkflowUserTaskOutcome(outcomeCtx))
+		}
+	case len(c.AllBOUNDARY()) > 0:
+		for _, beCtx := range c.AllWorkflowBoundaryEventClause() {
+			node.BoundaryEvents = append(node.BoundaryEvents, buildBoundaryEventNode(beCtx))
+		}
+	case c.AUTO() != nil:
+		node.AutoAssign = true
 	}
-
-	if utCtx.ENTITY() != nil && nameIdx < len(names) {
-		node.Entity = buildQualifiedName(names[nameIdx])
-	}
-
-	if utCtx.DUE() != nil && utCtx.DATE_TYPE() != nil && stringIdx < len(allStrings) {
-		node.DueDate = unquoteString(allStrings[stringIdx].GetText())
-		stringIdx++
-	}
-
-	if utCtx.DESCRIPTION() != nil && stringIdx < len(allStrings) {
-		node.TaskDescription = unquoteString(allStrings[stringIdx].GetText())
-		stringIdx++
-	}
-
-	// Outcomes
-	for _, outcomeCtx := range utCtx.AllWorkflowUserTaskOutcome() {
-		outcome := buildWorkflowUserTaskOutcome(outcomeCtx)
-		node.Outcomes = append(node.Outcomes, outcome)
-	}
-
-	// BoundaryEvents (Issue #7)
-	for _, beCtx := range utCtx.AllWorkflowBoundaryEventClause() {
-		node.BoundaryEvents = append(node.BoundaryEvents, buildBoundaryEventNode(beCtx))
-	}
-
-	return node
 }
 
 // buildWorkflowUserTaskOutcome builds a WorkflowUserTaskOutcomeNode.
 func buildWorkflowUserTaskOutcome(ctx parser.IWorkflowUserTaskOutcomeContext) ast.WorkflowUserTaskOutcomeNode {
 	outCtx := ctx.(*parser.WorkflowUserTaskOutcomeContext)
 	outcome := ast.WorkflowUserTaskOutcomeNode{
-		Caption: unquoteString(outCtx.STRING_LITERAL().GetText()),
+		Caption: unquoteStringLit(outCtx.STRING_LITERAL()),
 	}
 	if body := outCtx.WorkflowBody(); body != nil {
 		outcome.Activities = buildWorkflowBody(body)
@@ -542,16 +730,32 @@ func buildWorkflowUserTaskOutcome(ctx parser.IWorkflowUserTaskOutcomeContext) as
 	return outcome
 }
 
+// workflowActivityNameText reads an optional explicit activity name off a
+// statement. Mendix resolves `jump to` by activity NAME, so this is the only way
+// a described workflow's jump wiring survives a re-execution (ako/mxcli#408).
+func workflowActivityNameText(ctx parser.IWorkflowActivityNameContext) string {
+	if ctx == nil {
+		return ""
+	}
+	if qid := ctx.QUOTED_IDENTIFIER(); qid != nil {
+		return unquoteIdentifier(qid.GetText())
+	}
+	if id := ctx.IDENTIFIER(); id != nil {
+		return id.GetText()
+	}
+	return ""
+}
+
 // buildWorkflowCallMicroflow builds a WorkflowCallMicroflowNode.
 func buildWorkflowCallMicroflow(ctx parser.IWorkflowCallMicroflowStmtContext) *ast.WorkflowCallMicroflowNode {
 	cmCtx := ctx.(*parser.WorkflowCallMicroflowStmtContext)
 	node := &ast.WorkflowCallMicroflowNode{
+		Name:      workflowActivityNameText(cmCtx.WorkflowActivityName()),
+		Agent:     cmCtx.AGENT() != nil,
 		Microflow: buildQualifiedName(cmCtx.QualifiedName()),
 	}
 
-	if cmCtx.COMMENT() != nil && cmCtx.STRING_LITERAL() != nil {
-		node.Caption = unquoteString(cmCtx.STRING_LITERAL().GetText())
-	}
+	node.Caption = workflowCaptionText(cmCtx.WorkflowCaption())
 
 	for _, outcomeCtx := range cmCtx.AllWorkflowConditionOutcome() {
 		outcome := buildWorkflowConditionOutcome(outcomeCtx)
@@ -559,13 +763,9 @@ func buildWorkflowCallMicroflow(ctx parser.IWorkflowCallMicroflowStmtContext) *a
 	}
 
 	// Parameter mappings (Issue #10)
-	for _, pmCtx := range cmCtx.AllWorkflowParameterMapping() {
-		pmCtx2 := pmCtx.(*parser.WorkflowParameterMappingContext)
-		mapping := ast.WorkflowParameterMappingNode{
-			Parameter:  pmCtx2.QualifiedName().GetText(),
-			Expression: unquoteString(pmCtx2.STRING_LITERAL().GetText()),
-		}
-		node.ParameterMappings = append(node.ParameterMappings, mapping)
+	node.ParameterMappings = buildWorkflowCallArguments(cmCtx.WorkflowCallArguments())
+	if len(node.ParameterMappings) == 0 {
+		node.ParameterMappings = buildWorkflowParameterMappings(cmCtx.AllWorkflowParameterMapping())
 	}
 
 	// BoundaryEvents (Issue #7)
@@ -576,25 +776,68 @@ func buildWorkflowCallMicroflow(ctx parser.IWorkflowCallMicroflowStmtContext) *a
 	return node
 }
 
+// bareWorkflowParameterName normalizes the name in a workflow `with (Name = ...)`
+// mapping to the bare, unquoted last segment. A workflow call-microflow/call-workflow
+// maps to the target's parameter by BARE name: a fully-qualified name
+// (Mod.Flow.Param) writes a null ParameterId and makes the runtime fail to load the
+// model, and a quoted name ("Param") is looked up verbatim → CE1613. Studio Pro uses
+// the bare name, and this is the one place MDL's "always quote identifiers" habit is
+// actively wrong — so accept all three spellings and normalize (FINDINGS #41).
+func bareWorkflowParameterName(raw string) string {
+	if i := strings.LastIndex(raw, "."); i >= 0 {
+		raw = raw[i+1:]
+	}
+	return unquoteIdentifier(strings.TrimSpace(raw))
+}
+
+// buildWorkflowParameterMappings builds the `with (Name = 'expr')` list shared by
+// CALL MICROFLOW and CALL WORKFLOW.
+//
+// Both children are nil-checked because the AST builder runs over the parse tree
+// even when the parse failed — Build() walks first and returns the syntax errors
+// alongside the partial program, which is what lets `check` report more than the
+// first error. Under ANTLR error recovery a rule can therefore be visited with a
+// required child missing, and reading it unguarded takes the process down. The
+// grammar requires a STRING_LITERAL value, so an unquoted one (`Ctx = $Var`, the
+// spelling used everywhere else in MDL) left STRING_LITERAL() nil and every
+// command that parses the script — check, check --references, exec — died on a
+// nil dereference with no diagnostic at all (ako/mxcli#1023). Skipping the
+// mapping keeps the syntax error the listener already recorded as the thing the
+// author is told about.
+func buildWorkflowParameterMappings(ctxs []parser.IWorkflowParameterMappingContext) []ast.WorkflowParameterMappingNode {
+	var out []ast.WorkflowParameterMappingNode
+	for _, pmCtx := range ctxs {
+		pmCtx2, ok := pmCtx.(*parser.WorkflowParameterMappingContext)
+		if !ok || pmCtx2.QualifiedName() == nil || pmCtx2.STRING_LITERAL() == nil {
+			continue
+		}
+		out = append(out, ast.WorkflowParameterMappingNode{
+			Parameter:  bareWorkflowParameterName(pmCtx2.QualifiedName().GetText()),
+			Expression: unquoteStringLit(pmCtx2.STRING_LITERAL()),
+		})
+	}
+	return out
+}
+
 // buildWorkflowCallWorkflow builds a WorkflowCallWorkflowNode.
 func buildWorkflowCallWorkflow(ctx parser.IWorkflowCallWorkflowStmtContext) *ast.WorkflowCallWorkflowNode {
 	cwCtx := ctx.(*parser.WorkflowCallWorkflowStmtContext)
 	node := &ast.WorkflowCallWorkflowNode{
+		Name:     workflowActivityNameText(cwCtx.WorkflowActivityName()),
 		Workflow: buildQualifiedName(cwCtx.QualifiedName()),
 	}
 
-	if cwCtx.COMMENT() != nil && cwCtx.STRING_LITERAL() != nil {
-		node.Caption = unquoteString(cwCtx.STRING_LITERAL().GetText())
-	}
+	node.Caption = workflowCaptionText(cwCtx.WorkflowCaption())
 
 	// Parameter mappings
-	for _, pmCtx := range cwCtx.AllWorkflowParameterMapping() {
-		pmCtx2 := pmCtx.(*parser.WorkflowParameterMappingContext)
-		mapping := ast.WorkflowParameterMappingNode{
-			Parameter:  pmCtx2.QualifiedName().GetText(),
-			Expression: unquoteString(pmCtx2.STRING_LITERAL().GetText()),
-		}
-		node.ParameterMappings = append(node.ParameterMappings, mapping)
+	node.ParameterMappings = buildWorkflowCallArguments(cwCtx.WorkflowCallArguments())
+	if len(node.ParameterMappings) == 0 {
+		node.ParameterMappings = buildWorkflowParameterMappings(cwCtx.AllWorkflowParameterMapping())
+	}
+
+	// BoundaryEvents (mendixlabs/mxcli#1532)
+	for _, beCtx := range cwCtx.AllWorkflowBoundaryEventClause() {
+		node.BoundaryEvents = append(node.BoundaryEvents, buildBoundaryEventNode(beCtx))
 	}
 
 	return node
@@ -604,27 +847,8 @@ func buildWorkflowCallWorkflow(ctx parser.IWorkflowCallWorkflowStmtContext) *ast
 func buildWorkflowDecision(ctx parser.IWorkflowDecisionStmtContext) *ast.WorkflowDecisionNode {
 	dCtx := ctx.(*parser.WorkflowDecisionStmtContext)
 	node := &ast.WorkflowDecisionNode{}
-
-	allStrings := dCtx.AllSTRING_LITERAL()
-	stringIdx := 0
-
-	// First STRING_LITERAL is the expression (if present and COMMENT is not present or expression comes first)
-	if len(allStrings) > 0 && dCtx.COMMENT() == nil {
-		// All strings are expression
-		node.Expression = unquoteString(allStrings[0].GetText())
-		stringIdx = 1
-	} else if len(allStrings) > 0 && dCtx.COMMENT() != nil {
-		// Distinguish expression from comment
-		if len(allStrings) >= 2 {
-			node.Expression = unquoteString(allStrings[0].GetText())
-			node.Caption = unquoteString(allStrings[1].GetText())
-		} else {
-			// Only one string with COMMENT - it's the caption
-			node.Caption = unquoteString(allStrings[0].GetText())
-		}
-		stringIdx = len(allStrings)
-	}
-	_ = stringIdx
+	node.Name, node.Expression = activityNameAndExpression(dCtx.WorkflowActivityName(), dCtx.WorkflowExpression())
+	node.Caption = workflowCaptionText(dCtx.WorkflowCaption())
 
 	for _, outcomeCtx := range dCtx.AllWorkflowConditionOutcome() {
 		outcome := buildWorkflowConditionOutcome(outcomeCtx)
@@ -646,7 +870,7 @@ func buildWorkflowConditionOutcome(ctx parser.IWorkflowConditionOutcomeContext) 
 	} else if coCtx.DEFAULT() != nil {
 		outcome.Value = "Default"
 	} else if coCtx.STRING_LITERAL() != nil {
-		outcome.Value = unquoteString(coCtx.STRING_LITERAL().GetText())
+		outcome.Value = unquoteStringLit(coCtx.STRING_LITERAL())
 	}
 
 	if body := coCtx.WorkflowBody(); body != nil {
@@ -659,11 +883,11 @@ func buildWorkflowConditionOutcome(ctx parser.IWorkflowConditionOutcomeContext) 
 // buildWorkflowParallelSplit builds a WorkflowParallelSplitNode.
 func buildWorkflowParallelSplit(ctx parser.IWorkflowParallelSplitStmtContext) *ast.WorkflowParallelSplitNode {
 	psCtx := ctx.(*parser.WorkflowParallelSplitStmtContext)
-	node := &ast.WorkflowParallelSplitNode{}
-
-	if psCtx.COMMENT() != nil && psCtx.STRING_LITERAL() != nil {
-		node.Caption = unquoteString(psCtx.STRING_LITERAL().GetText())
+	node := &ast.WorkflowParallelSplitNode{
+		Name: workflowActivityNameText(psCtx.WorkflowActivityName()),
 	}
+
+	node.Caption = workflowCaptionText(psCtx.WorkflowCaption())
 
 	for _, pathCtx := range psCtx.AllWorkflowParallelPath() {
 		path := buildWorkflowParallelPath(pathCtx)
@@ -704,9 +928,7 @@ func buildWorkflowJumpTo(ctx parser.IWorkflowJumpToStmtContext) *ast.WorkflowJum
 		Target: target,
 	}
 
-	if jtCtx.COMMENT() != nil && jtCtx.STRING_LITERAL() != nil {
-		node.Caption = unquoteString(jtCtx.STRING_LITERAL().GetText())
-	}
+	node.Caption = workflowCaptionText(jtCtx.WorkflowCaption())
 
 	return node
 }
@@ -715,16 +937,8 @@ func buildWorkflowJumpTo(ctx parser.IWorkflowJumpToStmtContext) *ast.WorkflowJum
 func buildWorkflowWaitForTimer(ctx parser.IWorkflowWaitForTimerStmtContext) *ast.WorkflowWaitForTimerNode {
 	wtCtx := ctx.(*parser.WorkflowWaitForTimerStmtContext)
 	node := &ast.WorkflowWaitForTimerNode{}
-
-	allStrings := wtCtx.AllSTRING_LITERAL()
-	if len(allStrings) > 0 && wtCtx.COMMENT() == nil {
-		node.DelayExpression = unquoteString(allStrings[0].GetText())
-	} else if len(allStrings) >= 2 && wtCtx.COMMENT() != nil {
-		node.DelayExpression = unquoteString(allStrings[0].GetText())
-		node.Caption = unquoteString(allStrings[1].GetText())
-	} else if len(allStrings) == 1 && wtCtx.COMMENT() != nil {
-		node.Caption = unquoteString(allStrings[0].GetText())
-	}
+	node.Name, node.DelayExpression = activityNameAndExpression(wtCtx.WorkflowActivityName(), wtCtx.WorkflowExpression())
+	node.Caption = workflowCaptionText(wtCtx.WorkflowCaption())
 
 	return node
 }
@@ -732,11 +946,11 @@ func buildWorkflowWaitForTimer(ctx parser.IWorkflowWaitForTimerStmtContext) *ast
 // buildWorkflowWaitForNotification builds a WorkflowWaitForNotificationNode.
 func buildWorkflowWaitForNotification(ctx parser.IWorkflowWaitForNotificationStmtContext) *ast.WorkflowWaitForNotificationNode {
 	wnCtx := ctx.(*parser.WorkflowWaitForNotificationStmtContext)
-	node := &ast.WorkflowWaitForNotificationNode{}
-
-	if wnCtx.COMMENT() != nil && wnCtx.STRING_LITERAL() != nil {
-		node.Caption = unquoteString(wnCtx.STRING_LITERAL().GetText())
+	node := &ast.WorkflowWaitForNotificationNode{
+		Name: workflowActivityNameText(wnCtx.WorkflowActivityName()),
 	}
+
+	node.Caption = workflowCaptionText(wnCtx.WorkflowCaption())
 
 	// BoundaryEvents (Issue #7)
 	for _, beCtx := range wnCtx.AllWorkflowBoundaryEventClause() {
@@ -750,15 +964,34 @@ func buildWorkflowWaitForNotification(ctx parser.IWorkflowWaitForNotificationStm
 func buildBoundaryEventNode(beCtx parser.IWorkflowBoundaryEventClauseContext) ast.WorkflowBoundaryEventNode {
 	beCtx2 := beCtx.(*parser.WorkflowBoundaryEventClauseContext)
 	be := ast.WorkflowBoundaryEventNode{}
-	if beCtx2.NON() != nil {
+	notification := beCtx2.NOTIFICATION() != nil
+	switch {
+	case notification && beCtx2.NON() != nil:
+		be.EventType = "NonInterruptingNotification"
+	case notification:
+		be.EventType = "InterruptingNotification"
+	case beCtx2.NON() != nil:
 		be.EventType = "NonInterruptingTimer"
-	} else if beCtx2.INTERRUPTING() != nil {
+	case beCtx2.INTERRUPTING() != nil:
 		be.EventType = "InterruptingTimer"
-	} else {
+	default:
 		be.EventType = "Timer"
 	}
-	if beCtx2.STRING_LITERAL() != nil {
-		be.Delay = unquoteString(beCtx2.STRING_LITERAL().GetText())
+	// A timer's expression is its delay; a notification event's string is its
+	// caption.
+	if s := beCtx2.STRING_LITERAL(); s != nil && notification {
+		be.Caption = unquoteStringLit(s)
+	}
+	if !notification {
+		if d := beCtx2.WorkflowTimerDelay(); d != nil {
+			be.Delay = workflowExpressionText(d.WorkflowExpression())
+		}
+		// A timer's caption is the clause every activity takes (ako/mxcli#1715).
+		be.Caption = workflowCaptionText(beCtx2.WorkflowCaption())
+		be.Recurrence = buildWorkflowRecurrence(beCtx2.WorkflowRecurrence())
+	}
+	if notification {
+		be.Name = workflowActivityNameText(beCtx2.WorkflowActivityName())
 	}
 	if body := beCtx2.WorkflowBody(); body != nil {
 		be.Activities = buildWorkflowBody(body)
@@ -766,12 +999,52 @@ func buildBoundaryEventNode(beCtx parser.IWorkflowBoundaryEventClauseContext) as
 	return be
 }
 
+// buildWorkflowNotification builds `notification [<name>] [caption '<caption>']`.
+func buildWorkflowNotification(ctx parser.IWorkflowNotificationStmtContext) *ast.WorkflowNotificationNode {
+	c := ctx.(*parser.WorkflowNotificationStmtContext)
+	node := &ast.WorkflowNotificationNode{Name: workflowActivityNameText(c.WorkflowActivityName())}
+	node.Caption = workflowCaptionText(c.WorkflowCaption())
+	return node
+}
+
+// buildWorkflowEventSubProcess builds `event subprocess <name> ['<caption>'] on
+// [non] interrupting notification [<start>] ['<caption>'] { … }` and its timer
+// form, `… timer '<first execution time>' [as <start>] [caption '<caption>']`.
+func buildWorkflowEventSubProcess(ctx parser.IWorkflowEventSubProcessContext) ast.WorkflowEventSubProcessNode {
+	c := ctx.(*parser.WorkflowEventSubProcessContext)
+	node := ast.WorkflowEventSubProcessNode{
+		Name:         workflowActivityNameText(c.WorkflowActivityName()),
+		Interrupting: c.NON() == nil,
+	}
+	if s := c.STRING_LITERAL(); s != nil {
+		node.Caption = unquoteStringLit(s)
+	}
+	node.Annotation = workflowAttachedAnnotation(c.AllAnnotation())
+	if t, ok := c.WorkflowEventSubProcessTrigger().(*parser.WorkflowEventSubProcessTriggerContext); ok && t != nil {
+		node.Timer = t.TIMER() != nil
+		node.StartName = workflowActivityNameText(t.WorkflowActivityName())
+		// A timer's first execution time is an expression and its caption is its
+		// `caption '…'` clause; a notification's caption is its own string.
+		if node.Timer {
+			node.FirstExecutionTime = workflowExpressionText(t.WorkflowExpression())
+			node.StartCaption = workflowCaptionText(t.WorkflowCaption())
+			node.Recurrence = buildWorkflowRecurrence(t.WorkflowRecurrence())
+		} else if s := t.STRING_LITERAL(); s != nil {
+			node.StartCaption = unquoteStringLit(s)
+		}
+	}
+	if body := c.WorkflowBody(); body != nil {
+		node.Activities = buildWorkflowBody(body)
+	}
+	return node
+}
+
 // buildWorkflowAnnotation builds a WorkflowAnnotationActivityNode from the grammar context.
 func buildWorkflowAnnotation(ctx parser.IWorkflowAnnotationStmtContext) *ast.WorkflowAnnotationActivityNode {
 	annCtx := ctx.(*parser.WorkflowAnnotationStmtContext)
 	node := &ast.WorkflowAnnotationActivityNode{}
 	if annCtx.STRING_LITERAL() != nil {
-		node.Text = unquoteString(annCtx.STRING_LITERAL().GetText())
+		node.Text = unquoteStringLit(annCtx.STRING_LITERAL())
 	}
 	return node
 }
@@ -785,4 +1058,76 @@ func parseInt(s string) int {
 		}
 	}
 	return n
+}
+
+// buildWorkflowParticipants reads `participants all | N | N percent`.
+func buildWorkflowParticipants(ctx *parser.WorkflowParticipantsClauseContext) *ast.WorkflowParticipantsNode {
+	if ctx.ALL() != nil {
+		return &ast.WorkflowParticipantsNode{Kind: "all"}
+	}
+	n := &ast.WorkflowParticipantsNode{Kind: "number"}
+	if ctx.PERCENT_KW() != nil {
+		n.Kind = "percent"
+	}
+	if num := ctx.NUMBER_LITERAL(); num != nil {
+		n.Value, _ = strconv.Atoi(num.GetText())
+	}
+	return n
+}
+
+// buildWorkflowCompletionRule reads `decide by …`.
+func buildWorkflowCompletionRule(ctx *parser.WorkflowCompletionClauseContext) *ast.WorkflowCompletionRuleNode {
+	r := &ast.WorkflowCompletionRuleNode{}
+	switch {
+	case ctx.CONSENSUS() != nil:
+		r.Rule = "consensus"
+	case ctx.MAJORITY() != nil:
+		r.Rule = "majority"
+		r.Majority = "most chosen"
+		if ctx.MORE_KW() != nil {
+			r.Majority = "more than half"
+		}
+	case ctx.THRESHOLD() != nil:
+		r.Rule = "threshold"
+		r.ThresholdUnit = "votes"
+		if ctx.PERCENT_KW() != nil {
+			r.ThresholdUnit = "percent"
+		}
+		if num := ctx.NUMBER_LITERAL(); num != nil {
+			r.Threshold, _ = strconv.Atoi(num.GetText())
+		}
+	case ctx.VETO() != nil:
+		r.Rule = "veto"
+		if s := ctx.STRING_LITERAL(); s != nil {
+			r.Veto = unquoteStringLit(s)
+		}
+	case ctx.MICROFLOW() != nil:
+		r.Rule = "microflow"
+		if qn := ctx.QualifiedName(); qn != nil {
+			r.Microflow = buildQualifiedName(qn)
+		}
+	}
+	if fb, ok := ctx.WorkflowFallbackClause().(*parser.WorkflowFallbackClauseContext); ok && fb != nil && fb.STRING_LITERAL() != nil {
+		r.Fallback = unquoteStringLit(fb.STRING_LITERAL())
+		r.HasFallback = true
+	}
+	return r
+}
+
+// workflowCaptionText is the caption a `caption '…'` clause (or its alias
+// `comment '…'`) sets, or "" when there is none.
+func workflowCaptionText(ctx parser.IWorkflowCaptionContext) string {
+	c, ok := ctx.(*parser.WorkflowCaptionContext)
+	if !ok || c == nil || c.STRING_LITERAL() == nil {
+		return ""
+	}
+	return unquoteStringLit(c.STRING_LITERAL())
+}
+
+// ExitWorkflowCaption records `comment '…'`, the alias of an activity's
+// `caption '…'` (R9, ako/mxcli#755).
+func (b *Builder) ExitWorkflowCaption(ctx *parser.WorkflowCaptionContext) {
+	if c := ctx.COMMENT(); c != nil {
+		b.recordDeprecation(deprecation.WorkflowCommentCaption, c.GetSymbol(), "")
+	}
 }

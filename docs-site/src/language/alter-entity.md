@@ -2,82 +2,134 @@
 
 `ALTER ENTITY` modifies an existing entity's attributes, indexes, or documentation without recreating it. This is useful for incremental changes to entities that already contain data.
 
+Each `ALTER ENTITY` statement performs **one** action — add, drop, modify, or rename a single attribute; add or drop one index; etc. Apply several changes with several statements.
+
 ## ADD Attributes
 
-Add one or more new attributes:
+Add a new attribute with `ADD ATTRIBUTE`:
 
 ```sql
-ALTER ENTITY Sales.Customer
-  ADD (Phone: String(50), Notes: String(unlimited));
+ALTER ENTITY Sales.Customer ADD ATTRIBUTE Phone: String(50);
 ```
 
-New attributes support the same [constraints](./constraints.md) as in `CREATE ENTITY`:
+New attributes support the same [constraints](./constraints.md) as in `CREATE ENTITY`. Add several with one statement each:
 
 ```sql
-ALTER ENTITY Sales.Customer
-  ADD (
-    LoyaltyPoints: Integer DEFAULT 0,
-    MemberSince: DateTime NOT NULL
-  );
+mdl 1;
+ALTER ENTITY Sales.Customer ADD ATTRIBUTE LoyaltyPoints: Integer DEFAULT 0;
+ALTER ENTITY Sales.Customer ADD ATTRIBUTE MemberSince: DateTime NOT NULL;
 ```
 
 ## DROP Attributes
 
-Remove one or more attributes:
+Remove an attribute with `DROP ATTRIBUTE`:
 
 ```sql
-ALTER ENTITY Sales.Customer
-  DROP (Notes);
+ALTER ENTITY Sales.Customer DROP ATTRIBUTE Notes;
 ```
 
-Multiple attributes can be dropped at once:
+Drop several with one statement each:
 
 ```sql
-ALTER ENTITY Sales.Customer
-  DROP (Notes, TempField, OldStatus);
+mdl 1;
+ALTER ENTITY Sales.Customer DROP ATTRIBUTE Notes;
+ALTER ENTITY Sales.Customer DROP ATTRIBUTE TempField;
+ALTER ENTITY Sales.Customer DROP ATTRIBUTE OldStatus;
 ```
 
 ## MODIFY Attributes
 
-Change the type or constraints of existing attributes:
+Change the type or constraints of an existing attribute with `MODIFY ATTRIBUTE`:
 
 ```sql
-ALTER ENTITY Sales.Customer
-  MODIFY (Name: String(400) NOT NULL);
+ALTER ENTITY Sales.Customer MODIFY ATTRIBUTE Name: String(400) NOT NULL;
 ```
+
+**The type is not optional.** `MODIFY ATTRIBUTE` always parses a type, and its
+type slot accepts a bare qualified name (an entity or enumeration reference), so
+a clause written where the type belongs is read *as* the type:
+
+```mdl
+mdl 1;
+-- WRONG: `SET` is read as the type name, not as a keyword
+ALTER ENTITY Sales.Customer MODIFY ATTRIBUTE Discount: SET DEFAULT 0;
+
+-- Right: restate the type
+ALTER ENTITY Sales.Customer MODIFY ATTRIBUTE Discount: Decimal DEFAULT 0;
+```
+
+mxcli refuses the first form and names the alternatives. Before it did, that
+statement silently rewrote the attribute to an enumeration and produced a
+project Mendix could not open ([#910](https://github.com/mendixlabs/mxcli/issues/910)).
+
+### Clearing a default
+
+`DROP DEFAULT` removes a default value without touching the type:
+
+```mdl
+ALTER ENTITY Sales.Customer DROP DEFAULT ON ATTRIBUTE Discount;
+```
+
+Clearing a default that is already absent is a no-op, not an error. A
+*calculated* attribute is refused rather than silently converted to a plain
+stored one — that is a different change.
+
+### DateTime localization
+
+A DateTime that stays a DateTime keeps its stored **Localize** setting unless the
+statement states one, so restating the type does not undo a Studio Pro choice.
+`NOT LOCALIZED` and `LOCALIZED` switch it explicitly:
+
+```mdl
+mdl 1;
+ALTER ENTITY Sales.Customer MODIFY ATTRIBUTE BirthDate: DateTime NOT LOCALIZED;
+ALTER ENTITY Sales.Customer MODIFY ATTRIBUTE BirthDate: DateTime LOCALIZED;
+```
+
+See [Constraints](./constraints.md#localized--not-localized-datetime-only).
 
 ## RENAME Attributes
 
-Rename an attribute:
+Rename an attribute with `RENAME ATTRIBUTE`:
 
 ```sql
-ALTER ENTITY Sales.Customer
-  RENAME Phone TO PhoneNumber;
+ALTER ENTITY Sales.Customer RENAME ATTRIBUTE Phone TO PhoneNumber;
 ```
+
+Every reference stored *as* a reference follows the rename — microflow create and
+change members, page attribute widgets, and the entity's own validation and
+access rules — and the command reports how many documents it updated.
+
+XPath constraints follow too — `[Phone = '06-1234']` and paths that reach the
+entity through an association alike — because a constraint's target entity is
+known from where it is stored. Another entity's attribute of the same name is
+left alone, and any constraint that cannot be resolved is reported rather than
+rewritten.
+
+Microflow expressions (`$Customer/Phone`) are **not** rewritten: a bare name
+there is only resolvable from the type of what precedes it. `mx check` reports
+those as CE0117, so build after renaming an attribute used in one.
 
 ## ADD INDEX
 
-Add an index to the entity:
+Add an index to the entity (the index name is optional):
 
 ```sql
-ALTER ENTITY Sales.Customer
-  ADD INDEX (Email);
+ALTER ENTITY Sales.Customer ADD INDEX (Email);
 ```
 
-Composite indexes:
+Composite indexes, with optional sort direction:
 
 ```sql
-ALTER ENTITY Sales.Customer
-  ADD INDEX (Name, CreatedAt DESC);
+ALTER ENTITY Sales.Customer ADD INDEX (Name, CreatedAt DESC);
 ```
 
 ## DROP INDEX
 
-Remove an index:
+Remove an index by name:
 
 ```sql
-ALTER ENTITY Sales.Customer
-  DROP INDEX (Email);
+ALTER ENTITY Sales.Customer DROP INDEX idx_customer_email;
 ```
 
 ## SET DOCUMENTATION
@@ -91,9 +143,10 @@ ALTER ENTITY Sales.Customer
 
 ## ADD/DROP System Attributes
 
-System attributes use the same ADD/DROP syntax as regular attributes:
+System attributes use the same `ADD ATTRIBUTE` / `DROP ATTRIBUTE` syntax as regular attributes:
 
 ```sql
+mdl 1;
 -- Add system attributes
 ALTER ENTITY Sales.Order ADD ATTRIBUTE Owner: AutoOwner;
 ALTER ENTITY Sales.Order ADD ATTRIBUTE ChangedBy: AutoChangedBy;
@@ -110,6 +163,7 @@ ALTER ENTITY Sales.Order DROP ATTRIBUTE ChangedDate;
 Register microflows to run before or after entity operations:
 
 ```sql
+mdl 1;
 -- Before commit: validates and can abort (RAISE ERROR)
 ALTER ENTITY Sales.Order
   ADD EVENT HANDLER ON BEFORE COMMIT CALL Sales.ValidateOrder($currentObject) RAISE ERROR;
@@ -122,10 +176,21 @@ ALTER ENTITY Sales.Order
 ALTER ENTITY Sales.Order
   ADD EVENT HANDLER ON AFTER CREATE CALL Sales.NotifyNewOrder();
 
--- Remove an event handler
+-- A second handler for the same event runs as well
 ALTER ENTITY Sales.Order
-  DROP EVENT HANDLER ON BEFORE COMMIT;
+  ADD EVENT HANDLER ON BEFORE COMMIT CALL Sales.CheckCredit($currentObject) RAISE ERROR;
+
+-- Remove an event handler: CALL names which one
+ALTER ENTITY Sales.Order
+  DROP EVENT HANDLER ON BEFORE COMMIT CALL Sales.CheckCredit;
 ```
+
+An entity may have several handlers for one event. A handler is identified by
+its moment, event **and** microflow: `ADD EVENT HANDLER` with another microflow
+adds a second one, and only the same microflow again is a duplicate (an error,
+or skipped with `IF NOT EXISTS`). `DROP EVENT HANDLER ON BEFORE COMMIT` without
+`CALL` works while the entity has one Before Commit handler; when it has several,
+it is refused and the error names them.
 
 | Moment | Returns | RAISE ERROR | Use case |
 |--------|---------|-------------|----------|
@@ -139,30 +204,22 @@ Parameter: `($currentObject)` passes the entity to the microflow, `()` does not.
 ## Syntax Summary
 
 ```sql
-ALTER ENTITY <Module>.<Entity>
-  ADD (<attribute-definition> [, ...])
+ALTER ENTITY <Module>.<Entity> ADD ATTRIBUTE <name>: <type> [constraints];
 
-ALTER ENTITY <Module>.<Entity>
-  DROP (<attribute-name> [, ...])
+ALTER ENTITY <Module>.<Entity> DROP ATTRIBUTE <name>;
 
-ALTER ENTITY <Module>.<Entity>
-  MODIFY (<attribute-definition> [, ...])
+ALTER ENTITY <Module>.<Entity> MODIFY ATTRIBUTE <name>: <type> [constraints];
+ALTER ENTITY <Module>.<Entity> DROP DEFAULT ON ATTRIBUTE <name>;
 
-ALTER ENTITY <Module>.<Entity>
-  RENAME <old-name> TO <new-name>
+ALTER ENTITY <Module>.<Entity> RENAME ATTRIBUTE <old-name> TO <new-name>;
 
-ALTER ENTITY <Module>.<Entity>
-  ADD INDEX (<column-list>)
+ALTER ENTITY <Module>.<Entity> ADD INDEX [<name>] (<column> [ASC|DESC] [, ...]);
 
-ALTER ENTITY <Module>.<Entity>
-  DROP INDEX (<column-list>)
+ALTER ENTITY <Module>.<Entity> DROP INDEX <index-name>;
 
-ALTER ENTITY <Module>.<Entity>
-  SET DOCUMENTATION '<text>'
+ALTER ENTITY <Module>.<Entity> SET DOCUMENTATION '<text>';
 
-ALTER ENTITY <Module>.<Entity>
-  SET POSITION (<x>, <y>)
-
+ALTER ENTITY <Module>.<Entity> SET POSITION (<x>, <y>);
 ```
 
 ## See Also

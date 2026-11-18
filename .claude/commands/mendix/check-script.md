@@ -1,3 +1,8 @@
+---
+description: Validate an MDL script before executing it
+argument-hint: <script.mdl>
+---
+
 # Check Script
 
 Validate an MDL script before executing it.
@@ -5,12 +10,15 @@ Validate an MDL script before executing it.
 ## Commands
 
 ```bash
-# Syntax check only (no project needed)
-mxcli check script.mdl
+# Syntax check only (--no-project: do not auto-detect an .mpr in this directory)
+mxcli check script.mdl --no-project
 
 # Syntax + reference validation (checks entities/modules exist)
 mxcli check script.mdl -p app.mpr --references
 ```
+
+A script starts with `mdl 1;`. A headerless script is checked as the older `mdl 0`;
+upgrade it with `mxcli fmt --upgrade --header -p app.mpr -w script.mdl` before editing it.
 
 ## What It Checks
 

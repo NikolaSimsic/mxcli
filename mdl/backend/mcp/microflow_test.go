@@ -52,6 +52,20 @@ func TestMapMicroflowAction_VariableAndMessages(t *testing.T) {
 	if tmpl, _ := logged["messageTemplate"].(map[string]any); tmpl["$Type"] != "Microflows$StringTemplate" || tmpl["text"] != "done" {
 		t.Fatalf("log messageTemplate needs $Type: %+v", logged["messageTemplate"])
 	}
+	if _, set := logged["includeLatestStackTrace"]; set {
+		t.Fatalf("an unticked stack trace is the default and is not sent: %+v", logged)
+	}
+
+	// `log ... with stacktrace` (mendixlabs/mxcli#1543) must reach Studio Pro
+	// over --mcp too, not only the file backend.
+	traced, err := mapMicroflowAction(&microflows.LogMessageAction{
+		LogLevel:              microflows.LogLevelError,
+		MessageTemplate:       &model.Text{Translations: map[string]string{"en_US": "failed"}},
+		IncludeLastStackTrace: true,
+	})
+	if err != nil || traced["includeLatestStackTrace"] != true {
+		t.Fatalf("log with stack trace: %+v / %v", traced, err)
+	}
 }
 
 func TestMapMicroflowAction_ObjectActions(t *testing.T) {
@@ -438,11 +452,12 @@ func TestMapObjectTree_Loop(t *testing.T) {
 
 func TestMfCommitType(t *testing.T) {
 	cases := map[microflows.CommitType]string{
-		microflows.CommitTypeYes:           "Yes",
-		microflows.CommitTypeYesWithEvents: "Yes",
-		microflows.CommitTypeNoEvent:       "YesWithoutEvents",
-		microflows.CommitTypeNo:            "No",
-		microflows.CommitType(""):          "No",
+		microflows.CommitTypeYes:              "Yes",
+		microflows.CommitTypeYesWithoutEvents: "YesWithoutEvents",
+		microflows.CommitTypeNo:               "No",
+		// An unset flag is Mendix's default, No — the same as an unrecognised one.
+		microflows.CommitType(""):         "No",
+		microflows.CommitType("Nonsense"): "No",
 	}
 	for in, want := range cases {
 		if got := mfCommitType(in); got != want {

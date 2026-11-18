@@ -11,6 +11,21 @@
       "operation": "primitive"
     },
     {
+      "propertyKey": "imageObject",
+      "source": "Image",
+      "operation": "image"
+    },
+    {
+      "propertyKey": "defaultImageDynamic",
+      "source": "DefaultImage",
+      "operation": "image"
+    },
+    {
+      "propertyKey": "imageIcon",
+      "source": "Icon",
+      "operation": "icon"
+    },
+    {
       "propertyKey": "imageUrl",
       "source": "ImageUrl",
       "operation": "texttemplate"

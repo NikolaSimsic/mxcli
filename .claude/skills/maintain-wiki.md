@@ -16,13 +16,13 @@ Six page categories. Anything outside these belongs somewhere else.
    (e.g. association `ParentPointer`/`ChildPointer` inversion, storage names
    vs qualified names, version gating).
 3. **Design rationale** — *why* the project is shaped this way (e.g. why MDL
-   is SQL-shaped, why the executor must not import `sdk/mpr` for writes, why
+   is SQL-shaped, why the executor must not reach past `ctx.Backend` for writes, why
    pure-Go SQLite).
 4. **Project positioning** — how mxcli relates to its neighbours (TypeScript
    SDK, Mendix Studio Pro), what is intentionally not implemented.
 5. **Glossary / vocabulary bridge** — Mendix ↔ mxcli ↔ BSON terminology.
 6. **Bug-pattern taxonomy** — *categories* of recurring failure modes that
-   link out to symptom-table rows in `.claude/skills/fix-issue.md`.
+   link out to findings in `.claude/skills/fix-issue/findings/<area>/*.json`.
 
 ## What the wiki is NOT for
 
@@ -35,7 +35,7 @@ home instead.
 | MDL syntax tables | `docs/01-project/MDL_QUICK_REFERENCE.md` |
 | What a function does | source code |
 | Step-by-step task procedure | `.claude/skills/<task>.md` |
-| Specific bug fix recipe | symptom table in `.claude/skills/fix-issue.md` |
+| Specific bug fix recipe | `.claude/skills/fix-issue/findings/<area>/*.json` |
 | Proposal status, PR / issue numbers, roadmap | proposal frontmatter; GitHub |
 | Latest design proposal | `docs/11-proposals/` |
 | Architecture decision record | `docs/13-decisions/` (ADRs) |
@@ -54,6 +54,8 @@ load-bearing — it's how future syncs avoid re-stating canonical content.
 title: <concept name>
 category: architecture | mental-model | rationale | positioning | glossary | bug-pattern
 last-synced: <git short SHA at sync time>
+covers:                      # bug-pattern pages only; see below
+  - mdl/executor
 sources:
   - docs/11-proposals/<file>.md
   - docs/13-decisions/<file>.md
@@ -81,6 +83,23 @@ reference. Link out for specifics.>
 - [[other-wiki-page]] — related concept
 ```
 
+### `covers:` on a bug-pattern page
+
+The findings `area` paths this page digests. It is the **only** record of that,
+and `make digest-status` measures each area's backlog against the last sync of a
+page claiming it — so a page without `covers:` leaves its areas reading as
+entirely undigested, and the report names it.
+
+Claim what the page actually digests, not every area it mentions. Two signals
+were tried before this field existed and both were measured wrong: matching the
+area path against page text over-credits (a page citing one Go file from a
+package was credited with that package's whole findings area, zeroing 913
+records), and matching the findings shard in `sources:` under-credits (shards and
+`area` are different groupings — `mdl-other` alone holds `mdl/catalog`,
+`mdl/linter` and `mdl/exprcheck`).
+
+An area may be claimed by several pages; the newest of their syncs counts.
+
 ## Synthesis procedure
 
 For each page being synced:
@@ -95,7 +114,9 @@ For each page being synced:
    procedure, or status.
 4. **Update `last-synced:`** to the current `git rev-parse --short HEAD`.
 5. **Refresh `sources:`** to reflect what you actually read this run, not
-   what the previous run read.
+   what the previous run read. On a bug-pattern page, check `covers:` still
+   names every findings area the page digests — adding a new area to a page
+   without adding it here leaves that area reading as never digested.
 6. **Append a row to `docs-wiki/SYNC_LOG.md`** (see below). This is the last
    step and is non-optional.
 
@@ -119,29 +140,22 @@ Rules:
 - **The Sources column lists what was actually read**, not what was relevant.
   This is the audit trail; a reviewer can verify synthesis is grounded.
 - **Write the row as the final step of every sync.** No exceptions. Same
-  discipline as the symptom-table append in `fix-issue.md`.
+  discipline as appending a finding under `fix-issue/findings/`.
 
 ## Seed topic pages
 
-Start with these. Stubs are fine; the structure matters more than initial
-content. Adding pages outside the seed list requires a stated reason it
-isn't better served by an existing page or a different doc artifact.
+The page list lives in [`maintain-wiki/pages.md`](maintain-wiki/pages.md) — the
+wiki's table of contents. Stubs are fine; the structure matters more than initial
+content. Adding a page outside it requires a stated reason it isn't better served
+by an existing page or a different doc artifact.
 
-| Path | Category | Frames |
-|------|----------|--------|
-| `architecture/mdl-execution.md` | architecture | grammar → AST → visitor → executor → backend → MPR writer |
-| `architecture/mpr-read-write.md` | architecture | MPR v1/v2, BSON round-trip, write safety |
-| `architecture/widget-engine.md` | architecture | def.json, WidgetRegistry, V3 builders |
-| `models/association-pointers.md` | mental-model | why `ParentPointer` = FROM, `ChildPointer` = TO |
-| `models/storage-vs-qualified-names.md` | mental-model | BSON `$type` vs SDK qualified name |
-| `models/version-gating.md` | mental-model | feature registry, `min_version`, `checkFeature()` |
-| `rationale/mdl-as-sql.md` | rationale | why MDL is SQL-shaped, design principles (cites ADRs) |
-| `rationale/backend-abstraction.md` | rationale | why the executor never imports `sdk/mpr` for writes (cites ADRs) |
-| `positioning/vs-typescript-sdk.md` | positioning | gap analysis, intentional differences |
-| `glossary.md` | glossary | Mendix ↔ mxcli ↔ BSON term bridge |
-| `bug-patterns/bson-numeric-width.md` | bug-pattern | int32/int64 mismatches (links #583, #585 rows) |
-| `bug-patterns/visitor-wiring-gaps.md` | bug-pattern | parsed-but-not-stored (links #393 row) |
-| `bug-patterns/widget-type-object-drift.md` | bug-pattern | CE0463 family |
+It is a **table and nothing else**, in its own file, with `merge=union` in
+`.gitattributes`. That is deliberate: every wiki sync appends a row, so two
+parallel syncs would otherwise collide on one line and the work would have to be
+serialised — which is exactly what happened to the five bug-pattern PRs, and how
+13 pages went missing when the stack merged into itself. Union is safe here and
+is NOT safe on this file, which is prose: union keeps both sides of an edited
+prose line silently.
 
 ## Adding a new page
 
@@ -150,8 +164,9 @@ Before creating `docs-wiki/<new>.md`:
 1. Confirm the topic does not fit an existing page.
 2. Confirm it isn't better served by a skill (procedure), the user manual
    (how-to), source code (implementation), or proposal frontmatter (state).
-3. Add it to the seed table above as part of the same sync run, with its
-   category. The seed table is the wiki's table of contents.
+3. Add a row to [`maintain-wiki/pages.md`](maintain-wiki/pages.md) as part of
+   the same sync run, with its category. That file is the wiki's table of
+   contents.
 
 ## Final checklist
 
@@ -159,5 +174,7 @@ Before creating `docs-wiki/<new>.md`:
 - [ ] No sentence duplicates content that lives in a canonical home
 - [ ] `last-synced:` updated to current HEAD SHA
 - [ ] `sources:` reflects what was actually read this run
+- [ ] `covers:` present and accurate on a bug-pattern page (`make digest-status`
+      lists any page making no claim)
 - [ ] `SYNC_LOG.md` row appended
-- [ ] Seed table updated if a new page was added
+- [ ] `maintain-wiki/pages.md` updated if a new page was added

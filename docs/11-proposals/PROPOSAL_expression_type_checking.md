@@ -2,12 +2,25 @@
 title: Expression Type Checking for mxcli check
 status: draft
 date: 2026-05-10
+revised: 2026-06-19
 ---
 
 # Proposal: Expression Type Checking for mxcli check
 
 **Status:** Draft
-**Date:** 2026-05-10
+**Date:** 2026-05-10 (revised 2026-06-19)
+
+> **2026-06-19 revision.** Implementation investigation overturned this draft's
+> central premise. It assumed our microflow expressions are stored as **raw
+> strings** (so the missing piece was a parser, which `exprcheck` supplies). In
+> fact our visitor **already parses expressions into typed `mdl/ast` nodes**
+> (`FunctionCallExpr`, `BinaryExpr`, `AttributePathExpr`, `QualifiedNameExpr`, …).
+> So we do **not** need `exprcheck`'s lexer/parser — we need its **checker**
+> (type system, function-return table, slot resolver), fed from the AST we
+> already have. The authoritative plan is now
+> **[§ Revised Architecture](#revised-architecture-2026-06-19)**; the original
+> Architecture and Implementation Plan sections below are retained as history but
+> are superseded by it.
 
 ## Problem Statement
 
@@ -78,6 +91,109 @@ catalog builder can call it directly.
 
 ---
 
+## Third consumer: MxBuild-gap check heuristics beyond microflow expressions
+
+The resolution core (build-order step 1 — the `ModelResolver` interface:
+`AttributeKind`, `EnumCases`, `MicroflowReturn` + memoized index + script overlay)
+has consumers outside this proposal's microflow/nanoflow scope. See
+[`PROPOSAL_check_mxbuild_gap_heuristics.md`](PROPOSAL_check_mxbuild_gap_heuristics.md),
+which addresses constructs that pass `check` but MxBuild rejects. Two of its cases
+want this resolver:
+
+- **dynamictext `contentparams` on an enum/date attribute → CE0117.** The page
+  builder's `isNonStringAttribute` (`mdl/executor/cmd_pages_builder_v3.go:1432`)
+  currently **fails open** — unresolved type → assume String → skips the
+  `toString()` wrapping enum/date require. `ModelResolver.AttributeKind` is the
+  reliable attribute-kind answer that turns this from a warning band-aid into a
+  root-cause fix; the check heuristic and the builder consume the same resolver.
+- **Workflow decision outcomes ∈ enum cases** (the strong form of the free-text
+  outcome check) needs `MicroflowReturn` + `EnumCases` — though it additionally
+  requires extending typing scope to workflows and the workflow AST exposing the
+  decision's return type.
+
+These are reasons to keep step 1 **headless and page/workflow-agnostic** (as
+already intended for the catalog `refs` consumer), not microflow-coupled.
+
+---
+
+## Fourth consumer: attribute rename
+
+`alter entity Mod.Ent rename attribute Old to New` rewrites every reference
+Mendix stores *as a reference* — a create/change member, a page attribute
+widget, a validation or access rule — because those hold the fully qualified
+name as a string and a string scan finds them. It cannot touch the two places an
+attribute is named in **free text**, and those are exactly the two this proposal
+learns to read (one of which has since been closed without it — see the status
+note at the end of this section):
+
+| Shape | Example | Why a string scan cannot do it |
+|-------|---------|-------------------------------|
+| Expression | `$Order/Status` | The bare segment is only an attribute of `Mod.Order` if `$Order` is typed — the scope walker's job |
+| XPath constraint | `[Status = 'Open']`, `[Mod.A_B/Mod.B/Status = …]` | The bare step belongs to the constraint's *target* entity, or to the entity the association hops reach |
+
+mxbuild reports the leftovers as **CE0117** (expressions) and **CE0161** (XPath),
+measured on 11.13.0, so the rename tells the user they exist rather than reading
+as complete — but a rename that half-renames is the weakest form of the feature.
+This consumer is what finishes it. Origin: mendixlabs/mxcli#910.
+
+**Two asymmetries worth knowing before scheduling it.**
+
+*The XPath half is nearly there and does not need the type system.* A
+constraint's target entity is known **structurally** — a retrieve names its
+entity, a page datasource names its entity, an access rule belongs to one — so a
+top-level bare step needs no inference at all. The round trip already exists and
+already ships: `visitor.ParseXPathConstraint` → typed `XPathPathExpr` →
+`expressionToXPath`, with `visitor.SplitXPathPredicateGroups` for the sibling
+groups Mendix concatenates and a verbatim pass-through on any group that will not
+parse (#772). `enrichXPathConstraintForDescribe` is the working precedent: it
+already walks a constraint resolving bare attribute names against a known entity,
+for enum enrichment. Only the **multi-hop association path** needs this
+proposal's resolver, to answer "which entity does this hop land on".
+
+*The expression half is genuinely step 1.* Stored expressions come back from BSON
+as raw strings, so this is the one place the dormant `exprcheck` lexer/parser is
+in the hot path rather than the `mdl/ast` nodes the visitor produces; then the
+scope walker types `$Var`, and `ModelResolver` walks the path segments.
+
+**One thing that does not transfer: the failure mode inverts.** For checking,
+unresolved → `KindUnknown` → *catch less, never false-positive*, and § 4 is right
+to call that correct for an advisory gate. A **mutating** consumer cannot inherit
+it: unresolved must mean **do not rewrite, and report the occurrence**. Silently
+rewriting an occurrence whose type could not be established corrupts a model that
+was valid — strictly worse than today's honest half-rename. So the resolver needs
+to return *unresolved* distinguishably from *resolved to something else*, which is
+a constraint on the interface, not on the callers. (This is the same
+guard-don't-drop stance as [ADR-0005](../13-decisions/0005-semantic-model-interface-currency.md).)
+
+Sequencing follows from the asymmetry: the XPath half is shippable **before**
+step 1 lands, against structural entity knowledge alone. The expression half
+waits for step 1.
+
+**Status: the XPath half has shipped** (`mdl/xpathrefs`), and multi-hop paths did
+not need to wait for the resolver after all — Mendix spells the intermediate
+entity out in a stored path, so a hop resolves against a flat entity/association
+index built from the domain models rather than against a type system. Three
+findings worth carrying into step 1:
+
+- **A mutating consumer needs a third answer, not two.** The walk distinguishes
+  *this entity's attribute*, *a different entity's attribute* (a definite answer —
+  leave it alone, say nothing) and *could not tell* (refuse and report). Collapsing
+  the last two into one "not ours" made the rewrite silently skip constraints it
+  should have questioned. `KindUnknown` as § 4 defines it is the second and third
+  merged, which is fine for a checker and not for this.
+- **A lenient parser can still gate a rewrite, if the edit is counted against it.**
+  `visitor.ParseXPathConstraint` runs with ANTLR's error listeners removed and can
+  return a tree that omits part of its input. Requiring the lexical occurrence
+  count to equal the walked occurrence count is what makes leaning on that parse
+  safe; the expression half will need the same discipline, because `exprcheck`'s
+  parser recovers by design.
+- **Edit tokens, do not re-render.** Re-rendering the parsed tree would rewrite
+  spacing in constraints the rename has no business touching, and any
+  parser/renderer disagreement would corrupt a working one. The rewrite replaces a
+  single identifier and leaves every other byte alone.
+
+---
+
 ## Background: Mendix Type System
 
 Mendix expressions use these types:
@@ -120,7 +236,180 @@ Enum values behave differently depending on context:
 
 ---
 
-## Architecture
+## Revised Architecture (2026-06-19)
+
+**Authoritative.** Supersedes the original "Architecture" and "Implementation
+Plan" sections that follow.
+
+### Core principle: one resolution pass, two outputs
+
+Catching expression bugs in `mxcli check` and filling the catalog `refs`/graph
+edges (see [§ Second consumer](#second-consumer-catalog-refs-expression-edges))
+are two products of the **same** operation: resolving the references and types
+inside an expression against the project. Build that once; consume it twice.
+
+```
+                       ┌───────────────────────────────┐
+  our mdl/ast typed    │  converter: mdl/ast → exprcheck │
+  expression nodes ───▶│  (~13 nodes, ≈1:1)             │
+                       └───────────────┬───────────────┘
+                                       ▼
+                    exprcheck checker + resolver (ported, verbatim)
+                    over a Scope ($var→type) + CatalogReader
+                                       │
+                 ┌─────────────────────┴─────────────────────┐
+                 ▼                                             ▼
+        (a) diagnostics                            (b) refs/graph edges
+   mxcli check + LSP                       emit entity/attribute/association/
+   Tier-1: syntax + arg-count (no project) enum/constant edge per resolved
+   Tier-2: type/enum/attr/return (catalog) reference (fills CATALOG.REFS)
+```
+
+### 1. Canonical representation = our `mdl/ast` typed nodes
+
+The visitor already produces typed expression nodes, and they already drive BSON
+serialization and `describe` round-trips. Do **not** fork the representation and
+do **not** keep `exprcheck`'s lexer/parser in the hot path. The node sets are
+near 1:1 (verified): `LiteralExpr`↔`StringLit/NumberLit/BoolLit/EmptyExpr`,
+`VariableExpr`, `AttributePathExpr`, `QualifiedNameExpr`↔`QNameExpr`,
+`FunctionCallExpr`↔`CallExpr`, `BinaryExpr`↔`BinExpr`, `UnaryExpr`, `ParenExpr`,
+`IfThenElseExpr`, `TokenExpr`, `ConstantRefExpr`↔`ConstantRef`. `exprcheck`'s
+`RobustExpr`/`RecoveredExpr`/`Position` are parser **error-recovery** machinery
+we don't need (our parser already produced the tree).
+
+> Keep `exprcheck`'s parser/recovery in the tree but **dormant** — still useful
+> for the one genuine raw-string slot (`ast_microflow.go:797`) and for LSP
+> partial-parse-while-typing. Revisit deleting it later.
+
+### 2. One converter (the only new glue surface)
+
+`mdl/ast.Expression → exprcheck` AST. A single mechanical mapping; lets us keep
+`exprcheck`'s checker / function table / slot resolver **verbatim**, preserving
+easy re-syncs from the engalar fork. The ported `adapters/` layer (which
+extracts a source string and re-parses) is **not** used on our branch.
+
+### 3. The resolver reads an **overlay**, not the catalog alone
+
+This is the correctness crux for large, multi-document scripts. A script that
+`create`s/`alter`s many entities/microflows references symbols that are not on
+disk yet (and forward-references between them). Resolution must therefore be:
+
+```
+resolve(symbol) = script-defined symbols (this run's CREATE/ALTER AST)   ┐ first
+                  ⊕ catalog (existing project on disk)                    ┘ fallback
+```
+
+`ValidateProgram` already does this overlay for **existence** ("skips references
+to objects created within the script"). The type-checking `CatalogReader`
+extends the same overlay to **types**: a script-created entity's attribute types
+come from its CREATE statement's AST; an `alter entity … add/modify attribute`
+applies the delta; everything pre-existing falls back to the catalog. Build the
+script symbol index **once** per run, then layer the catalog under it.
+
+`exprcheck`'s `CatalogReader` seam is exactly the right shape:
+`AttributeKind`, `AttributeEnumQN`, `EnumCases`, `MicroflowReturn`.
+
+**What the catalog already answers vs. gaps:**
+
+| Lookup | Status |
+|--------|--------|
+| `AttributeKind(entity, attr)` | ✓ `attributes_data.DataType` |
+| `MicroflowReturn(qn)` | ✓ `microflows_data.ReturnType` |
+| `EnumCases(enumQN)` | ✗ — `enumerations_data` stores only `ValueCount`. **Add an `enum_values` table / column** (the builder already has `enum.Values` in hand at `builder_modules.go:277`). Also feeds enum-value usage edges for the graph consumer. |
+| script-defined / `alter`ed symbols | ✗ on disk — supplied by the overlay (above) |
+
+### 4. Scale & failure mode
+
+- **Scale:** wrap `CatalogReader` in a **memoized in-memory index** (load
+  entity→attributes and enum→cases once per run). SQLite is fast, but a
+  per-expression-per-member query across thousands of expressions is wasteful.
+  The per-microflow `Scope` is cheap.
+- **Safe degradation:** anything the overlay+catalog cannot resolve →
+  `KindUnknown` → downstream errors suppressed. On a huge script with a stale or
+  partial catalog the checker **catches less**, never raises **false positives**
+  on valid code. Correct behaviour for a `check` gate.
+
+### 5. Freshness: depend on a `ModelResolver` interface, not "the catalog"
+
+If the catalog becomes central to checking, the trap is treating it as *the*
+source the resolver reads. It should not be. The resolver depends on a
+**`ModelResolver` interface** (`AttributeKind`, `AttributeEnumQN`, `EnumCases`,
+`MicroflowReturn`, + entity/attribute existence) plus the script overlay; the
+catalog is just **one implementation** — a derived cache — not the contract. This
+is the ADR-0005 stance (the backend speaks the semantic model) applied to reads.
+With that seam, freshness becomes a **per-backend policy** behind one interface,
+and the script overlay (§ 3) sits on top of either, unchanged:
+
+| Backend | Authoritative source | Freshness policy |
+|---------|----------------------|------------------|
+| MPR-on-disk (file) | `.mpr` files | catalog cache + staleness detection + incremental top-up |
+| MCP / Studio Pro (live) | live in-memory model via MCP/PED | **read-through to the live model** for lookups MCP exposes; disk-catalog fallback for the rest |
+
+**Why this matters per concern:**
+
+- **Disk staleness.** `check`'s failure mode is `KindUnknown` = *catches less,
+  never false-positive*, so a mildly stale catalog degrades gracefully — the
+  freshness bar for an advisory check is far lower than for a build. Refresh is
+  **all-or-nothing today** (`builder.Build` rebuilds everything; no per-document
+  hashing), but `snapshots` already records `SourceRevision`/`SourceBranch`/
+  `SnapshotDate` — a coarse hook. So: (1) **now** — a cheap *staleness warning*
+  (compare working-tree git revision / mtime to `snapshots.SourceRevision`,
+  print *"catalog N revisions stale; run `refresh catalog` for full coverage"*);
+  (2) **next** — **incremental refresh** keyed by per-document content hash
+  (MPR v2's file-per-document layout makes this tractable; full rebuild per check
+  is too slow at scale); (3) **later** — an optional file-watcher (reuse the TUI's
+  fsnotify watcher) to keep it warm for LSP/long sessions. Do **not** auto-refresh
+  everything on every check — that is the expensive trap.
+
+- **MCP / concurrent Studio Pro edits.** Here the disk catalog is not merely stale
+  but the *wrong source of truth*: Studio Pro holds unsaved in-memory edits and
+  the user mutates concurrently, so the disk `.mpr` lags in both directions.
+  Building catalog-sync machinery against a live dirty model is a losing game (and
+  out of scope per the MCP-avoid-MPR-writer-conflicts constraint). The interface
+  reframe sidesteps it: under MCP the `ModelResolver` **reads through to the live
+  model** for what MCP/PED exposes (freshest possible, no drift), falls back to the
+  disk catalog for the rest (`KindUnknown` keeps that safe), and **tolerates
+  races** — `check` is advisory, so a momentarily inconsistent read is acceptable;
+  never lock the model for a lint.
+
+### 6. The two consumers differ on the overlay
+
+- **check-a-script** (consumer a) needs the overlay — it runs against a transient
+  script over an existing project.
+- **refs/graph** (consumer b) runs at `refresh catalog` over the **whole
+  project**; every document is already present, so no overlay and no
+  forward-reference problem — catalog-against-catalog is correct and complete.
+
+### Build order (each independently shippable)
+
+1. **Headless semantic core** — `mdl/ast → exprcheck` converter, `Scope` +
+   first-pass `$var→type` walker, and a **`ModelResolver` interface** with an
+   overlay implementation (script index ⊕ catalog) + memoization, `enum_values`
+   catalog addition. Unit-tested, no `check`/LSP/refs coupling. The interface seam
+   is what lets the MCP backend bind live reads later without touching the
+   resolver or overlay.
+2. **Consumer (a):** wire into `mxcli check` — Tier-1 unconditional, Tier-2 under
+   `--references`; add the **staleness warning** (§ 5); then LSP diagnostics.
+   Delivers the field-report P0.
+3. **Consumer (b):** wire the resolver into the catalog `refs` builder; fold in
+   the hand-rolled change/delete resolution it does today. Delivers graph/
+   community expression-edge completeness (and fills enum/constant nodes that
+   have zero inbound edges today).
+
+**Independent follow-ups (not blockers for the type-checker):** incremental
+catalog refresh; the LSP file-watcher; MCP `ModelResolver` read-through. These
+improve the whole catalog subsystem, not just type-checking, and `KindUnknown`
+safe-degradation means the checker ships useful without them.
+
+### Status of the port
+
+`mdl/exprcheck/` is already ported to this branch (builds, all its tests pass).
+Its core checker/type-system/resolver are reused as above; its parser stays
+dormant; its `adapters/` source-string re-parse path is not used here.
+
+---
+
+## Architecture (original draft — superseded by § Revised Architecture above)
 
 ### 1. Type Representation
 
@@ -243,7 +532,7 @@ inline; catalog-backed checks require the project to be open.
 
 ---
 
-## Implementation Plan
+## Implementation Plan (original draft — superseded by § Revised Architecture "Build order")
 
 ### Phase 1 — Type infrastructure (no project needed)
 
@@ -364,6 +653,14 @@ implementation of this proposal's Phase 1–2**, architected the same way. This
 section recasts the proposal accordingly: **the recommended path is to port and
 adapt `exprcheck`, not build `mdl/typesystem` from scratch.**
 
+> **Correction (2026-06-19):** this section claimed our expressions are raw
+> strings so a parser is the missing piece. That is **wrong** for the expressions
+> that matter — the visitor already parses DECLARE/SET/RETURN/IF expressions into
+> typed `mdl/ast` nodes. Only one niche slot (`ast_microflow.go:797`) keeps a raw
+> `Expression string`. So we reuse `exprcheck`'s **checker**, not its parser, fed
+> via a `mdl/ast → exprcheck` converter. See § Revised Architecture. The original
+> text below is retained as history.
+
 Decisive detail this draft missed: our microflow/nanoflow expressions are stored
 as **raw strings** (`Expression string` in `ast_microflow.go`) — the typed
 `LiteralExpr`/`BinaryExpr`/`FunctionCallExpr` nodes in `ast_expression.go` are not
@@ -398,10 +695,41 @@ refactors (`mprrepos`/`mxgraph`). Cherry-pickable like the modelsdk engine.
 superseding "Phase 1 — Type infrastructure" above, which `exprcheck` already
 delivers):
 
-1. Provide our-catalog-backed `CatalogReader` + `SlotResolver` implementations and
-   finish Tier-2 depth (attribute types, microflow return types) — the
-   `AttributePathExpr → KindUnknown` gap.
-2. Wire the `exprcheck` adapters into **our** `mxcli check` / `validate` path.
+1. ~~Provide our-catalog-backed `CatalogReader`~~ **done** — `mdl/exprcatalog`,
+   a memoized index over the catalog. It needed three catalog additions first
+   (`attributes_data.EnumerationQualifiedName`, `enumeration_values_data`,
+   `microflow_parameters_data`): the seam had no implementation *and* three of
+   its five lookups had no data. Still open: **Tier-2 depth** — `inferKind`
+   returns `KindUnknown` for `AttributePathExpr`, so `$obj/Attr` resolves to
+   nothing and only slot-qualified positions (a create/change member, where the
+   adapter builds `CreateItem.Value:Entity.Attr`) reach the catalog. That is what
+   makes `if $obj/Status = 'Open'` still pass. **Also done** — an `EntityScope`
+   seam (`VariableEntity` + `AssociationTarget`) sits beside `Scope` rather than
+   inside it, because `Scope` speaks `TypeKind` and cannot carry "$P is
+   Mod.Person"; `CatalogReader`'s shape is left untouched so it stays
+   re-syncable. `inferKind` now resolves an attribute path, including multi-hop
+   ones — a Mendix expression, unlike XPath, does not name the intermediate
+   entity, so each hop resolves through the association index. Two further gaps
+   closed on the way: the adapter's variable→entity map was computed and never
+   handed to the checker, and it covered only body-introduced variables, never
+   **parameters** — the ordinary case.
+
+   `if $obj/Status = 'Open'` needed one more thing than resolution: E001 fired
+   only from a **slot** (`CreateItem.Value:Entity.Attr`), which exists for an
+   assignment and not for a comparison. A comparison-side detection now emits the
+   same code and message from the other operand's resolved type — one defect
+   should not have two names depending on where it was spotted.
+
+   Still open: a **terminal association** step (`$Order/Mod.Order_Lines`) types
+   to unknown rather than Object or List, because which one depends on the
+   association's kind and direction and guessing would cost false positives.
+2. ~~Wire the `exprcheck` adapters into **our** `mxcli check` / `validate` path~~
+   **done** — `Executor.TypeCheckProgram`, called by `mxcli check --references`.
+   Two things were wrong in the ported adapter and are worth knowing before
+   wiring the LSP to it: `exprSource` read only `ast.SourceExpr` (the visitor
+   attaches one to some slots and not others, so most expressions were invisible
+   — now injectable via `WithSourceFunc`), and the variable scope it builds is
+   never passed into the parse `Context`.
 3. **Phase 3 LSP** — still to-do; the `Context`-based design makes it
    straightforward (run with `Scope` only for the inline, project-less path).
 4. Decide the cosmetics: keep `exprcheck`'s `E0xx` codes (faithful port) vs remap

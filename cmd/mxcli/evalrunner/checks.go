@@ -8,6 +8,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/mendixlabs/mxcli/cmd/mxcli/docker"
 )
 
 // CheckOptions configures how checks are executed.
@@ -23,6 +25,9 @@ type CheckOptions struct {
 
 	// SkipMxCheck skips the mx check validation (expensive).
 	SkipMxCheck bool
+
+	// SkipTests skips tests_pass checks (they boot the app).
+	SkipTests bool
 }
 
 // RunChecks executes all checks for a test phase and returns results.
@@ -31,9 +36,10 @@ func RunChecks(checks []Check, opts CheckOptions) []CheckResult {
 	entityList := runMxCli(opts, "SHOW ENTITIES")
 	pageList := runMxCli(opts, "SHOW PAGES")
 	microflowList := runMxCli(opts, "SHOW MICROFLOWS")
-	navMenu := runMxCli(opts, "SHOW NAVIGATION MENU")
+	navMenu := runMxCli(opts, "LIST NAVIGATION MENU")
 
-	// Cache for DESCRIBE results (avoid re-describing the same entity/page)
+	// Cache for DESCRIBE results (avoid re-describing the same entity/page),
+	// and for listings only some checks need.
 	describeCache := make(map[string]string)
 
 	var results []CheckResult
@@ -51,6 +57,8 @@ func runCheck(check Check, opts CheckOptions, entityList, pageList, microflowLis
 		return checkEntityExists(check, entityList)
 	case "entity_has_attribute":
 		return checkEntityHasAttribute(check, opts, entityList, describeCache)
+	case "entity_has_type":
+		return checkEntityHasType(check, entityList)
 	case "page_exists":
 		return checkPageExists(check, pageList)
 	case "page_has_widget":
@@ -66,6 +74,19 @@ func runCheck(check Check, opts CheckOptions, entityList, pageList, microflowLis
 		return checkMxCheck(check, opts)
 	case "lint_passes":
 		return checkLint(check, opts)
+	case "association_exists":
+		return checkListed(check, cachedList(opts, describeCache, "list associations"), "association")
+	case "module_role_exists":
+		return checkListed(check, cachedList(opts, describeCache, "list module roles"), "module role")
+	case "workflow_exists":
+		return checkListed(check, cachedList(opts, describeCache, "list workflows"), "workflow")
+	case "file_exists":
+		return checkFileExists(check, opts)
+	case "tests_pass":
+		if opts.SkipTests {
+			return CheckResult{Check: check, Passed: true, Detail: "skipped"}
+		}
+		return checkTestsPass(check, opts)
 	default:
 		return CheckResult{Check: check, Passed: false, Detail: fmt.Sprintf("unknown check type: %s", check.Type)}
 	}
@@ -77,6 +98,51 @@ func checkEntityExists(check Check, entityList string) CheckResult {
 	match := findMatch(entityList, pattern)
 	if match != "" {
 		return CheckResult{Check: check, Passed: true, Detail: fmt.Sprintf("found: %s", match)}
+	}
+	return CheckResult{Check: check, Passed: false, Detail: "entity not found"}
+}
+
+// checkEntityHasType verifies that `SHOW ENTITIES` lists the entity under the
+// expected Type column: "Persistent", "View", "Non-Persistent" or "External".
+// Args format: "Service.OpenRequestsPerFab View".
+//
+// entity_exists cannot do this. It matches on the qualified name alone, so a
+// brief that asks for a view entity passes when the agent builds an ordinary
+// persistent entity of the same name — which is the whole of what makes a view
+// entity a view entity. The Type column is the only place the distinction is
+// visible in a listing, and a name that merely ends in "View" is not evidence.
+func checkEntityHasType(check Check, entityList string) CheckResult {
+	parts := strings.Fields(check.Args)
+	if len(parts) != 2 {
+		return CheckResult{Check: check, Passed: false, Detail: `invalid args: expected "EntityPattern Type"`}
+	}
+	pattern, want := parts[0], parts[1]
+
+	for _, line := range strings.Split(entityList, "\n") {
+		matched := ""
+		for _, name := range extractQualifiedNames(line) {
+			if matchPattern(name, pattern) {
+				matched = name
+				break
+			}
+		}
+		if matched == "" {
+			continue
+		}
+		for _, field := range strings.Fields(line) {
+			field = strings.Trim(field, "()[]{}:,;|")
+			// The qualified name itself is never the type, so an entity called
+			// Mod.View does not answer for a view entity.
+			if field == matched {
+				continue
+			}
+			if strings.EqualFold(field, want) {
+				return CheckResult{Check: check, Passed: true, Detail: fmt.Sprintf("found: %s (%s)", matched, field)}
+			}
+		}
+		// Distinguished on purpose from "not found": the entity was built and
+		// is the wrong kind, which every other check kind reads as a pass.
+		return CheckResult{Check: check, Passed: false, Detail: fmt.Sprintf("found %s, but not as %s", matched, want)}
 	}
 	return CheckResult{Check: check, Passed: false, Detail: "entity not found"}
 }
@@ -246,13 +312,10 @@ func checkMxCheck(check Check, opts CheckOptions) CheckResult {
 		return CheckResult{Check: check, Passed: false, Detail: "mx binary not found"}
 	}
 
-	cmd := exec.Command(mxPath, "check", opts.ProjectPath)
+	// On a temporary copy: mx check writes theme-cache/ and deployment/sass/
+	// into the project it checks (ako/mxcli#961).
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-
-	err := cmd.Run()
-	if err != nil {
+	if err := docker.MxCheckOnCopy(mxPath, opts.ProjectPath, nil, &stdout, &stderr); err != nil {
 		// Parse error output for error count
 		output := stdout.String() + stderr.String()
 		return CheckResult{Check: check, Passed: false, Detail: fmt.Sprintf("mx check failed: %s", firstLine(output))}
@@ -453,4 +516,64 @@ func firstLine(s string) string {
 		}
 	}
 	return s
+}
+
+// cachedList runs an MDL listing once per check run.
+func cachedList(opts CheckOptions, cache map[string]string, mdl string) string {
+	key := "list:" + mdl
+	if out, ok := cache[key]; ok {
+		return out
+	}
+	out := runMxCli(opts, mdl)
+	cache[key] = out
+	return out
+}
+
+// checkListed verifies that a listing names an element matching the pattern.
+func checkListed(check Check, list, what string) CheckResult {
+	if match := findMatch(list, check.Args); match != "" {
+		return CheckResult{Check: check, Passed: true, Detail: "found: " + match}
+	}
+	return CheckResult{Check: check, Passed: false, Detail: what + " not found"}
+}
+
+// checkFileExists verifies that a glob, relative to the project directory,
+// matches at least one file — e.g. "tests/*.test.mdl".
+func checkFileExists(check Check, opts CheckOptions) CheckResult {
+	pattern := filepath.Join(filepath.Dir(opts.ProjectPath), check.Args)
+	matches, _ := filepath.Glob(pattern)
+	if len(matches) == 0 {
+		return CheckResult{Check: check, Passed: false, Detail: "no file matches " + check.Args}
+	}
+	return CheckResult{Check: check, Passed: true, Detail: fmt.Sprintf("%d file(s), e.g. %s", len(matches), filepath.Base(matches[0]))}
+}
+
+// checkTestsPass runs `mxcli test <path> [flags] -p <project>`. Args are the
+// test path, relative to the project directory, then any flags: "tests --local".
+func checkTestsPass(check Check, opts CheckOptions) CheckResult {
+	fields := strings.Fields(check.Args)
+	if len(fields) == 0 {
+		return CheckResult{Check: check, Passed: false, Detail: "invalid args: expected '<test path> [flags]'"}
+	}
+	cliPath := opts.MxCliPath
+	if cliPath == "" {
+		cliPath = "mxcli"
+	}
+	args := append([]string{"test", fields[0]}, fields[1:]...)
+	args = append(args, "-p", opts.ProjectPath)
+	cmd := exec.Command(cliPath, args...)
+	cmd.Dir = filepath.Dir(opts.ProjectPath)
+	cmd.Env = append(cmd.Environ(), "MXCLI_QUIET=1")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		return CheckResult{Check: check, Passed: false, Detail: "tests failed: " + lastLine(out.String())}
+	}
+	return CheckResult{Check: check, Passed: true, Detail: lastLine(out.String())}
+}
+
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	return strings.TrimSpace(lines[len(lines)-1])
 }

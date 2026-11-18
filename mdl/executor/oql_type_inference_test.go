@@ -1,0 +1,280 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package executor
+
+import (
+	"testing"
+
+	"github.com/mendixlabs/mxcli/mdl/ast"
+)
+
+// TestExtractSelectClause guards against the case-comparison regression where
+// extractSelectClause searched an uppercased query for a lowercase "select"
+// needle (and compared uppercased slices to lowercase "from"/"union"), so it
+// returned "" for every real query. That made `check --references` both
+// false-positive ("could not parse select clause from OQL query") and silently
+// skip all OQL type validation. Bug 9b.
+// TestPassthroughStringLengthMismatch guards ledger finding #36: a pass-through
+// view-entity string column must declare the SAME length as its source
+// attribute, or Mendix fails the build with CE6770 "View Entity out of sync".
+func TestPassthroughStringLengthMismatch(t *testing.T) {
+	str := func(n int) ast.DataType { return ast.DataType{Kind: ast.TypeString, Length: n} }
+	cases := []struct {
+		name       string
+		declared   ast.DataType
+		inferred   ast.DataType
+		sourceAttr string
+		want       bool
+	}{
+		{"unbounded vs string(100) source", str(0), str(100), "Name", true},
+		{"string(50) vs string(100) source", str(50), str(100), "Name", true},
+		{"string(200) vs string(100) source", str(200), str(100), "Name", true},
+		{"exact match", str(100), str(100), "Name", false},
+		{"not a pass-through (aggregate/derived)", str(0), str(200), "", false},
+		{"non-string pass-through ignored", ast.DataType{Kind: ast.TypeInteger}, ast.DataType{Kind: ast.TypeInteger}, "Age", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := passthroughStringLengthMismatch(c.declared, c.inferred, c.sourceAttr); got != c.want {
+				t.Errorf("passthroughStringLengthMismatch = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+func TestExtractSelectClause(t *testing.T) {
+	cases := []struct {
+		name string
+		oql  string
+		want string
+	}{
+		{
+			name: "lowercase group-by aggregate",
+			oql:  "select e.Status, count(e.ID) as StatusCount from ExpenseApproval.Expense e group by e.Status",
+			want: "e.Status, count(e.ID) as StatusCount",
+		},
+		{
+			name: "uppercase keywords",
+			oql:  "SELECT e.Status FROM Mod.E e",
+			want: "e.Status",
+		},
+		{
+			name: "mixed case",
+			oql:  "Select a From B.C",
+			want: "a",
+		},
+		{
+			// Was "": the scanner needed a FROM to know where the list ended,
+			// so a FROM-less query read as unreadable. The list is simply the
+			// rest of the query, and saying so matters now that an unreadable
+			// clause is REPORTED rather than skipped — "" here would refuse a
+			// query over a column the checker can perfectly well check.
+			name: "no from clause reads to the end of the query",
+			oql:  "select 1",
+			want: "1",
+		},
+		{
+			name: "from inside subquery is not the main FROM",
+			oql:  "select (select count(x.ID) from Mod.X x) as N from Mod.Y y",
+			want: "(select count(x.ID) from Mod.X x) as N",
+		},
+		{
+			name: "union ends the first query term",
+			oql:  "select a from Mod.A union select b from Mod.B",
+			want: "a",
+		},
+		{
+			name: "no select keyword",
+			oql:  "update Mod.E set x = 1",
+			want: "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractSelectClause(tc.oql)
+			if got != tc.want {
+				t.Errorf("extractSelectClause(%q) = %q, want %q", tc.oql, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateOQLTypesNoFalsePositive guards the other half of bug 9b: with
+// extractSelectClause working again, ValidateOQLTypes actually runs — it must
+// not over-fire on the valid view-entity queries the report cites. The static
+// inferrer returns TypeUnknown for anything it can't confidently type
+// (attribute refs, division), so those columns are skipped rather than flagged.
+func TestValidateOQLTypesNoFalsePositive(t *testing.T) {
+	cases := []struct {
+		name  string
+		oql   string
+		attrs []ast.ViewAttribute
+	}{
+		{
+			name: "trivial group-by aggregate",
+			oql:  "select e.Status, count(e.ID) as StatusCount from ExpenseApproval.Expense e group by e.Status",
+			attrs: []ast.ViewAttribute{
+				{Name: "StatusValue", Type: ast.DataType{Kind: ast.TypeString, Length: 200}}, // e.Status → Unknown, skipped
+				{Name: "StatusCount", Type: ast.DataType{Kind: ast.TypeInteger}},             // count() → Integer, matches
+			},
+		},
+		{
+			name: "case/division aggregate is not flagged",
+			oql:  "select e.Category, sum(e.Amount) / count(e.ID) as AvgAmount from ExpenseApproval.Expense e group by e.Category",
+			attrs: []ast.ViewAttribute{
+				{Name: "Category", Type: ast.DataType{Kind: ast.TypeString, Length: 200}},
+				{Name: "AvgAmount", Type: ast.DataType{Kind: ast.TypeDecimal}}, // division → Unknown, skipped
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			violations := ValidateOQLTypes(tc.oql, tc.attrs)
+			if len(violations) != 0 {
+				for _, v := range violations {
+					t.Errorf("unexpected violation: %s — %s", v.RuleID, v.Message)
+				}
+			}
+		})
+	}
+}
+
+// TestValidateOQLTypesDerivedString covers the CE6770 case: a DERIVED string
+// column (CAST(x AS string) or a string-returning CASE) is normalized by Mendix
+// to the platform default length (200). Declaring any other length builds fine
+// in mxcli but makes mxbuild report CE6770 "View Entity is out of sync". The
+// checker must flag the mismatch pre-build (MDL031) and accept string(200).
+func TestValidateOQLTypesDerivedString(t *testing.T) {
+	cases := []struct {
+		name      string
+		oql       string
+		attrs     []ast.ViewAttribute
+		wantMDL31 bool
+	}{
+		{
+			name: "CAST enum to string declared short is flagged",
+			oql:  "select cast(e.Status as string) as StatusName from Mod.E e",
+			attrs: []ast.ViewAttribute{
+				{Name: "StatusName", Type: ast.DataType{Kind: ast.TypeString, Length: 30}},
+			},
+			wantMDL31: true,
+		},
+		{
+			name: "CAST to string declared 200 passes",
+			oql:  "select cast(e.Status as string) as StatusName from Mod.E e",
+			attrs: []ast.ViewAttribute{
+				{Name: "StatusName", Type: ast.DataType{Kind: ast.TypeString, Length: 200}},
+			},
+			wantMDL31: false,
+		},
+		{
+			name: "CAST to string declared unlimited is flagged",
+			oql:  "select cast(e.Status as string) as StatusName from Mod.E e",
+			attrs: []ast.ViewAttribute{
+				{Name: "StatusName", Type: ast.DataType{Kind: ast.TypeString, Length: 0}},
+			},
+			wantMDL31: true,
+		},
+		{
+			name: "string-returning CASE declared short is flagged",
+			oql:  "select case when e.Amount > 100 then 'High' else 'Low' end as Bucket from Mod.E e",
+			attrs: []ast.ViewAttribute{
+				{Name: "Bucket", Type: ast.DataType{Kind: ast.TypeString, Length: 10}},
+			},
+			wantMDL31: true,
+		},
+		{
+			name: "string-returning CASE declared 200 passes",
+			oql:  "select case when e.Amount > 100 then 'High' else 'Low' end as Bucket from Mod.E e",
+			attrs: []ast.ViewAttribute{
+				{Name: "Bucket", Type: ast.DataType{Kind: ast.TypeString, Length: 200}},
+			},
+			wantMDL31: false,
+		},
+		{
+			name: "CAST to integer declared integer passes",
+			oql:  "select cast(e.Code as integer) as CodeNum from Mod.E e",
+			attrs: []ast.ViewAttribute{
+				{Name: "CodeNum", Type: ast.DataType{Kind: ast.TypeInteger}},
+			},
+			wantMDL31: false,
+		},
+		{
+			name: "CAST to integer declared decimal is flagged",
+			oql:  "select cast(e.Code as integer) as CodeNum from Mod.E e",
+			attrs: []ast.ViewAttribute{
+				{Name: "CodeNum", Type: ast.DataType{Kind: ast.TypeDecimal}},
+			},
+			wantMDL31: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			violations := ValidateOQLTypes(tc.oql, tc.attrs)
+			got := false
+			for _, v := range violations {
+				if v.RuleID == "MDL031" {
+					got = true
+				}
+			}
+			if got != tc.wantMDL31 {
+				t.Errorf("ValidateOQLTypes MDL031=%v, want %v (violations=%v)", got, tc.wantMDL31, violations)
+			}
+		})
+	}
+}
+
+// ako/mxcli#859 (rehearsal V1): a view attribute over an AutoNumber column is
+// a Long (mx check accepts it; declared AutoNumber is CE6770). Declared
+// AutoNumber stays accepted as it was; another type is still a mismatch.
+func TestTypesCompatible_AutoNumberColumn(t *testing.T) {
+	auto := ast.DataType{Kind: ast.TypeAutoNumber}
+	for _, c := range []struct {
+		declared ast.DataTypeKind
+		want     bool
+	}{
+		{ast.TypeLong, true},
+		{ast.TypeAutoNumber, true},
+		// Measured CE6770 on 11.14.0 (ako/mxcli#565): an AutoNumber column is
+		// a Long, and Decimal/Integer over it are out of sync.
+		{ast.TypeDecimal, false},
+		{ast.TypeInteger, false},
+		{ast.TypeBoolean, false},
+		{ast.TypeString, false},
+	} {
+		if got := typesCompatible(ast.DataType{Kind: c.declared}, auto); got != c.want {
+			t.Errorf("declared %v over an AutoNumber column: %v, want %v", c.declared, got, c.want)
+		}
+	}
+	if got := formatDataTypeForMDL(viewColumnType(auto)); got != "Long" {
+		t.Errorf("the suggested type for an AutoNumber column: %q, want Long", got)
+	}
+}
+
+// ako/mxcli#565: a view attribute's numeric kind must equal the OQL column's.
+// Every row is one probe view measured with mx check on 11.14.0 — `want` false
+// is CE6770 "View Entity is out of sync with the OQL Query", true is 0 errors.
+// The reported case is the first row: sum() over an Integer column declared
+// Long passed check --references and exec, then failed the build.
+func TestTypesCompatible_NumericKindsMustMatch(t *testing.T) {
+	for _, c := range []struct {
+		probe    string
+		declared ast.DataTypeKind
+		column   ast.DataTypeKind
+		want     bool
+	}{
+		{"sum(Integer) declared Long", ast.TypeLong, ast.TypeInteger, false},
+		{"sum(Integer) declared Integer", ast.TypeInteger, ast.TypeInteger, true},
+		{"sum(Long) declared Integer", ast.TypeInteger, ast.TypeLong, false},
+		{"sum(Long) declared Long", ast.TypeLong, ast.TypeLong, true},
+		{"sum(Integer) declared Decimal", ast.TypeDecimal, ast.TypeInteger, false},
+		{"Long column declared Decimal", ast.TypeDecimal, ast.TypeLong, false},
+		{"max(Integer) declared Long", ast.TypeLong, ast.TypeInteger, false},
+		{"Decimal column declared Decimal", ast.TypeDecimal, ast.TypeDecimal, true},
+	} {
+		got := typesCompatible(ast.DataType{Kind: c.declared}, ast.DataType{Kind: c.column})
+		if got != c.want {
+			t.Errorf("%s: compatible=%v, want %v (mx check 11.14.0)", c.probe, got, c.want)
+		}
+	}
+}

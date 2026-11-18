@@ -62,6 +62,34 @@ func TestSelectFromCatalog(t *testing.T) {
 		{"lowercase", "select * from catalog.microflows;"},
 		{"with alias", "SELECT e.Name FROM CATALOG.ENTITIES e;"},
 		{"with join", "SELECT e.Name, a.Name FROM CATALOG.ENTITIES e JOIN CATALOG.ATTRIBUTES a ON e.Id = a.EntityId;"},
+		// COMMUNITIES is a lexer keyword (SHOW COMMUNITIES); it must still parse as
+		// a catalog table name for CATALOG.COMMUNITIES — otherwise the SELECT
+		// silently fails to parse and produces no statement (and no output).
+		{"communities keyword table", "SELECT * FROM CATALOG.COMMUNITIES;"},
+		{"communities lowercase", "select * from catalog.communities;"},
+		{"communities with where", "SELECT AssetName FROM CATALOG.COMMUNITIES WHERE CommunityId = 1;"},
+		// Same trap, hit again when QUEUES became a lexer keyword (SHOW QUEUES):
+		// CATALOG.QUEUES stopped parsing and the SELECT produced no statement and
+		// no output — no error, just silence. Every new plural keyword that names
+		// a catalog table has to be added to catalogTableName.
+		{"queues keyword table", "SELECT * FROM CATALOG.QUEUES;"},
+		{"queues lowercase", "select * from catalog.queues;"},
+		{"queues with where", "SELECT Name FROM CATALOG.QUEUES WHERE ClusterWide = 1;"},
+		// SCHEDULED_EVENTS lexes as one IDENTIFIER (the underscore joins it), so
+		// the SCHEDULED keyword does not reach it — asserted so a future lexer
+		// change that splits it is caught here.
+		{"scheduled events table", "SELECT * FROM CATALOG.SCHEDULED_EVENTS;"},
+		{"scheduled events with where", "SELECT Name FROM CATALOG.SCHEDULED_EVENTS WHERE Enabled = 1;"},
+		// ENTITY_EVENT_HANDLERS starts with the ENTITY keyword but lexes as one
+		// IDENTIFIER (maximal munch), so it needs no catalogTableName entry —
+		// asserted so a lexer change that splits it is caught here rather than
+		// as the silent no-output QUEUES went through.
+		{"entity event handlers table", "SELECT * FROM CATALOG.ENTITY_EVENT_HANDLERS;"},
+		// `Event` is an MDL lexer keyword (EVENT), and the column is named Event
+		// — so this pins the keyword reaching both a select list and a WHERE.
+		// The QUEUES precedent is why: a keyword the grammar does not expect
+		// parsed to NOTHING, with no error and no output.
+		{"entity event handlers with keyword column", "SELECT Microflow FROM CATALOG.ENTITY_EVENT_HANDLERS WHERE Moment = 'Before' AND Event = 'Commit';"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

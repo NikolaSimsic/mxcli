@@ -17,6 +17,7 @@ func (b *Builder) ExitCreateDataTransformerStatement(ctx *parser.CreateDataTrans
 	stmt := &ast.CreateDataTransformerStmt{
 		Name: buildQualifiedName(qn),
 	}
+	stmt.Documentation, stmt.DocumentationSet = findDocComment(ctx) // mendixlabs/mxcli#1510
 
 	// Source type: JSON or XML
 	if ctx.JSON() != nil {
@@ -25,9 +26,14 @@ func (b *Builder) ExitCreateDataTransformerStatement(ctx *parser.CreateDataTrans
 		stmt.SourceType = "XML"
 	}
 
-	// Source content — the STRING_LITERAL after JSON/XML
-	if sl := ctx.STRING_LITERAL(); sl != nil {
-		stmt.SourceJSON = unquoteString(sl.GetText())
+	// Source content and folder are read by grammar label: the rule now has two
+	// direct STRING_LITERALs, so an index would depend on whether a folder was
+	// given.
+	if tok := ctx.GetSource(); tok != nil {
+		stmt.SourceJSON = unquoteStringLit(tok)
+	}
+	if tok := ctx.GetFolder(); tok != nil {
+		stmt.Folder = unquoteStringLit(tok)
 	}
 
 	// Steps
@@ -43,7 +49,7 @@ func (b *Builder) ExitCreateDataTransformerStatement(ctx *parser.CreateDataTrans
 			step.Technology = "XSLT"
 		}
 		if sl := sc.STRING_LITERAL(); sl != nil {
-			step.Expression = unquoteString(sl.GetText())
+			step.Expression = unquoteStringLit(sl)
 		} else if ds := sc.DOLLAR_STRING(); ds != nil {
 			step.Expression = unquoteDollarString(ds.GetText())
 		}

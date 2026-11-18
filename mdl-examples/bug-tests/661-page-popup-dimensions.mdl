@@ -1,0 +1,64 @@
+mdl 1;
+-- ============================================================================
+-- Bug #661: The Pop-up width / Pop-up height of a Page are not managed
+-- ============================================================================
+--
+-- Symptom (before fix):
+--   There was no way to set a page's Pop-up width / Pop-up height / Resizable
+--   programmatically. CREATE PAGE always emitted the hardcoded defaults
+--   (PopupWidth=600, PopupHeight=600, PopupResizable=false), and ALTER PAGE's
+--   page-level SET handler only understood Title and Url.
+--
+-- After fix:
+--   * CREATE PAGE accepts PopupWidth / PopupHeight / PopupResizable in the
+--     header (case-sensitive; omitting them keeps the 600/600/false defaults).
+--   * ALTER PAGE's page-level SET understands the same properties.
+--   * The values are written to the top level of the Forms$Page document as
+--     int64, matching Studio Pro. (The modelsdk codec wrote int32 until
+--     ako/mxcli#1264; mx check tolerated it, like its canvas dimensions.)
+--   * DESCRIBE PAGE emits the non-default values back in the header so it
+--     round-trips.
+--
+-- Usage:
+--   mxcli exec mdl-examples/bug-tests/661-page-popup-dimensions.mdl -p app.mpr
+--   Open the pages in Studio Pro → page properties → Pop-up.
+-- ============================================================================
+
+create module BugTest661;
+
+-- (1) CREATE PAGE with pop-up dimensions in the header.
+create page BugTest661.P_PopupCreate
+(
+  Title: 'Pop-up via CREATE',
+  Layout: Atlas_Core.PopupLayout,
+  PopupWidth: 720,
+  PopupHeight: 460,
+  PopupResizable: true
+)
+{
+  container ctnBody {
+    dynamictext txtHello (content: 'Configured at create time')
+  }
+};
+
+-- (2) CREATE a plain page, then set the dimensions with ALTER PAGE.
+create page BugTest661.P_PopupAlter
+(
+  Title: 'Pop-up via ALTER',
+  Layout: Atlas_Core.PopupLayout
+)
+{
+  container ctnBody {
+    dynamictext txtHello (content: 'Configured via ALTER')
+  }
+};
+
+alter page BugTest661.P_PopupAlter {
+  set (PopupWidth: 800);
+  set (PopupHeight: 480);
+  set (PopupResizable: true);
+};
+
+-- Read back — both pages should report their pop-up dimensions in the header.
+describe page BugTest661.P_PopupCreate;
+describe page BugTest661.P_PopupAlter;

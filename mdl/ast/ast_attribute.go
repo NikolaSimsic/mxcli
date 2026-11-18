@@ -21,6 +21,9 @@ type Attribute struct {
 	Comment             string
 	Documentation       string
 	RenamedFrom         string // @RenamedFrom annotation value
+	// ExportLevel is "API" or "Hidden" from an EXPORT LEVEL clause; nil keeps
+	// the stored level (Hidden on a new attribute). mendixlabs/mxcli#1498.
+	ExportLevel *string
 }
 
 // ============================================================================
@@ -36,4 +39,8 @@ type IndexColumn struct {
 // Index represents an index definition on an entity.
 type Index struct {
 	Columns []IndexColumn
+	// Name is the name the source gave the index, if any. A Mendix index is
+	// anonymous (DomainModels$Index has no name), so it is never written; it
+	// is kept only so `check` can say so (MDL-IDX01, ako/mxcli#706).
+	Name string
 }

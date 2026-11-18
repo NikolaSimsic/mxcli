@@ -10191,7 +10191,9 @@ func (o *RuleCall) RemoveParameterMappings(index int) {
 
 // InitFromRaw populates lazy-decoded property holders from raw BSON.
 func (o *RuleCall) InitFromRaw(raw bson.Raw) {
-	if val, err := raw.LookupErr("Rule"); err == nil {
+	// STORAGE-NAME OVERRIDE: see initRuleCall — the rule reference is stored
+	// under "Microflow".
+	if val, err := raw.LookupErr("Microflow"); err == nil {
 		if s, ok := val.StringValueOK(); ok {
 			o.rule.SetFromDecode(s)
 		}
@@ -10617,7 +10619,8 @@ func (o *SequenceFlow) InitFromRaw(raw bson.Raw) {
 	if child, err := codec.DecodeChild(raw, "Line"); err == nil {
 		o.line.SetFromDecode(child)
 	}
-	if child, err := codec.DecodeChild(raw, "CaseValue"); err == nil {
+	// STORAGE-NAME OVERRIDE, decode half — see initSequenceFlow.
+	if child, err := codec.DecodeChild(raw, "NewCaseValue"); err == nil {
 		o.caseValue.SetFromDecode(child)
 	}
 	if children, err := codec.DecodeChildren(raw, "CaseValues"); err == nil {
@@ -15493,7 +15496,13 @@ func initNotifyWorkflowAction() *NotifyWorkflowAction {
 	o.activity.Bind(&o.Base, 2)
 	o.notifyTarget = property.NewPart[element.Element]("NotifyTarget")
 	o.notifyTarget.Bind(&o.Base, 3)
-	o.outputVariableName = property.NewPrimitive[string]("VariableName", property.DecodeString)
+	// STORAGE-NAME OVERRIDE: BSON key is "OutputVariableName", not "VariableName"
+	// (generated/metamodel tags it `json:"outputVariableName"`, and ako/TestApp's
+	// Studio Pro 11.14 notify actions store "OutputVariableName"). Measured on the
+	// 11.6, 11.10 and 11.13 mxbuilds: under "VariableName" the output variable is
+	// undefined (CE0109). A Primitive uses its bound name for both decode and
+	// encode, so this one literal covers InitFromRaw too.
+	o.outputVariableName = property.NewPrimitive[string]("OutputVariableName", property.DecodeString)
 	o.outputVariableName.Bind(&o.Base, 4)
 	o.SetProperties([]element.Property{o.errorHandlingType, o.workflowVariable, o.activity, o.notifyTarget, o.outputVariableName})
 	return o
@@ -16065,7 +16074,14 @@ func NewRule() *Rule {
 func initRuleCall() *RuleCall {
 	o := &RuleCall{}
 	o.SetTypeName("Microflows$RuleCall")
-	o.rule = property.NewByNameRef[element.Element]("Rule", "Microflows$Rule")
+	// STORAGE-NAME OVERRIDE: real BSON key is Microflow, not Rule. Rules share the
+	// microflow namespace and Mendix stores the reference under the microflow key
+	// (generated/metamodel: `json:"microflow"`; sdk/mpr/writer_microflow.go writes
+	// it; modelsdk/gen/keyaudit_test.go records the mismatch). Written as "Rule"
+	// the reference is invisible to Mendix — mx check CE0080 "The 'Condition'
+	// property is required" (upstream #939). Patched on BOTH sides: InitFromRaw
+	// below reads the same key.
+	o.rule = property.NewByNameRef[element.Element]("Microflow", "Microflows$Rule")
 	o.rule.Bind(&o.Base, 0)
 	o.parameterMappings = property.NewPartList[element.Element]("ParameterMappings")
 	o.parameterMappings.Bind(&o.Base, 1)
@@ -16202,7 +16218,12 @@ func initSequenceFlow() *SequenceFlow {
 	o.lineType.Bind(&o.Base, 6)
 	o.line = property.NewPart[element.Element]("Line")
 	o.line.Bind(&o.Base, 7)
-	o.caseValue = property.NewPart[element.Element]("CaseValue")
+	// STORAGE-NAME OVERRIDE: the single case (Model SDK caseValue, deleted in
+	// 10.15.0 for the caseValues list) is stored under "NewCaseValue" — measured
+	// on every sequence flow of a Studio Pro 9.24.30 document (mendixlabs/mxcli#1410).
+	// Bound as "CaseValue" it could be read only through the decoder's alias and
+	// written under a key no Mendix version declares.
+	o.caseValue = property.NewPart[element.Element]("NewCaseValue")
 	o.caseValue.Bind(&o.Base, 8)
 	o.caseValues = property.NewPartList[element.Element]("CaseValues")
 	o.caseValues.Bind(&o.Base, 9)

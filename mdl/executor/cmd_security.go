@@ -36,6 +36,10 @@ func listProjectSecurity(ctx *ExecContext) error {
 		if ps.AdminUserName != "" {
 			result.Rows = append(result.Rows, []any{"AdminUser", ps.AdminUserName})
 		}
+		if ps.AdminUserRole != "" {
+			result.Rows = append(result.Rows, []any{"AdminUserRole", ps.AdminUserRole})
+		}
+		result.Rows = append(result.Rows, []any{"AdminPasswordSet", fmt.Sprintf("%v", ps.AdminPassword != "")})
 		if ps.GuestUserRole != "" {
 			result.Rows = append(result.Rows, []any{"GuestUserRole", ps.GuestUserRole})
 		}
@@ -58,6 +62,18 @@ func listProjectSecurity(ctx *ExecContext) error {
 	fmt.Fprintf(ctx.Output, "Guest Access: %v\n", ps.EnableGuestAccess)
 	if ps.AdminUserName != "" {
 		fmt.Fprintf(ctx.Output, "Admin User: %s\n", ps.AdminUserName)
+	}
+	// The role `drop user role` must not take away (ako/mxcli#2015); set with
+	// alter app security ( AdminUserRole: … ).
+	if ps.AdminUserRole != "" {
+		fmt.Fprintf(ctx.Output, "Admin User Role: %s\n", ps.AdminUserRole)
+	}
+	// Whether, never what: an empty one is CE0129 at prototype and production
+	// level, which `alter app security ( AdminPassword: '…' )` resolves.
+	if ps.AdminPassword != "" {
+		fmt.Fprintln(ctx.Output, "Admin Password: set")
+	} else {
+		fmt.Fprintln(ctx.Output, "Admin Password: not set (CE0129 unless the security level is off)")
 	}
 	if ps.GuestUserRole != "" {
 		fmt.Fprintf(ctx.Output, "Guest User Role: %s\n", ps.GuestUserRole)
@@ -148,7 +164,7 @@ func listDemoUsers(ctx *ExecContext) error {
 	if !ps.EnableDemoUsers {
 		if ctx.Format != FormatJSON {
 			fmt.Fprintln(ctx.Output, "Demo users are disabled.")
-			fmt.Fprintln(ctx.Output, "Enable with: alter project security demo users on;")
+			fmt.Fprintln(ctx.Output, "Enable with: alter app security ( EnableDemoUsers: true );")
 			return nil
 		}
 		return writeResult(ctx, &TableResult{Columns: []string{"User Name", "User Roles"}})
@@ -296,7 +312,7 @@ func listAccessOnEntity(ctx *ExecContext, name *ast.QualifiedName) error {
 		}
 
 		if rule.XPathConstraint != "" {
-			fmt.Fprintf(ctx.Output, "  where '%s'\n", rule.XPathConstraint)
+			fmt.Fprintf(ctx.Output, "  where %s\n", mdlQuoted(rule.XPathConstraint))
 		}
 		fmt.Fprintln(ctx.Output)
 	}
@@ -320,7 +336,7 @@ func listAccessOnMicroflow(ctx *ExecContext, name *ast.QualifiedName) error {
 		return mdlerrors.NewBackend("list microflows", err)
 	}
 
-	for _, mf := range mfs {
+	for _, mf := range liveFirst(mfs, microflowExcluded) {
 		modName := h.GetModuleName(h.FindModuleID(mf.ContainerID))
 		if modName == name.Module && mf.Name == name.Name {
 			if ctx.Format == FormatJSON {
@@ -366,7 +382,7 @@ func listAccessOnPage(ctx *ExecContext, name *ast.QualifiedName) error {
 		return mdlerrors.NewBackend("list pages", err)
 	}
 
-	for _, pg := range pages {
+	for _, pg := range liveFirst(pages, pageExcluded) {
 		modName := h.GetModuleName(h.FindModuleID(pg.ContainerID))
 		if modName == name.Module && pg.Name == name.Name {
 			if ctx.Format == FormatJSON {
@@ -417,7 +433,7 @@ func listAccessOnNanoflow(ctx *ExecContext, name *ast.QualifiedName) error {
 		return mdlerrors.NewBackend("list nanoflows", err)
 	}
 
-	for _, nf := range nfs {
+	for _, nf := range liveFirst(nfs, nanoflowExcluded) {
 		modName := h.GetModuleName(h.FindModuleID(nf.ContainerID))
 		if modName == name.Module && nf.Name == name.Name {
 			if ctx.Format == FormatJSON {
@@ -782,12 +798,11 @@ func describeModuleRole(ctx *ExecContext, name ast.QualifiedName) error {
 		}
 		for _, mr := range ms.ModuleRoles {
 			if mr.Name == name.Name {
-				fmt.Fprintf(ctx.Output, "create module role %s.%s", modName, mr.Name)
+				fmt.Fprintf(ctx.Output, "create or modify module role %s.%s", modName, mr.Name)
 				if mr.Description != "" {
-					fmt.Fprintf(ctx.Output, " description '%s'", mr.Description)
+					fmt.Fprintf(ctx.Output, " description %s", mdlQuoted(mr.Description))
 				}
 				fmt.Fprintln(ctx.Output, ";")
-				fmt.Fprintln(ctx.Output, "/")
 
 				// Show which user roles include this module role
 				qualifiedRole := modName + "." + mr.Name
@@ -823,15 +838,22 @@ func describeDemoUser(ctx *ExecContext, userName string) error {
 
 	for _, du := range ps.DemoUsers {
 		if du.UserName == userName {
-			fmt.Fprintf(ctx.Output, "create demo user '%s' password '***'", du.UserName)
+			// The password is never printed (ako/mxcli#707). It used to be
+			// printed as '***', and replaying that set the password to three
+			// asterisks. The placeholder now stands for "the stored password":
+			// `create or modify` keeps it on a project that has this user, and
+			// refuses it on one that does not. See demoUserPasswordPlaceholder.
+			// The properties are a ( Key: value ) list with Studio Pro's
+			// names (phase 3.6, ako/mxcli#755).
+			props := []string{"Password: " + mdlQuoted(demoUserPasswordPlaceholder)}
 			if du.Entity != "" {
-				fmt.Fprintf(ctx.Output, " entity %s", du.Entity)
+				props = append(props, "Entity: "+du.Entity)
 			}
 			if len(du.UserRoles) > 0 {
-				fmt.Fprintf(ctx.Output, " (%s)", strings.Join(du.UserRoles, ", "))
+				props = append(props, "UserRoles: ("+strings.Join(du.UserRoles, ", ")+")")
 			}
-			fmt.Fprintln(ctx.Output, ";")
-			fmt.Fprintln(ctx.Output, "/")
+			fmt.Fprintf(ctx.Output, "create or modify demo user %s ( %s );\n",
+				mdlQuoted(du.UserName), strings.Join(props, ", "))
 			return nil
 		}
 	}
@@ -848,30 +870,7 @@ func describeUserRole(ctx *ExecContext, name ast.QualifiedName) error {
 
 	for _, ur := range ps.UserRoles {
 		if ur.Name == name.Name {
-			fmt.Fprintf(ctx.Output, "create user role %s", ur.Name)
-
-			// Module roles
-			if len(ur.ModuleRoles) > 0 {
-				fmt.Fprintf(ctx.Output, " (%s)", strings.Join(ur.ModuleRoles, ", "))
-			}
-
-			if ur.ManageAllRoles {
-				fmt.Fprint(ctx.Output, " manage all roles")
-			}
-
-			fmt.Fprintln(ctx.Output, ";")
-			fmt.Fprintln(ctx.Output, "/")
-
-			// Show description if present
-			if ur.Description != "" {
-				fmt.Fprintf(ctx.Output, "\n-- Description: %s\n", ur.Description)
-			}
-
-			// Show check security flag
-			if ur.CheckSecurity {
-				fmt.Fprintln(ctx.Output, "-- Check security: enabled")
-			}
-
+			fmt.Fprint(ctx.Output, formatUserRoleMDL(ur))
 			return nil
 		}
 	}
@@ -881,3 +880,40 @@ func describeUserRole(ctx *ExecContext, name ast.QualifiedName) error {
 
 // Executor method wrappers — delegate to free functions for callers that
 // still use the Executor receiver (e.g. executor_query.go).
+
+// formatUserRoleMDL writes a user role as `create or modify user role`, its
+// properties in a ( Key: value ) list (ako/mxcli#707). The positional form it
+// replaces had no slot for the description or the check-security flag, which
+// describe printed as `--` comments that a replay dropped, and it could not
+// write a role with no module roles at all. A property at Mendix's default for
+// a new role is left out (R12), except CheckSecurity, which is always stated.
+func formatUserRoleMDL(ur *security.UserRole) string {
+	var props []string
+	if len(ur.ModuleRoles) > 0 {
+		props = append(props, "ModuleRoles: ("+strings.Join(ur.ModuleRoles, ", ")+")")
+	}
+	if ur.Description != "" {
+		props = append(props, "Description: "+mdlQuoted(ur.Description))
+	}
+	if ur.ManageAllRoles {
+		props = append(props, "ManageAllRoles: true")
+	}
+	if len(ur.ManageableRoles) > 0 && !ur.ManageAllRoles {
+		props = append(props, "ManageableRoles: ("+strings.Join(ur.ManageableRoles, ", ")+")")
+	}
+	if ur.ManageUsersWithoutRoles {
+		props = append(props, "ManageUsersWithoutRoles: true")
+	}
+	// Always stated: a new role is written with CheckSecurity true, so leaving
+	// out a false value re-enabled security checking on replay, and `create or
+	// modify` keeps an unstated stored value either way (#1427).
+	props = append(props, fmt.Sprintf("CheckSecurity: %t", ur.CheckSecurity))
+	head := "create or modify user role " + ur.Name
+	switch len(props) {
+	case 0:
+		return head + ";\n"
+	case 1:
+		return head + " ( " + props[0] + " );\n"
+	}
+	return head + " (\n  " + strings.Join(props, ",\n  ") + "\n);\n"
+}

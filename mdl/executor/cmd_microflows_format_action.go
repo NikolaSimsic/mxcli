@@ -7,25 +7,212 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"github.com/mendixlabs/mxcli/modelsdk/bsoncompat"
+	"regexp"
 	"sort"
 	"strings"
 
-	mdltypes "github.com/mendixlabs/mxcli/mdl/types"
+	"github.com/mendixlabs/mxcli/mdl/langver"
 	"github.com/mendixlabs/mxcli/mdl/visitor"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // formatActivity formats a single microflow activity as an MDL statement.
 
-// escapeExpressionValue escapes raw control characters inside string literals
-// of a Mendix expression value so it can be safely embedded in MDL output.
-// The lexer's STRING_LITERAL rule forbids raw \r and \n inside single-quoted
-// strings. Only characters inside '...' regions are escaped; characters
+// commitModifier renders the Commit flag of a create/change activity as the MDL
+// modifier, or "" for Mendix's default (No) so the common case stays unwritten.
+// The leading space is included, since the caller appends it directly after the
+// member list.
+//
+// Before #779 this was never emitted: DESCRIBE could not distinguish a committing
+// create from a non-committing one, and re-executing its output cleared the flag.
+func commitModifier(c microflows.CommitType) string {
+	switch c {
+	case microflows.CommitTypeYes:
+		return " commit"
+	case microflows.CommitTypeYesWithoutEvents:
+		return " commit without events"
+	default:
+		return ""
+	}
+}
+
+// associationMemberChangeStatement renders a Change object activity whose only
+// member is an Add or Remove on an association as `add $X to $Obj/Assoc` or
+// `remove $X from $Obj/Assoc` — the statements that build it. ok is false when
+// the activity has another shape, or a Remove whose value is not a bare
+// variable (the remove form takes a variable, as the list form does).
+func associationMemberChangeStatement(ctx *ExecContext, varName string, a *microflows.ChangeObjectAction) (string, bool) {
+	if len(a.Changes) != 1 {
+		return "", false
+	}
+	m := a.Changes[0]
+	if m.AssociationQualifiedName == "" {
+		return "", false
+	}
+	value := escapeExpressionValue(ctx, describeExpr(ctx, m.Value))
+	modifiers := commitModifier(a.Commit) + refreshModifier(a.RefreshInClient)
+	switch m.Type {
+	case microflows.MemberChangeTypeAdd:
+		return fmt.Sprintf("add %s to $%s/%s%s;", value, varName, m.AssociationQualifiedName, modifiers), true
+	case microflows.MemberChangeTypeRemove:
+		if !isBareVariable(value) {
+			return "", false
+		}
+		return fmt.Sprintf("remove %s from $%s/%s%s;", value, varName, m.AssociationQualifiedName, modifiers), true
+	}
+	return "", false
+}
+
+// memberChangeOperator is the CHANGE member operator for a stored MemberChange
+// Type: Add and Remove are `+=` and `-=`, so an activity mixing them with other
+// members re-executes to the same members (mendixlabs/mxcli#1473). Written as
+// `=` they would come back as set assignments that replace the reference set.
+func memberChangeOperator(t microflows.MemberChangeType) string {
+	switch t {
+	case microflows.MemberChangeTypeAdd:
+		return "+="
+	case microflows.MemberChangeTypeRemove:
+		return "-="
+	}
+	return "="
+}
+
+// isBareVariable reports whether s is a single `$Name` reference.
+func isBareVariable(s string) bool {
+	if len(s) < 2 || s[0] != '$' {
+		return false
+	}
+	for _, r := range s[1:] {
+		if !(r == '_' || r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') {
+			return false
+		}
+	}
+	return true
+}
+
+// refreshModifier renders the REFRESH modifier shared by create, change,
+// commit, delete and rollback. Absent means Refresh in client = No, which is
+// Mendix's default on every one of them.
+//
+// It is a helper rather than five inline conditionals because the five drifted:
+// delete and create had no REFRESH in the grammar and none in the describer, so
+// a Studio Pro activity with the flag set round-tripped back to No — the same
+// defect #407 fixed for change alone.
+func refreshModifier(refresh bool) string {
+	if refresh {
+		return " refresh"
+	}
+	return ""
+}
+
+// describeExpr renders a stored Mendix expression for describe output.
+//
+// Studio Pro stores an expression exactly as typed, and a trailing newline (or
+// space) left in the expression editor is common in real projects. Emitted
+// verbatim it puts the closing `)` or `;` of the MDL statement on a line of its
+// own. Leading and trailing whitespace is never part of an expression's meaning
+// — an expression cannot end inside a string literal — so it is dropped here,
+// in the describer, and never in the stored model. Interior newlines are the
+// author's formatting of a multi-line expression and are kept.
+//
+// Every describe site that interpolates a stored microflow expression goes
+// through this helper; the ad-hoc TrimSuffix/TrimRight calls it replaced each
+// covered one slot and let the neighbouring ones drift.
+//
+// It also writes the expression's string literals in the language describe
+// writes (describeLanguage). Under mdl 1 a Mendix expression is MDL as it
+// stands. Under mdl 0 a backslash in a string literal escapes, and the reader
+// takes every literal of a microflow expression for its unescaped value, so a
+// stored backslash is written `\\` (mdl0ExpressionStrings): written as it is,
+// `'C:\temp'` would read back as a tab (ako/mxcli#810, #820). A control
+// character is left as it is — the mdl 0 reader accepts it raw — except in a
+// create or change member (escapeExpressionValue).
+//
+// Widget and workflow expressions are not microflow expressions: they are
+// stored as written in both languages, so their describers only trim.
+// describeCallArgument renders a call microflow / call nanoflow / call external
+// action argument. A
+// blank stored argument — the mapping is present, its expression empty, which
+// is what Studio Pro writes for an argument field left empty — is `nothing`.
+// Printing it through describeExpr gave `Param = ,` / `Param = )`, which does
+// not parse; `empty` would re-store the Mendix value "empty" and omitting the
+// argument would drop the mapping, so neither round-trips.
+func describeCallArgument(ctx *ExecContext, v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "nothing"
+	}
+	return describeExpr(ctx, v)
+}
+
+func describeExpr(ctx *ExecContext, v string) string {
+	return describeExprText(ctx, strings.TrimSpace(v))
+}
+
+// describeExprText is describeExpr keeping the stored text's surrounding
+// whitespace, for a field whose round trip carries it (a retrieve's limit).
+func describeExprText(ctx *ExecContext, v string) string {
+	if describeLanguage(ctx) >= langver.V1 {
+		return v
+	}
+	return mdl0ExpressionStrings(v)
+}
+
+// mdl0ExpressionStrings doubles every backslash inside the string literals of
+// a stored Mendix expression, where a doubled apostrophe is the only escape,
+// so that the mdl 0 reader reads each literal back as the stored value.
+func mdl0ExpressionStrings(v string) string {
+	if !strings.Contains(v, `\`) {
+		return v
+	}
+	var b strings.Builder
+	b.Grow(len(v) + 8)
+	inString := false
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c == '\'' && inString && i+1 < len(v) && v[i+1] == '\'':
+			b.WriteString("''")
+			i++
+		case c == '\'':
+			inString = !inString
+			b.WriteByte(c)
+		case c == '\\' && inString:
+			b.WriteString(`\\`)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// describeXPath writes a stored XPath constraint for describe output in the
+// language describe writes. A string in a stored constraint is spelled the
+// Mendix way, a backslash as itself, and a bracketed XPath in a script reads
+// its strings by the script's rule and stores their values (ako/mxcli#825):
+// under mdl 1 the constraint is written as stored, under mdl 0 with every
+// backslash in a string doubled (mdl0ExpressionStrings) so that it reads back
+// as the stored value. Every describer of a bracketed XPath — retrieve, access
+// rule, page datasource, workflow targeting, navigation sync — goes through
+// here.
+func describeXPath(ctx *ExecContext, x string) string {
+	return describeExprText(ctx, x)
+}
+
+// escapeExpressionValue writes a stored Mendix expression for describe output
+// in the language describe writes (describeLanguage).
+//
+// Under mdl 1 a Mendix expression is MDL as it stands — a string literal's
+// only escape is `”` in both — so it is written as stored, a line break in a
+// literal included; the reader stores such an expression as written, which is
+// the stored expression (ako/mxcli#804). Under mdl 0 a control character
+// inside a string literal is written as its backslash escape (`\n`, `\r`,
+// `\t`), which the mdl 0 reader turns back into the character; characters
 // outside string literals (structural whitespace) are preserved as-is.
-func escapeExpressionValue(v string) string {
-	if !strings.ContainsAny(v, "\n\r\t") {
+func escapeExpressionValue(ctx *ExecContext, v string) string {
+	if describeLanguage(ctx) >= langver.V1 || !strings.ContainsAny(v, "\n\r\t") {
 		return v
 	}
 	var b strings.Builder
@@ -73,10 +260,13 @@ func formatActivity(
 
 	case *microflows.EndEvent:
 		if activity.ReturnValue != "" {
-			returnVal := strings.TrimSuffix(activity.ReturnValue, "\n")
-			// Only add $ prefix for bare identifiers (no operators, quotes, or parens)
-			if !strings.HasPrefix(returnVal, "$") && !isMendixKeyword(returnVal) && !isQualifiedEnumLiteral(returnVal) &&
-				!strings.ContainsAny(returnVal, "+'\"()") && !isNumericLiteral(returnVal) {
+			returnVal := describeExpr(ctx, activity.ReturnValue)
+			// A legacy writer stored a returned variable without its `$`; add it
+			// back for exactly that shape — a bare name, optionally with an
+			// attribute path — and leave every other expression as stored. A
+			// blacklist of characters here turned `[%CurrentUser%]` into
+			// `$[%CurrentUser%]`, which does not parse (ako/mxcli#950).
+			if isBareReturnVariable(returnVal) {
 				returnVal = "$" + returnVal
 			}
 			return fmt.Sprintf("return %s;", returnVal)
@@ -91,7 +281,7 @@ func formatActivity(
 		return formatAction(ctx, activity.Action, entityNames, microflowNames)
 
 	case *microflows.ExclusiveSplit:
-		condition := formatSplitCondition(activity.SplitCondition)
+		condition := formatSplitCondition(ctx, activity.SplitCondition)
 		return fmt.Sprintf("if %s then", condition)
 
 	case *microflows.InheritanceSplit:
@@ -107,7 +297,7 @@ func formatActivity(
 	case *microflows.LoopedActivity:
 		switch ls := activity.LoopSource.(type) {
 		case *microflows.WhileLoopCondition:
-			return fmt.Sprintf("while %s", ls.WhileExpression)
+			return fmt.Sprintf("while %s", describeExpr(ctx, ls.WhileExpression))
 		case *microflows.IterableList:
 			iterVar := "Item"
 			listVar := "List"
@@ -151,6 +341,33 @@ func formatAction(
 	}
 
 	switch a := action.(type) {
+	case *microflows.SynchronizeAction:
+		// Emit the mode explicitly in every case, including the All default, so
+		// the statement is self-describing and a describe→exec round trip cannot
+		// turn a Specific-mode action into an All-mode one by omission.
+		switch a.SyncType {
+		case microflows.SynchronizationTypeSpecific:
+			vars := make([]string, 0, len(a.VariableNames))
+			for _, v := range a.VariableNames {
+				vars = append(vars, "$"+strings.TrimPrefix(v, "$"))
+			}
+			return fmt.Sprintf("synchronize %s;", strings.Join(vars, ", "))
+		case microflows.SynchronizationTypeUnsynchronized:
+			return "synchronize unsynchronized;"
+		default:
+			return "synchronize all;"
+		}
+
+	case *microflows.UnsupportedAction:
+		// The reader had no mapping for this action's $Type. Name it: the old
+		// anonymous "-- Empty action" was indistinguishable from an activity that
+		// genuinely has no action, so a describe→edit→exec cycle deleted the
+		// activity with nothing in the output to suggest anything was lost (#863).
+		if a.StorageType == "" {
+			return "-- Empty action"
+		}
+		return fmt.Sprintf("-- Unsupported action: %s", a.StorageType)
+
 	case *microflows.CastAction:
 		outputVar := a.OutputVariable
 		if outputVar != "" && !strings.HasPrefix(outputVar, "$") {
@@ -173,7 +390,7 @@ func formatAction(
 		if a.DataType != nil {
 			varType = formatMicroflowDataType(ctx, a.DataType, entityNames)
 		}
-		initialValue := strings.TrimSuffix(a.InitialValue, "\n")
+		initialValue := describeExpr(ctx, a.InitialValue)
 		if initialValue == "" {
 			initialValue = "empty"
 		}
@@ -195,13 +412,13 @@ func formatAction(
 			if !strings.HasPrefix(objectName, "$") {
 				objectName = "$" + objectName
 			}
-			return fmt.Sprintf("change %s (%s = %s);", objectName, attrName, a.Value)
+			return fmt.Sprintf("change %s (%s = %s);", objectName, attrName, describeExpr(ctx, a.Value))
 		}
 		// Simple variable change
 		if strings.HasPrefix(varName, "$") {
-			return fmt.Sprintf("set %s = %s;", varName, a.Value)
+			return fmt.Sprintf("set %s = %s;", varName, describeExpr(ctx, a.Value))
 		}
-		return fmt.Sprintf("set $%s = %s;", varName, a.Value)
+		return fmt.Sprintf("set $%s = %s;", varName, describeExpr(ctx, a.Value))
 
 	case *microflows.CreateObjectAction:
 		// Use EntityQualifiedName (BY_NAME_REFERENCE) or fall back to EntityID lookup
@@ -254,20 +471,27 @@ func formatAction(
 						memberName = parts[len(parts)-1]
 					}
 				}
-				members = append(members, fmt.Sprintf("%s = %s", memberName, escapeExpressionValue(m.Value)))
+				members = append(members, fmt.Sprintf("%s = %s", memberName, escapeExpressionValue(ctx, describeExpr(ctx, m.Value))))
 			}
-			return fmt.Sprintf("$%s = create %s (%s);", outputVar, entityName, strings.Join(members, ", "))
+			return fmt.Sprintf("$%s = create %s (%s)%s%s;", outputVar, entityName, strings.Join(members, ", "), commitModifier(a.Commit), refreshModifier(a.RefreshInClient))
 		}
-		return fmt.Sprintf("$%s = create %s;", outputVar, entityName)
+		return fmt.Sprintf("$%s = create %s%s%s;", outputVar, entityName, commitModifier(a.Commit), refreshModifier(a.RefreshInClient))
 
 	case *microflows.ChangeObjectAction:
 		varName := a.ChangeVariable
 		if varName == "" {
 			varName = "Object"
 		}
+		if stmt, ok := associationMemberChangeStatement(ctx, varName, a); ok {
+			return stmt
+		}
 		if len(a.Changes) > 0 {
 			var members []string
+			var listQualified []string
 			for _, m := range a.Changes {
+				if isListQualifiedMember(m) {
+					listQualified = append(listQualified, m.AttributeQualifiedName+m.AssociationQualifiedName)
+				}
 				var memberName string
 				// Check if this is an association change or an attribute change
 				if m.AssociationQualifiedName != "" {
@@ -284,40 +508,46 @@ func formatAction(
 						memberName = parts[len(parts)-1]
 					}
 				}
-				members = append(members, fmt.Sprintf("%s = %s", memberName, escapeExpressionValue(m.Value)))
+				members = append(members, fmt.Sprintf("%s %s %s", memberName, memberChangeOperator(m.Type), escapeExpressionValue(ctx, describeExpr(ctx, m.Value))))
 			}
-			if a.RefreshInClient {
-				return fmt.Sprintf("change $%s (%s) refresh;", varName, strings.Join(members, ", "))
+			stmt := fmt.Sprintf("change $%s (%s)%s%s;", varName, strings.Join(members, ", "), commitModifier(a.Commit), refreshModifier(a.RefreshInClient))
+			if len(listQualified) > 0 {
+				// Written over a list before mendixlabs/mxcli#1422: the bare
+				// name above is not what is stored, and mxbuild reports CE1613.
+				stmt += fmt.Sprintf(" -- WARNING: stored member %s is qualified through a list type (CE1613); "+
+					"re-create this flow with $%s retrieved as an object (`first`)",
+					strings.Join(listQualified, ", "), varName)
 			}
-			return fmt.Sprintf("change $%s (%s);", varName, strings.Join(members, ", "))
+			return stmt
 		}
-		if a.RefreshInClient {
-			return fmt.Sprintf("change $%s refresh;", varName)
-		}
-		return fmt.Sprintf("change $%s;", varName)
+		return fmt.Sprintf("change $%s%s%s;", varName, commitModifier(a.Commit), refreshModifier(a.RefreshInClient))
 
 	case *microflows.CommitObjectsAction:
 		varName := a.CommitVariable
 		if varName == "" {
 			varName = "Object"
 		}
+		// Events ON is the default and is left unwritten; events OFF is the
+		// deviation and must be spelled out, or a describe → exec round trip
+		// silently turns the handlers back on (#895).
 		suffix := ""
-		if a.WithEvents {
-			suffix += " with events"
+		if !a.WithEvents {
+			suffix += " without events"
 		}
-		if a.RefreshInClient {
-			suffix += " refresh"
-		}
+		suffix += refreshModifier(a.RefreshInClient)
 		return fmt.Sprintf("commit $%s%s;", varName, suffix)
 
 	case *microflows.DeleteObjectAction:
-		return fmt.Sprintf("delete $%s;", a.DeleteVariable)
+		return fmt.Sprintf("delete $%s%s;", a.DeleteVariable, refreshModifier(a.RefreshInClient))
 
 	case *microflows.RollbackObjectAction:
-		if a.RefreshInClient {
-			return fmt.Sprintf("rollback $%s refresh;", a.RollbackVariable)
-		}
-		return fmt.Sprintf("rollback $%s;", a.RollbackVariable)
+		return fmt.Sprintf("rollback $%s%s;", a.RollbackVariable, refreshModifier(a.RefreshInClient))
+
+	case *microflows.SendExternalObjectAction:
+		return fmt.Sprintf("send external object $%s%s;", a.Variable, refreshModifier(a.RefreshInClient))
+
+	case *microflows.DeleteExternalObjectAction:
+		return fmt.Sprintf("delete external object $%s%s;", a.Variable, refreshModifier(a.RefreshInClient))
 
 	case *microflows.CreateListAction:
 		// Use EntityQualifiedName (BY_NAME_REFERENCE) or fall back to EntityID lookup
@@ -334,13 +564,13 @@ func formatAction(
 		varName := a.ChangeVariable
 		switch a.Type {
 		case microflows.ChangeListTypeAdd:
-			return fmt.Sprintf("add %s to $%s;", a.Value, varName)
+			return fmt.Sprintf("add %s to $%s;", describeExpr(ctx, a.Value), varName)
 		case microflows.ChangeListTypeRemove:
-			return fmt.Sprintf("remove %s from $%s;", a.Value, varName)
+			return fmt.Sprintf("remove %s from $%s;", describeExpr(ctx, a.Value), varName)
 		case microflows.ChangeListTypeClear:
 			return fmt.Sprintf("clear $%s;", varName)
 		case microflows.ChangeListTypeSet:
-			return fmt.Sprintf("set $%s = %s;", varName, a.Value)
+			return fmt.Sprintf("set $%s = %s;", varName, describeExpr(ctx, a.Value))
 		default:
 			return fmt.Sprintf("change list $%s (%s);", varName, a.Type)
 		}
@@ -357,9 +587,12 @@ func formatAction(
 		if outputVar == "" {
 			outputVar = "Result"
 		}
-		fn := string(a.Function)
-		if fn == "" {
-			fn = "count"
+		fn, known := mdlAggregateKeyword(a.Function)
+		if !known {
+			// A function this build has no MDL keyword for. Rendering it by
+			// lowercasing the stored name is what produced unreadable MDL for
+			// Reduce/All/Any (#1004), so say so instead of emitting a lie.
+			return fmt.Sprintf("// unsupported aggregate function %q on $%s — mxcli cannot render this activity as MDL;", a.Function, outputVar)
 		}
 		// Extract attribute name (use last part of qualified name for readability)
 		attrName := a.AttributeQualifiedName
@@ -370,15 +603,11 @@ func formatAction(
 				attrName = parts[len(parts)-1]
 			}
 		}
-		// Expression-based aggregate: SUM($list, $currentObject/Attr + 1)
-		if a.UseExpression && a.Expression != "" {
-			return fmt.Sprintf("$%s = %s($%s, %s);", outputVar, strings.ToLower(fn), a.InputVariable, a.Expression)
-		}
-		// Attribute-based aggregate: SUM($list.Attr)
-		if attrName != "" && a.Function != microflows.AggregateFunctionCount {
-			return fmt.Sprintf("$%s = %s($%s.%s);", outputVar, strings.ToLower(fn), a.InputVariable, attrName)
-		}
-		return fmt.Sprintf("$%s = %s($%s);", outputVar, strings.ToLower(fn), a.InputVariable)
+		// The statement that mirrors the activity, in every language version:
+		// the call form `$n = count($L)` is deprecated (MDL-DEPR004), and
+		// describe never emits a deprecated spelling (ako/mxcli#840). The
+		// statement form reads the same under mdl 0 and mdl 1.
+		return formatAggregateActivity(ctx, a, fn, attrName, outputVar, entityNames)
 
 	case *microflows.RetrieveAction:
 		outputVar := a.OutputVariable
@@ -396,38 +625,50 @@ func formatAction(
 				entityName = "Entity"
 			}
 
-			if startVar, assocName, ok := parseReverseAssociationRetrieve(ctx, dbSource, entityName); ok {
-				return fmt.Sprintf("retrieve $%s from $%s/%s;", outputVar, startVar, assocName)
-			}
-
+			// A DatabaseRetrieveSource always renders in database form
+			// (`from Entity where …`). It must NOT be collapsed to the
+			// association shorthand `from $var/Assoc` even when its XPath is a
+			// reverse-association constraint — that shorthand is the in-memory
+			// retrieve-by-association form, and rendering a database retrieve
+			// that way makes the two indistinguishable and breaks round-trip
+			// (issue #726).
 			stmt := fmt.Sprintf("retrieve $%s from %s", outputVar, entityName)
 
 			if dbSource.XPathConstraint != "" {
-				constraint := strings.TrimSpace(dbSource.XPathConstraint)
+				// A stored constraint may be broken across lines — mxcli formats a
+				// long one that way so it can be read in Studio Pro's editor
+				// (upstream #979), and that layout is described on one line: the
+				// executor re-derives it on write. A layout a person gave it is
+				// described as stored, which is what re-executing it stores
+				// (mendixlabs/mxcli#1542).
+				constraint := visitor.DescribeXPathConstraintLayout(strings.TrimSpace(dbSource.XPathConstraint))
 				// Enrich string literals for enum attributes to qualified names
 				// (e.g. Status = 'Open' → Status = Module.OrderStatus.Open) when
 				// the entity is known and we are connected to a project.
 				constraint = enrichXPathConstraintForDescribe(ctx, entityName, constraint)
-				// XPath may contain multiple predicates like [a][b] or [a]\n[b].
-				// Split them and join with MDL 'and' so the parser sees
-				// separate xpathConstraint nodes.
-				if strings.HasPrefix(constraint, "[") && strings.HasSuffix(constraint, "]") {
-					// Split on "][" boundary (possibly separated by \n literals),
-					// then re-wrap each predicate.
-					inner := constraint[1 : len(constraint)-1]
-					// Normalise real newlines between predicates: ]\n[ → ][
-					inner = strings.ReplaceAll(inner, "]\n[", "][")
-					parts := strings.Split(inner, "][")
-					if len(parts) > 1 {
-						var wrapped []string
-						for _, p := range parts {
-							wrapped = append(wrapped, "["+strings.TrimSpace(p)+"]")
-						}
-						constraint = strings.Join(wrapped, "\n    ")
-					} else {
-						constraint = parts[0]
+				// XPath may hold several sibling predicate groups — [a][b], or
+				// separated by newlines. Emit each on its own line so the parser
+				// sees separate xpathConstraint nodes. The splitter is nesting- and
+				// quote-aware: the previous "][" split mangled a group containing a
+				// nested bracket or a literal with a ']' in it (#772).
+				if groups := visitor.SplitXPathPredicateGroups(constraint); len(groups) > 0 {
+					if len(groups) > 1 {
+						constraint = strings.Join(groups, "\n    ")
+					} else if inner := strings.TrimSuffix(strings.TrimPrefix(groups[0], "["), "]"); !xpathHasNestedPredicate(inner) {
+						// A lone group renders without its outer brackets, matching
+						// the `where <expr>` form the MDL grammar expects.
+						constraint = inner
 					}
+					// A group holding a nested predicate (`A/B[Name = empty]`)
+					// keeps its outer brackets: the bare `where <expr>` form is
+					// read as an expression, which has no `[`, so its own parser
+					// rejected the description and create or modify could not
+					// compare the stored flow at all (ako/mxcli#859).
 				}
+				// A string in the constraint is stored as its value, as in an
+				// expression; under mdl 0 its backslashes are escaped so that it
+				// reads back as that value.
+				constraint = describeXPath(ctx, constraint)
 				stmt += fmt.Sprintf("\n    where %s", constraint)
 			}
 
@@ -435,7 +676,21 @@ func formatAction(
 			if len(dbSource.Sorting) > 0 {
 				var sortParts []string
 				for _, sortItem := range dbSource.Sorting {
+					// A sort that navigates associations is emitted with its hops,
+					// one `/` per step. Emitting the attribute alone is lossy in the
+					// way that hides longest: the replay has to guess which
+					// association was meant, and where two reach the same entity it
+					// can pick the other one — a model that builds cleanly and sorts
+					// by the wrong thing (mendixlabs/mxcli#1152).
 					attrName := sortItem.AttributeQualifiedName
+					if len(sortItem.EntityRefSteps) == 0 {
+						attrName = shortSortAttribute(ctx, entityName, attrName)
+					}
+					for i := len(sortItem.EntityRefSteps) - 1; i >= 0; i-- {
+						if assoc := sortItem.EntityRefSteps[i].Association; assoc != "" {
+							attrName = assoc + "/" + attrName
+						}
+					}
 					order := "asc"
 					if sortItem.Direction == microflows.SortDirectionDescending {
 						order = "desc"
@@ -448,13 +703,19 @@ func formatAction(
 			if dbSource.Range != nil {
 				switch dbSource.Range.RangeType {
 				case microflows.RangeTypeFirst:
-					stmt += "\n    limit 1"
+					// `first`, not `limit 1`: under mdl 1 `limit 1` is a list of
+					// one, and `first` means the object in every version, so the
+					// output reads back to this range whatever the reader's
+					// header (ako/mxcli#734).
+					stmt += "\n    first"
 				case microflows.RangeTypeCustom:
+					// Limit and offset are Mendix expressions, spelled for the
+					// describe language like any other (ako/mxcli#825).
 					if dbSource.Range.Limit != "" {
-						stmt += fmt.Sprintf("\n    limit %s", dbSource.Range.Limit)
+						stmt += fmt.Sprintf("\n    limit %s", describeExprText(ctx, dbSource.Range.Limit))
 					}
 					if dbSource.Range.Offset != "" {
-						stmt += fmt.Sprintf("\n    offset %s", dbSource.Range.Offset)
+						stmt += fmt.Sprintf("\n    offset %s", describeExprText(ctx, dbSource.Range.Offset))
 					}
 				}
 			}
@@ -484,21 +745,13 @@ func formatAction(
 		}
 		// Node is an expression in Mendix (e.g., 'TEST' or $variable or 'Prefix' + $var)
 		// Output it as-is since it's already stored as an expression
-		node := a.LogNodeName
+		node := describeExpr(ctx, a.LogNodeName)
 		if node == "" {
 			node = defaultLogNodeExpression
 		}
 		message := "'Message'"
-		if a.MessageTemplate != nil && len(a.MessageTemplate.Translations) > 0 {
-			// Get message text from template (prefer en_US, fallback to any)
-			for _, text := range a.MessageTemplate.Translations {
-				message = text
-				break
-			}
-			if text, ok := a.MessageTemplate.Translations["en_US"]; ok {
-				message = text
-			}
-			message = mdlQuote(message)
+		if text := pickTextTranslation(a.MessageTemplate, describeDefaultLanguage(ctx)); text != "" {
+			message = mdlQuote(ctx, text)
 		}
 
 		// Build WITH clause if there are template parameters
@@ -506,12 +759,26 @@ func formatAction(
 		if len(a.TemplateParameters) > 0 {
 			var params []string
 			for i, expr := range a.TemplateParameters {
-				params = append(params, fmt.Sprintf("{%d} = %s", i+1, expr))
+				params = append(params, fmt.Sprintf("{%d} = %s", i+1, describeExpr(ctx, expr)))
 			}
 			withClause = fmt.Sprintf(" with (%s)", strings.Join(params, ", "))
 		}
+		// "Include latest stack trace" (mendixlabs/mxcli#1543). Unticked is what
+		// an absent clause builds, so only a ticked box is printed.
+		if a.IncludeLastStackTrace {
+			withClause += " with stacktrace"
+		}
 
-		return fmt.Sprintf("log %s node %s %s%s;", strings.ToLower(level), node, message, withClause)
+		// Level info and node 'Application' are what an unstated level and node
+		// build (addLogMessageAction), so neither is printed (R12, #748).
+		head := "log"
+		if lvl := strings.ToLower(level); lvl != "info" {
+			head += " " + lvl
+		}
+		if node != defaultLogNodeExpression {
+			head += " node " + node
+		}
+		return fmt.Sprintf("%s %s%s;", head, message, withClause)
 
 	case *microflows.MicroflowCallAction:
 		mfName := ""
@@ -529,7 +796,7 @@ func formatAction(
 				if idx := strings.LastIndex(paramName, "."); idx != -1 {
 					paramName = paramName[idx+1:]
 				}
-				params = append(params, fmt.Sprintf("%s = %s", paramName, pm.Argument))
+				params = append(params, fmt.Sprintf("%s = %s", paramName, describeCallArgument(ctx, pm.Argument)))
 			}
 		}
 
@@ -538,10 +805,16 @@ func formatAction(
 			paramStr = strings.Join(params, ", ")
 		}
 
-		if a.UseReturnVariable && a.ResultVariableName != "" {
-			return fmt.Sprintf("$%s = call microflow %s(%s);", a.ResultVariableName, mfName, paramStr)
+		queue := ""
+		if a.MicroflowCall != nil {
+			queue = queueClauseMDL(a.MicroflowCall.QueueSettings)
 		}
-		return fmt.Sprintf("call microflow %s(%s);", mfName, paramStr)
+		// A name kept on a call to a flow that returns nothing names no
+		// variable: Studio Pro does not show it (ako/mxcli#2138).
+		if a.UseReturnVariable && a.ResultVariableName != "" && !describedCallIsVoid(ctx, false, mfName) {
+			return fmt.Sprintf("$%s = call microflow %s(%s)%s;", a.ResultVariableName, mfName, paramStr, queue)
+		}
+		return fmt.Sprintf("call microflow %s(%s)%s;", mfName, paramStr, queue)
 
 	case *microflows.NanoflowCallAction:
 		nfName := ""
@@ -558,7 +831,7 @@ func formatAction(
 				if idx := strings.LastIndex(paramName, "."); idx != -1 {
 					paramName = paramName[idx+1:]
 				}
-				params = append(params, fmt.Sprintf("%s = %s", paramName, pm.Argument))
+				params = append(params, fmt.Sprintf("%s = %s", paramName, describeCallArgument(ctx, pm.Argument)))
 			}
 		}
 
@@ -567,7 +840,7 @@ func formatAction(
 			paramStr = strings.Join(params, ", ")
 		}
 
-		if a.UseReturnVariable && a.OutputVariableName != "" {
+		if a.UseReturnVariable && a.OutputVariableName != "" && !describedCallIsVoid(ctx, true, nfName) {
 			return fmt.Sprintf("$%s = call nanoflow %s(%s);", a.OutputVariableName, nfName, paramStr)
 		}
 		return fmt.Sprintf("call nanoflow %s(%s);", nfName, paramStr)
@@ -589,26 +862,30 @@ func formatAction(
 			valueStr := ""
 			switch v := pm.Value.(type) {
 			case *microflows.StringTemplateParameterValue:
-				if v.TypedTemplate != nil {
-					valueStr = mdlQuote(v.TypedTemplate.Text)
+				valueStr = describeTypedTemplate(ctx, v.TypedTemplate)
+			case *microflows.CustomBlobDocumentCodeActionParameterValue:
+				if v.CustomDocument != "" {
+					valueStr = mdlQuote(ctx, v.CustomDocument)
+				} else {
+					valueStr = "empty"
 				}
 			case *microflows.ExpressionBasedCodeActionParameterValue:
-				valueStr = v.Expression
+				valueStr = describeExpr(ctx, v.Expression)
 			case *microflows.BasicCodeActionParameterValue:
 				if v.Argument == "" {
 					valueStr = "empty"
 				} else {
-					valueStr = v.Argument
+					valueStr = describeExpr(ctx, v.Argument)
 				}
 			case *microflows.MicroflowParameterValue:
 				if v.Microflow != "" {
-					valueStr = mdlQuote(v.Microflow)
+					valueStr = mdlQuote(ctx, v.Microflow)
 				} else {
 					valueStr = "empty"
 				}
 			case *microflows.EntityTypeCodeActionParameterValue:
 				if v.Entity != "" {
-					valueStr = mdlQuote(v.Entity)
+					valueStr = mdlQuote(ctx, v.Entity)
 				}
 			}
 			if valueStr != "" {
@@ -621,10 +898,11 @@ func formatAction(
 			paramStr = strings.Join(params, ", ")
 		}
 
+		queue := queueClauseMDL(a.QueueSettings)
 		if a.UseReturnVariable && a.ResultVariableName != "" {
-			return fmt.Sprintf("$%s = call java action %s(%s);", a.ResultVariableName, javaActionName, paramStr)
+			return fmt.Sprintf("$%s = call java action %s(%s)%s;", a.ResultVariableName, javaActionName, paramStr, queue)
 		}
-		return fmt.Sprintf("call java action %s(%s);", javaActionName, paramStr)
+		return fmt.Sprintf("call java action %s(%s)%s;", javaActionName, paramStr, queue)
 
 	case *microflows.CallExternalAction:
 		serviceName := a.ConsumedODataService
@@ -638,7 +916,12 @@ func formatAction(
 
 		var params []string
 		for _, pm := range a.ParameterMappings {
-			params = append(params, fmt.Sprintf("%s = %s", pm.ParameterName, pm.Argument))
+			// describeCallArgument, not describeExpr: Studio Pro 11.16 stores an
+			// optional parameter left blank as `Argument: ""`, which printed as
+			// `name = )` and did not parse (ako/mxcli#1915). `nothing` is the
+			// blank; `empty` (11.14's spelling of the same field) stays a value.
+			arg := fmt.Sprintf("%s = %s", pm.ParameterName, describeCallArgument(ctx, pm.Argument))
+			params = append(params, arg+describeIncludedAssociations(ctx, pm.IncludedAssociations))
 		}
 
 		paramStr := ""
@@ -677,7 +960,7 @@ func formatAction(
 			// Extract just the parameter name from the qualified name
 			parts := strings.Split(pm.Parameter, ".")
 			paramName := parts[len(parts)-1]
-			params = append(params, fmt.Sprintf("$%s = %s", paramName, pm.Argument))
+			params = append(params, fmt.Sprintf("%s = %s", paramName, describeExpr(ctx, pm.Argument)))
 		}
 
 		// Build the statement
@@ -685,7 +968,25 @@ func formatAction(
 		if len(params) > 0 {
 			paramStr = "(" + strings.Join(params, ", ") + ")"
 		}
-		return fmt.Sprintf("show page %s%s;", pageName, paramStr)
+		// The page title override. Left out, describe -> exec dropped it, and
+		// taking it out of a create or modify compared as no change
+		// (ako/mxcli#869). An override without text has no statement form:
+		// `with title = ''` builds none.
+		var settings []string
+		if title := pickTextTranslation(a.OverridePageTitle, describeDefaultLanguage(ctx)); title != "" {
+			settings = append(settings, "title = "+mdlQuote(ctx, title))
+		}
+		// "Number of pages to close". Left out, an action that closes the
+		// current page read exactly like one that closes none
+		// (mendixlabs/mxcli#1617). "" is Studio Pro's default: none.
+		if n := strings.TrimSpace(a.NumberOfPagesToClose); n != "" {
+			settings = append(settings, "NumberOfPagesToClose = "+describeExpr(ctx, n))
+		}
+		withStr := ""
+		if len(settings) > 0 {
+			withStr = " with " + strings.Join(settings, ", ")
+		}
+		return fmt.Sprintf("show page %s%s%s;", pageName, paramStr, withStr)
 
 	case *microflows.ClosePageAction:
 		if a.NumberOfPages > 1 {
@@ -702,20 +1003,20 @@ func formatAction(
 			msgType = "Information"
 		}
 		message := "'...'"
-		if a.Template != nil && len(a.Template.Translations) > 0 {
-			// Get message text from template (prefer en_US, fallback to any)
-			for _, text := range a.Template.Translations {
-				message = text
-				break
-			}
-			if text, ok := a.Template.Translations["en_US"]; ok {
-				message = text
-			}
-			message = mdlQuote(message)
+		if text := pickTextTranslation(a.Template, describeDefaultLanguage(ctx)); text != "" {
+			message = mdlQuote(ctx, text)
 		}
 		result := fmt.Sprintf("show message %s type %s", message, msgType)
 		if len(a.TemplateParameters) > 0 {
-			result += " objects [" + strings.Join(a.TemplateParameters, ", ") + "]"
+			result += templateArgsClause(ctx, a.TemplateParameters)
+		}
+		// Without this, a describe -> exec round trip turned a BLOCKING message
+		// box into a non-blocking one. The model carried Blocking on both
+		// engines all along; MDL simply had no word for it, which is why the
+		// loss happened in the middle of a path where every other layer was
+		// correct.
+		if a.Blocking {
+			result += " blocking"
 		}
 		return result + ";"
 
@@ -731,17 +1032,9 @@ func formatAction(
 		return result + ";"
 
 	case *microflows.ValidationFeedbackAction:
-		// Get the message text from template translations (prefer en_US, fallback to any)
 		msgText := "'...'"
-		if a.Template != nil && len(a.Template.Translations) > 0 {
-			for _, text := range a.Template.Translations {
-				msgText = text
-				break
-			}
-			if text, ok := a.Template.Translations["en_US"]; ok {
-				msgText = text
-			}
-			msgText = mdlQuote(msgText)
+		if text := pickTextTranslation(a.Template, describeDefaultLanguage(ctx)); text != "" {
+			msgText = mdlQuote(ctx, text)
 		}
 		// Build attribute path from variable and attribute name
 		// AttributeName format: Module.Entity.Attribute
@@ -760,10 +1053,13 @@ func formatAction(
 		} else if a.AssociationName != "" {
 			attrPath = varName + "/" + a.AssociationName
 		}
-		return fmt.Sprintf("validation feedback %s message %s;", attrPath, msgText)
+		return fmt.Sprintf("validation feedback %s message %s%s;", attrPath, msgText, templateArgsClause(ctx, a.TemplateParameters))
 
 	case *microflows.RestCallAction:
 		return formatRestCallAction(ctx, a)
+
+	case *microflows.SendEmailAction:
+		return formatSendEmailAction(ctx, a)
 
 	case *microflows.RestOperationCallAction:
 		return formatRestOperationCallAction(ctx, a)
@@ -809,37 +1105,33 @@ func formatAction(
 		return formatWorkflowOperationAction(ctx, a)
 
 	case *microflows.SetTaskOutcomeAction:
-		return fmt.Sprintf("set task outcome $%s %s;", a.WorkflowTaskVariable, mdlQuote(a.OutcomeValue))
+		return fmt.Sprintf("set task outcome $%s %s;", a.WorkflowTaskVariable, mdlQuote(ctx, a.OutcomeValue))
 
 	case *microflows.OpenUserTaskAction:
 		return fmt.Sprintf("open user task $%s;", a.UserTaskVariable)
 
 	case *microflows.NotifyWorkflowAction:
-		if a.OutputVariableName != "" {
-			return fmt.Sprintf("$%s = notify workflow $%s;", a.OutputVariableName, a.WorkflowVariable)
+		// The target used to be left out, so a rewrite from describe output wrote a
+		// notify the build refuses (CE0166).
+		target := ""
+		if a.Target != nil && a.Target.Name != "" {
+			target = " target " + a.Target.Name
+		} else if a.Activity != "" {
+			target = " target " + a.Activity
 		}
-		return fmt.Sprintf("notify workflow $%s;", a.WorkflowVariable)
+		if a.OutputVariableName != "" {
+			return fmt.Sprintf("$%s = notify workflow $%s%s;", a.OutputVariableName, a.WorkflowVariable, target)
+		}
+		return fmt.Sprintf("notify workflow $%s%s;", a.WorkflowVariable, target)
 
 	case *microflows.OpenWorkflowAction:
 		return fmt.Sprintf("open workflow $%s;", a.WorkflowVariable)
 
 	case *microflows.LockWorkflowAction:
-		if a.PauseAllWorkflows {
-			return "lock workflow all;"
-		}
-		if a.Workflow != "" {
-			return fmt.Sprintf("lock workflow %s;", a.Workflow)
-		}
-		return fmt.Sprintf("lock workflow $%s;", a.WorkflowVariable)
+		return "lock workflow " + workflowSelectionMDL(a.Workflow, a.WorkflowVariable, a.PauseAllWorkflows, "pause all") + ";"
 
 	case *microflows.UnlockWorkflowAction:
-		if a.ResumeAllPausedWorkflows {
-			return "unlock workflow all;"
-		}
-		if a.Workflow != "" {
-			return fmt.Sprintf("unlock workflow %s;", a.Workflow)
-		}
-		return fmt.Sprintf("unlock workflow $%s;", a.WorkflowVariable)
+		return "unlock workflow " + workflowSelectionMDL(a.Workflow, a.WorkflowVariable, a.ResumeAllPausedWorkflows, "unpause all") + ";"
 
 	case *microflows.JavaScriptActionCallAction:
 		jsActionName := a.JavaScriptAction
@@ -865,12 +1157,12 @@ func formatAction(
 				switch v := pm.Value.(type) {
 				case *microflows.StringTemplateParameterValue:
 					if v.TypedTemplate != nil {
-						valueStr = mdlQuote(v.TypedTemplate.Text)
+						valueStr = mdlQuote(ctx, v.TypedTemplate.Text)
 					}
 				case *microflows.ExpressionBasedCodeActionParameterValue:
-					valueStr = v.Expression
+					valueStr = describeExpr(ctx, v.Expression)
 				case *microflows.BasicCodeActionParameterValue:
-					valueStr = v.Argument
+					valueStr = describeExpr(ctx, v.Argument)
 				case *microflows.EntityTypeCodeActionParameterValue:
 					valueStr = v.Entity
 				}
@@ -909,7 +1201,7 @@ func formatWorkflowOperationAction(ctx *ExecContext, a *microflows.WorkflowOpera
 	switch op := a.Operation.(type) {
 	case *microflows.AbortOperation:
 		if op.Reason != "" {
-			return fmt.Sprintf("workflow operation abort $%s reason %s;", op.WorkflowVariable, mdlQuote(op.Reason))
+			return fmt.Sprintf("workflow operation abort $%s reason %s;", op.WorkflowVariable, mdlQuote(ctx, op.Reason))
 		}
 		return fmt.Sprintf("workflow operation abort $%s;", op.WorkflowVariable)
 	case *microflows.ContinueOperation:
@@ -934,30 +1226,66 @@ func formatWebServiceCallAction(ctx *ExecContext, a *microflows.WebServiceCallAc
 	}
 	if len(a.RawBSON) > 0 {
 		raw := base64.StdEncoding.EncodeToString(canonicalRawBSON(a.RawBSON))
-		return prefix + "call web service raw " + mdlQuote(raw) + ";"
+		return prefix + "call web service raw " + mdlQuote(ctx, raw) + ";"
 	}
 
-	parts := []string{prefix + "call web service " + formatWebServiceReference(resolveWebServiceReference(ctx, a.ServiceID))}
+	// The service and the two mappings are BY_NAME_REFERENCE properties: what is
+	// stored IS the qualified name, so there is nothing to resolve. See
+	// TestFormatAction_WebServiceCallRendersStoredQualifiedNames for what the
+	// three resolvers that used to stand here actually did.
+	parts := []string{prefix + "call web service " + formatWebServiceReference(ctx, string(a.ServiceID))}
 	if a.OperationName != "" {
-		parts = append(parts, "operation "+formatWebServiceReference(a.OperationName))
+		op := "operation " + formatWebServiceReference(ctx, a.OperationName)
+		// The arguments carry the stored ParameterPath, but only its last
+		// segment is spelled in MDL — the rest is rebuilt from the operation
+		// document on the way back in.
+		if args := formatWebServiceArguments(ctx, a.Arguments); args != "" {
+			op += " (" + args + ")"
+		}
+		parts = append(parts, op)
 	}
 	if a.SendMappingID != "" {
-		parts = append(parts, "send mapping "+formatWebServiceReference(resolveWebServiceMappingReference(ctx, a.SendMappingID, true)))
+		send := "send mapping " + formatWebServiceReference(ctx, string(a.SendMappingID))
+		if a.SendMappingVariable != "" {
+			send += " from $" + a.SendMappingVariable
+		}
+		parts = append(parts, send)
 	}
 	if a.ReceiveMappingID != "" {
-		parts = append(parts, "receive mapping "+formatWebServiceReference(resolveWebServiceMappingReference(ctx, a.ReceiveMappingID, false)))
+		parts = append(parts, "receive mapping "+formatWebServiceReference(ctx, string(a.ReceiveMappingID)))
 	}
 	if a.TimeoutExpression != "" {
-		parts = append(parts, "timeout "+strings.TrimRight(a.TimeoutExpression, " \t\n\r"))
+		parts = append(parts, "timeout "+describeExpr(ctx, a.TimeoutExpression))
 	}
 	return strings.Join(parts, "\n") + ";"
 }
 
-func formatWebServiceReference(ref string) string {
+// formatWebServiceArguments renders the operation's argument list, or "" when
+// there is nothing MDL can spell.
+//
+// An argument whose Name did not survive the read — a ParameterPath with no
+// "|", which no reference document has — renders nothing at all, and the
+// action falls back to the raw form rather than emitting a list that would
+// write a different path back.
+func formatWebServiceArguments(ctx *ExecContext, args []microflows.WebServiceArgument) string {
+	if len(args) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg.Name == "" {
+			return ""
+		}
+		parts = append(parts, arg.Name+" = "+describeExpr(ctx, arg.Expression))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func formatWebServiceReference(ctx *ExecContext, ref string) string {
 	if isBareQualifiedReference(ref) {
 		return ref
 	}
-	return mdlQuote(ref)
+	return mdlQuote(ctx, ref)
 }
 
 func isBareQualifiedReference(ref string) bool {
@@ -990,110 +1318,9 @@ func isBareIdentifier(part string) bool {
 	return true
 }
 
-func resolveWebServiceReference(ctx *ExecContext, id model.ID) string {
-	raw := string(id)
-	if raw == "" || ctx == nil || ctx.Backend == nil {
-		return raw
-	}
-	units, err := ctx.Backend.ListRawUnitsByType("WebServices$ImportedWebService")
-	if err != nil {
-		return raw
-	}
-	h, err := getHierarchy(ctx)
-	if err != nil {
-		return raw
-	}
-	for _, unit := range units {
-		if unit == nil || unit.ID != id {
-			continue
-		}
-		return qualifiedRawUnitName(h, unit, raw)
-	}
-	return raw
-}
-
-func qualifiedRawUnitName(h *ContainerHierarchy, unit *mdltypes.RawUnit, fallback string) string {
-	name := rawUnitName(unit.Contents)
-	if name == "" {
-		return fallback
-	}
-	if h == nil {
-		return name
-	}
-	if qn := h.GetQualifiedName(unit.ContainerID, name); qn != "." && qn != "" {
-		return qn
-	}
-	return name
-}
-
-func resolveWebServiceMappingReference(ctx *ExecContext, id model.ID, preferExport bool) string {
-	if preferExport {
-		if qn := resolveExportMappingReference(ctx, id); qn != "" {
-			return qn
-		}
-		if qn := resolveImportMappingReference(ctx, id); qn != "" {
-			return qn
-		}
-	} else {
-		if qn := resolveImportMappingReference(ctx, id); qn != "" {
-			return qn
-		}
-		if qn := resolveExportMappingReference(ctx, id); qn != "" {
-			return qn
-		}
-	}
-	return string(id)
-}
-
-func resolveImportMappingReference(ctx *ExecContext, id model.ID) string {
-	if id == "" || ctx == nil || ctx.Backend == nil {
-		return ""
-	}
-	mappings, err := ctx.Backend.ListImportMappings()
-	if err != nil {
-		return ""
-	}
-	for _, mapping := range mappings {
-		if mapping != nil && mapping.ID == id {
-			return qualifiedNameForContainer(ctx, mapping.ContainerID, mapping.Name)
-		}
-	}
-	return ""
-}
-
-func resolveExportMappingReference(ctx *ExecContext, id model.ID) string {
-	if id == "" || ctx == nil || ctx.Backend == nil {
-		return ""
-	}
-	mappings, err := ctx.Backend.ListExportMappings()
-	if err != nil {
-		return ""
-	}
-	for _, mapping := range mappings {
-		if mapping != nil && mapping.ID == id {
-			return qualifiedNameForContainer(ctx, mapping.ContainerID, mapping.Name)
-		}
-	}
-	return ""
-}
-
-func qualifiedNameForContainer(ctx *ExecContext, containerID model.ID, name string) string {
-	if name == "" {
-		return ""
-	}
-	h, err := getHierarchy(ctx)
-	if err != nil || h == nil {
-		return name
-	}
-	if qn := h.GetQualifiedName(containerID, name); qn != "." && qn != "" {
-		return qn
-	}
-	return name
-}
-
 func rawUnitName(contents []byte) string {
 	var raw map[string]any
-	if err := bson.Unmarshal(contents, &raw); err != nil {
+	if err := bsoncompat.UnmarshalDocMap(contents, &raw); err != nil {
 		return ""
 	}
 	name, _ := raw["Name"].(string)
@@ -1105,6 +1332,14 @@ func formatListOperation(ctx *ExecContext, op microflows.ListOperation, outputVa
 	if op == nil {
 		return fmt.Sprintf("$%s = list operation ...;", outputVar)
 	}
+	// The statement that mirrors the activity, in every language version: the
+	// call forms are deprecated (MDL-DEPR003) and, for find/filter, mean
+	// something else under mdl 1 — describe never emits a deprecated spelling
+	// (ako/mxcli#840). Only an activity the statement cannot express falls
+	// back to the call form below.
+	if stmt, ok := formatListActivity(ctx, op, outputVar); ok {
+		return stmt
+	}
 
 	switch o := op.(type) {
 	case *microflows.HeadOperation:
@@ -1112,9 +1347,9 @@ func formatListOperation(ctx *ExecContext, op microflows.ListOperation, outputVa
 	case *microflows.TailOperation:
 		return fmt.Sprintf("$%s = tail($%s);", outputVar, o.ListVariable)
 	case *microflows.FindOperation:
-		return fmt.Sprintf("$%s = find($%s, %s);", outputVar, o.ListVariable, o.Expression)
+		return fmt.Sprintf("$%s = find($%s, %s);", outputVar, o.ListVariable, describeExpr(ctx, o.Expression))
 	case *microflows.FilterOperation:
-		return fmt.Sprintf("$%s = filter($%s, %s);", outputVar, o.ListVariable, o.Expression)
+		return fmt.Sprintf("$%s = filter($%s, %s);", outputVar, o.ListVariable, describeExpr(ctx, o.Expression))
 	case *microflows.SortOperation:
 		if len(o.Sorting) > 0 {
 			var sortCols []string
@@ -1134,7 +1369,7 @@ func formatListOperation(ctx *ExecContext, op microflows.ListOperation, outputVa
 				if attrName == "" {
 					attrName = "..."
 				}
-				sortCols = append(sortCols, fmt.Sprintf("%s %s", attrName, dir))
+				sortCols = append(sortCols, fmt.Sprintf("%s %s", mdlIdent(attrName), dir))
 			}
 			return fmt.Sprintf("$%s = sort($%s, %s);", outputVar, o.ListVariable, strings.Join(sortCols, ", "))
 		}
@@ -1152,26 +1387,26 @@ func formatListOperation(ctx *ExecContext, op microflows.ListOperation, outputVa
 	case *microflows.FindByAttributeOperation:
 		fieldName := extractFieldName(o.Attribute, o.Association)
 		if fieldName != "" && o.Expression != "" {
-			return fmt.Sprintf("$%s = find($%s, %s = %s);", outputVar, o.ListVariable, fieldName, o.Expression)
+			return fmt.Sprintf("$%s = find($%s, %s = %s);", outputVar, o.ListVariable, fieldName, describeExpr(ctx, o.Expression))
 		} else if o.Expression != "" {
-			return fmt.Sprintf("$%s = find($%s, %s);", outputVar, o.ListVariable, o.Expression)
+			return fmt.Sprintf("$%s = find($%s, %s);", outputVar, o.ListVariable, describeExpr(ctx, o.Expression))
 		}
 		return fmt.Sprintf("-- $%s = find($%s) — missing attribute/expression", outputVar, o.ListVariable)
 	case *microflows.FilterByAttributeOperation:
 		fieldName := extractFieldName(o.Attribute, o.Association)
 		if fieldName != "" && o.Expression != "" {
-			return fmt.Sprintf("$%s = filter($%s, %s = %s);", outputVar, o.ListVariable, fieldName, o.Expression)
+			return fmt.Sprintf("$%s = filter($%s, %s = %s);", outputVar, o.ListVariable, fieldName, describeExpr(ctx, o.Expression))
 		} else if o.Expression != "" {
-			return fmt.Sprintf("$%s = filter($%s, %s);", outputVar, o.ListVariable, o.Expression)
+			return fmt.Sprintf("$%s = filter($%s, %s);", outputVar, o.ListVariable, describeExpr(ctx, o.Expression))
 		}
 		return fmt.Sprintf("-- $%s = filter($%s) — missing attribute/expression", outputVar, o.ListVariable)
 	case *microflows.ListRangeOperation:
 		if o.OffsetExpression != "" && o.LimitExpression != "" {
-			return fmt.Sprintf("$%s = range($%s, %s, %s);", outputVar, o.ListVariable, o.OffsetExpression, o.LimitExpression)
+			return fmt.Sprintf("$%s = range($%s, %s, %s);", outputVar, o.ListVariable, describeExpr(ctx, o.OffsetExpression), describeExpr(ctx, o.LimitExpression))
 		} else if o.OffsetExpression != "" {
-			return fmt.Sprintf("$%s = range($%s, %s);", outputVar, o.ListVariable, o.OffsetExpression)
+			return fmt.Sprintf("$%s = range($%s, %s);", outputVar, o.ListVariable, describeExpr(ctx, o.OffsetExpression))
 		} else if o.LimitExpression != "" {
-			return fmt.Sprintf("$%s = range($%s, 0, %s);", outputVar, o.ListVariable, o.LimitExpression)
+			return fmt.Sprintf("$%s = range($%s, 0, %s);", outputVar, o.ListVariable, describeExpr(ctx, o.LimitExpression))
 		}
 		return fmt.Sprintf("$%s = range($%s);", outputVar, o.ListVariable)
 	default:
@@ -1182,17 +1417,39 @@ func formatListOperation(ctx *ExecContext, op microflows.ListOperation, outputVa
 // extractFieldName returns the short field name from a qualified attribute
 // or association reference (e.g. "MyModule.Entity.Status" → "Status",
 // "MyModule.Order_Customer" → "Order_Customer"). Returns the association
-// name if attribute is empty.
+// name if attribute is empty — qualified for a System association
+// ("System.owner").
 func extractFieldName(attribute, association string) string {
 	ref := attribute
 	if ref == "" {
 		ref = association
+		// A System association stays qualified. The builder resolves a bare
+		// name in the list entity's own module, so `owner` came back as an
+		// attribute of the entity and `User_Language` on an Administration.Account
+		// list as Administration.Account.User_Language — CE1613 on the next
+		// build (ako/mxcli#1629). The member speller spells it the same way.
+		if strings.HasPrefix(ref, "System.") {
+			return ref
+		}
 	}
 	if ref == "" {
 		return ""
 	}
 	parts := strings.Split(ref, ".")
 	return parts[len(parts)-1]
+}
+
+// unsupportedRestResult renders a result handling mxcli cannot express as MDL.
+//
+// It deliberately produces something the parser REJECTS. A describe whose output
+// silently means something else is worse than one that fails: the previous
+// behaviour rendered any unrecognised handling as `returns String`, so a
+// describe → exec round trip rewrote a FileDocument result into a String one and
+// mxbuild still reported zero errors (#922). Anything that reaches this is a gap
+// in the reader, and the text names it so the report says which.
+func unsupportedRestResult(what string) string {
+	return fmt.Sprintf("<<unsupported result handling: %s — please report this "+
+		"with the microflow name at https://github.com/mendixlabs/mxcli/issues>>", what)
 }
 
 // formatRestCallAction formats a REST call action as MDL.
@@ -1209,6 +1466,8 @@ func formatRestCallAction(ctx *ExecContext, a *microflows.RestCallAction) string
 			outputVar = rh.VariableName
 		case *microflows.ResultHandlingMapping:
 			outputVar = rh.ResultVariable
+		case *microflows.ResultHandlingFileDocument:
+			outputVar = rh.VariableName
 		}
 	}
 	if outputVar != "" {
@@ -1217,7 +1476,7 @@ func formatRestCallAction(ctx *ExecContext, a *microflows.RestCallAction) string
 		sb.WriteString(" = ")
 	}
 
-	sb.WriteString("rest call ")
+	sb.WriteString("call rest service ")
 
 	// HTTP method
 	method := "get"
@@ -1241,7 +1500,7 @@ func formatRestCallAction(ctx *ExecContext, a *microflows.RestCallAction) string
 	// URL
 	url := "''"
 	if a.HttpConfiguration != nil && a.HttpConfiguration.LocationTemplate != "" {
-		url = mdlQuote(a.HttpConfiguration.LocationTemplate)
+		url = mdlQuote(ctx, a.HttpConfiguration.LocationTemplate)
 	}
 	sb.WriteString(url)
 
@@ -1252,68 +1511,80 @@ func formatRestCallAction(ctx *ExecContext, a *microflows.RestCallAction) string
 			if i > 0 {
 				sb.WriteString(", ")
 			}
-			sb.WriteString(fmt.Sprintf("{%d} = %s", i+1, param))
+			sb.WriteString(fmt.Sprintf("{%d} = %s", i+1, describeExpr(ctx, param)))
 		}
 		sb.WriteString(")")
 	}
 
-	// Headers
+	// The dialog's settings: one property list after the URL (ADR-0013),
+	// keyed as the consumed REST service names the same concepts.
+	var settings []string
+
 	if a.HttpConfiguration != nil && len(a.HttpConfiguration.CustomHeaders) > 0 {
+		hdrs := make([]string, 0, len(a.HttpConfiguration.CustomHeaders))
 		for _, h := range a.HttpConfiguration.CustomHeaders {
-			sb.WriteString("\n    header ")
-			sb.WriteString(mdlQuote(h.Name))
-			sb.WriteString(" = ")
-			sb.WriteString(h.Value)
+			hdrs = append(hdrs, mdlQuote(ctx, h.Name)+": "+describeExpr(ctx, h.Value))
 		}
+		settings = append(settings, "Headers: ("+strings.Join(hdrs, ", ")+")")
 	}
 
-	// Authentication
 	if a.HttpConfiguration != nil && a.HttpConfiguration.UseAuthentication {
-		sb.WriteString("\n    auth basic ")
-		sb.WriteString(a.HttpConfiguration.Username)
-		sb.WriteString(" password ")
-		sb.WriteString(a.HttpConfiguration.Password)
+		settings = append(settings, "Authentication: basic (Username: "+a.HttpConfiguration.Username+
+			", Password: "+a.HttpConfiguration.Password+")")
 	}
 
-	// Body
 	if a.RequestHandling != nil {
 		switch rh := a.RequestHandling.(type) {
 		case *microflows.CustomRequestHandling:
 			if rh.Template != "" {
-				sb.WriteString("\n    body ")
-				sb.WriteString(mdlQuote(rh.Template))
-				// Add template parameters if present
+				body := "Body: template " + mdlQuote(ctx, rh.Template)
 				if len(rh.TemplateParams) > 0 {
-					sb.WriteString(" with (")
+					params := make([]string, 0, len(rh.TemplateParams))
 					for i, param := range rh.TemplateParams {
-						if i > 0 {
-							sb.WriteString(", ")
-						}
-						sb.WriteString(fmt.Sprintf("{%d} = %s", i+1, param))
+						params = append(params, fmt.Sprintf("{%d} = %s", i+1, describeExpr(ctx, param)))
 					}
-					sb.WriteString(")")
+					body += " with (" + strings.Join(params, ", ") + ")"
 				}
+				settings = append(settings, body)
+			}
+		case *microflows.BinaryRequestHandling:
+			// The expression is stored as source text (`$Doc/Contents`), so it is
+			// emitted verbatim — quoting it would make the round trip send the
+			// path as a string literal.
+			if rh.Expression != "" {
+				settings = append(settings, "Body: binary "+rh.Expression)
 			}
 		case *microflows.MappingRequestHandling:
 			if rh.MappingID != "" {
-				sb.WriteString("\n    body mapping ")
-				sb.WriteString(string(rh.MappingID))
+				body := "Body: mapping " + string(rh.MappingID)
 				if rh.ParameterVariable != "" {
-					sb.WriteString(" from $")
-					sb.WriteString(rh.ParameterVariable)
+					body += " from $" + rh.ParameterVariable
 				}
+				settings = append(settings, body)
 			}
 		}
 	}
 
-	// Timeout
 	if a.TimeoutExpression != "" {
-		sb.WriteString("\n    timeout ")
-		sb.WriteString(a.TimeoutExpression)
+		settings = append(settings, "Timeout: "+a.TimeoutExpression)
+	}
+
+	if len(settings) > 0 {
+		sb.WriteString(" (")
+		for _, setting := range settings {
+			sb.WriteString("\n    ")
+			sb.WriteString(setting)
+			sb.WriteString(",")
+		}
+		sb.WriteString("\n  )")
 	}
 
 	// Returns
-	sb.WriteString("\n    returns ")
+	if len(settings) > 0 {
+		sb.WriteString(" returns ")
+	} else {
+		sb.WriteString("\n    returns ")
+	}
 	if a.ResultHandling != nil {
 		switch rh := a.ResultHandling.(type) {
 		case *microflows.ResultHandlingString:
@@ -1337,13 +1608,25 @@ func formatRestCallAction(ctx *ExecContext, a *microflows.RestCallAction) string
 				}
 				sb.WriteString(string(rh.ResultEntityID))
 			}
+		case *microflows.ResultHandlingFileDocument:
+			// A file document result is always bound to a System.FileDocument
+			// specialization, so the entity is the whole clause. Rendering this
+			// as "String" was #922: the description round-tripped into a model
+			// whose activity returned a string instead of a file, and mxbuild
+			// reported nothing.
+			sb.WriteString(rh.EntityRef)
 		case *microflows.ResultHandlingNone:
-			sb.WriteString("Nothing")
+			sb.WriteString("nothing")
 		default:
-			sb.WriteString("String")
+			// Refuse rather than guess. The previous "String" fallback here and
+			// below is what turned an unread result handling into a silent
+			// retyping of the activity (#922); an unknown one is a gap in the
+			// reader, and saying so is the only outcome that cannot corrupt a
+			// round trip.
+			sb.WriteString(unsupportedRestResult(fmt.Sprintf("%T", rh)))
 		}
 	} else {
-		sb.WriteString("String")
+		sb.WriteString(unsupportedRestResult("no result handling"))
 	}
 
 	// Note: Error handling suffix is added at the activity level, not here
@@ -1372,14 +1655,14 @@ func formatRestOperationCallAction(ctx *ExecContext, a *microflows.RestOperation
 		if idx := strings.LastIndex(name, "."); idx >= 0 {
 			name = name[idx+1:]
 		}
-		allParams = append(allParams, struct{ name, value string }{name, pm.Value})
+		allParams = append(allParams, struct{ name, value string }{name, describeExpr(ctx, pm.Value)})
 	}
 	for _, qm := range a.QueryParameterMappings {
 		name := qm.Parameter
 		if idx := strings.LastIndex(name, "."); idx >= 0 {
 			name = name[idx+1:]
 		}
-		allParams = append(allParams, struct{ name, value string }{name, qm.Value})
+		allParams = append(allParams, struct{ name, value string }{name, describeExpr(ctx, qm.Value)})
 	}
 	if len(allParams) > 0 {
 		sb.WriteString("\n    with (")
@@ -1387,7 +1670,6 @@ func formatRestOperationCallAction(ctx *ExecContext, a *microflows.RestOperation
 			if i > 0 {
 				sb.WriteString(", ")
 			}
-			sb.WriteString("$")
 			sb.WriteString(p.name)
 			sb.WriteString(" = ")
 			sb.WriteString(p.value)
@@ -1420,7 +1702,10 @@ func formatExecuteDatabaseQueryAction(ctx *ExecContext, a *microflows.ExecuteDat
 
 	// Dynamic query override
 	if a.DynamicQuery != "" {
-		sb.WriteString(fmt.Sprintf(" dynamic %s", a.DynamicQuery))
+		// A Mendix expression, spelled for the describe language like any other
+		// (ako/mxcli#825): written as stored, `'C:\temp'` read back under
+		// mdl 0 as a tab.
+		sb.WriteString(fmt.Sprintf(" dynamic %s", describeExpr(ctx, a.DynamicQuery)))
 	}
 
 	// Parameter mappings
@@ -1430,7 +1715,7 @@ func formatExecuteDatabaseQueryAction(ctx *ExecContext, a *microflows.ExecuteDat
 			if i > 0 {
 				sb.WriteString(", ")
 			}
-			sb.WriteString(fmt.Sprintf("%s = %s", pm.ParameterName, pm.Value))
+			sb.WriteString(fmt.Sprintf("%s = %s", pm.ParameterName, describeExpr(ctx, pm.Value)))
 		}
 		sb.WriteString(")")
 	}
@@ -1442,7 +1727,7 @@ func formatExecuteDatabaseQueryAction(ctx *ExecContext, a *microflows.ExecuteDat
 			if i > 0 {
 				sb.WriteString(", ")
 			}
-			sb.WriteString(fmt.Sprintf("%s = %s", cm.ParameterName, cm.Value))
+			sb.WriteString(fmt.Sprintf("%s = %s", cm.ParameterName, describeExpr(ctx, cm.Value)))
 		}
 		sb.WriteString(")")
 	}
@@ -1459,6 +1744,16 @@ func isMendixKeyword(s string) bool {
 		return true
 	}
 	return false
+}
+
+// bareReturnVariable is a variable name without its `$`, optionally followed
+// by an attribute path (`Order/Total`, `Order/Module.Assoc/Name`).
+var bareReturnVariable = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(/[A-Za-z_][A-Za-z0-9_.]*)*$`)
+
+// isBareReturnVariable reports whether a stored return value is a variable
+// reference missing its `$` — the only shape describe may prefix.
+func isBareReturnVariable(s string) bool {
+	return bareReturnVariable.MatchString(s) && !isMendixKeyword(s)
 }
 
 // isQualifiedEnumLiteral returns true for qualified enum literals (e.g., "Module.Enum.Value")
@@ -1518,9 +1813,77 @@ func formatImportXmlAction(ctx *ExecContext, a *microflows.ImportXmlAction, enti
 	sb.WriteString(mappingName)
 	sb.WriteString("($")
 	sb.WriteString(a.XmlDocumentVariable)
-	sb.WriteString(");")
+	sb.WriteString(")")
+	sb.WriteString(formatImportMappingSettings(a.ResultHandling))
+	sb.WriteString(formatImportMappingRange(a.ResultHandling))
+	sb.WriteString(";")
 
 	return sb.String()
+}
+
+// formatImportMappingSettings renders the activity's settings list, `
+// (Parameter: $Obj, Commit: No)`, or "" when it has neither. Unprinted, a
+// rewrite dropped the input object and the commit mode (ako/mxcli#1681).
+// YesWithoutEvents is what the writer stores for an unwritten Commit, so it is
+// not printed.
+func formatImportMappingSettings(h *microflows.ResultHandlingMapping) string {
+	if h == nil {
+		return ""
+	}
+	var parts []string
+	if h.ParameterVariable != "" {
+		parts = append(parts, "Parameter: $"+h.ParameterVariable)
+	}
+	if h.Commit != "" && h.Commit != "YesWithoutEvents" {
+		parts = append(parts, "Commit: "+h.Commit)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
+}
+
+// formatImportMappingRange renders the activity's Range — Studio Pro's
+// All / First / Custom setting.
+//
+// Before #881 all three settings described identically, so the
+// describe→edit→exec cycle silently rewrote the activity; each is now distinct.
+//
+// The one form left bare is All against an OBJECT variable — Studio Pro's
+// default for an object-rooted mapping (the blank app's
+// FeedbackModule.IMM_PostResponse). There `all` read as "returns a list"
+// (upstream #1176). Bare is exact, not a shorthand: the builder writes a
+// missing keyword as All explicitly and infers the object from the mapping.
+// That equivalence is what makes omitting it safe — before the builder did
+// so, silence stored First and the runtime threw on import. A list result
+// keeps its `all`.
+func formatImportMappingRange(h *microflows.ResultHandlingMapping) string {
+	if h == nil {
+		return ""
+	}
+	if h.LimitExpression != "" || h.OffsetExpression != "" {
+		var sb strings.Builder
+		if h.LimitExpression != "" {
+			sb.WriteString(" limit ")
+			sb.WriteString(h.LimitExpression)
+		}
+		if h.OffsetExpression != "" {
+			sb.WriteString(" offset ")
+			sb.WriteString(h.OffsetExpression)
+		}
+		return sb.String()
+	}
+	// The RANGE's own flag, not the result variable's cardinality: the two
+	// disagree in Mendix's own models (ConstantRange{SingleObject:false} against
+	// an ObjectType variable), and printing the variable's would describe
+	// Studio Pro's "All" as `first`.
+	if microflows.RangeSingleObjectOf(h) {
+		return " first"
+	}
+	if h.SingleObject {
+		return ""
+	}
+	return " all"
 }
 
 // formatExportXmlAction formats an export mapping action as MDL.
@@ -1742,6 +2105,88 @@ func (e *Executor) formatListOperation(op microflows.ListOperation, outputVar st
 	return formatListOperation(e.newExecContext(context.Background()), op, outputVar)
 }
 
+// formatSendEmailAction renders a Send Email activity as `send email ( … )`:
+// the dialog's settings as one property list (ADR-0013), one per line with a
+// trailing comma, in the order the visitor documents them. Platform defaults
+// (SecurityType tls, ConnectionTimeout 20000, CheckServerIdentity false, no
+// authentication) and empty optional settings are omitted, so a statement that
+// does not state them builds the same action (R12).
+func formatSendEmailAction(ctx *ExecContext, a *microflows.SendEmailAction) string {
+	var settings []string
+	set := func(key, value string) { settings = append(settings, key+": "+value) }
+	expr := func(e string) string {
+		if d := describeExpr(ctx, e); d != "" {
+			return d
+		}
+		return "''"
+	}
+	params := func(t microflows.EmailTemplate) string {
+		if len(t.Parameters) == 0 {
+			return ""
+		}
+		ps := make([]string, 0, len(t.Parameters))
+		for i, p := range t.Parameters {
+			ps = append(ps, fmt.Sprintf("{%d} = %s", i+1, expr(p)))
+		}
+		return " with (" + strings.Join(ps, ", ") + ")"
+	}
+	present := func(t microflows.EmailTemplate) bool { return t.Text != "" || len(t.Parameters) > 0 }
+
+	set("From", expr(a.From))
+	if a.To != "" {
+		set("To", describeExpr(ctx, a.To))
+	}
+	if a.Cc != "" {
+		set("Cc", describeExpr(ctx, a.Cc))
+	}
+	if a.Bcc != "" {
+		set("Bcc", describeExpr(ctx, a.Bcc))
+	}
+	if present(a.Subject) {
+		set("Subject", mdlQuote(ctx, a.Subject.Text)+params(a.Subject))
+	}
+	if present(a.BodyPlainText) {
+		set("Body", "template "+mdlQuote(ctx, a.BodyPlainText.Text)+params(a.BodyPlainText))
+	}
+	if present(a.BodyHTML) {
+		set("HtmlBody", "template "+mdlQuote(ctx, a.BodyHTML.Text)+params(a.BodyHTML))
+	}
+	if len(a.CustomHeaders) > 0 {
+		hdrs := make([]string, 0, len(a.CustomHeaders))
+		for _, h := range a.CustomHeaders {
+			hdrs = append(hdrs, mdlQuote(ctx, h.Name)+": "+mdlQuote(ctx, h.Value))
+		}
+		set("Headers", "("+strings.Join(hdrs, ", ")+")")
+	}
+	if a.Attachment != "" {
+		set("Attachment", "$"+strings.TrimPrefix(a.Attachment, "$"))
+	}
+	set("Host", expr(a.Host))
+	set("Port", expr(a.Port))
+	if a.SecurityType != "" && a.SecurityType != microflows.EmailSecurityTLS {
+		set("SecurityType", strings.ToLower(string(a.SecurityType)))
+	}
+	if a.CheckServerIdentity {
+		set("CheckServerIdentity", "true")
+	}
+	if a.ConnectionTimeout != 0 && a.ConnectionTimeout != microflows.DefaultEmailConnectionTimeout {
+		set("ConnectionTimeout", fmt.Sprintf("%d", a.ConnectionTimeout))
+	}
+	if a.UseAuthentication {
+		set("Authentication", "basic (Username: "+expr(a.Username)+", Password: "+expr(a.Password)+")")
+	}
+
+	var sb strings.Builder
+	sb.WriteString("send email (")
+	for _, s := range settings {
+		sb.WriteString("\n    ")
+		sb.WriteString(s)
+		sb.WriteString(",")
+	}
+	sb.WriteString("\n  );")
+	return sb.String()
+}
+
 func (e *Executor) formatRestCallAction(a *microflows.RestCallAction) string {
 	return formatRestCallAction(e.newExecContext(context.Background()), a)
 }
@@ -1753,10 +2198,10 @@ func (e *Executor) formatRestCallAction(a *microflows.RestCallAction) string {
 // Unknown or nil conditions fall back to "true" so the describer still produces
 // valid MDL; callers should rely on the original Caption (emitted via @caption)
 // to preserve human-readable intent.
-func formatSplitCondition(cond microflows.SplitCondition) string {
+func formatSplitCondition(ctx *ExecContext, cond microflows.SplitCondition) string {
 	switch c := cond.(type) {
 	case *microflows.ExpressionSplitCondition:
-		expr := strings.TrimRight(c.Expression, " \t\n\r")
+		expr := describeExpr(ctx, c.Expression)
 		if expr == "" {
 			return "true"
 		}
@@ -1772,7 +2217,7 @@ func formatSplitCondition(cond microflows.SplitCondition) string {
 			if idx := strings.LastIndex(paramName, "."); idx >= 0 {
 				paramName = paramName[idx+1:]
 			}
-			arg := strings.TrimRight(pm.Argument, " \t\n\r")
+			arg := describeExpr(ctx, pm.Argument)
 			if paramName != "" {
 				args = append(args, fmt.Sprintf("%s = %s", paramName, arg))
 			} else {
@@ -1846,6 +2291,57 @@ func canonicalBSONMap(m map[string]any) bson.D {
 	return canonicalBSONDocument(doc)
 }
 
+// shortSortAttribute returns the bare attribute name for a sort on the
+// retrieved entity's own (or inherited) attribute, and the qualified name
+// otherwise.
+//
+// A fully qualified `sort by M.Order.Name` is the default spelling of what
+// `sort by Name` already means (R12, #748): the builder qualifies a bare name
+// with the entity that DECLARES it, walking the generalization chain. So the
+// short form is printed exactly when that same walk, from the retrieved
+// entity, lands on the stored reference — then re-executing it writes the
+// same AttributeQualifiedName. Anything the walk does not confirm (no project,
+// a system member, an attribute of another entity) keeps the qualified name.
+func shortSortAttribute(ctx *ExecContext, entityQN, attrQN string) string {
+	if !ctx.Connected() || entityQN == "" {
+		return attrQN
+	}
+	dot := strings.LastIndex(attrQN, ".")
+	if dot <= 0 || strings.Count(attrQN, ".") != 2 {
+		return attrQN
+	}
+	bare := attrQN[dot+1:]
+	fb := &flowBuilder{backend: ctx.Backend}
+	if declared, ok := fb.resolveAttributeInEntityHierarchy(entityQN, bare); ok && declared == attrQN {
+		return bare
+	}
+	return attrQN
+}
+
+// xpathHasNestedPredicate reports whether an XPath constraint, without its
+// outer brackets, holds a `[` outside a string literal — a predicate on a path
+// step, which only the bracketed `where [ … ]` form can state.
+func xpathHasNestedPredicate(xpath string) bool {
+	for i := 0; i < len(xpath); i++ {
+		switch xpath[i] {
+		case '\'':
+			// Skip the literal; a doubled quote is an escaped one.
+			for i++; i < len(xpath); i++ {
+				if xpath[i] == '\'' {
+					if i+1 < len(xpath) && xpath[i+1] == '\'' {
+						i++
+						continue
+					}
+					break
+				}
+			}
+		case '[':
+			return true
+		}
+	}
+	return false
+}
+
 // enrichXPathConstraintForDescribe enriches the raw BSON XPathConstraint string for
 // DESCRIBE output. String-literal comparisons against enum attributes are replaced with
 // qualified enum value references (e.g. Status = 'Open' → Status = Module.OrderStatus.Open).
@@ -1858,10 +2354,239 @@ func enrichXPathConstraintForDescribe(ctx *ExecContext, entityQN, constraint str
 	if len(enumAttrs) == 0 {
 		return constraint
 	}
-	expr, ok := visitor.ParseXPathConstraint(constraint)
-	if !ok || expr == nil {
+	return enrichXPathGroups(constraint, enumAttrs)
+}
+
+// enrichXPathGroups applies enum enrichment to every top-level predicate group of a
+// stored constraint.
+//
+// Mendix stores sibling groups concatenated (`[a][b][c]`), but the grammar rule
+// matches one group. Enriching the whole string at once parsed only the first and
+// re-rendered just that, silently discarding the rest — describe then showed a
+// materially less restrictive query than the project actually contains
+// (mendixlabs/mxcli#772). ParseXPathConstraint now refuses that partial parse, which
+// stops the data loss on its own; splitting first is what keeps enrichment working
+// for every group rather than only the first.
+func enrichXPathGroups(constraint string, enumAttrs map[string]string) string {
+	groups := visitor.SplitXPathPredicateGroups(constraint)
+	if len(groups) == 0 {
 		return constraint
 	}
-	enriched := enrichXPathExprWithEnums(expr, enumAttrs)
-	return "[" + xpathExprToMDLString(enriched) + "]"
+	out := make([]string, 0, len(groups))
+	for _, g := range groups {
+		out = append(out, enrichXPathGroup(g, enumAttrs))
+	}
+	return strings.Join(out, "")
+}
+
+// enrichXPathGroup enriches one bracket group, returning it unchanged when it does
+// not parse — a group mxcli cannot read is passed through verbatim rather than
+// dropped or guessed at.
+func enrichXPathGroup(group string, enumAttrs map[string]string) string {
+	expr, ok := visitor.ParseXPathConstraint(group)
+	if !ok || expr == nil {
+		return group
+	}
+	return "[" + xpathExprToMDLString(enrichXPathExprWithEnums(expr, enumAttrs)) + "]"
+}
+
+// queueClauseMDL renders the `IN QUEUE Module.Name` clause of a queued call, or
+// "" for an unqueued one. A DESCRIBE that omitted it would emit a script whose
+// re-execution silently unqueues the call.
+func queueClauseMDL(qs *microflows.QueueSettings) string {
+	if qs == nil || qs.Queue == "" {
+		return ""
+	}
+	return " in queue " + qs.Queue + queueRetryClauseMDL(qs.RetryPolicy)
+}
+
+// queueRetryClauseMDL renders a queued call's retry policy, so a stored retry
+// round-trips (mendixlabs/mxcli#1729). Every property is printed: the clause
+// has no defaults.
+func queueRetryClauseMDL(r *microflows.QueueRetry) string {
+	if r == nil {
+		return ""
+	}
+	switch r.Kind {
+	case microflows.QueueRetryFixed:
+		return fmt.Sprintf(" retry fixed (Retries: %d, Interval: %d, IntervalType: %s)",
+			r.Retries, r.Interval, r.IntervalType)
+	case microflows.QueueRetryExponential:
+		return fmt.Sprintf(" retry exponential (Retries: %d, InitialInterval: %d, MaximumInterval: %d, IntervalType: %s)",
+			r.Retries, r.InitialInterval, r.MaximumInterval, r.IntervalType)
+	}
+	return ""
+}
+
+// mdlAggregateKeyword maps a Mendix aggregate function to the MDL keyword that
+// parses back to it, reporting false for one this build cannot express.
+//
+// DESCRIBE used to render an aggregate by lowercasing whatever was stored,
+// which silently assumed every value of Mendix's enumeration was also an MDL
+// keyword. It was not: Reduce, All and Any described as MDL that the grammar
+// then rejected (#1004). Mapping explicitly means a function added to Mendix
+// later fails TestAggregateKeywordsCoverEveryFunction rather than a user's
+// script.
+func mdlAggregateKeyword(fn microflows.AggregateFunction) (string, bool) {
+	switch fn {
+	case microflows.AggregateFunctionCount, "":
+		// Count is also the fallback for an activity with no function stored,
+		// which is what Mendix defaults a fresh aggregate to.
+		return "count", true
+	case microflows.AggregateFunctionSum:
+		return "sum", true
+	case microflows.AggregateFunctionAverage:
+		return "average", true
+	case microflows.AggregateFunctionMin:
+		return "minimum", true
+	case microflows.AggregateFunctionMax:
+		return "maximum", true
+	case microflows.AggregateFunctionReduce:
+		return "reduce", true
+	case microflows.AggregateFunctionAll:
+		return "all", true
+	case microflows.AggregateFunctionAny:
+		return "any", true
+	default:
+		return "", false
+	}
+}
+
+// describeTypedTemplate renders a Java action's text-template argument
+// (ako/mxcli#1451): the text, with its arguments as ` with ({1} = …)`. The
+// template '{1}' holding one expression is that expression — what the builder
+// writes for one — unless the expression is itself a string literal, which
+// would read back as the template's text.
+func describeTypedTemplate(ctx *ExecContext, tt *microflows.TypedTemplate) string {
+	if tt == nil {
+		return "''"
+	}
+	args := make([]string, 0, len(tt.Arguments))
+	for _, a := range tt.Arguments {
+		if a != nil {
+			args = append(args, a.Expression)
+		}
+	}
+	if tt.Text == "{1}" && len(args) == 1 {
+		if _, isText := singleStringLiteral(args[0]); !isText {
+			return describeExpr(ctx, args[0])
+		}
+	}
+	return mdlQuote(ctx, tt.Text) + templateArgsClause(ctx, args)
+}
+
+// templateArgsClause renders a text template's arguments as ` with ({1} = a,
+// {2} = b)` — R4's one text-template form (ako/mxcli#751) — or "" when there
+// are none.
+func templateArgsClause(ctx *ExecContext, args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	parts := make([]string, len(args))
+	for i, a := range args {
+		parts[i] = fmt.Sprintf("{%d} = %s", i+1, describeExpr(ctx, a))
+	}
+	return " with (" + strings.Join(parts, ", ") + ")"
+}
+
+// workflowSelectionMDL spells a lock/unlock's workflow and its instances flag.
+// The flag is Studio Pro's "Pause instances" / "Unpause instances" on the
+// selected workflow, and was printed as a bare `all` in place of the workflow
+// — a statement that dropped the selection and rebuilt as CE1825
+// (mendixlabs/mxcli#870). A stored activity with the flag and no selection
+// still prints as `all`, which check and exec refuse: it has no buildable form.
+func workflowSelectionMDL(workflow, variable string, flag bool, flagWords string) string {
+	var sel string
+	switch {
+	case workflow != "":
+		sel = workflow
+	case variable != "":
+		sel = "$" + variable
+	default:
+		return "all"
+	}
+	if flag {
+		sel += " " + flagWords
+	}
+	return sel
+}
+
+// describeIncludedAssociations prints an argument's stored Associations to
+// include as its `include associations ( … )` clause (ako/mxcli#1914), so
+// describe -> exec restates the tree rather than relying on the carry. A tree
+// holding a self-association cannot be written back — the builder refuses one,
+// its direction not being derivable — so it is printed as a comment instead:
+// left out, the clause carries the stored tree on create or modify.
+func describeIncludedAssociations(ctx *ExecContext, tree []*microflows.IncludedAssociation) string {
+	if len(tree) == 0 {
+		return ""
+	}
+	if self := selfAssociationsIn(ctx, tree); len(self) > 0 {
+		return fmt.Sprintf(" /* include associations (%s): holds the self-association %s, which MDL cannot write; "+
+			"create or modify keeps it while this clause is left out — change it in Studio Pro */",
+			formatIncludedAssociations(tree), strings.Join(self, ", "))
+	}
+	return " include associations (" + formatIncludedAssociations(tree) + ")"
+}
+
+// selfAssociationsIn lists the tree's associations whose two ends are one
+// entity. An association the project does not resolve is not one.
+func selfAssociationsIn(ctx *ExecContext, tree []*microflows.IncludedAssociation) []string {
+	if ctx == nil || ctx.Backend == nil {
+		return nil
+	}
+	var names []string
+	var walk func([]*microflows.IncludedAssociation)
+	walk = func(in []*microflows.IncludedAssociation) {
+		for _, ia := range in {
+			names = append(names, ia.Association)
+			walk(ia.IncludedAssociations)
+		}
+	}
+	walk(tree)
+	ends := projectAssociationEnds(ctx)
+	var self []string
+	seen := map[string]bool{}
+	for _, n := range names {
+		if e, ok := ends[n]; ok && e[0] != "" && e[0] == e[1] && !seen[n] {
+			seen[n] = true
+			self = append(self, n)
+		}
+	}
+	return self
+}
+
+// projectAssociationEnds maps each association's qualified name to its
+// {FROM, TO} entities.
+func projectAssociationEnds(ctx *ExecContext) map[string][2]string {
+	out := map[string][2]string{}
+	modules, err := getModulesFromCache(ctx)
+	if err != nil {
+		return out
+	}
+	moduleNames := make(map[model.ID]string, len(modules))
+	for _, m := range modules {
+		moduleNames[m.ID] = m.Name
+	}
+	dms, err := ctx.Backend.ListDomainModels()
+	if err != nil {
+		return out
+	}
+	for _, dm := range dms {
+		mod := moduleNames[dm.ContainerID]
+		if mod == "" {
+			continue
+		}
+		byID := make(map[model.ID]string, len(dm.Entities))
+		for _, e := range dm.Entities {
+			byID[e.ID] = mod + "." + e.Name
+		}
+		for _, a := range dm.Associations {
+			out[mod+"."+a.Name] = [2]string{byID[a.ParentID], byID[a.ChildID]}
+		}
+		for _, a := range dm.CrossAssociations {
+			out[mod+"."+a.Name] = [2]string{byID[a.ParentID], a.ChildRef}
+		}
+	}
+	return out
 }

@@ -33,6 +33,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -280,56 +281,150 @@ func mxbuildSearchPaths() []string {
 	return mendixSearchPaths(mxbuildBinaryName())
 }
 
-// resolveJDK21 finds a JDK 21 installation.
+// resolveJDK finds a JDK of the requested major release.
 // Priority: JAVA_HOME (verify version) > macOS java_home > java in PATH (verify version) > OS-specific known locations.
-func resolveJDK21() (string, error) {
+//
+// The major comes from the PROJECT (Settings > Model > JavaVersion), not from a
+// constant: Mendix 11.14's blank app asks for Java 25, matching Studio Pro's own
+// support for it, while every version up to 11.13 asks for 21. Resolving 21
+// unconditionally is what made an 11.14 project impossible to build or boot.
+func resolveJDK(major int) (string, error) { return resolveJDKWith(hostJDKEnv(), major) }
+
+// jdkEnv is everything resolveJDK asks of the machine, injectable so the macOS
+// path is testable from a Linux runner — the /usr/bin/java stub that hung
+// `mxcli new` exists on no machine CI runs on.
+type jdkEnv struct {
+	goos         string
+	getenv       func(string) string
+	macJavaHome  func(major int) (string, error) // /usr/libexec/java_home -v <major>
+	lookPath     func(string) (string, error)
+	evalSymlinks func(string) (string, error)
+	isJDK        func(home string, major int) bool
+	glob         func(string) ([]string, error)
+	searchPaths  func(major int) []string
+	versionOf    func(home string) string
+}
+
+func hostJDKEnv() jdkEnv {
+	return jdkEnv{
+		goos:         runtime.GOOS,
+		getenv:       os.Getenv,
+		macJavaHome:  resolveMacOSJavaHome,
+		lookPath:     exec.LookPath,
+		evalSymlinks: filepath.EvalSymlinks,
+		isJDK:        isJDK,
+		glob:         filepath.Glob,
+		searchPaths:  jdkSearchPaths,
+		versionOf:    javaVersionString,
+	}
+}
+
+// isMacOSJavaStub reports whether home is what the PATH fallback derives from
+// macOS's /usr/bin/java. That file is a launcher stub, not a symlink, so
+// EvalSymlinks leaves it alone and the derived home is /usr. Worse, isJDK
+// cannot tell: the stub forwards `-version` to the default JDK, so /usr
+// "passes" for any major that happens to be installed, and MxBuild handed
+// --java-home=/usr spins Gradle at 100% CPU indefinitely (ChipCoV8 #3).
+func isMacOSJavaStub(home string) bool {
+	return filepath.Clean(home) == "/usr"
+}
+
+func resolveJDKWith(e jdkEnv, major int) (string, error) {
+	major = javaMajorOrDefault(major)
+	darwin := e.goos == "darwin"
 	// Try JAVA_HOME
-	if javaHome := os.Getenv("JAVA_HOME"); javaHome != "" {
-		if isJDK21(javaHome) {
+	if javaHome := e.getenv("JAVA_HOME"); javaHome != "" {
+		if !(darwin && isMacOSJavaStub(javaHome)) && e.isJDK(javaHome, major) {
 			return javaHome, nil
 		}
 		// JAVA_HOME set but wrong version — continue searching
 	}
 
-	// On macOS, use /usr/libexec/java_home to find the real JDK path.
-	// The /usr/bin/java shim is not a symlink, so EvalSymlinks won't resolve
-	// it to the actual JDK, and MxBuild needs the real installation path.
-	if runtime.GOOS == "darwin" {
-		if javaHome, err := resolveMacOSJavaHome(); err == nil && isJDK21(javaHome) {
+	// On macOS, use /usr/libexec/java_home to find the real JDK path — for the
+	// PROJECT's major, not a fixed 21 (a fixed 21 always failed the check below
+	// for an 11.14+ project and fell through to the /usr/bin/java stub).
+	var macErr error
+	if darwin {
+		javaHome, err := e.macJavaHome(major)
+		switch {
+		case err != nil:
+			macErr = err
+		case isMacOSJavaStub(javaHome):
+			macErr = fmt.Errorf("java_home answered %s", javaHome)
+		case e.isJDK(javaHome, major):
 			return javaHome, nil
+		default:
+			macErr = fmt.Errorf("java_home answered %s, which is not a JDK %d", javaHome, major)
 		}
 	}
 
 	// Try java in PATH
-	if javaPath, err := exec.LookPath("java"); err == nil {
+	if javaPath, err := e.lookPath("java"); err == nil {
 		// Resolve symlinks to find the actual installation
-		resolved, err := filepath.EvalSymlinks(javaPath)
-		if err == nil {
+		if resolved, err := e.evalSymlinks(javaPath); err == nil {
 			javaPath = resolved
 		}
 		// java binary is typically at <jdk>/bin/java
 		javaHome := filepath.Dir(filepath.Dir(javaPath))
-		if isJDK21(javaHome) {
+		if !(darwin && isMacOSJavaStub(javaHome)) && e.isJDK(javaHome, major) {
 			return javaHome, nil
 		}
 	}
 
 	// Try OS-specific known locations
-	for _, pattern := range jdkSearchPaths() {
-		matches, _ := filepath.Glob(pattern)
+	searched := e.searchPaths(major)
+	for _, pattern := range searched {
+		matches, _ := e.glob(pattern)
 		for _, m := range matches {
-			if isJDK21(m) {
+			if e.isJDK(m, major) {
 				return m, nil
 			}
 		}
 	}
 
-	return "", fmt.Errorf("JDK 21 not found; set JAVA_HOME or install JDK 21")
+	// Name what was searched. "JDK 21 not found" alone sent a Windows user
+	// hunting through mxcli's source for the detection logic; the list makes it
+	// obvious whether their JDK simply sits somewhere unlisted.
+	msg := fmt.Sprintf("JDK %d not found", major)
+	if jh := e.getenv("JAVA_HOME"); jh != "" {
+		if javaTool(jh, "java") != "" && !hasJavaCompiler(jh) {
+			msg += fmt.Sprintf("\n  JAVA_HOME is set to %s, a Java runtime (JRE) without bin/javac: MxBuild needs a JDK to compile Java actions", jh)
+		} else {
+			msg += fmt.Sprintf("\n  JAVA_HOME is set to %s but is not a JDK %d (java -version reports %s)", jh, major, e.versionOf(jh))
+		}
+	}
+	if darwin {
+		msg += fmt.Sprintf("\n  /usr/libexec/java_home -v %d found none", major)
+		if macErr != nil {
+			msg += fmt.Sprintf(" (%v)", firstLine(strings.TrimSpace(macErr.Error())))
+		}
+		msg += "; /usr/bin/java is the macOS launcher stub, not a JDK home, so it is not used."
+	}
+	if len(searched) > 0 {
+		msg += "\n  Searched: " + strings.Join(searched, ", ")
+	}
+	msg += fmt.Sprintf("\n  Install Eclipse Temurin JDK %d, or set JAVA_HOME to one.", major)
+	if darwin {
+		msg += fmt.Sprintf("\n  On macOS: brew install --cask temurin@%d, then check with /usr/libexec/java_home -v %d"+
+			"\n  (or export JAVA_HOME=$(/usr/libexec/java_home -v %d)).", major, major, major)
+	}
+	// Which Java a project needs is a MODEL setting, so a user staring at this
+	// has a second way out that a bare "install a JDK" hides: build for a release
+	// they already have. Only say so when the requirement is above the default:
+	// below 11.14 the default is the only supported value, and a Mendix 9
+	// project (JDK 17) has no JavaVersion setting at all, so the statement would
+	// change nothing (mendixlabs/mxcli#1437).
+	if major > DefaultJavaMajor {
+		msg += fmt.Sprintf("\n  This is the project's own Settings > Model > JavaVersion. To build for a"+
+			"\n  release you already have instead: mxcli -p <project>.mpr -c \"alter settings runtime ( JavaVersion: '%d' )\"", DefaultJavaMajor)
+	}
+	return "", fmt.Errorf("%s", msg)
 }
 
-// resolveMacOSJavaHome uses /usr/libexec/java_home to find a JDK 21 on macOS.
-func resolveMacOSJavaHome() (string, error) {
-	out, err := exec.Command("/usr/libexec/java_home", "-v", "21").Output()
+// resolveMacOSJavaHome asks /usr/libexec/java_home for a JDK of the given major
+// on macOS. java_home exits non-zero when none is installed.
+func resolveMacOSJavaHome(major int) (string, error) {
+	out, err := exec.Command("/usr/libexec/java_home", "-v", strconv.Itoa(major)).Output()
 	if err != nil {
 		return "", err
 	}
@@ -337,54 +432,108 @@ func resolveMacOSJavaHome() (string, error) {
 }
 
 // jdkSearchPaths returns OS-specific glob patterns for JDK installations.
-func jdkSearchPaths() []string {
-	switch runtime.GOOS {
+func jdkSearchPaths(major int) []string { return jdkSearchPathsFor(runtime.GOOS, major) }
+
+// jdkSearchPathsFor is jdkSearchPaths with the OS injected, so the Windows list
+// is assertable from a Linux runner — nothing in CI executes Windows code, which
+// is how the java.exe suffix stayed broken.
+//
+// Studio Pro does not ship a JDK of its own to point at: Mendix's install guide
+// lists "Eclipse Temurin JDK 21 (x64 or ARM64)" as the prerequisite and installs
+// it if absent, so the Temurin location below IS Studio Pro's JDK. (Its Gradle
+// 8.5 does live with Studio Pro — "extracted to the parent directory of the
+// folder where Studio Pro is installed (usually C:\Program Files\Mendix)" —
+// but mxbuild invokes that itself; mxcli never calls gradle.)
+func jdkSearchPathsFor(goos string, major int) []string {
+	v := strconv.Itoa(javaMajorOrDefault(major))
+	switch goos {
 	case "windows":
 		var paths []string
 		for _, dir := range windowsProgramDirs() {
 			paths = append(paths,
-				filepath.Join(dir, "Eclipse Adoptium", "jdk-21*"),
-				filepath.Join(dir, "Java", "jdk-21*"),
-				filepath.Join(dir, "Microsoft", "jdk-21*"),
+				filepath.Join(dir, "Eclipse Adoptium", "jdk-"+v+"*"),
+				filepath.Join(dir, "Java", "jdk-"+v+"*"),
+				filepath.Join(dir, "Microsoft", "jdk-"+v+"*"),
+			)
+		}
+		// Per-user installs (winget and the Temurin MSI both offer one) land
+		// outside Program Files, where nothing above would find them.
+		if local := os.Getenv("LOCALAPPDATA"); local != "" {
+			paths = append(paths,
+				filepath.Join(local, "Programs", "Eclipse Adoptium", "jdk-"+v+"*"),
+				filepath.Join(local, "Programs", "Microsoft", "jdk-"+v+"*"),
 			)
 		}
 		return paths
 	case "darwin":
 		return []string{
-			"/Library/Java/JavaVirtualMachines/temurin-21*/Contents/Home",
-			"/Library/Java/JavaVirtualMachines/jdk-21*/Contents/Home",
+			"/Library/Java/JavaVirtualMachines/temurin-" + v + "*/Contents/Home",
+			"/Library/Java/JavaVirtualMachines/jdk-" + v + "*/Contents/Home",
 		}
 	default: // linux
 		return []string{
-			"/usr/lib/jvm/java-21-*",
-			"/usr/lib/jvm/temurin-21-*",
+			"/usr/lib/jvm/java-" + v + "-*",
+			"/usr/lib/jvm/temurin-" + v + "-*",
 		}
 	}
 }
 
-// isJDK21 checks if the given JAVA_HOME points to a JDK 21 installation.
-func isJDK21(javaHome string) bool {
-	javaBin := filepath.Join(javaHome, "bin", "java")
-	if runtime.GOOS == "windows" {
-		javaBin += ".exe"
-	}
-	if _, err := os.Stat(javaBin); err != nil {
+// isJDK reports whether the given JAVA_HOME is a JDK of the requested major
+// release. The version string is matched rather than parsed because `java
+// -version` has never had a stable machine-readable form.
+func isJDK(javaHome string, major int) bool {
+	return jdkAt(javaHome, major, func(javaBin string) (string, error) {
+		out, err := exec.Command(javaBin, "-version").CombinedOutput()
+		return string(out), err
+	})
+}
+
+// jdkAt is isJDK with `java -version` injected. A JDK is a java of the
+// requested major AND a Java compiler: a JRE reports the same version, and
+// MxBuild handed one fails compiling Java actions with "Java compiler is not
+// available. Please check that <dir> contains a valid JDK installation". On
+// Windows with a JRE 21 and a JDK 21 side by side and JAVA_HOME unset, the JRE
+// came first on PATH and was chosen (mendixlabs/mxcli#1839, ako/mxcli#2186).
+func jdkAt(javaHome string, major int, javaVersion func(javaBin string) (string, error)) bool {
+	javaBin := javaTool(javaHome, "java")
+	if javaBin == "" || !hasJavaCompiler(javaHome) {
 		return false
 	}
-
-	out, err := exec.Command(javaBin, "-version").CombinedOutput()
+	out, err := javaVersion(javaBin)
 	if err != nil {
 		return false
 	}
-
-	return jdk21VersionRegex.Match(out)
+	return javaMajorRegex(major).MatchString(out)
 }
 
-var jdk21VersionRegex = regexp.MustCompile(`version "21[\.\s"]`)
+// hasJavaCompiler reports whether a Java installation has bin/javac — what
+// tells a JDK from a JRE.
+func hasJavaCompiler(javaHome string) bool { return javaTool(javaHome, "javac") != "" }
+
+// javaTool returns the path of bin/<tool> or bin/<tool>.exe in a Java
+// installation, whichever exists, or "". Both spellings are looked for so the
+// Windows layout is testable from a Linux runner.
+func javaTool(javaHome, tool string) string {
+	for _, name := range []string{tool, tool + ".exe"} {
+		p := filepath.Join(javaHome, "bin", name)
+		if fi, err := os.Stat(p); err == nil && !fi.IsDir() {
+			return p
+		}
+	}
+	return ""
+}
+
+// javaMajorRegex matches the major release in `java -version` output, which
+// prints `version "21.0.4"` or `version "25"` — so the major must be followed by
+// a dot, whitespace or the closing quote, or 21 would also match 210.
+func javaMajorRegex(major int) *regexp.Regexp {
+	v := regexp.QuoteMeta(strconv.Itoa(javaMajorOrDefault(major)))
+	return regexp.MustCompile(`version "` + v + `[\.\s"]`)
+}
 
 // javaVersionString runs java -version and returns the output for diagnostics.
 func javaVersionString(javaHome string) string {
-	javaBin := filepath.Join(javaHome, "bin", "java")
+	javaBin := JavaExePath(javaHome)
 	out, err := exec.Command(javaBin, "-version").CombinedOutput()
 	if err != nil {
 		return "(unknown)"
@@ -395,3 +544,10 @@ func javaVersionString(javaHome string) string {
 	}
 	return "(unknown)"
 }
+
+// ResolveJDK reports the JAVA_HOME for a Java release, or an error naming what
+// was searched. Exported so callers outside this package can ask whether the
+// environment can build a given project before deciding what to do about it —
+// `mxcli new` uses it to leave a project's Java version alone when a matching
+// JDK exists.
+func ResolveJDK(major int) (string, error) { return resolveJDK(major) }

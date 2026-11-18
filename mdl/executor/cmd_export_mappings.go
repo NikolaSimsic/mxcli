@@ -49,7 +49,7 @@ func listExportMappings(ctx *ExecContext, inModule string) error {
 			src = em.XmlSchema
 		}
 		if src == "" {
-			src = em.MessageDefinition
+			src = em.MessageDefinitionSource()
 		}
 		if src == "" {
 			src = "(none)"
@@ -57,7 +57,7 @@ func listExportMappings(ctx *ExecContext, inModule string) error {
 		rows = append(rows, row{qualifiedName: qn, name: em.Name, schemaSource: src, elementCount: len(em.Elements)})
 	}
 
-	if len(rows) == 0 {
+	if len(rows) == 0 && ctx.Format != FormatJSON {
 		if inModule != "" {
 			fmt.Fprintf(ctx.Output, "No export mappings found in module %s\n", inModule)
 		} else {
@@ -84,7 +84,9 @@ func describeExportMapping(ctx *ExecContext, name ast.QualifiedName) error {
 		return mdlerrors.NewNotConnected()
 	}
 
-	em, err := ctx.Backend.GetExportMappingByQualifiedName(name.Module, name.Name)
+	em, err := describedMapping(ctx, name,
+		ctx.Backend.GetExportMappingByQualifiedName, ctx.Backend.ListExportMappings,
+		func(m *model.ExportMapping) model.ID { return m.ID })
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			return mdlerrors.NewNotFound("export mapping", name.String())
@@ -92,8 +94,12 @@ func describeExportMapping(ctx *ExecContext, name ast.QualifiedName) error {
 		return mdlerrors.NewBackend("get export mapping", err)
 	}
 
-	if em.Documentation != "" {
-		fmt.Fprintf(ctx.Output, "/**\n * %s\n */\n", strings.ReplaceAll(em.Documentation, "\n", "\n * "))
+	writeDocumentDocComment(ctx.Output, em.Documentation)
+	// The same prefix a microflow or page carries: without it an excluded
+	// mapping reads as live, and beside a live twin of the same name the two
+	// are indistinguishable (#1185).
+	if em.Excluded {
+		fmt.Fprintln(ctx.Output, "@excluded")
 	}
 
 	h, err := getHierarchy(ctx)
@@ -103,12 +109,35 @@ func describeExportMapping(ctx *ExecContext, name ast.QualifiedName) error {
 	modID := h.FindModuleID(em.ContainerID)
 	moduleName := h.GetModuleName(modID)
 
-	fmt.Fprintf(ctx.Output, "create export mapping %s.%s\n", moduleName, em.Name)
+	fmt.Fprintf(ctx.Output, "create or modify export mapping %s.%s\n", moduleName, em.Name)
+	// Without this the description round-trips to the module root: replaying
+	// it in a fresh project would recreate the mapping unfiled (#932).
+	if folderPath := h.BuildFolderPath(em.ContainerID); folderPath != "" {
+		fmt.Fprintf(ctx.Output, "  folder %s\n", mdlQuote(ctx, folderPath))
+	}
 
 	if em.JsonStructure != "" {
-		fmt.Fprintf(ctx.Output, "  with json structure %s\n", em.JsonStructure)
+		rootClause := ""
+		if len(em.Elements) > 0 {
+			rootClause = schemaRootClause(em.Elements[0].JsonPath)
+		}
+		fmt.Fprintf(ctx.Output, "  with json structure %s%s\n", em.JsonStructure, rootClause)
 	} else if em.XmlSchema != "" {
 		fmt.Fprintf(ctx.Output, "  with xml schema %s\n", em.XmlSchema)
+	} else if src := em.MessageDefinitionSource(); src != "" {
+		// Dropped entirely before #263 — and the output still PARSED, so
+		// re-executing a DESCRIBE rebuilt the mapping bound to nothing. On 11.15
+		// the source is in MessageDefinition2 (ako/mxcli#987).
+		fmt.Fprintf(ctx.Output, "  with message definition %s\n", src)
+	} else if em.WebServiceSource.IsSet() {
+		// MDL has no `with web service` clause, so this cannot round-trip.
+		// Emitting NOTHING would be worse than saying so: the output parses, and
+		// re-executing it deletes the binding (ako/mxcli#365). The precedent is
+		// the range-bounded-by-attribute rule, which is marked rather than
+		// rendered wrong.
+		fmt.Fprintf(ctx.Output, "  -- SOURCE NOT REPRESENTABLE: imported web service %s%s\n",
+			em.WebServiceSource.ImportedWebService, webServiceDetail(em.WebServiceSource))
+		fmt.Fprintf(ctx.Output, "  -- re-executing this statement would drop it (CE6896); mxcli refuses the rewrite\n")
 	}
 
 	if em.NullValueOption != "" && em.NullValueOption != "LeaveOutElement" {
@@ -118,7 +147,7 @@ func describeExportMapping(ctx *ExecContext, name ast.QualifiedName) error {
 	if len(em.Elements) > 0 {
 		fmt.Fprintln(ctx.Output, "{")
 		for _, elem := range em.Elements {
-			printExportMappingElement(ctx.Output, elem, 1, true)
+			printExportMappingElement(ctx.Output, exportRootToPrint(elem), 1, true, "")
 			fmt.Fprintln(ctx.Output)
 		}
 		fmt.Fprintln(ctx.Output, "};")
@@ -126,16 +155,78 @@ func describeExportMapping(ctx *ExecContext, name ast.QualifiedName) error {
 	return nil
 }
 
-func printExportMappingElement(w io.Writer, elem *model.ExportMappingElement, depth int, isRoot bool) {
+// exportRootToPrint unwraps the bare Array container an array-rooted export
+// mapping stores (#248) so DESCRIBE prints the MDL that produced it — the root
+// entity, not the container.
+//
+// Without this the container falls into printExportMappingElement's value branch
+// (it is Kind "Array", not "Object") and prints "Root = " with its whole subtree
+// dropped, which is the #260 defect. Every mapping this change makes authorable
+// would have gone straight into the silent-loss set otherwise.
+//
+// Only the shape mxcli itself writes is unwrapped: a container carrying an
+// entity, or one with more than a single object child, is a shape MDL cannot
+// author (DigitalTwin.EMM_EntityQuery — see buildExportRootArrayElement), so it
+// is left alone for #260/#262 to handle rather than being printed as something
+// it is not.
+func exportRootToPrint(elem *model.ExportMappingElement) *model.ExportMappingElement {
+	return exportArrayItemToPrint(elem)
+}
+
+// exportArrayItemToPrint unwraps a bare array container to the item that carries
+// the entity, so DESCRIBE prints the MDL that produced it (#248, #262).
+//
+// Discriminate on the stored PATHS, not on Kind: the two engines' readers label
+// the container differently ("Array" vs "Object"), and the item's path is the
+// container's plus the "|(Object)" step — which is what makes it a container
+// rather than some other entity-less node.
+//
+// Only the generated shape is unwrapped. A container that carries an entity, or
+// one with more than a single object child, is something MDL cannot author
+// (DigitalTwin.EMM_EntityQuery, MxGenAIConnector.EM_ConverseRequest's
+// toolConfig), so it is left alone rather than printed as something it is not.
+func exportArrayItemToPrint(elem *model.ExportMappingElement) *model.ExportMappingElement {
+	if elem == nil || elem.Entity != "" || len(elem.Children) != 1 {
+		return elem
+	}
+	item := elem.Children[0]
+	// "|(Object)" for an array of objects, "|(Wrapper)" for an array of
+	// primitives (#268) — both are the container's single item.
+	if item.Entity == "" ||
+		(item.JsonPath != elem.JsonPath+"|(Object)" && item.JsonPath != elem.JsonPath+"|(Wrapper)") {
+		return elem
+	}
+	// Returned unchanged: mappingMemberName already renders an item path
+	// ("…|items|(Object)") as the ARRAY's key, by trimming the "|(Object)"
+	// marker — the same rule that makes a nested array's member print correctly
+	// (#915). Rewriting the clone's JsonPath to the container's would break the
+	// item's own children, which are addressed relative to it.
+	return item
+}
+
+func printExportMappingElement(w io.Writer, elem *model.ExportMappingElement, depth int, isRoot bool, parentPath string) {
 	indent := strings.Repeat("  ", depth)
-	if elem.Kind == "Object" {
+	// "Wrapper" is an object element (an array of primitives binds an entity per
+	// item); leaving it out sent it to the value branch, which prints an empty
+	// binding and drops the subtree — #260's defect in a new place (#268).
+	// "Array" and "Wrapper" are object elements too — an array container that is
+	// NOT unwrapped (the two-level form, where it carries its own entity) and an
+	// array of primitives. Leaving either out sent it to the value branch, which
+	// prints an empty binding and drops the subtree: #260's defect, and why
+	// MxGenAIConnector.EM_CohereEmbed_Request described as `texts = ` (#268).
+	if elem.Kind == "Object" || elem.Kind == "Wrapper" || elem.Kind == "Array" {
+		by := customHandlerText(elem.CustomHandler, elem.JsonPath)
 		if isRoot {
-			// Root: Module.Entity { — use "." if entity is empty (parameter mapping)
-			entity := elem.Entity
-			if entity == "" {
-				entity = "."
+			// Root: Module.Entity {, or `group {` when the root has no entity —
+			// a JSON object with no Mendix object behind it. `.` was emitted
+			// here and never parsed (ako/mxcli#260's last describe-only
+			// spelling); CapitalConnector.EM_AttachedDataRequest is the real
+			// document with that shape.
+			if elem.Entity == "" {
+				fmt.Fprintf(w, "%sgroup {\n", indent)
+			} else {
+				fmt.Fprintf(w, "%s%s%s {\n", indent, elem.Entity, by)
 			}
-			fmt.Fprintf(w, "%s%s {\n", indent, entity)
 		} else {
 			// Nested object element. Several cases:
 			//   Assoc/Entity AS jsonKey  — normal association path
@@ -144,11 +235,16 @@ func printExportMappingElement(w io.Writer, elem *model.ExportMappingElement, de
 			assoc := elem.Association
 			entity := elem.Entity
 			if assoc == "" && entity == "" {
-				fmt.Fprintf(w, "%s. as %s", indent, elem.ExposedName)
+				// A grouping node (#262). `.` was emitted here before and never
+				// parsed — one of the describe-only spellings of #260.
+				fmt.Fprintf(w, "%sgroup as %s", indent, quoteMemberPath(mappingMemberName(parentPath, elem.JsonPath, elem.ExposedName)))
 			} else if assoc == "" {
-				fmt.Fprintf(w, "%s./%s as %s", indent, entity, elem.ExposedName)
+				// An entity with no association; `./Entity` never parsed (#260
+				// item 3). The `by` clause belongs here too.
+				fmt.Fprintf(w, "%s%s%s as %s", indent, entity, by,
+					quoteMemberPath(mappingMemberName(parentPath, elem.JsonPath, elem.ExposedName)))
 			} else {
-				fmt.Fprintf(w, "%s%s/%s as %s", indent, assoc, entity, elem.ExposedName)
+				fmt.Fprintf(w, "%s%s/%s%s as %s", indent, assoc, entity, by, quoteMemberPath(mappingMemberName(parentPath, elem.JsonPath, elem.ExposedName)))
 			}
 			if len(elem.Children) > 0 {
 				fmt.Fprintln(w, " {")
@@ -156,7 +252,7 @@ func printExportMappingElement(w io.Writer, elem *model.ExportMappingElement, de
 		}
 		if len(elem.Children) > 0 {
 			for i, child := range elem.Children {
-				printExportMappingElement(w, child, depth+1, false)
+				printExportMappingElement(w, exportArrayItemToPrint(child), depth+1, false, elem.JsonPath)
 				if i < len(elem.Children)-1 {
 					fmt.Fprintln(w, ",")
 				} else {
@@ -172,7 +268,12 @@ func printExportMappingElement(w io.Writer, elem *model.ExportMappingElement, de
 		if parts := strings.Split(attrName, "."); len(parts) == 3 {
 			attrName = parts[2]
 		}
-		fmt.Fprintf(w, "%s%s = %s", indent, elem.ExposedName, attrName)
+		member := quoteMemberPath(mappingMemberName(parentPath, elem.JsonPath, elem.ExposedName))
+		if elem.Converter != "" {
+			fmt.Fprintf(w, "%s%s = %s(%s)", indent, member, elem.Converter, attrName)
+			return
+		}
+		fmt.Fprintf(w, "%s%s = %s", indent, member, attrName)
 	}
 }
 
@@ -186,18 +287,67 @@ func execCreateExportMapping(ctx *ExecContext, s *ast.CreateExportMappingStmt) e
 	if existing != nil && !s.CreateOrModify {
 		return mdlerrors.NewAlreadyExists("export mapping", s.Name.String())
 	}
+	// A stored SOAP binding is not something the statement can restate, so a
+	// rewrite would delete it (ako/mxcli#365).
+	if existing != nil {
+		if err := checkNoWebServiceSource("export", s.Name.String(), existing.WebServiceSource); err != nil {
+			return err
+		}
+		// Nor are an XML-schema mapping's root element and element paths: its
+		// own description replays as Unchanged, and any other rewrite is refused
+		// rather than written without them (mendixlabs/mxcli#1623).
+		unchanged, err := exportMappingXmlSchemaRewrite(ctx, s, existing)
+		if err != nil {
+			return err
+		}
+		if unchanged {
+			if !ctx.Quiet {
+				reportUnchanged(ctx, "export mapping "+s.Name.String())
+			}
+			return nil
+		}
+	}
 
 	module, err := findModule(ctx, s.Name.Module)
 	if err != nil {
 		return mdlerrors.NewNotFound("module", s.Name.Module)
 	}
-	containerID := module.ID
+	// A folder clause places the mapping; without one a new mapping goes to the
+	// module root and an existing one stays where it is (#932).
+	containerID, err := resolveRequestedFolder(ctx, module.ID, s.Folder)
+	if err != nil {
+		return err
+	}
+	if containerID == "" {
+		containerID = module.ID
+		if existing != nil {
+			containerID = existing.ContainerID
+		}
+	}
+
+	// `null values` is an enum, not free text: mxcli wrote whatever identifier it
+	// was given straight into the document (#259).
+	nullValueOption, nvErr := canonicalNullValueOption(s.NullValueOption)
+	if nvErr != nil {
+		return mdlerrors.NewValidation(fmt.Sprintf("export mapping %s: %v", s.Name.String(), nvErr))
+	}
 
 	em := &model.ExportMapping{
 		ContainerID:     containerID,
 		Name:            s.Name.Name,
 		ExportLevel:     "Hidden",
-		NullValueOption: s.NullValueOption,
+		NullValueOption: nullValueOption,
+		// @excluded, which DESCRIBE prints for an excluded mapping (#1185).
+		Excluded: s.Excluded,
+		// The doc comment (mendixlabs/mxcli#1510).
+		Documentation: s.Documentation,
+	}
+	if existing != nil {
+		// Excluded is model state, not script state: an absent @excluded must
+		// not clear a stored exclusion (#914).
+		em.Excluded = s.Excluded || existing.Excluded
+		// A rewrite that carried no doc comment keeps the stored one (#1018).
+		em.Documentation = carriedDocumentation(s.DocumentationSet, s.Documentation, existing.Documentation)
 	}
 	if em.NullValueOption == "" {
 		em.NullValueOption = "LeaveOutElement"
@@ -210,28 +360,101 @@ func execCreateExportMapping(ctx *ExecContext, s *ast.CreateExportMappingStmt) e
 	case "XML_SCHEMA":
 		em.XmlSchema = s.SchemaRef.String()
 	}
+	// The message-definition keys are version-dependent and CARRIED: 11.10 added
+	// MessageDefinition2, 11.15 removed MessageDefinition and moved the source
+	// into MessageDefinition2 (ako/mxcli#987).
+	var existingMD, existingMD2 *string
+	if existing != nil {
+		existingMD, existingMD2 = existing.MessageDefinition, existing.MessageDefinition2
+	}
+	// A message definition is resolved first: the reference stored is the
+	// resolved one, which on 11.15 is the document's Module.Name even when the
+	// script wrote the pre-11.15 three-part form (ako/mxcli#987).
+	var md *model.MessageDefinition
+	mdRef := s.SchemaRef.String()
+	if s.SchemaKind == "MESSAGE_DEFINITION" {
+		var mdErr error
+		md, mdRef, mdErr = findMessageDefinition(ctx, mdRef)
+		if mdErr != nil {
+			return mdlerrors.NewValidation(fmt.Sprintf("export mapping %s: %v", s.Name.String(), mdErr))
+		}
+	}
+	em.MessageDefinition, em.MessageDefinition2 = mappingMessageDefinitionKeys(
+		ctx.Backend.ProjectVersion(), existing != nil, existingMD, existingMD2,
+		s.SchemaKind == "MESSAGE_DEFINITION", mdRef)
 
-	// Build a path→element info map from the JSON structure for schema alignment.
-	jsElems := map[string]*types.JsonElement{}
+	// See the import twin: a message definition has its own builder (#263).
+	if s.SchemaKind == "MESSAGE_DEFINITION" {
+		if s.RootElement != nil {
+			root, err := buildExportMappingFromMessageDefinition(s.Name.Module, s.RootElement,
+				md.Root, "", "", true, ctx.Backend)
+			if err != nil {
+				return mdlerrors.NewValidation(fmt.Sprintf("export mapping %s: %v", s.Name.String(), err))
+			}
+			em.Elements = append(em.Elements, root)
+		}
+		return finishExportMapping(ctx, s, em, existing, containerID)
+	}
+
+	// Index the JSON structure for schema alignment.
+	idx := newJSONSchemaIndex(nil)
 	if s.SchemaKind == "JSON_STRUCTURE" && s.SchemaRef.Module != "" {
-		if js, err2 := ctx.Backend.GetJsonStructureByQualifiedName(s.SchemaRef.Module, s.SchemaRef.Name); err2 == nil && js != nil {
-			buildJsonElementPathMap(js.Elements, jsElems)
+		resolved, err := resolveJsonStructureSource(ctx.Backend, s.SchemaRef)
+		if err != nil {
+			return mdlerrors.NewValidation(fmt.Sprintf("%s mapping %s: %v", "export", s.Name.String(), err))
+		}
+		idx = resolved
+	}
+	if s.SchemaKind == "XML_SCHEMA" && s.SchemaRef.Module != "" {
+		if err := resolveXmlSchemaSource(ctx.Backend, s.SchemaRef); err != nil {
+			return mdlerrors.NewValidation(fmt.Sprintf("export mapping %s: %v", s.Name.String(), err))
 		}
 	}
 
 	// Build element tree from the AST definition, cloning JSON structure properties
+	// `root a/b/c` starts the mapping at a nested schema element (#267).
+	rootPath := ""
+	if s.SchemaRoot != "" {
+		if !idx.resolvable() {
+			return mdlerrors.NewValidation(fmt.Sprintf("export mapping %s: `root %s` needs a schema "+
+				"source that can be read", s.Name.String(), s.SchemaRoot))
+		}
+		je, err := resolveSchemaRoot(idx, s.SchemaRoot)
+		if err != nil {
+			return mdlerrors.NewValidation(fmt.Sprintf("export mapping %s: %v", s.Name.String(), err))
+		}
+		rootPath = je.Path
+	}
+
 	if s.RootElement != nil {
-		root := buildExportMappingElementModel(s.Name.Module, s.RootElement, "", "(Object)", jsElems, ctx.Backend, true)
+		root, err := buildExportMappingElementModel(s.Name.Module, s.RootElement, "", rootPath, idx, ctx.Backend, true)
+		if err != nil {
+			return mdlerrors.NewValidation(fmt.Sprintf("export mapping %s: %v", s.Name.String(), err))
+		}
 		em.Elements = append(em.Elements, root)
 	}
 
+	return finishExportMapping(ctx, s, em, existing, containerID)
+}
+
+// finishExportMapping writes the built mapping, shared by the JSON-structure and
+// message-definition paths.
+func finishExportMapping(ctx *ExecContext, s *ast.CreateExportMappingStmt,
+	em *model.ExportMapping, existing *model.ExportMapping, containerID model.ID,
+) error {
 	if existing != nil {
 		em.ID = existing.ID
+		// A rewrite must not delete the samples the stored document carries
+		// (ako/mxcli#379).
+		carryExportOriginalValues(em, existing)
 		if err := ctx.Backend.UpdateExportMapping(em); err != nil {
 			return mdlerrors.NewBackend("update export mapping", err)
 		}
+		if _, err := applyDocumentFolder(ctx, em.ID, existing.ContainerID, containerID); err != nil {
+			return err
+		}
 		if !ctx.Quiet {
-			fmt.Fprintf(ctx.Output, "Modified export mapping %s.%s\n", s.Name.Module, s.Name.Name)
+			ctx.ReportMutation("Modified", "export mapping %s.%s", s.Name.Module, s.Name.Name)
 		}
 		return nil
 	}
@@ -239,6 +462,7 @@ func execCreateExportMapping(ctx *ExecContext, s *ast.CreateExportMappingStmt) e
 	if err := ctx.Backend.CreateExportMapping(em); err != nil {
 		return mdlerrors.NewBackend("create export mapping", err)
 	}
+	invalidateHierarchy(ctx)
 
 	if !ctx.Quiet {
 		fmt.Fprintf(ctx.Output, "Created export mapping %s.%s\n", s.Name.Module, s.Name.Name)
@@ -246,31 +470,195 @@ func execCreateExportMapping(ctx *ExecContext, s *ast.CreateExportMappingStmt) e
 	return nil
 }
 
+// buildExportRootArrayElement builds the two-level shape Studio Pro stores for an
+// array-rooted export mapping: a bare Array container at the structure's root
+// path, whose single child is the item object carrying the entity.
+//
+// Measured on SnowflakeIntegration.EXM_SensorData (Evora demo app, Mendix
+// 11.13), which is the shape a root entity in MDL means — the mapping's
+// parameter is the item and the array is produced from a list of them:
+//
+//	et=Array   oh=Find      entity=-                          max=1   path=(Array)
+//	  et=Object  oh=Parameter entity=SnowflakeIntegration.SensorData max=-1  path=(Array)|(Object)
+//
+// The other shape in the corpus (DigitalTwin.EMM_EntityQuery) puts an entity on
+// the container and Find on the item — the parameter owns the list rather than
+// being in it. MDL names one entity at the root and cannot say which, so that
+// shape stays unauthorable; it needs the container syntax tracked by #262.
+func buildExportRootArrayElement(moduleName string, def *ast.ExportMappingElementDef,
+	root *types.JsonElement, idx *jsonSchemaIndex, b backend.FullBackend,
+) (*model.ExportMappingElement, error) {
+	entity := def.Entity
+	if entity != "" && !strings.Contains(entity, ".") {
+		entity = moduleName + "." + entity
+	}
+
+	itemPath := root.Path + "|(Object)"
+	item := &model.ExportMappingElement{
+		BaseElement: model.BaseElement{
+			ID:       model.ID(types.GenerateID()),
+			TypeName: "ExportMappings$ObjectMappingElement",
+		},
+		Kind:           "Object",
+		Entity:         entity,
+		ObjectHandling: "Parameter",
+		JsonPath:       itemPath,
+		MaxOccurs:      -1, // 0..*, mirroring the schema item (#841)
+	}
+	if jsItem, ok := idx.byPath[itemPath]; ok {
+		item.ExposedName = jsItem.ExposedName
+		item.MaxOccurs = jsItem.MaxOccurs
+	}
+	for _, child := range def.Children {
+		c, err := buildExportMappingElementModel(moduleName, child, entity, itemPath, idx, b, false)
+		if err != nil {
+			return nil, err
+		}
+		item.Children = append(item.Children, c)
+	}
+
+	return &model.ExportMappingElement{
+		BaseElement: model.BaseElement{
+			ID:       model.ID(types.GenerateID()),
+			TypeName: "ExportMappings$ObjectMappingElement",
+		},
+		Kind:           "Array",
+		ObjectHandling: "Find",
+		ExposedName:    root.ExposedName,
+		JsonPath:       root.Path,
+		MinOccurs:      root.MinOccurs,
+		MaxOccurs:      root.MaxOccurs,
+		Children:       []*model.ExportMappingElement{item},
+	}, nil
+}
+
 // buildExportMappingElementModel converts an AST element definition to a model element.
 // It clones properties from the matching JSON structure element and adds mapping bindings.
-func buildExportMappingElementModel(moduleName string, def *ast.ExportMappingElementDef, parentEntity, parentPath string, jsElems map[string]*types.JsonElement, b backend.FullBackend, isRoot bool) *model.ExportMappingElement {
+func buildExportMappingElementModel(moduleName string, def *ast.ExportMappingElementDef, parentEntity, parentPath string, idx *jsonSchemaIndex, b backend.FullBackend, isRoot bool) (*model.ExportMappingElement, error) {
 	elem := &model.ExportMappingElement{
 		BaseElement: model.BaseElement{
 			ID: model.ID(types.GenerateID()),
 		},
 	}
 
-	// Determine lookup path
-	var lookupPath string
+	// Resolve the member against the JSON structure, accepting the raw JSON key
+	// or the exposed name. DESCRIBE emits the latter, so both have to work or
+	// mxcli's own output does not round-trip — re-executing it rewrote
+	// "(Object)|total" as "(Object)|Total". (issue #882)
+	var jsElem *types.JsonElement
+	lookupPath := parentPath + "|" + def.JsonName
 	if isRoot {
-		lookupPath = "(Object)"
+		// The structure decides where its own root is (#248) — see the twin
+		// comment in cmd_import_mappings.go. The export side needs one thing the
+		// import side does not: an array-rooted EXPORT mapping is stored as TWO
+		// elements, a bare Array container plus the item that carries the entity,
+		// where the import mapping collapses to the item alone.
+		// parentPath carries an explicit `root a/b/c` selection when there is
+		// one; otherwise the structure's own root is used (#248, #267).
+		if parentPath != "" {
+			lookupPath = parentPath
+		} else {
+			lookupPath = "(Object)"
+			if root := idx.root(); root != nil {
+				lookupPath = root.Path
+				if root.ElementType == "Array" {
+					return buildExportRootArrayElement(moduleName, def, root, idx, b)
+				}
+			}
+		}
+		jsElem = idx.byPath[lookupPath]
 	} else {
-		lookupPath = parentPath + "|" + def.JsonName
+		// An EXPORT mapping cannot collapse levels the way an import mapping can.
+		// Measured on mxbuild 11.13 with a three-way control: an import mapping
+		// binding "(Object)|customer|name" under an object element at "(Object)"
+		// builds at 0 errors, an export mapping over the same structure mapping
+		// only top-level fields builds at 0 errors, and the same export mapping
+		// with the collapsed member is CE5015 "There is no child mapping matching
+		// schema element". That follows from what the two do: an export mapping
+		// has to PRODUCE the customer node, so something must map it.
+		//
+		// Refused here rather than written, because the model would be valid MDL,
+		// pass `mxcli check`, and fail only in the build. (issue #927)
+		if strings.Contains(def.JsonName, "/") {
+			return nil, nestedExportMemberError(def.JsonName)
+		}
+		jsElem = idx.resolve(parentPath, def.JsonName)
 	}
 
-	// Clone properties from the matching JSON structure element
-	if jsElem, ok := jsElems[lookupPath]; ok {
+	if jsElem == nil && !isRoot && idx.resolvable() {
+		known := idx.memberNames(parentPath)
+		if len(known) == 0 {
+			return nil, fmt.Errorf("%q is not a member of the JSON structure at %s, which has no members there",
+				def.JsonName, parentPath)
+		}
+		return nil, fmt.Errorf("%q is not a member of the JSON structure at %s; available: %s",
+			def.JsonName, parentPath, strings.Join(known, ", "))
+	}
+	if jsElem != nil {
 		elem.ExposedName = jsElem.ExposedName
 		elem.JsonPath = jsElem.Path
+		// Mirror the schema element, as the import twin does: Studio Pro's export
+		// elements carry the structure's own MinOccurs and MaxLength, and the
+		// writers used to hardcode both to 0 (#277, #279).
+		elem.MinOccurs = jsElem.MinOccurs
 		elem.MaxOccurs = jsElem.MaxOccurs
+		elem.MaxLength = jsElem.MaxLength
+		lookupPath = jsElem.Path
 	} else {
 		elem.ExposedName = def.JsonName
 		elem.JsonPath = lookupPath
+	}
+
+	if def.Group {
+		// A grouping node: a JSON object with no Mendix object behind it, stored
+		// as an entity-less object element with ObjectHandling Find (#262).
+		//
+		// It may contain OBJECT elements only. Every one of the 10 entity-less
+		// object elements in the demo apps holds objects and nothing else, and a
+		// VALUE under one is rejected by mxbuild with CE0061 "No entity
+		// selected." — the attribute has no entity to bind to. Refused here so
+		// the author gets the reason instead of the build's.
+		for _, child := range def.Children {
+			if child.Entity == "" && !child.Group {
+				return nil, fmt.Errorf("`group as %s` can hold object elements only — %q is a "+
+					"value, and a value has no entity to bind its attribute to "+
+					"(mxbuild reports CE0061 \"No entity selected.\"). Give the group an "+
+					"entity instead: Assoc/Module.Entity as %s { ... }",
+					def.JsonName, child.JsonName, def.JsonName)
+			}
+		}
+		elem.Kind = "Object"
+		elem.TypeName = "ExportMappings$ObjectMappingElement"
+		elem.ObjectHandling = "Find"
+		for _, child := range def.Children {
+			c, err := buildExportMappingElementModel(moduleName, child, parentEntity, lookupPath, idx, b, false)
+			if err != nil {
+				return nil, err
+			}
+			elem.Children = append(elem.Children, c)
+		}
+		return elem, nil
+	}
+
+	if isRoot && def.Entity == "" {
+		// An entity-less ROOT — `group {`. A JSON object with no Mendix object
+		// behind it, stored as an object element with ObjectHandling Parameter
+		// and no entity, which is what CapitalConnector.EM_AttachedDataRequest
+		// carries. Without this branch it fell through to the VALUE branch below
+		// and produced a document mxbuild cannot even load:
+		// "Type ExportValueMappingElement does not contain a constructor with a
+		// parameter of type ExportMapping."
+		elem.Kind = "Object"
+		elem.TypeName = "ExportMappings$ObjectMappingElement"
+		elem.ObjectHandling = "Parameter"
+		for _, child := range def.Children {
+			c, err := buildExportMappingElementModel(moduleName, child, parentEntity, lookupPath, idx, b, false)
+			if err != nil {
+				return nil, err
+			}
+			elem.Children = append(elem.Children, c)
+		}
+		return elem, nil
 	}
 
 	if def.Entity != "" {
@@ -291,73 +679,131 @@ func buildExportMappingElementModel(moduleName string, def *ast.ExportMappingEle
 		handling := "Parameter"
 		if !isRoot {
 			handling = "Find"
+			// An element with NO association has nothing to find THROUGH, and
+			// mxbuild says so: CE0224 "No association selected for obtaining
+			// objects." Studio Pro stores Parameter on exactly this shape —
+			// CapitalConnector.EM_AttachedDataRequest's child carries an entity,
+			// no association, and ObjectHandling Parameter, directly under an
+			// entity-less root. (A custom handler overrides this below: `by`
+			// makes it Custom, which is how the association-less elements in
+			// MxGenAIConnector.IM_Collection_RetrieveNearestNeighbors are
+			// stored.)
+			if assoc == "" {
+				handling = "Parameter"
+			}
 		}
 
 		// Check if this is an array element in the JSON structure
-		if jsElem, ok := jsElems[lookupPath]; ok && jsElem.ElementType == "Array" {
-			// Export arrays have two levels:
-			// 1. Array container: Kind=Array, entity=container entity, assoc to parent
-			// 2. Item object: Kind=Object, entity=item entity, assoc to container
+		if jsElem != nil && jsElem.ElementType == "Array" {
+			// A nested array is TWO elements, and Studio Pro leaves the
+			// container BARE — 93 of the 93 entity-less object elements in the
+			// demo apps have that shape (#262):
 			//
-			// MDL syntax: Assoc/Entity AS items { ItemAssoc/ItemEntity AS ItemsItem { values } }
-			// The outer Assoc/Entity is for the container, the nested child provides the item.
-			elem.Kind = "Array"
-			elem.Association = assoc
-			elem.ObjectHandling = handling
-			elem.Entity = entity
-
+			//	et=Array  entity=-   assoc=-  oh=Find   path=…|Versions
+			//	  et=Object entity=…  assoc=…  oh=Find   path=…|Versions|(Object)
+			//
+			// So the array is declared like a plain nested object —
+			// `Assoc/Entity as items { values }` — and the container is
+			// generated, the same rule #248 applied to a root array.
+			//
+			// The OLD two-level spelling is still honoured as written:
+			// `Assoc/Entity as items { ItemAssoc/ItemEntity as ItemsItem { … } }`
+			// names TWO entities, one per level, which the bare-container shape
+			// cannot express — and it is what DESCRIBE emitted before this
+			// change, so scripts in the wild and the doctype suite use it.
+			// Rewriting it into the bare shape produced CE0295 (the item's
+			// association no longer reaches its parent).
+			// The step is to the array's ACTUAL child: "|(Object)" for an array
+			// of objects, "|(Wrapper)" for an array of primitives (#268).
 			itemPath := lookupPath + "|(Object)"
-
-			// The first (and typically only) child of the array in the MDL is the item definition.
-			// Its children become the item element's value children.
-			if len(def.Children) == 1 && def.Children[0].Entity != "" {
-				itemDef := def.Children[0]
-				itemEntity := itemDef.Entity
-				if !strings.Contains(itemEntity, ".") {
-					itemEntity = moduleName + "." + itemEntity
-				}
-				itemAssoc := itemDef.Association
-				if itemAssoc != "" && !strings.Contains(itemAssoc, ".") {
-					itemAssoc = moduleName + "." + itemAssoc
-				}
-
-				itemElem := &model.ExportMappingElement{
-					BaseElement: model.BaseElement{
-						ID:       model.ID(types.GenerateID()),
-						TypeName: "ExportMappings$ObjectMappingElement",
-					},
-					Kind:           "Object",
-					Entity:         itemEntity,
-					Association:    itemAssoc,
-					ObjectHandling: "Find",
-				}
-				if jsItem, ok2 := jsElems[itemPath]; ok2 {
-					itemElem.ExposedName = jsItem.ExposedName
-					itemElem.JsonPath = jsItem.Path
-					itemElem.MaxOccurs = jsItem.MaxOccurs
-				} else {
-					itemElem.ExposedName = elem.ExposedName + "Item"
-					itemElem.JsonPath = itemPath
-					itemElem.MaxOccurs = -1
-				}
-				// Item's children are the value elements
-				for _, valChild := range itemDef.Children {
-					itemElem.Children = append(itemElem.Children, buildExportMappingElementModel(moduleName, valChild, itemEntity, itemPath, jsElems, b, false))
-				}
-				elem.Children = append(elem.Children, itemElem)
-			} else {
-				// Fallback: treat children as direct item children (no intermediate entity)
-				for _, child := range def.Children {
-					elem.Children = append(elem.Children, buildExportMappingElementModel(moduleName, child, entity, itemPath, jsElems, b, false))
+			itemKind := "Object"
+			if jsItem := arrayItemOf(idx, jsElem); jsItem != nil {
+				itemPath = jsItem.Path
+				if jsItem.ElementType == "Wrapper" {
+					itemKind = "Wrapper"
 				}
 			}
+			twoLevel := len(def.Children) == 1 && def.Children[0].Entity != ""
+
+			itemDef := def
+			valueChildren := def.Children
+			if twoLevel {
+				itemDef = def.Children[0]
+				valueChildren = itemDef.Children
+			}
+			itemEntity := itemDef.Entity
+			if !strings.Contains(itemEntity, ".") {
+				itemEntity = moduleName + "." + itemEntity
+			}
+			itemAssoc := itemDef.Association
+			if itemAssoc != "" && !strings.Contains(itemAssoc, ".") {
+				itemAssoc = moduleName + "." + itemAssoc
+			}
+
+			itemElem := &model.ExportMappingElement{
+				BaseElement: model.BaseElement{
+					ID:       model.ID(types.GenerateID()),
+					TypeName: "ExportMappings$ObjectMappingElement",
+				},
+				Kind:           itemKind,
+				Entity:         itemEntity,
+				Association:    itemAssoc,
+				ObjectHandling: "Find",
+				JsonPath:       itemPath,
+				MaxOccurs:      -1,
+			}
+			if jsItem, ok2 := idx.byPath[itemPath]; ok2 {
+				itemElem.ExposedName = jsItem.ExposedName
+				itemElem.MaxOccurs = jsItem.MaxOccurs
+			} else {
+				itemElem.ExposedName = elem.ExposedName + "Item"
+			}
+			if itemDef.CustomHandler != nil {
+				ch, err := buildCustomHandler(itemDef.CustomHandler, moduleName, itemElem.JsonPath, b, idx)
+				if err != nil {
+					return nil, err
+				}
+				itemElem.CustomHandler = ch
+				itemElem.ObjectHandling = "Custom"
+			}
+			for _, child := range valueChildren {
+				c, err := buildExportMappingElementModel(moduleName, child, itemEntity, itemPath, idx, b, false)
+				if err != nil {
+					return nil, err
+				}
+				itemElem.Children = append(itemElem.Children, c)
+			}
+
+			elem.Kind = "Array"
+			elem.ObjectHandling = "Find"
+			if twoLevel {
+				// The outer declaration is the CONTAINER's in this spelling.
+				elem.Entity = entity
+				elem.Association = assoc
+			} else {
+				elem.Entity = ""
+				elem.Association = ""
+			}
+			elem.Children = append(elem.Children, itemElem)
 		} else {
 			// Regular object element
 			elem.Entity = entity
 			elem.Association = assoc
 			elem.ObjectHandling = handling
+			if def.CustomHandler != nil {
+				ch, err := buildCustomHandler(def.CustomHandler, moduleName, elem.JsonPath, b, idx)
+				if err != nil {
+					return nil, err
+				}
+				elem.CustomHandler = ch
+				elem.ObjectHandling = "Custom"
+			}
 			for _, child := range def.Children {
-				elem.Children = append(elem.Children, buildExportMappingElementModel(moduleName, child, entity, lookupPath, jsElems, b, false))
+				c, err := buildExportMappingElementModel(moduleName, child, entity, lookupPath, idx, b, false)
+				if err != nil {
+					return nil, err
+				}
+				elem.Children = append(elem.Children, c)
 			}
 		}
 	} else {
@@ -365,15 +811,28 @@ func buildExportMappingElementModel(moduleName string, def *ast.ExportMappingEle
 		elem.Kind = "Value"
 		elem.TypeName = "ExportMappings$ValueMappingElement"
 		elem.DataType = resolveAttributeType(parentEntity, def.Attribute, b)
+		// See the import twin: the value may pass through a microflow (#266).
+		if err := setMappingConverter(&elem.Converter, def.Converter, moduleName, b); err != nil {
+			return nil, err
+		}
+		// A member reference is qualified against the entity that DECLARES it, so
+		// an inherited attribute carries an ancestor's name. Prefixing the entity
+		// being mapped produced CE1613 "The selected attribute no longer exists"
+		// and left the field unmapped in Studio Pro (mendixlabs/mxcli#703) — the
+		// same rule as entity access rules (#758), both under the #765 umbrella.
 		attr := def.Attribute
 		if parentEntity != "" && !strings.Contains(attr, ".") {
-			attr = parentEntity + "." + attr
+			if ref, ok := ResolveMemberRef(b, parentEntity, attr); ok {
+				attr = ref
+			} else {
+				attr = parentEntity + "." + attr
+			}
 		}
 		elem.Attribute = attr
 		// JsonPath already set from JSON structure clone above
 	}
 
-	return elem
+	return elem, nil
 }
 
 // execDropExportMapping deletes an export mapping.
@@ -398,4 +857,15 @@ func execDropExportMapping(ctx *ExecContext, s *ast.DropExportMappingStmt) error
 		fmt.Fprintf(ctx.Output, "Dropped export mapping %s.%s\n", s.Name.Module, s.Name.Name)
 	}
 	return nil
+}
+
+// nestedExportMemberError is shared by the check-time guard and the executor so
+// the author sees one message wherever the statement is stopped.
+func nestedExportMemberError(member string) error {
+	level := strings.Split(member, "/")[0]
+	return mdlerrors.NewValidationf("export mapping member %q: an export mapping cannot reach a nested "+
+		"member directly — Mendix rejects it with CE5015 because the intermediate object has nothing "+
+		"producing it. Give %q its own element: Association/Module.Entity as %s { ... }. "+
+		"(Collapsing levels this way works for IMPORT mappings, which only read.)",
+		member, level, level)
 }

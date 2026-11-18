@@ -1,0 +1,1049 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package docker
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// ensuredb.go provisions the local PostgreSQL a standalone runtime needs, so a
+// fresh session comes up testable without a manual createdb (slice 2 of the
+// warm-loop proposal). It is best-effort: it starts the local Postgres service
+// if the port is down — via a service manager, or a user-owned initdb/pg_ctl
+// cluster when no service becomes ready (e.g. Arch, #823), but never in place of
+// a stopped system cluster for the same port (ako/mxcli#866) — then ensures the app
+// role and database exist via a superuser (a trust connection over the
+// user-owned cluster's private socket, or `sudo -u postgres psql` for a system
+// cluster). For a non-local DB host it does nothing but verify reachability —
+// provisioning a remote database is not mxcli's business.
+
+// pgIdent is a conservative PostgreSQL identifier (unquoted): a safe database or
+// role name. We refuse anything else rather than quote/escape it into DDL.
+var pgIdent = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
+
+// serviceReadyTimeout bounds how long we probe for a service-manager-started
+// server before falling back to a user-owned cluster. It is deliberately short:
+// the single authoritative readiness wait lives in EnsureDatabase, so a dead or
+// slow attempt must not multiply the overall deadline (#823 review). A variable
+// so tests can shrink it further.
+var serviceReadyTimeout = 3 * time.Second
+
+// readyTimeout is that single authoritative wait. A variable so tests need not
+// sit out the full deadline.
+var readyTimeout = 20 * time.Second
+
+// currentEUID reports the effective user id. A variable so a test can exercise
+// the unprivileged path on a root CI runner, and the root path on a laptop.
+var currentEUID = os.Geteuid
+
+// postgresServerBinGlobs are the directories a distribution may keep the
+// PostgreSQL *server* tools in when they are not on PATH. Debian and Ubuntu ship
+// initdb, pg_ctl and postgres under /usr/lib/postgresql/<major>/bin and wrap only
+// the client tools (psql, pg_isready, pg_ctlcluster) into /usr/bin. The
+// user-owned cluster below needs initdb and pg_ctl, so without this the whole
+// fallback is inert on the commonest devcontainer base — the safety net for a
+// failed service start could never deploy on the platform that needs it most
+// (#984). A variable so a stubbed PATH also gets a hermetic tool lookup.
+var postgresServerBinGlobs = []string{"/usr/lib/postgresql/*/bin"}
+
+// systemClusterRoot prefixes every well-known location probed for a system
+// cluster (see findSystemClusters), so a test can point the probe at a
+// temporary tree. Empty means the real filesystem root.
+var systemClusterRoot = ""
+
+// clusterProbeStat is the stat behind the system-cluster probe; a variable so a
+// test running as root can still exercise a permission-denied data directory.
+var clusterProbeStat = os.Stat
+
+// newClusterOptInEnv, set to 1, lets the user-owned fallback initialize a new
+// cluster although a stopped system cluster is configured for the same port —
+// the deliberate way past the ako/mxcli#866 refusal when that cluster is not
+// this app's and cannot be started (no sudo).
+const newClusterOptInEnv = "MXCLI_ENSURE_DB_NEW_CLUSTER"
+
+// systemClusterLayouts are the data directories a package or service manager
+// creates, beyond Debian's postgresql-common (read from /etc/postgresql). Paths
+// are slash-separated and taken relative to systemClusterRoot.
+var systemClusterLayouts = []struct {
+	glob string
+	kind clusterKind
+}{
+	{"/var/lib/postgresql/*/*", clusterDebian}, // a data directory whose /etc config is gone
+	{"/var/lib/pgsql/data", clusterSystemd},    // RHEL, Fedora, CentOS
+	{"/var/lib/pgsql/*/data", clusterSystemd},  // PGDG packages on RHEL
+	{"/var/lib/postgres/data", clusterSystemd}, // Arch
+	{"/opt/homebrew/var/postgres*", clusterHomebrew},
+	{"/usr/local/var/postgres*", clusterHomebrew},
+	{"C:/Program Files/PostgreSQL/*/data", clusterWindows},
+}
+
+type clusterKind int
+
+const (
+	clusterDebian clusterKind = iota
+	clusterSystemd
+	clusterHomebrew
+	clusterWindows
+)
+
+// systemCluster is a PostgreSQL cluster mxcli did not create: an initialized
+// data directory in a location a package or service manager uses.
+type systemCluster struct {
+	dataDir string
+	// port is the configured port, or PostgreSQL's default 5432 when the
+	// configuration cannot be read (a 0700 data directory, as a non-root user).
+	port string
+	kind clusterKind
+	// version and name identify a postgresql-common cluster, which
+	// pg_ctlcluster addresses by exactly those two.
+	version, name string
+}
+
+// startCommand is how a user starts this cluster by hand.
+func (c systemCluster) startCommand() string {
+	switch c.kind {
+	case clusterDebian:
+		if c.version != "" && c.name != "" {
+			return fmt.Sprintf("sudo pg_ctlcluster %s %s start   (or: sudo service postgresql start)", c.version, c.name)
+		}
+		return fmt.Sprintf("sudo service postgresql start   (or: sudo -u postgres pg_ctl -D %s start)", c.dataDir)
+	case clusterHomebrew:
+		return fmt.Sprintf("brew services start %s   (or: pg_ctl -D %s start)", filepath.Base(c.dataDir), c.dataDir)
+	case clusterWindows:
+		return fmt.Sprintf("net start postgresql-x64-%s   (as Administrator; or start it in services.msc)",
+			filepath.Base(filepath.Dir(c.dataDir)))
+	}
+	return fmt.Sprintf("sudo systemctl start postgresql   (or: sudo -u postgres pg_ctl -D %s start)", c.dataDir)
+}
+
+// clusterDataDirPresent reports whether dir is a data directory initdb has
+// populated. A PG_VERSION the probe may not read counts: as a non-root user,
+// /var/lib/postgresql/16/main is 0700 and owned by postgres, so stat is refused
+// rather than answered — and that user is exactly who #866 happened to.
+func clusterDataDirPresent(dir string) bool {
+	info, err := clusterProbeStat(dir)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	_, err = clusterProbeStat(filepath.Join(dir, "PG_VERSION"))
+	return err == nil || errors.Is(err, fs.ErrPermission)
+}
+
+var (
+	pgConfPortRe    = regexp.MustCompile(`^\s*port\s*=?\s*'?(\d+)'?`)
+	pgConfDataDirRe = regexp.MustCompile(`^\s*data_directory\s*=?\s*'([^']*)'`)
+)
+
+// readClusterConf returns the port and data_directory a postgresql.conf sets;
+// either is "" when the file is unreadable or leaves it at the default.
+func readClusterConf(path string) (port, dataDir string) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", ""
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		if m := pgConfPortRe.FindStringSubmatch(line); m != nil {
+			port = m[1]
+		}
+		if m := pgConfDataDirRe.FindStringSubmatch(line); m != nil {
+			dataDir = m[1]
+		}
+	}
+	return port, dataDir
+}
+
+// findSystemClusters lists the initialized PostgreSQL clusters a package or
+// service manager made on this machine, whether or not they are running.
+func findSystemClusters() []systemCluster {
+	at := func(p string) string { return filepath.Join(systemClusterRoot, filepath.FromSlash(p)) }
+	var out []systemCluster
+	seen := map[string]bool{}
+	add := func(c systemCluster) {
+		c.dataDir = filepath.Clean(c.dataDir)
+		if seen[c.dataDir] || !clusterDataDirPresent(c.dataDir) {
+			return
+		}
+		seen[c.dataDir] = true
+		if c.port == "" {
+			c.port = "5432"
+		}
+		out = append(out, c)
+	}
+
+	// Debian/Ubuntu postgresql-common: the configuration, port included, lives
+	// in /etc/postgresql/<version>/<name>/ and stays readable to every user.
+	confs, _ := filepath.Glob(at("/etc/postgresql/*/*/postgresql.conf"))
+	for _, conf := range confs {
+		clusterDir := filepath.Dir(conf)
+		name, version := filepath.Base(clusterDir), filepath.Base(filepath.Dir(clusterDir))
+		port, dataDir := readClusterConf(conf)
+		if dataDir == "" {
+			dataDir = "/var/lib/postgresql/" + version + "/" + name
+		}
+		add(systemCluster{dataDir: at(dataDir), port: port, kind: clusterDebian, version: version, name: name})
+	}
+
+	for _, layout := range systemClusterLayouts {
+		// A drive-letter glob is a RELATIVE path off Windows, resolved against
+		// the working directory; a /var glob means nothing on Windows.
+		if (layout.kind == clusterWindows) != (runtime.GOOS == "windows") {
+			continue
+		}
+		dirs, _ := filepath.Glob(at(layout.glob))
+		for _, dir := range dirs {
+			port, _ := readClusterConf(filepath.Join(dir, "postgresql.conf"))
+			add(systemCluster{dataDir: dir, port: port, kind: layout.kind})
+		}
+	}
+	return out
+}
+
+// conflictingSystemCluster returns the system cluster configured for port, if
+// one exists. The caller has already established that nothing listens there,
+// so a match is a cluster that is down.
+func conflictingSystemCluster(port string) (systemCluster, bool) {
+	for _, c := range findSystemClusters() {
+		if c.port == port {
+			return c, true
+		}
+	}
+	return systemCluster{}, false
+}
+
+// systemClusterDownError is the refusal to initialize a new cluster over a
+// stopped one. Its first line carries the data directory, because that is the
+// line a hook banner shows; nothing after it may read as a second error.
+func systemClusterDownError(c systemCluster) error {
+	return fmt.Errorf("refusing to create a new, empty PostgreSQL cluster: the cluster in %s "+
+		"(port %s) exists but is not running\n"+
+		"  The app's data, if it lives there, would be absent from a new cluster, and an empty\n"+
+		"  database looks exactly like a new one, so nothing would say so (ako/mxcli#866).\n"+
+		"  Start it, then rerun:\n"+
+		"    %s\n"+
+		"  If that cluster does not hold this app's data, create a new, empty one deliberately:\n"+
+		"    %s=1 mxcli run --local --ensure-db ...\n"+
+		"  or boot on the built-in database instead: --db-type hsqldb",
+		c.dataDir, c.port, c.startCommand(), newClusterOptInEnv)
+}
+
+// userClusterInitialized reports whether the user-owned cluster under
+// ~/.mxcli/postgres already exists — a restart of it is not a new database.
+func userClusterInitialized() bool {
+	_, dataDir, _, err := userClusterDirs()
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(filepath.Join(dataDir, "PG_VERSION"))
+	return err == nil
+}
+
+// onPath reports whether a command is resolvable through PATH.
+func onPath(name string) bool {
+	_, err := exec.LookPath(name)
+	return err == nil
+}
+
+// isExecutableFile reports whether path is a regular file with an execute bit.
+func isExecutableFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir() && info.Mode().Perm()&0o111 != 0
+}
+
+// postgresServerBinDir returns the directory to take initdb and pg_ctl from, or
+// "" to resolve them through PATH. Both must come from the SAME installation: a
+// data directory initialized by one major version cannot be started by another,
+// so a directory is only a candidate when it carries both tools.
+func postgresServerBinDir() string {
+	if onPath("initdb") && onPath("pg_ctl") {
+		return ""
+	}
+	best, bestMajor := "", -1
+	for _, glob := range postgresServerBinGlobs {
+		matches, err := filepath.Glob(glob)
+		if err != nil {
+			continue
+		}
+		for _, dir := range matches {
+			if !isExecutableFile(filepath.Join(dir, "initdb")) ||
+				!isExecutableFile(filepath.Join(dir, "pg_ctl")) {
+				continue
+			}
+			// Prefer the newest major. Comparing the paths as strings would rank
+			// "9" above "16", so read the version component as a number.
+			major, err := strconv.Atoi(filepath.Base(filepath.Dir(dir)))
+			if err != nil {
+				major = -1
+			}
+			if best == "" || major > bestMajor {
+				best, bestMajor = dir, major
+			}
+		}
+	}
+	return best
+}
+
+// postgresTool resolves a PostgreSQL server binary by name. It returns the bare
+// name when nothing is found, so a genuinely missing tool still fails with the
+// familiar "executable file not found in $PATH".
+func postgresTool(name string) string {
+	if dir := postgresServerBinDir(); dir != "" {
+		return filepath.Join(dir, name)
+	}
+	return name
+}
+
+// serviceAttempt is one service-manager invocation, with a label for diagnostics
+// (the elevated and unprivileged forms of the same command must not report
+// themselves identically).
+type serviceAttempt struct {
+	label string
+	argv  []string
+}
+
+// serviceStartAttempts lists the service-manager invocations to try, in order.
+//
+// Debian's /etc/init.d/postgresql runs under `set -e` and calls
+// create_socket_directory first, which chmods (or chowns) /var/run/postgresql —
+// so as a non-root user the script aborts on a permission denial before it looks
+// at a single cluster (#984). Every devcontainer mxcli itself generates is in
+// exactly that position: the image runs as "vscode" with passwordless sudo. Try
+// the elevated form first; `sudo -n` never prompts, so where sudo is absent or
+// unauthorised it fails in milliseconds and the unprivileged attempt still runs.
+func serviceStartAttempts() []serviceAttempt {
+	plain := []string{"service", "postgresql", "start"}
+	unprivileged := serviceAttempt{label: "service", argv: plain}
+	if currentEUID() == 0 || !onPath("sudo") {
+		return []serviceAttempt{unprivileged}
+	}
+	return []serviceAttempt{
+		{label: "sudo service", argv: append([]string{"sudo", "-n", "--"}, plain...)},
+		unprivileged,
+	}
+}
+
+// withServiceDiag appends what the service manager said to a later failure.
+// Without it the caller sees a bare readiness timeout for a permission denial
+// this package already has in hand — a guard naming the wrong cause, which costs
+// the reader more than no guard at all.
+func withServiceDiag(err error, diag []string) error {
+	if len(diag) == 0 {
+		return err
+	}
+	return fmt.Errorf("%w\n(a service manager ran first but Postgres did not "+
+		"become ready:\n%s)", err, strings.Join(diag, "\n"))
+}
+
+// splitHostPort splits a PostgreSQL endpoint into host and port, defaulting the
+// port to 5432 when absent. net.SplitHostPort handles the canonical bracketed
+// IPv6 form; the compatibility branch keeps accepting the historical
+// unbracketed "::1:5432" spelling used by this CLI.
+func splitHostPort(hostPort string) (host, port string) {
+	if host, port, err := net.SplitHostPort(hostPort); err == nil {
+		return host, port
+	}
+	if strings.HasPrefix(hostPort, "[") && strings.HasSuffix(hostPort, "]") {
+		return strings.TrimSuffix(strings.TrimPrefix(hostPort, "["), "]"), "5432"
+	}
+	if strings.Count(hostPort, ":") > 1 {
+		if i := strings.LastIndexByte(hostPort, ':'); i >= 0 {
+			candidateHost, candidatePort := hostPort[:i], hostPort[i+1:]
+			if net.ParseIP(candidateHost) != nil {
+				if _, err := normalizePostgresPort(candidatePort); err == nil {
+					return candidateHost, candidatePort
+				}
+			}
+		}
+		if net.ParseIP(hostPort) != nil {
+			return hostPort, "5432"
+		}
+	}
+	if i := strings.LastIndexByte(hostPort, ':'); i >= 0 {
+		return hostPort[:i], hostPort[i+1:]
+	}
+	return hostPort, "5432"
+}
+
+// normalizePostgresPort validates a user-supplied PostgreSQL port and returns
+// its canonical decimal form, so an invalid value cannot reach PostgreSQL's
+// command arguments or managed configuration.
+func normalizePostgresPort(port string) (string, error) {
+	n, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || n == 0 {
+		return "", fmt.Errorf("invalid PostgreSQL port %q (expected 1-65535)", port)
+	}
+	return strconv.FormatUint(n, 10), nil
+}
+
+// normalizePostgresEndpoint returns the endpoint in the single canonical form
+// shared by psql, readiness checks, and the Mendix runtime configuration.
+func normalizePostgresEndpoint(hostPort string) (host, port, endpoint string, err error) {
+	host, port = splitHostPort(hostPort)
+	port, err = normalizePostgresPort(port)
+	if err != nil {
+		return "", "", "", err
+	}
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	return host, port, net.JoinHostPort(host, port), nil
+}
+
+// isLocalHost reports whether host refers to the local machine (so it is safe to
+// start a service / use a local superuser).
+func isLocalHost(host string) bool {
+	switch host {
+	case "127.0.0.1", "localhost", "::1", "":
+		return true
+	}
+	return false
+}
+
+// quoteSQLString wraps s in single quotes for use as a SQL string literal,
+// doubling any embedded single quotes (used only for the role password, which
+// cannot be a bind parameter in CREATE ROLE).
+func quoteSQLString(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// EnsureDatabase makes db reachable and the app role + database present. It is a
+// no-op when the app can already connect. For a local host whose port is down it
+// starts Postgres, then creates the role and database if missing. It
+// canonicalizes db.Host in place so the runtime receives the exact endpoint
+// that was checked and provisioned.
+func EnsureDatabase(db *DBConfig, w io.Writer) error {
+	if db == nil {
+		return fmt.Errorf("--ensure-db requires a database configuration")
+	}
+	if strings.ToLower(db.Type) != "postgresql" {
+		return fmt.Errorf("--ensure-db only supports PostgreSQL (DatabaseType=%q)", db.Type)
+	}
+	if !pgIdent.MatchString(db.Name) {
+		return fmt.Errorf("unsafe database name %q (expected %s)", db.Name, pgIdent)
+	}
+	if !pgIdent.MatchString(db.User) {
+		return fmt.Errorf("unsafe database user %q (expected %s)", db.User, pgIdent)
+	}
+	originalHost := db.Host
+	host, port, endpoint, err := normalizePostgresEndpoint(originalHost)
+	if err != nil {
+		return fmt.Errorf("invalid --db-host %q: %w", originalHost, err)
+	}
+	db.Host = endpoint
+
+	// Already usable? Then we're done.
+	if canConnectDB(*db) {
+		return nil
+	}
+	if !isLocalHost(host) {
+		return fmt.Errorf("database is not usable at %s and host is not local; "+
+			"start it and create the %q database (user %q)", db.Host, db.Name, db.User)
+	}
+
+	// Port down: start the local Postgres service (best-effort).
+	if err := pingTCP(db.Host, 2*time.Second); err != nil {
+		fmt.Fprintln(w, "  Starting local PostgreSQL...")
+		serviceDiag, err := startLocalPostgres(host, port, w)
+		if err != nil {
+			return fmt.Errorf("starting local PostgreSQL: %w", err)
+		}
+		if err := waitPGReady(host, port, readyTimeout); err != nil {
+			return withServiceDiag(err, serviceDiag)
+		}
+	}
+
+	// Ensure the role and database exist (needs a local superuser).
+	su, err := resolveSuperuser(host, port, dbAdmin{User: db.AdminUser, Password: db.AdminPassword})
+	if errors.Is(err, errNoSuperuser) {
+		return fmt.Errorf("%w%s", err, noSuperuserHint(*db))
+	}
+	if err != nil {
+		return err
+	}
+	if err := ensureRole(su, *db, w); err != nil {
+		return err
+	}
+	if err := ensureDatabase(su, *db, w); err != nil {
+		return err
+	}
+
+	if !canConnectDB(*db) {
+		return fmt.Errorf("provisioned PostgreSQL but still cannot connect to %q as %q at %s",
+			db.Name, db.User, db.Host)
+	}
+	fmt.Fprintf(w, "  Database ready: %s (user %q) at %s\n", db.Name, db.User, db.Host)
+	return nil
+}
+
+// canConnectDB reports whether the app can connect to its database as its user.
+func canConnectDB(db DBConfig) bool {
+	host, port := splitHostPort(db.Host)
+	cmd := exec.Command("psql", "-X", "-w", "-h", host, "-p", port, "-U", db.User, "-d", db.Name,
+		"-tAc", "select 1")
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+db.Password, "PGCONNECT_TIMEOUT=3")
+	return cmd.Run() == nil
+}
+
+// startLocalPostgres starts the local PostgreSQL service, trying the common
+// service managers in turn. When none is present — e.g. on Arch — or they do
+// not produce a ready server, it falls back to a user-owned cluster started with
+// the portable initdb/pg_ctl tools (#823) — unless a system cluster configured
+// for the port exists and is down, which it refuses to paper over (#866).
+// It returns whatever the service managers reported, so a caller whose own
+// readiness wait then fails can say what this package already saw.
+func startLocalPostgres(host, port string, w io.Writer) ([]string, error) {
+	port, err := normalizePostgresPort(port)
+	if err != nil {
+		return nil, err
+	}
+	// Only real, portable service managers belong here. The old
+	// {"pg_ctlcluster", "--", "start"} entry was a placeholder whose args could
+	// never start a cluster, so it only ever burned a readiness timeout before
+	// the fallback — dropped (#823 review).
+	var serviceDiag []string
+	for _, a := range serviceStartAttempts() {
+		if _, err := exec.LookPath(a.argv[0]); err != nil {
+			continue
+		}
+		// The command may exit non-zero yet still bring Postgres up, so a short
+		// readiness probe decides — not the exit code. The probe is intentionally
+		// short: the single authoritative wait is in EnsureDatabase, so a
+		// slow-but-working manager is honoured there rather than paid for here.
+		out, _ := exec.Command(a.argv[0], a.argv[1:]...).CombinedOutput()
+		if waitPGReady(host, port, serviceReadyTimeout) == nil {
+			return serviceDiag, nil
+		}
+		if d := strings.TrimSpace(string(out)); d != "" {
+			serviceDiag = append(serviceDiag, a.label+": "+d)
+		}
+	}
+
+	// A service-started server may own the port while crash recovery still makes
+	// pg_isready report "not ready". Never initialize a competitor in that case:
+	// EnsureDatabase's authoritative 20-second wait decides whether it recovers.
+	// This guard also covers a process that won the port between the caller's
+	// initial reachability check and this fallback.
+	if pingTCP(net.JoinHostPort(host, port), time.Second) == nil {
+		return serviceDiag, nil
+	}
+
+	// A system cluster configured for this port exists and is down — the
+	// service managers above did not bring it up. A new cluster here would
+	// answer every probe the app makes while holding none of its data, so the
+	// run would boot healthy against an empty database with nothing saying so
+	// (ako/mxcli#866). Refuse, unless the user-owned cluster already exists (a
+	// restart of it is not a new database) or the user opted in.
+	if sys, found := conflictingSystemCluster(port); found {
+		switch {
+		case userClusterInitialized():
+			_, dataDir, _, _ := userClusterDirs()
+			fmt.Fprintf(w, "  Note: using the user-owned cluster in %s; the system cluster in %s (port %s) "+
+				"is not running.\n  If the app's data is in that one, stop this cluster (pg_ctl -D %s stop) and start it:\n    %s\n",
+				dataDir, sys.dataDir, sys.port, dataDir, sys.startCommand())
+		case os.Getenv(newClusterOptInEnv) == "1":
+			fmt.Fprintf(w, "  %s=1: not starting the stopped cluster in %s; creating a new one instead.\n",
+				newClusterOptInEnv, sys.dataDir)
+		default:
+			return serviceDiag, withServiceDiag(systemClusterDownError(sys), serviceDiag)
+		}
+	}
+
+	// No service manager made PostgreSQL ready: start a user-owned cluster with
+	// the portable tools. This needs neither a `postgres` OS account nor sudo.
+	if err := startUserCluster(host, port, w); err != nil {
+		// Surface what the service manager said; otherwise the user sees only
+		// an initdb/pg_ctl error from two steps later.
+		return serviceDiag, withServiceDiag(err, serviceDiag)
+	}
+	return serviceDiag, nil
+}
+
+// userClusterDirs returns the state, data, and socket directories for the
+// user-owned cluster under ~/.mxcli/postgres. The socket dir is separate and
+// short because some systems cap the Unix-socket path length.
+func userClusterDirs() (stateDir, dataDir, sockDir string, err error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", "", "", fmt.Errorf("determining home directory: %w", err)
+	}
+	stateDir = filepath.Join(home, ".mxcli", "postgres")
+	return stateDir, filepath.Join(stateDir, "data"), filepath.Join(stateDir, "sock"), nil
+}
+
+// writeFileAtomic replaces a cluster configuration file without exposing a
+// partially-written file to a concurrent or subsequent postgres start.
+func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	keep := false
+	defer func() {
+		_ = tmp.Close()
+		if !keep {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(mode); err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	keep = true
+	return nil
+}
+
+func postgresConfigString(value string) (string, error) {
+	if strings.ContainsAny(value, "\x00\r\n") {
+		return "", fmt.Errorf("value contains a line break or NUL byte")
+	}
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'", nil
+}
+
+const (
+	mxcliPostgresConfigBegin = "# BEGIN mxcli managed connection settings"
+	mxcliPostgresConfigEnd   = "# END mxcli managed connection settings"
+)
+
+// persistUserClusterConfig makes the private endpoint a property of the
+// cluster, so it also holds for a later plain `pg_ctl -D ... start`.
+func persistUserClusterConfig(dataDir, host, port, sockDir string) error {
+	hostValue, err := postgresConfigString(host)
+	if err != nil {
+		return fmt.Errorf("quoting listen address: %w", err)
+	}
+	sockValue, err := postgresConfigString(sockDir)
+	if err != nil {
+		return fmt.Errorf("quoting socket directory: %w", err)
+	}
+	managed := fmt.Sprintf("%s\n"+
+		"listen_addresses = %s\n"+
+		"port = %s\n"+
+		"unix_socket_directories = %s\n"+
+		"unix_socket_permissions = 0700\n"+
+		"%s\n", mxcliPostgresConfigBegin, hostValue, port, sockValue, mxcliPostgresConfigEnd)
+
+	confPath := filepath.Join(dataDir, "postgresql.conf")
+	conf, err := os.ReadFile(confPath)
+	if err != nil {
+		return fmt.Errorf("reading postgresql.conf: %w", err)
+	}
+	for {
+		start := strings.Index(string(conf), mxcliPostgresConfigBegin)
+		if start < 0 {
+			break
+		}
+		relEnd := strings.Index(string(conf[start:]), mxcliPostgresConfigEnd)
+		if relEnd < 0 {
+			return fmt.Errorf("managed block in postgresql.conf is missing its end marker")
+		}
+		end := start + relEnd + len(mxcliPostgresConfigEnd)
+		if end < len(conf) && conf[end] == '\n' {
+			end++
+		}
+		conf = append(conf[:start], conf[end:]...)
+	}
+	conf = []byte(strings.TrimRight(string(conf), "\r\n"))
+	if len(conf) > 0 {
+		conf = append(conf, '\n', '\n')
+	}
+	conf = append(conf, managed...)
+	if err := writeFileAtomic(confPath, conf, 0o600); err != nil {
+		return fmt.Errorf("updating postgresql.conf: %w", err)
+	}
+	return nil
+}
+
+// rejectLegacyHostTrust prevents silent reuse of a cluster initialized by an
+// earlier development revision, which used trust for loopback TCP. Local trust
+// is expected and remains confined to the private Unix socket.
+func rejectLegacyHostTrust(dataDir string) error {
+	hbaPath := filepath.Join(dataDir, "pg_hba.conf")
+	hba, err := os.ReadFile(hbaPath)
+	if err != nil {
+		return fmt.Errorf("reading pg_hba.conf: %w", err)
+	}
+	for lineNo, line := range strings.Split(string(hba), "\n") {
+		fields := strings.Fields(strings.SplitN(line, "#", 2)[0])
+		if len(fields) < 5 || !strings.HasPrefix(fields[0], "host") {
+			continue
+		}
+		for _, field := range fields[4:] {
+			if field == "trust" {
+				return fmt.Errorf("unsafe host trust authentication in %s line %d; stop PostgreSQL, "+
+					"remove ~/.mxcli/postgres, and rerun --ensure-db", hbaPath, lineNo+1)
+			}
+		}
+	}
+	return nil
+}
+
+// clusterStatus reports whether a server is running from dataDir and, when
+// readable, its TCP port and Unix-socket directory from postmaster.pid.
+// `pg_ctl status` alone only proves that some server runs from this data directory.
+func clusterStatus(dataDir string) (running bool, port, sockDir string) {
+	if exec.Command(postgresTool("pg_ctl"), "-D", dataDir, "status").Run() != nil {
+		return false, "", ""
+	}
+	data, err := os.ReadFile(filepath.Join(dataDir, "postmaster.pid"))
+	if err != nil {
+		return true, "", "" // running, but its endpoint is unknown
+	}
+	// postmaster.pid: line 1 PID, 2 data dir, 3 start time, 4 port, 5 socket dir…
+	if lines := strings.Split(string(data), "\n"); len(lines) >= 5 {
+		return true, strings.TrimSpace(lines[3]), strings.TrimSpace(lines[4])
+	}
+	return true, "", ""
+}
+
+// startUserCluster initializes (once) and starts a PostgreSQL cluster owned by
+// the current user under ~/.mxcli/postgres, listening on host:port. It is safe
+// to run repeatedly: an initialized data directory is reused and an already
+// running server is left alone.
+func startUserCluster(host, port string, w io.Writer) error {
+	stateDir, dataDir, sockDir, err := userClusterDirs()
+	if err != nil {
+		return err
+	}
+	// Normalise an empty host so the persisted listen address is explicit even if
+	// this helper is called directly with a bare ":port".
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	if !isLocalHost(host) {
+		return fmt.Errorf("refusing to start a user-owned PostgreSQL cluster on non-local host %q", host)
+	}
+	port, err = normalizePostgresPort(port)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(sockDir, 0o700); err != nil {
+		return fmt.Errorf("creating PostgreSQL socket directory %s: %w", sockDir, err)
+	}
+	// MkdirAll ignores its mode for an existing directory. Tighten it explicitly:
+	// local trust authentication relies on this directory as its access boundary.
+	if err := os.Chmod(sockDir, 0o700); err != nil {
+		return fmt.Errorf("securing PostgreSQL socket directory %s: %w", sockDir, err)
+	}
+
+	// Initialize once — PG_VERSION marks a data directory initdb has populated.
+	if _, err := os.Stat(filepath.Join(dataDir, "PG_VERSION")); os.IsNotExist(err) {
+		fmt.Fprintln(w, "  Initializing user-owned PostgreSQL cluster...")
+		// Bootstrap superuser "postgres". trust over the private 0700 socket keeps
+		// our own provisioning password-free, but loopback TCP is scram-sha-256:
+		// binding 127.0.0.1 is not an access control on a multi-user host, so trust
+		// there would let any local account act as the postgres superuser.
+		init := exec.Command(postgresTool("initdb"), "-D", dataDir, "-U", "postgres",
+			"--auth-local=trust", "--auth-host=scram-sha-256", "--encoding=UTF8")
+		if out, err := init.CombinedOutput(); err != nil {
+			return fmt.Errorf("initializing PostgreSQL cluster in %s: %w\n%s",
+				dataDir, err, strings.TrimSpace(string(out)))
+		}
+		// An empty database is indistinguishable from a new one, so the one
+		// moment that knows the difference has to say it (ako/mxcli#866).
+		fmt.Fprintf(w, "  WARNING: created a NEW, EMPTY PostgreSQL cluster in %s.\n"+
+			"           The app's database in it starts empty: no data from any other PostgreSQL\n"+
+			"           installation is in it. If the app had data elsewhere, stop here and start that server.\n",
+			dataDir)
+	} else if err != nil {
+		return fmt.Errorf("checking PostgreSQL cluster in %s: %w", dataDir, err)
+	}
+
+	if err := rejectLegacyHostTrust(dataDir); err != nil {
+		return err
+	}
+
+	// A cluster left from an earlier --db-host satisfies `pg_ctl status` even when
+	// its endpoint differs. Validate the live endpoint before changing its future
+	// restart configuration, so a rejected request has no hidden side effect.
+	running, livePort, liveSockDir := clusterStatus(dataDir)
+	if running {
+		if livePort == "" {
+			return fmt.Errorf("a user-owned PostgreSQL cluster is running from %s, but its port "+
+				"could not be read from %s", dataDir, filepath.Join(dataDir, "postmaster.pid"))
+		}
+		if livePort != port {
+			return fmt.Errorf("a user-owned PostgreSQL cluster is already running from %s on "+
+				"port %s, but port %s was requested — stop it with `pg_ctl -D %s stop` or rerun "+
+				"with --db-host %s", dataDir, livePort, port, dataDir, net.JoinHostPort(host, livePort))
+		}
+		if liveSockDir == "" {
+			return fmt.Errorf("a user-owned PostgreSQL cluster is running from %s, but its socket "+
+				"directory could not be read from %s", dataDir, filepath.Join(dataDir, "postmaster.pid"))
+		}
+		if filepath.Clean(liveSockDir) != filepath.Clean(sockDir) {
+			return fmt.Errorf("a user-owned PostgreSQL cluster is running with socket directory %s, "+
+				"but the private directory %s is required — stop it with `pg_ctl -D %s stop` and "+
+				"rerun --ensure-db", liveSockDir, sockDir, dataDir)
+		}
+	}
+
+	if err := persistUserClusterConfig(dataDir, host, port, sockDir); err != nil {
+		return fmt.Errorf("persisting PostgreSQL connection settings in %s: %w", dataDir, err)
+	}
+	if running {
+		return nil
+	}
+
+	fmt.Fprintln(w, "  Starting user-owned PostgreSQL cluster...")
+	logPath := filepath.Join(stateDir, "server.log")
+	start := exec.Command(postgresTool("pg_ctl"), "-D", dataDir, "-w",
+		"-t", "30", "-l", logPath, "start")
+	if out, err := start.CombinedOutput(); err != nil {
+		return fmt.Errorf("starting PostgreSQL cluster in %s: %w\n%s\n  (see the server "+
+			"log at %s)", dataDir, err, strings.TrimSpace(string(out)), logPath)
+	}
+	return nil
+}
+
+// waitPGReady polls pg_isready until the server accepts connections or timeout.
+func waitPGReady(host, port string, timeout time.Duration) error {
+	if _, err := exec.LookPath("pg_isready"); err != nil {
+		// Fall back to a raw TCP check.
+		return waitTCP(net.JoinHostPort(host, port), timeout)
+	}
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		cmd := exec.Command("pg_isready", "-h", host, "-p", port)
+		if cmd.Run() == nil {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("PostgreSQL did not become ready at %s within %s", net.JoinHostPort(host, port), timeout)
+}
+
+// waitTCP polls a host:port until it accepts a connection or timeout.
+func waitTCP(hostPort string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if pingTCP(hostPort, time.Second) == nil {
+			return nil
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("%s did not accept connections within %s", hostPort, timeout)
+}
+
+// dbAdmin is a PostgreSQL superuser login supplied by the user
+// (--db-admin-user/--db-admin-password). A server whose superuser has a password
+// — every Windows install, where the installer always sets one, and there is no
+// sudo either — can be provisioned no other way (mendixlabs/mxcli#1485).
+type dbAdmin struct{ User, Password string }
+
+func (a dbAdmin) given() bool { return a.User != "" || a.Password != "" }
+
+// superuser is how we reach a PostgreSQL superuser to provision the role and
+// database: a direct `psql -U postgres` against the user-owned cluster (over its
+// private socket), `sudo -u postgres psql` over the system cluster's default
+// Unix socket (the peer-auth path used by Debian/Ubuntu), or the user's own
+// admin login over TCP.
+type superuser struct {
+	host, port string
+	// user is the role to connect as; empty means postgres. password, when set,
+	// reaches psql through PGPASSWORD, never argv, where any local user could
+	// read it from the process list.
+	user, password string
+	sock           string // Unix-socket dir for the user-owned cluster; preferred over TCP
+	sudo           bool
+	// viaRoot reaches the postgres account through root instead of directly.
+	// Devcontainers built from mcr.microsoft.com/devcontainers/base grant their
+	// non-root user sudo to root ONLY (`vscode ALL=(root) NOPASSWD:ALL`), so
+	// `sudo -u postgres` is refused there even though the user is effectively an
+	// administrator — while root may in turn target any account (#984).
+	viaRoot bool
+}
+
+// withoutPostgresTargetEnv prevents inherited libpq settings from overriding a
+// deliberately host-less sudo connection. In that path, omitting -h selects the
+// distribution's default Unix socket; an inherited PGHOST/PGHOSTADDR/PGSERVICE
+// could otherwise silently turn it back into TCP or target another cluster.
+func withoutPostgresTargetEnv(env []string) []string {
+	clean := make([]string, 0, len(env))
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		switch key {
+		case "PGHOST", "PGHOSTADDR", "PGSERVICE":
+			continue
+		}
+		clean = append(clean, entry)
+	}
+	return clean
+}
+
+// psql builds a psql command for the superuser. ON_ERROR_STOP makes a failed
+// statement a non-zero exit rather than a silent success; -X keeps a user's
+// psqlrc from changing this non-interactive provisioning session.
+func (s superuser) psql(args ...string) *exec.Cmd {
+	// Prefer the cluster's private socket: initdb set --auth-local=trust there,
+	// while loopback TCP is scram-sha-256, so the passwordless superuser can only
+	// reach itself over the socket. A system-cluster sudo connection also needs a
+	// Unix socket: changing the OS user to postgres enables peer auth, but gives no
+	// TCP password. Its requested port still selects the exact default-socket
+	// cluster. -w never prompts, so every other path fails fast.
+	host := ""
+	if s.sock != "" {
+		host = s.sock
+	} else if !s.sudo {
+		host = s.host
+	}
+	base := []string{"-X", "-v", "ON_ERROR_STOP=1", "-w"}
+	if host != "" {
+		base = append(base, "-h", host)
+	}
+	base = append(base, "-p", s.port, "-U", s.psqlUser(), "-d", "postgres")
+	if s.sudo {
+		// -n prevents sudo from opening /dev/tty for a password; psql's -w above
+		// independently prevents a database-password prompt. Omit -h to retain the
+		// system cluster's peer-authenticated Unix socket, but pass the requested
+		// port so a non-default cluster cannot fall through to port 5432.
+		sudoBase := []string{"-n", "-u", "postgres", "--", "psql"}
+		if s.viaRoot {
+			sudoBase = append([]string{"-n", "--", "sudo"}, sudoBase...)
+		}
+		cmd := exec.Command("sudo", append(sudoBase, append(base, args...)...)...)
+		cmd.Env = withoutPostgresTargetEnv(os.Environ())
+		return cmd
+	}
+	cmd := exec.Command("psql", append(base, args...)...)
+	if s.password != "" {
+		cmd.Env = append(os.Environ(), "PGPASSWORD="+s.password)
+	}
+	return cmd
+}
+
+// resolveSuperuser picks a working superuser path: the user's own admin login
+// when one is given, otherwise a direct connection (the user-owned initdb cluster
+// over its trust socket, or a plain loopback cluster — the only paths that work
+// without elevation on Arch) or `sudo -u postgres` for a system cluster.
+func resolveSuperuser(host, port string, admin dbAdmin) (superuser, error) {
+	if !isLocalHost(host) {
+		return superuser{}, fmt.Errorf("refusing to use a local PostgreSQL superuser for non-local host %q", host)
+	}
+	if admin.given() {
+		// Explicit credentials are the only path tried: falling back to sudo
+		// after they fail would hide that the user's own login was rejected.
+		su := superuser{host: host, port: port, user: admin.User, password: admin.Password}
+		out, err := su.psql("-tAc", "select 1").CombinedOutput()
+		if err != nil {
+			return superuser{}, fmt.Errorf("connecting as PostgreSQL admin %q at %s: %w\n%s",
+				su.psqlUser(), net.JoinHostPort(host, port), err, strings.TrimSpace(string(out)))
+		}
+		return su, nil
+	}
+	// Prefer our cluster's private socket (trust); fall back to a plain
+	// loopback connection for a pre-existing cluster a user pointed us at.
+	// That one also succeeds with a password from PGPASSWORD or a .pgpass file,
+	// which psql reads on its own.
+	candidates := []superuser{{host: host, port: port}}
+	if _, _, sockDir, err := userClusterDirs(); err == nil {
+		candidates = append([]superuser{{host: host, port: port, sock: sockDir}}, candidates...)
+	}
+	for _, direct := range candidates {
+		if direct.psql("-tAc", "select 1").Run() == nil {
+			return direct, nil
+		}
+	}
+	if _, err := exec.LookPath("sudo"); err == nil {
+		// Direct first; through root only if the sudoers policy refuses to target
+		// the postgres account, which is the devcontainer default.
+		for _, viaRoot := range []bool{false, true} {
+			sudo := superuser{host: host, port: port, sudo: true, viaRoot: viaRoot}
+			if sudo.psql("-tAc", "select 1").Run() == nil {
+				return sudo, nil
+			}
+		}
+	}
+	return superuser{}, errNoSuperuser
+}
+
+// errNoSuperuser is resolveSuperuser's refusal when nothing was given and no
+// passwordless path works. EnsureDatabase adds the way out, which needs the
+// app's database and role names.
+var errNoSuperuser = fmt.Errorf("no local PostgreSQL superuser available to create the " +
+	"role/database (tried a direct 'psql -U postgres' connection over the cluster socket " +
+	"and TCP, and non-interactive 'sudo -u postgres' both directly and via root)")
+
+// noSuperuserHint is the way past errNoSuperuser: the superuser's password (a
+// Windows install always has one), or the two statements to run by hand. The
+// app password is not echoed — this text lands in logs.
+func noSuperuserHint(db DBConfig) string {
+	return fmt.Sprintf("\n  If the postgres superuser has a password (the Windows installer always sets one),\n"+
+		"  pass it: --db-admin-user postgres --db-admin-password <password> (or set PGPASSWORD).\n"+
+		"  Or create the role and database yourself as a superuser, then rerun:\n"+
+		"    CREATE ROLE %s WITH LOGIN PASSWORD '<--db-password>' CREATEDB;\n"+
+		"    CREATE DATABASE %s OWNER %s;", db.User, db.Name, db.User)
+}
+
+// psqlUser is the role this superuser connects as.
+func (s superuser) psqlUser() string {
+	if s.user == "" {
+		return "postgres"
+	}
+	return s.user
+}
+
+// ensureRole creates the app login role if it does not already exist.
+func ensureRole(su superuser, db DBConfig, w io.Writer) error {
+	check := su.psql("-tAc", fmt.Sprintf("select 1 from pg_roles where rolname='%s'", db.User))
+	out, _ := check.Output()
+	if strings.TrimSpace(string(out)) == "1" {
+		return nil
+	}
+	fmt.Fprintf(w, "  Creating role %q...\n", db.User)
+	// initdb writes this setting when --auth-host=scram-sha-256 is used, but an
+	// existing system cluster can still retain PostgreSQL <=13's md5 default.
+	// Set it for this session so every role created for a SCRAM HBA record gets a
+	// compatible verifier without changing the administrator's global config.
+	ddl := fmt.Sprintf("SET standard_conforming_strings = on; SET password_encryption = 'scram-sha-256'; "+
+		"CREATE ROLE %s WITH LOGIN PASSWORD %s CREATEDB;\n",
+		db.User, quoteSQLString(db.Password))
+	// Feed the only SQL containing a secret over stdin. Passing it via `-c` would
+	// expose the database password in the process list to other local users.
+	cmd := su.psql("-f", "-")
+	cmd.Stdin = strings.NewReader(ddl)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("creating role %q: %w\n%s\n"+
+			"  (need a local postgres superuser; create the role manually if unavailable)",
+			db.User, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// ensureDatabase creates the app database owned by the app role if it is absent.
+func ensureDatabase(su superuser, db DBConfig, w io.Writer) error {
+	check := su.psql("-tAc", fmt.Sprintf("select 1 from pg_database where datname='%s'", db.Name))
+	out, _ := check.Output()
+	if strings.TrimSpace(string(out)) == "1" {
+		return nil
+	}
+	fmt.Fprintf(w, "  Creating database %q owned by %q...\n", db.Name, db.User)
+	ddl := fmt.Sprintf("CREATE DATABASE %s OWNER %s", db.Name, db.User)
+	cmd := su.psql("-c", ddl)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("creating database %q: %w\n%s", db.Name, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}

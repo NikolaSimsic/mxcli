@@ -20,11 +20,20 @@ type MicroflowBackend interface {
 	// map. Used by diff-local and other callers that have raw map data.
 	ParseMicroflowFromRaw(raw map[string]any, unitID, containerID model.ID) *microflows.Microflow
 
+	// ParseNanoflowFromRaw is ParseMicroflowFromRaw for a Microflows$Nanoflow
+	// document. nil when the map is not a nanoflow or does not decode.
+	ParseNanoflowFromRaw(raw map[string]any, unitID, containerID model.ID) *microflows.Nanoflow
+
 	// ParseMicroflowBSON parses raw microflow BSON bytes into a Microflow.
 	// Used by the executor to inspect microflows it has not necessarily
 	// loaded via ListMicroflows (e.g. to resolve a CALL MICROFLOW's return
 	// type from its raw unit).
 	ParseMicroflowBSON(contents []byte, unitID, containerID model.ID) (*microflows.Microflow, error)
+
+	// ReadBackMicroflow returns a microflow as it reads back once stored —
+	// through the writer CreateMicroflow uses and the reader, writing nothing —
+	// so a built microflow compares like for like with a stored one.
+	ReadBackMicroflow(mf *microflows.Microflow) (*microflows.Microflow, error)
 
 	ListNanoflows() ([]*microflows.Nanoflow, error)
 	GetNanoflow(id model.ID) (*microflows.Nanoflow, error)
@@ -32,6 +41,18 @@ type MicroflowBackend interface {
 	UpdateNanoflow(nf *microflows.Nanoflow) error
 	DeleteNanoflow(id model.ID) error
 	MoveNanoflow(nf *microflows.Nanoflow) error
+	// ReadBackNanoflow is ReadBackMicroflow for a nanoflow.
+	ReadBackNanoflow(nf *microflows.Nanoflow) (*microflows.Nanoflow, error)
+
+	// ListRules / GetRule read rule documents (Microflows$Rule). A rule is its
+	// own doctype, not a microflow variant: ListMicroflows does not return them,
+	// exactly as it does not return nanoflows or workflows.
+	ListRules() ([]*microflows.Rule, error)
+	GetRule(id model.ID) (*microflows.Rule, error)
+	CreateRule(rule *microflows.Rule) error
+	UpdateRule(rule *microflows.Rule) error
+	DeleteRule(id model.ID) error
+	MoveRule(rule *microflows.Rule) error
 
 	// IsRule reports whether the given qualified name refers to a rule
 	// (Microflows$Rule) rather than a microflow. The flow builder uses this

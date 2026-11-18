@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/doccomment"
 	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
@@ -215,6 +216,15 @@ func listEntity(ctx *ExecContext, name *ast.QualifiedName) error {
 
 // describeEntity handles DESCRIBE ENTITY command.
 func describeEntity(ctx *ExecContext, name ast.QualifiedName) error {
+	return describeEntityWith(ctx, name, true)
+}
+
+// describeEntityWith describes an entity, with its access rules as grants when
+// withGrants is set. `describe module` leaves them out and prints them after
+// the module's associations, which a grant may name: replayed in entity order,
+// such a grant was refused because the association did not exist yet
+// (mendixlabs/mxcli#1409).
+func describeEntityWith(ctx *ExecContext, name ast.QualifiedName, withGrants bool) error {
 	module, err := findModule(ctx, name.Module)
 	if err != nil {
 		return err
@@ -225,11 +235,13 @@ func describeEntity(ctx *ExecContext, name ast.QualifiedName) error {
 		return mdlerrors.NewBackend("get domain model", err)
 	}
 
+	lang := describeDefaultLanguage(ctx)
+
 	for _, entity := range dm.Entities {
 		if entity.Name == name.Name {
 			// Output JavaDoc documentation if present
 			if entity.Documentation != "" {
-				fmt.Fprintf(ctx.Output, "/**\n * %s\n */\n", entity.Documentation)
+				outputJavadocIndented(ctx.Output, entity.Documentation, "")
 			}
 
 			// Output position annotation
@@ -276,11 +288,24 @@ func describeEntity(ctx *ExecContext, name ast.QualifiedName) error {
 
 				// Attribute documentation
 				if attr.Documentation != "" {
-					line.WriteString(fmt.Sprintf("  /** %s */\n", attr.Documentation))
+					// The inline form only holds one line that does not itself
+					// start with `*`: the parser strips one leading `*` per line
+					// as the gutter, so anything else needs the guttered block
+					// or a markdown bullet is eaten (mendixlabs/mxcli#1428).
+					if !strings.Contains(attr.Documentation, "\n") && !strings.HasPrefix(attr.Documentation, "*") {
+						line.WriteString(fmt.Sprintf("  /** %s */\n", doccomment.Escape(attr.Documentation)))
+					} else {
+						outputJavadocIndented(&line, attr.Documentation, "  ")
+					}
 				}
 
 				typeStr := formatAttributeType(attr.Type)
 				var constraints strings.Builder
+				// A view's DateTime LocalizeDate is derived from its OQL source
+				// (#1297); stating it would pin a value that must follow it.
+				if entityType != "view" {
+					constraints.WriteString(localizeClause(attr.Type))
+				}
 
 				// Check for validation rules - try by ID first, then by name
 				attrValidations := validationsByAttr[attr.ID]
@@ -290,20 +315,14 @@ func describeEntity(ctx *ExecContext, name ast.QualifiedName) error {
 				for _, vr := range attrValidations {
 					if vr.Type == "Required" {
 						constraints.WriteString(" not null")
-						if vr.ErrorMessage != nil {
-							errMsg := vr.ErrorMessage.GetTranslation("en_US")
-							if errMsg != "" {
-								constraints.WriteString(fmt.Sprintf(" error '%s'", errMsg))
-							}
+						if errMsg := pickTextTranslation(vr.ErrorMessage, lang); errMsg != "" {
+							constraints.WriteString(" error message " + mdlQuoted(errMsg))
 						}
 					}
 					if vr.Type == "Unique" {
 						constraints.WriteString(" unique")
-						if vr.ErrorMessage != nil {
-							errMsg := vr.ErrorMessage.GetTranslation("en_US")
-							if errMsg != "" {
-								constraints.WriteString(fmt.Sprintf(" error '%s'", errMsg))
-							}
+						if errMsg := pickTextTranslation(vr.ErrorMessage, lang); errMsg != "" {
+							constraints.WriteString(" error message " + mdlQuoted(errMsg))
 						}
 					}
 				}
@@ -322,7 +341,7 @@ func describeEntity(ctx *ExecContext, name ast.QualifiedName) error {
 					defaultVal := attr.Value.DefaultValue
 					// Quote string defaults
 					if _, ok := attr.Type.(*domainmodel.StringAttributeType); ok {
-						defaultVal = fmt.Sprintf("'%s'", defaultVal)
+						defaultVal = mdlQuoted(defaultVal)
 					}
 					// Re-qualify enum defaults for MDL syntax (BSON stores just the value name)
 					if enumType, ok := attr.Type.(*domainmodel.EnumerationAttributeType); ok {
@@ -331,6 +350,11 @@ func describeEntity(ctx *ExecContext, name ast.QualifiedName) error {
 						}
 					}
 					constraints.WriteString(fmt.Sprintf(" default %s", defaultVal))
+				}
+				// In a Protected module the level decides whether other modules
+				// may use the member (mendixlabs/mxcli#1498).
+				if c := exportLevelClause(attr.ExportLevel); c != "" {
+					constraints.WriteString(" " + c)
 				}
 
 				line.WriteString(fmt.Sprintf("  %s: %s%s", attr.Name, typeStr, constraints.String()))
@@ -360,16 +384,17 @@ func describeEntity(ctx *ExecContext, name ast.QualifiedName) error {
 				fmt.Fprintf(ctx.Output, "%s%s\n", al.text, comma)
 			}
 			fmt.Fprint(ctx.Output, ")")
+			// In a Protected module an entity's export level decides whether
+			// other modules may use it (CE1406) and whether a Usable microflow
+			// may expose it (CE5400). Before a view's `as (…)`, which ends the
+			// statement's options (mendixlabs/mxcli#1498).
+			if c := exportLevelClause(entity.ExportLevel); c != "" {
+				fmt.Fprintf(ctx.Output, "\n%s", c)
+			}
 
 			// For VIEW entities, output the OQL query
 			if entityType == "view" && entity.OqlQuery != "" {
-				fmt.Fprint(ctx.Output, " as (\n")
-				// Indent OQL query lines
-				oqlLines := strings.SplitSeq(entity.OqlQuery, "\n")
-				for line := range oqlLines {
-					fmt.Fprintf(ctx.Output, "  %s\n", line)
-				}
-				fmt.Fprint(ctx.Output, ")")
+				fmt.Fprint(ctx.Output, describedViewQuery(entity.OqlQuery))
 			}
 
 			// Build attribute name map
@@ -381,12 +406,24 @@ func describeEntity(ctx *ExecContext, name ast.QualifiedName) error {
 			// Output indexes
 			for _, idx := range entity.Indexes {
 				var cols []string
+				unresolved := false
 				for _, ia := range idx.Attributes {
-					colName := attrNames[ia.AttributeID]
+					colName := indexSegmentName(ia, attrNames)
+					if colName == "" {
+						unresolved = true
+						break
+					}
 					if !ia.Ascending {
 						colName += " desc"
 					}
 					cols = append(cols, colName)
+				}
+				// A segment naming no attribute and no system member has no MDL
+				// spelling; `index ( desc)` is refused by check (#1401), so say
+				// it in a comment rather than print a statement that cannot run.
+				if unresolved {
+					fmt.Fprint(ctx.Output, "\n-- index skipped: a column points at no attribute of this entity\n")
+					continue
 				}
 				if len(cols) > 0 {
 					fmt.Fprintf(ctx.Output, "\nindex (%s)", strings.Join(cols, ", "))
@@ -419,10 +456,15 @@ func describeEntity(ctx *ExecContext, name ast.QualifiedName) error {
 
 			fmt.Fprintln(ctx.Output, ";")
 
-			// Output access rule GRANT statements
-			outputEntityAccessGrants(ctx, entity, name.Module, name.Name)
+			// RegEx and Range rules are standalone statements, not attribute
+			// constraints like Required/Unique above, so they follow the entity.
+			outputEntityValidationRules(ctx, entity, name.Module, name.Name, attrNames)
 
-			fmt.Fprintln(ctx.Output, "/")
+			// Output access rule GRANT statements
+			if withGrants {
+				outputEntityAccessGrants(ctx, entity, name.Module, name.Name)
+			}
+
 			return nil
 		}
 	}

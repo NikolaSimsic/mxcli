@@ -47,7 +47,7 @@ func (b *Backend) CreateConstant(c *model.Constant) error {
 // set it directly (same as an attribute's type), so a type change is rejected
 // rather than silently ignored.
 func (b *Backend) UpdateConstant(c *model.Constant) error {
-	mod, err := b.GetModule(c.ContainerID)
+	modName, err := b.moduleNameForContainer(c.ContainerID)
 	if err != nil {
 		return fmt.Errorf("resolve module for constant %q: %w", c.Name, err)
 	}
@@ -55,7 +55,7 @@ func (b *Backend) UpdateConstant(c *model.Constant) error {
 	if err != nil {
 		return err
 	}
-	qn := mod.Name + "." + c.Name
+	qn := modName + "." + c.Name
 	if live, err := b.liveConstantType(qn); err == nil && live != "" && live != pedType {
 		return fmt.Errorf("constant %q: changing its type (%s -> %s) is not supported by the MCP backend — PED can't set the type element in place; drop and recreate, or edit in Studio Pro", c.Name, live, pedType)
 	}
@@ -66,7 +66,7 @@ func (b *Backend) UpdateConstant(c *model.Constant) error {
 	if err := b.pedUpdateDoc(constantDocType, qn, ops...); err != nil {
 		return err
 	}
-	b.markDirty(mod.Name)
+	b.markDirty(modName)
 	b.upsertSessionConstant(c)
 	return b.pedCheckDocument(constantDocType, qn)
 }
@@ -102,8 +102,8 @@ func (b *Backend) liveConstantType(qn string) (string, error) {
 	return k, nil
 }
 
-// DeleteConstant drops a constant via Concord's delete_document (PED has no delete
-// tool). Requires --mcp-concord; errors clearly otherwise.
+// DeleteConstant drops a constant via deleteDocument: ped_delete_document
+// (Studio Pro 11.16+).
 func (b *Backend) DeleteConstant(id model.ID) error {
 	c, err := b.GetConstant(id)
 	if err != nil {
@@ -113,7 +113,7 @@ func (b *Backend) DeleteConstant(id model.ID) error {
 	if err != nil {
 		return fmt.Errorf("resolve module for constant %q: %w", c.Name, err)
 	}
-	if err := b.concordDeleteDocument(modName, c.Name); err != nil {
+	if err := b.deleteDocument(constantDocType, modName, c.Name); err != nil {
 		return err
 	}
 	b.forgetSessionConstant(modName, c.Name)
@@ -167,7 +167,7 @@ func (b *Backend) upsertSessionConstant(c *model.Constant) {
 func (b *Backend) forgetSessionConstant(moduleName, name string) {
 	out := b.sessionConstants[:0]
 	for _, c := range b.sessionConstants {
-		if mod, err := b.GetModule(c.ContainerID); err == nil && mod.Name == moduleName && c.Name == name {
+		if mod, err := b.moduleNameForContainer(c.ContainerID); err == nil && mod == moduleName && c.Name == name {
 			continue
 		}
 		out = append(out, c)

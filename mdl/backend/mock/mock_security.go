@@ -3,6 +3,8 @@
 package mock
 
 import (
+	"fmt"
+
 	"github.com/mendixlabs/mxcli/mdl/backend"
 	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
@@ -30,9 +32,51 @@ func (m *MockBackend) SetProjectDemoUsersEnabled(unitID model.ID, enabled bool) 
 	return nil
 }
 
+func (m *MockBackend) SetProjectAdminUserName(unitID model.ID, name string) error {
+	if m.SetProjectAdminUserNameFunc != nil {
+		return m.SetProjectAdminUserNameFunc(unitID, name)
+	}
+	return fmt.Errorf("MockBackend.SetProjectAdminUserName not configured")
+}
+
+func (m *MockBackend) SetProjectAdminUserRole(unitID model.ID, role string) error {
+	if m.SetProjectAdminUserRoleFunc != nil {
+		return m.SetProjectAdminUserRoleFunc(unitID, role)
+	}
+	return fmt.Errorf("MockBackend.SetProjectAdminUserRole not configured")
+}
+
+func (m *MockBackend) SetProjectAdminPassword(unitID model.ID, password string) error {
+	if m.SetProjectAdminPasswordFunc != nil {
+		return m.SetProjectAdminPasswordFunc(unitID, password)
+	}
+	return fmt.Errorf("MockBackend.SetProjectAdminPassword not configured")
+}
+
+func (m *MockBackend) SetProjectStrictMode(unitID model.ID, enabled bool) error {
+	if m.SetProjectStrictModeFunc != nil {
+		return m.SetProjectStrictModeFunc(unitID, enabled)
+	}
+	return fmt.Errorf("MockBackend.SetProjectStrictMode not configured")
+}
+
+func (m *MockBackend) SetProjectGuestAccess(unitID model.ID, enabled bool, guestUserRole string) error {
+	if m.SetProjectGuestAccessFunc != nil {
+		return m.SetProjectGuestAccessFunc(unitID, enabled, guestUserRole)
+	}
+	return fmt.Errorf("MockBackend.SetProjectGuestAccess not configured")
+}
+
 func (m *MockBackend) AddUserRole(unitID model.ID, name string, moduleRoles []string, manageAllRoles bool) error {
 	if m.AddUserRoleFunc != nil {
 		return m.AddUserRoleFunc(unitID, name, moduleRoles, manageAllRoles)
+	}
+	return nil
+}
+
+func (m *MockBackend) SetUserRoleProperties(unitID model.ID, userRoleName string, props backend.UserRoleProperties) error {
+	if m.SetUserRolePropertiesFunc != nil {
+		return m.SetUserRolePropertiesFunc(unitID, userRoleName, props)
 	}
 	return nil
 }

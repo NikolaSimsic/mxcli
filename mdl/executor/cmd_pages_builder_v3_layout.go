@@ -3,9 +3,11 @@
 package executor
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
 	"github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/pages"
@@ -21,10 +23,20 @@ func (pb *pageBuilder) buildLayoutGridV3(w *ast.WidgetV3) (*pages.LayoutGrid, er
 			Name: w.Name,
 		},
 	}
+	// Width: FullWidth | FixedWidth (ako/mxcli-ledger FINDINGS #170).
+	width, err := layoutGridWidth(w)
+	if err != nil {
+		return nil, mdlerrors.NewValidation(err.Error())
+	}
+	lg.Width = width
 
 	// Build rows from children
 	for _, child := range w.Children {
 		if strings.ToLower(child.Type) == "row" {
+			// Built here, not by buildWidgetV3 (ako/mxcli#1698).
+			if err := refuseNativeWidgetProps(pb.ctx, "layoutgrid row", child); err != nil {
+				return nil, err
+			}
 			row, err := pb.buildLayoutGridRowV3(child)
 			if err != nil {
 				return nil, err
@@ -42,11 +54,42 @@ func (pb *pageBuilder) buildLayoutGridRowV3(w *ast.WidgetV3) (*pages.LayoutGridR
 			ID:       model.ID(types.GenerateID()),
 			TypeName: "Forms$LayoutGridRow",
 		},
+		Class:          w.GetClass(),
+		Style:          w.GetStyle(),
+		DynamicClasses: w.GetDynamicClasses(),
+	}
+	var err error
+	if row.DesignProperties, err = designPropertyValuesV3(w, "LayoutGridRow", pb.themeRegistry); err != nil {
+		return nil, fmt.Errorf("layout grid row: %w", err)
+	}
+	if row.VerticalAlignment, err = layoutGridAlignment(w, "VerticalAlignment"); err != nil {
+		return nil, err
+	}
+	if row.HorizontalAlignment, err = layoutGridAlignment(w, "HorizontalAlignment"); err != nil {
+		return nil, err
+	}
+	if raw, ok := lookupPropCI(w, "SpacingBetweenColumns"); ok {
+		v, err := propBool(raw)
+		if err != nil {
+			return nil, fmt.Errorf("layout grid row SpacingBetweenColumns: %w", err)
+		}
+		row.NoSpacingBetweenColumns = !v
+	}
+	// A row's own visibility (Forms$LayoutGridRow.ConditionalVisibilitySettings).
+	// Like a tab page, a row is built here and not by buildWidgetV3, whose tail
+	// applies Visible: to every widget, so it was parsed and dropped
+	// (mendixlabs/mxcli#1461).
+	if row.ConditionalVisibility, err = pb.childVisibility(w); err != nil {
+		return nil, err
 	}
 
 	// Build columns from children
 	for _, child := range w.Children {
 		if strings.ToLower(child.Type) == "column" {
+			// Built here, not by buildWidgetV3 (ako/mxcli#1698).
+			if err := refuseNativeWidgetProps(pb.ctx, "layoutgrid column", child); err != nil {
+				return nil, err
+			}
 			col, err := pb.buildLayoutGridColumnV3(child)
 			if err != nil {
 				return nil, err
@@ -64,43 +107,27 @@ func (pb *pageBuilder) buildLayoutGridColumnV3(w *ast.WidgetV3) (*pages.LayoutGr
 			ID:       model.ID(types.GenerateID()),
 			TypeName: "Forms$LayoutGridColumn",
 		},
-		Weight: 1,
+		Weight:         1,
+		Class:          w.GetClass(),
+		Style:          w.GetStyle(),
+		DynamicClasses: w.GetDynamicClasses(),
+	}
+	var err error
+	if col.DesignProperties, err = designPropertyValuesV3(w, "LayoutGridColumn", pb.themeRegistry); err != nil {
+		return nil, fmt.Errorf("layout grid column: %w", err)
+	}
+	if col.VerticalAlignment, err = layoutGridAlignment(w, "VerticalAlignment"); err != nil {
+		return nil, err
 	}
 
-	// Handle DesktopWidth
 	if dw := w.GetDesktopWidth(); dw != nil {
-		switch v := dw.(type) {
-		case int:
-			col.Weight = v
-		case string:
-			if strings.EqualFold(v, "autofill") {
-				col.Weight = -1 // Auto
-			}
-		}
+		col.Weight = layoutGridWeight(dw, col.Weight)
 	}
-
-	// Handle TabletWidth
 	if tw := w.Properties["TabletWidth"]; tw != nil {
-		switch v := tw.(type) {
-		case int:
-			col.TabletWeight = v
-		case string:
-			if strings.EqualFold(v, "autofill") {
-				col.TabletWeight = -1
-			}
-		}
+		col.TabletWeight = layoutGridWeight(tw, col.TabletWeight)
 	}
-
-	// Handle PhoneWidth
 	if pw := w.Properties["PhoneWidth"]; pw != nil {
-		switch v := pw.(type) {
-		case int:
-			col.PhoneWeight = v
-		case string:
-			if strings.EqualFold(v, "autofill") {
-				col.PhoneWeight = -1
-			}
-		}
+		col.PhoneWeight = layoutGridWeight(pw, col.PhoneWeight)
 	}
 
 	// Build child widgets
@@ -113,6 +140,49 @@ func (pb *pageBuilder) buildLayoutGridColumnV3(w *ast.WidgetV3) (*pages.LayoutGr
 	}
 
 	return col, nil
+}
+
+// layoutGridAlignment reads a row's or column's VerticalAlignment /
+// HorizontalAlignment: Start, Center or End (any case), "" when unset — which
+// the writer stores as Mendix's default, None.
+func layoutGridAlignment(w *ast.WidgetV3, key string) (string, error) {
+	raw, ok := lookupPropCI(w, key)
+	if !ok {
+		return "", nil
+	}
+	if s, ok := raw.(string); ok {
+		for _, a := range []string{"None", "Start", "Center", "End"} {
+			if strings.EqualFold(s, a) {
+				return a, nil
+			}
+		}
+	}
+	return "", mdlerrors.NewValidationf("layout grid %s %s: invalid value %v (expected Start, Center or End)",
+		strings.ToLower(w.Type), key, raw)
+}
+
+// Stored layout-grid column weights besides 1..12.
+const (
+	layoutGridWeightAutoFill = -1
+	layoutGridWeightAutoFit  = -2 // "Auto-fit content" in Studio Pro
+)
+
+// layoutGridWeight maps a DesktopWidth / TabletWidth / PhoneWidth value to the
+// stored weight: a number as-is, AutoFill to -1, AutoFit to -2. Any other value
+// keeps current.
+func layoutGridWeight(v any, current int) int {
+	switch v := v.(type) {
+	case int:
+		return v
+	case string:
+		switch {
+		case strings.EqualFold(v, "autofill"):
+			return layoutGridWeightAutoFill
+		case strings.EqualFold(v, "autofit"):
+			return layoutGridWeightAutoFit
+		}
+	}
+	return current
 }
 
 // buildContainerWithRowV3 creates a Container holding a LayoutGrid with one row.
@@ -141,6 +211,12 @@ func (pb *pageBuilder) buildContainerWithRowV3(w *ast.WidgetV3) (*pages.Containe
 	if err != nil {
 		return nil, err
 	}
+	// The appearance written on a top-level `row` is the container's
+	// (applyWidgetAppearance sets it there); writing it on the row too would
+	// apply every class and design property twice.
+	// Its Visible: likewise (buildWidgetV3's tail sets it on the container).
+	row.Class, row.Style, row.DynamicClasses, row.DesignProperties = "", "", "", nil
+	row.ConditionalVisibility = nil
 	lg.Rows = append(lg.Rows, row)
 	container.Widgets = append(container.Widgets, lg)
 
@@ -180,6 +256,8 @@ func (pb *pageBuilder) buildContainerWithColumnV3(w *ast.WidgetV3) (*pages.Conta
 	if err != nil {
 		return nil, err
 	}
+	// The container carries a top-level `column`'s appearance, as for `row`.
+	col.Class, col.Style, col.DynamicClasses, col.DesignProperties = "", "", "", nil
 	row.Columns = append(row.Columns, col)
 	lg.Rows = append(lg.Rows, row)
 	container.Widgets = append(container.Widgets, lg)
@@ -198,9 +276,29 @@ func (pb *pageBuilder) buildContainerV3(w *ast.WidgetV3) (*pages.Container, erro
 		},
 	}
 
-	// Handle RenderMode
+	// Handle RenderMode. The codec stores it verbatim, so an unknown member is
+	// refused here rather than written into a document Studio Pro cannot open.
 	if rm := w.GetRenderMode(); rm != "" {
-		container.RenderMode = pages.ContainerRenderMode(rm)
+		mode, ok := pages.CanonicalContainerRenderMode(rm)
+		if !ok {
+			names := make([]string, len(pages.ContainerRenderModes))
+			for i, m := range pages.ContainerRenderModes {
+				names[i] = string(m)
+			}
+			return nil, mdlerrors.NewValidationf("container %q: unknown RenderMode %q — valid modes are %s",
+				w.Name, rm, strings.Join(names, ", "))
+		}
+		container.RenderMode = mode
+	}
+
+	// Handle Action / OnClick property — a Container is clickable in Mendix via
+	// its OnClickAction (Forms$DivContainer.onClickAction). See issue #603.
+	if action := w.GetAction(); action != nil {
+		clientAction, err := pb.buildClientActionV3(action)
+		if err != nil {
+			return nil, err
+		}
+		container.OnClickAction = clientAction
 	}
 
 	// Build child widgets
@@ -245,6 +343,10 @@ func (pb *pageBuilder) buildTabContainerV3(w *ast.WidgetV3) (*pages.TabContainer
 }
 
 func (pb *pageBuilder) buildTabPageV3(w *ast.WidgetV3) (*pages.TabPage, error) {
+	// A key the vocabulary accepts and Forms$TabPage cannot hold (#1465).
+	if err := refuseTabPageDroppedProps(pb.ctx, w); err != nil {
+		return nil, err
+	}
 	tp := &pages.TabPage{
 		BaseElement: model.BaseElement{
 			ID:       model.ID(types.GenerateID()),
@@ -260,8 +362,22 @@ func (pb *pageBuilder) buildTabPageV3(w *ast.WidgetV3) (*pages.TabPage, error) {
 				ID:       model.ID(types.GenerateID()),
 				TypeName: "Texts$Text",
 			},
-			Translations: map[string]string{"en_US": caption},
+			Translations: map[string]string{pb.textLang(): caption},
 		}
+	}
+
+	// Visibility: a tab page bypasses buildWidgetV3, whose common tail applies
+	// it to every widget, so it is applied here — it used to be parsed and
+	// dropped, the tab always visible (mendixlabs/mxcli#1465).
+	cvs, err := pb.childVisibility(w)
+	if err != nil {
+		return nil, err
+	}
+	tp.ConditionalVisibility = cvs
+
+	// Its badge (mendixlabs/mxcli#1644, tabpage_badge.go).
+	if tp.Badge, err = pb.buildTabPageBadge(w); err != nil {
+		return nil, err
 	}
 
 	// Build child widgets
@@ -301,7 +417,7 @@ func (pb *pageBuilder) buildGroupBoxV3(w *ast.WidgetV3) (*pages.GroupBox, error)
 					ID:       model.ID(types.GenerateID()),
 					TypeName: "Texts$Text",
 				},
-				Translations: map[string]string{"en_US": caption},
+				Translations: map[string]string{pb.textLang(): caption},
 			},
 		}
 	}
@@ -423,4 +539,22 @@ func (pb *pageBuilder) buildControlBarV3(w *ast.WidgetV3) (*pages.Container, err
 	}
 
 	return controlBar, nil
+}
+
+// childVisibility is the ConditionalVisibilitySettings for `Visible:` on an
+// element its parent builds outside buildWidgetV3 — a tab page (#1465) or a
+// layout-grid row (#1461) — in either form: an expression, or `Attr in (…)` —
+// plus any `Visible: roles (…)` (#1460). nil when there is none.
+func (pb *pageBuilder) childVisibility(w *ast.WidgetV3) (*pages.ConditionalVisibilitySettings, error) {
+	if err := refuseRolesInVisibility(w); err != nil {
+		return nil, err
+	}
+	if vw, ok := w.Properties["VisibleWhen"].(*ast.VisibleWhenV3); ok && vw != nil {
+		cvs, err := pb.visibleWhenSettings(w, vw)
+		if err != nil {
+			return nil, err
+		}
+		return withVisibleRoles(cvs, w), nil
+	}
+	return withVisibleRoles(expressionVisibility(w), w), nil
 }

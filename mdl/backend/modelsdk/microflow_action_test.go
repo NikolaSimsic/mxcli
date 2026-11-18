@@ -5,8 +5,11 @@ package modelsdkbackend
 import (
 	"testing"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
+
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/modelsdk/codec"
+	"github.com/mendixlabs/mxcli/modelsdk/element"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
 )
 
@@ -191,5 +194,176 @@ func TestMicroflowActionToGen_ExecuteDatabaseQuery(t *testing.T) {
 	}
 	if g.TypeName() != "DatabaseConnector$ExecuteDatabaseQueryAction" {
 		t.Errorf("$Type = %q, want DatabaseConnector$ExecuteDatabaseQueryAction", g.TypeName())
+	}
+}
+
+// TestMicroflowActionToGen_JavaScriptActionCall guards finding #11: a
+// `call javascript action` (e.g. NanoflowCommons.OpenURL) must convert to a
+// Microflows$JavaScriptActionCallAction. Before the fix the modelsdk engine had
+// no case for it, so it returned nil → the ActionActivity was written without an
+// Action (`-- Empty action`), failing the build with CE0008 "No action defined."
+// and CE0109 on the now-missing output variable. This affects both microflows
+// and nanoflows (nanoflows reuse microflowActionToGen).
+func TestMicroflowActionToGen_JavaScriptActionCall(t *testing.T) {
+	g := microflowActionToGen(&microflows.JavaScriptActionCallAction{
+		JavaScriptAction:   "NanoflowCommons.OpenURL",
+		OutputVariableName: "Opened",
+		UseReturnVariable:  true,
+		ParameterMappings: []*microflows.JavaScriptActionParameterMapping{
+			{Parameter: "NanoflowCommons.OpenURL.url", Value: &microflows.ExpressionBasedCodeActionParameterValue{Expression: "$Active/Link"}},
+		},
+	})
+	if g == nil {
+		t.Fatal("nil action (CE0008/CE0109 regression — JS action call dropped on write)")
+	}
+	if g.TypeName() != "Microflows$JavaScriptActionCallAction" {
+		t.Errorf("$Type = %q, want Microflows$JavaScriptActionCallAction", g.TypeName())
+	}
+	// The whole subtree must encode cleanly (guards a missing list marker / mistyped property).
+	if _, err := (&codec.Encoder{}).Encode(g); err != nil {
+		t.Errorf("encode: %v", err)
+	}
+	// JS parameter mappings use the "ParameterValue" storage key, not the
+	// Java-style "Value" — the read side and legacy serializer both key off it.
+	var mappings []element.Element
+	for _, p := range g.Properties() {
+		if p.Name() == "ParameterMappings" {
+			if lst, ok := p.(element.ChildListProperty); ok {
+				mappings = lst.ChildElements()
+			}
+		}
+	}
+	if len(mappings) != 1 {
+		t.Fatalf("ParameterMappings = %d, want 1", len(mappings))
+	}
+	var hasParameterValue, hasWrongValueKey bool
+	for _, p := range mappings[0].Properties() {
+		switch p.Name() {
+		case "ParameterValue":
+			hasParameterValue = true
+		case "Value":
+			hasWrongValueKey = true
+		}
+	}
+	if !hasParameterValue {
+		t.Error("mapping missing ParameterValue key (JS uses ParameterValue, not Value)")
+	}
+	if hasWrongValueKey {
+		t.Error("mapping emits the Java-style Value key instead of ParameterValue")
+	}
+}
+
+// TestActionFromGen_WorkflowActions guards FINDINGS #54: the modelsdk read path
+// had no case for the workflow microflow actions (SET TASK OUTCOME / OPEN USER
+// TASK / NOTIFY WORKFLOW), so DESCRIBE rendered them as "-- Empty action" and a
+// describe→drop→exec round-trip silently dropped them. Each must survive a
+// write→encode→decode→read round-trip (the real describe path) with its fields
+// intact.
+func TestActionFromGen_WorkflowActions(t *testing.T) {
+	// readBack encodes the write-path gen element to BSON and decodes it through
+	// the codec registry — the concrete *genMf.* type the read path sees — then
+	// runs actionFromGen, exactly as DESCRIBE does.
+	readBack := func(t *testing.T, action microflows.MicroflowAction) microflows.MicroflowAction {
+		t.Helper()
+		raw, err := (&codec.Encoder{}).Encode(microflowActionToGen(action))
+		if err != nil {
+			t.Fatalf("encode: %v", err)
+		}
+		el, err := codec.NewDecoder(codec.DefaultRegistry).Decode(bson.Raw(raw))
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		return actionFromGen(el)
+	}
+
+	setOutcome := &microflows.SetTaskOutcomeAction{OutcomeValue: "Approve", WorkflowTaskVariable: "UserTask"}
+	setOutcome.ID = "id-set"
+	if got, ok := readBack(t, setOutcome).(*microflows.SetTaskOutcomeAction); !ok {
+		t.Fatalf("SetTaskOutcome read back as %T (Empty-action regression)", readBack(t, setOutcome))
+	} else if got.OutcomeValue != "Approve" || got.WorkflowTaskVariable != "UserTask" {
+		t.Errorf("SetTaskOutcome fields lost: %+v", got)
+	}
+
+	openTask := &microflows.OpenUserTaskAction{UserTaskVariable: "UserTask"}
+	openTask.ID = "id-open"
+	if got, ok := readBack(t, openTask).(*microflows.OpenUserTaskAction); !ok {
+		t.Fatalf("OpenUserTask read back as %T", readBack(t, openTask))
+	} else if got.UserTaskVariable != "UserTask" {
+		t.Errorf("OpenUserTask field lost: %+v", got)
+	}
+
+	notify := &microflows.NotifyWorkflowAction{WorkflowVariable: "Wf"}
+	notify.ID = "id-notify"
+	if got, ok := readBack(t, notify).(*microflows.NotifyWorkflowAction); !ok {
+		t.Fatalf("NotifyWorkflow read back as %T (Empty-action regression)", readBack(t, notify))
+	} else if got.WorkflowVariable != "Wf" {
+		t.Errorf("NotifyWorkflow WorkflowVariable lost: %+v", got)
+	}
+}
+
+// TestMicroflowActionToGen_JavaScriptActionEntityTypeParameter pins the BSON the
+// write path produces for a JavaScript-action entity-type parameter
+// (mendixlabs/mxcli#1137). The reported symptom was an `mxcli bson dump`
+// showing
+//
+//	"$Type": "Microflows$BasicCodeActionParameterValue",
+//	"Argument": "CustomModule.BufferDefinition"
+//
+// where Studio Pro stores $Type Microflows$EntityTypeCodeActionParameterValue
+// with the entity under the "Entity" key. The wrong shape leaves the Studio Pro
+// entity picker empty and fails mxbuild with CE0115 (measured on 11.6.6).
+// The builder chooses the value (mdl/executor); this asserts the chosen value
+// survives to BSON under the right $Type and key rather than being flattened on
+// the way out.
+func TestMicroflowActionToGen_JavaScriptActionEntityTypeParameter(t *testing.T) {
+	g := microflowActionToGen(&microflows.JavaScriptActionCallAction{
+		JavaScriptAction: "NanoflowCommons.RefreshEntity",
+		ParameterMappings: []*microflows.JavaScriptActionParameterMapping{
+			{
+				Parameter: "NanoflowCommons.RefreshEntity.EntityToRefresh",
+				Value:     &microflows.EntityTypeCodeActionParameterValue{Entity: "CustomModule.BufferDefinition"},
+			},
+		},
+	})
+	if g == nil {
+		t.Fatal("nil action")
+	}
+	encoded, err := (&codec.Encoder{}).Encode(g)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+
+	mappings, err := bson.Raw(encoded).LookupErr("ParameterMappings")
+	if err != nil {
+		t.Fatalf("no ParameterMappings in encoded action: %v", err)
+	}
+	vals, err := mappings.Array().Values()
+	if err != nil {
+		t.Fatalf("ParameterMappings array: %v", err)
+	}
+	// Element 0 is Mendix's typed-array marker (an int), not a mapping.
+	var docs []bson.Raw
+	for _, v := range vals {
+		if doc, ok := v.DocumentOK(); ok {
+			docs = append(docs, doc)
+		}
+	}
+	if len(docs) != 1 {
+		t.Fatalf("ParameterMappings documents = %d, want 1", len(docs))
+	}
+	value, err := docs[0].LookupErr("ParameterValue")
+	if err != nil {
+		t.Fatalf("mapping has no ParameterValue: %v", err)
+	}
+	valueDoc := value.Document()
+
+	if got := valueDoc.Lookup("$Type").StringValue(); got != "Microflows$EntityTypeCodeActionParameterValue" {
+		t.Fatalf("$Type = %q, want Microflows$EntityTypeCodeActionParameterValue", got)
+	}
+	if got := valueDoc.Lookup("Entity").StringValue(); got != "CustomModule.BufferDefinition" {
+		t.Errorf("Entity = %q, want CustomModule.BufferDefinition", got)
+	}
+	if _, err := valueDoc.LookupErr("Argument"); err == nil {
+		t.Error("value carries an Argument key; that is the BasicCodeActionParameterValue shape")
 	}
 }

@@ -1,3 +1,4 @@
+mdl 1;
 -- Bug test: SNIPPETCALL on a parameterized snippet without Params should error.
 -- Issue #291: mxcli silently wrote a corrupt PageParameterMapping with null Variable.
 -- After the fix: mxcli returns a validation error when Params are omitted.
@@ -8,9 +9,8 @@
 -- The correct call is:
 --   SNIPPETCALL call1 (Snippet: Mod.MySnippet, Params: {Asset: $Asset})
 
-CREATE SNIPPET Mod.MySnippet (
-  Params: { $Asset: Mod.Asset },
-  Folder: 'Snippets'
+CREATE SNIPPET Mod.MySnippet FOLDER 'Snippets' (
+  Params: ( $Asset: Mod.Asset )
 ) {
   DYNAMICTEXT txt1 (Content: 'Hello')
 };

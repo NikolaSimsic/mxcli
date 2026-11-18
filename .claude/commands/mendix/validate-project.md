@@ -1,3 +1,7 @@
+---
+description: Validate the project with mxbuild and report the errors
+---
+
 # Validate Project
 
 Run Mendix's `mx check` command to validate the project for errors.
@@ -6,7 +10,7 @@ This is the same validation that Studio Pro performs - it checks for consistency
 
 ## Prerequisites
 
-The `mx` command must be available. In a dev container, run `mxcli setup mxbuild -p app.mpr` to auto-download it.
+The `mx` command must be available; `mxcli docker check` does not download it. In a dev container, run `mxcli setup mxbuild -p app.mpr` once to download it.
 
 **Where to find `mx`:**
 
@@ -19,14 +23,11 @@ The `mx` command must be available. In a dev container, run `mxcli setup mxbuild
 ## Command
 
 ```bash
-# In dev container (after mxcli setup mxbuild -p app.mpr)
-~/.mxcli/mxbuild/*/modeler/mx check app.mpr
-
-# Or use the integrated command (auto-downloads mxbuild)
+# After mxcli setup mxbuild -p app.mpr (docker check does not download mxbuild)
 mxcli docker check -p app.mpr
 
-# With explicit path
-/path/to/mxbuild/modeler/mx check /path/to/project.mpr
+# With an explicit MxBuild (still checks a temporary copy; bare `mx check` writes into the project)
+mxcli docker check -p app.mpr --mxbuild-path /path/to/mxbuild
 ```
 
 ## Example Output
@@ -54,6 +55,21 @@ Found 1 error(s) and 1 warning(s)
 | CW0xxx | Warning | Warning - should be reviewed |
 | CD0xxx | Deprecation | Deprecated feature usage |
 
+## Reading CE0463
+
+`mxcli docker check` checks the project as stored, and labels each CE0463 ("The
+definition of this widget has changed") after re-checking a temporary copy with the
+widgets resynced:
+
+- `stale widget definition — mxcli fix widgets fixes it`: the widget is older than its
+  installed package. Run `mxcli fix widgets -p app.mpr` (never bare `mx update-widgets`
+  on an MPR v2 project: it deletes `mprcontents/`).
+- `persists after update-widgets`: a resync does not clear it; something in the stored
+  widget is wrong. If mxcli wrote the widget, report it.
+
+`--update-widgets` checks only the resynced copy and hides the stale ones, which still
+fail MxBuild and `mxcli run --local`; do not use it to decide that the project builds.
+
 ## When to Use
 
 - After making changes with mxcli to verify they're valid
@@ -63,22 +79,22 @@ Found 1 error(s) and 1 warning(s)
 
 ## Workflow
 
-1. Make changes with mxcli:
+1. Make changes with an mxcli script that starts with `mdl 1;`, and execute it
+   (`./mxcli exec changes.mdl -p MyApp.mpr`). `exec` writes the project as it
+   runs; there is nothing to save or disconnect afterwards.
    ```sql
-   CREATE ENTITY Sales.Product (...);
+   mdl 1;
+   create persistent entity Sales.Product (
+     Name: string(200)
+   );
    ```
 
-2. Disconnect to save changes:
-   ```sql
-   DISCONNECT;
-   ```
-
-3. Validate with mx check:
+2. Validate with mx check:
    ```bash
    mx check MyApp.mpr
    ```
 
-4. Fix any errors and repeat
+3. Fix any errors and repeat
 
 ## Tips
 

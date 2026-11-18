@@ -6,54 +6,80 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/mendixlabs/mxcli/mdl/ast"
+	mdlerrors "github.com/mendixlabs/mxcli/mdl/errors"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/security"
 )
 
-const (
-	autoDocumentRoleName        = "User"
-	autoDocumentRoleDescription = "Auto-created default role for mxcli document access"
-)
-
-// defaultDocumentAccessRoles returns a conservative fallback role set for newly
-// created pages/microflows when the target module has no module roles at all.
+// checkDocumentAccessRolesSameModule rejects granting a document (page,
+// microflow, nanoflow, or a published OData/REST service) access to a module role
+// from a different module than the document. Mendix stores document access as
+// references to the document's OWN module roles only — Studio Pro's role picker
+// only offers the containing module's roles — so a cross-module reference builds
+// with CE0148 ("reselect roles") even though it is otherwise well-formed. Without
+// this guard the grant writes an invalid reference that passes mxcli but fails the
+// Mendix build with an opaque error. The MOVE path enforces the same rule by
+// remapping to same-named target-module roles (see remapDocumentAccessRoles); on
+// an explicit GRANT we reject instead, so a wrong role or wrong document is not
+// silently substituted.
 //
-// Mendix accepts document access only when it references a role from the same
-// module; using an existing role from another module causes CE0148 on freshly
-// created documents. To keep mx-check green, auto-create a local `User` module
-// role only for modules that currently have zero roles. Modules that already
-// manage their own roles keep the existing "no access by default" behavior.
-func defaultDocumentAccessRoles(ctx *ExecContext, module *model.Module) []model.ID {
-	if module == nil {
-		return nil
+// docKind/docName are used only for the message; docModule is the document's module.
+func checkDocumentAccessRolesSameModule(docKind, docModule, docName string, roles []ast.QualifiedName) error {
+	for _, role := range roles {
+		if role.Module != docModule {
+			return mdlerrors.NewValidationf(
+				"cannot grant %s %s.%s access to %s.%s: a %s can only reference module roles from its own module %q "+
+					"(Mendix rejects a cross-module document role with CE0148 \"reselect roles\"). "+
+					"Grant a %s module role instead — e.g. %s.%s if it exists — and map the user role to it.",
+				docKind, docModule, docName, role.Module, role.Name,
+				docKind, docModule,
+				docModule, docModule, role.Name)
+		}
 	}
-
-	ms, err := ctx.Backend.GetModuleSecurity(module.ID)
-	if err != nil || ms == nil {
-		return nil
-	}
-	if moduleUsesAutoDocumentRole(ms) {
-		return []model.ID{model.ID(module.Name + "." + autoDocumentRoleName)}
-	}
-	if len(ms.ModuleRoles) > 0 {
-		return nil
-	}
-
-	if err := ctx.Backend.AddModuleRole(ms.ID, autoDocumentRoleName, autoDocumentRoleDescription); err != nil {
-		return nil
-	}
-	return []model.ID{model.ID(module.Name + "." + autoDocumentRoleName)}
+	return nil
 }
 
-func moduleUsesAutoDocumentRole(ms *security.ModuleSecurity) bool {
-	if ms == nil {
-		return false
+// validateCrossModuleGrant applies the CE0148 guard above to a GRANT statement
+// without touching the project, so `check --references` reports it instead of
+// letting exec fail partway through a script (#836). mxcli does not run a script
+// in a single transaction, so a grant that only fails at exec time leaves every
+// preceding statement applied — exactly what a pre-flight check exists to avoid.
+//
+// The document's module is taken from the statement's own qualified name rather
+// than from the resolved document: the comparison is the same, and this keeps
+// the check usable before the document exists (it may be created earlier in the
+// same script).
+//
+// Statements other than the five document-access grants return nil.
+func validateCrossModuleGrant(stmt ast.Statement) error {
+	switch s := stmt.(type) {
+	case *ast.GrantMicroflowAccessStmt:
+		return checkDocumentAccessRolesSameModule("microflow", s.Microflow.Module, s.Microflow.Name, s.Roles)
+	case *ast.GrantNanoflowAccessStmt:
+		return checkDocumentAccessRolesSameModule("nanoflow", s.Nanoflow.Module, s.Nanoflow.Name, s.Roles)
+	case *ast.GrantPageAccessStmt:
+		return checkDocumentAccessRolesSameModule("page", s.Page.Module, s.Page.Name, s.Roles)
+	case *ast.GrantODataServiceAccessStmt:
+		return checkDocumentAccessRolesSameModule("OData service", s.Service.Module, s.Service.Name, s.Roles)
+	case *ast.GrantPublishedRestServiceAccessStmt:
+		return checkDocumentAccessRolesSameModule("published REST service", s.Service.Module, s.Service.Name, s.Roles)
 	}
-	return len(ms.ModuleRoles) == 1 &&
-		ms.ModuleRoles[0].Name == autoDocumentRoleName &&
-		ms.ModuleRoles[0].Description == autoDocumentRoleDescription
+	return nil
 }
 
+// autoDocumentRoleDescription marks the <Module>.User role mxcli used to
+// create, unasked, for a new document in a module with no module roles. It no
+// longer does (mendixlabs/mxcli#1474): a security role is the author's choice.
+// Projects written by an earlier mxcli still hold the role, so the description
+// stays recognised — a later `create module role M.User` adopts it rather than
+// reporting a duplicate.
+const autoDocumentRoleDescription = "Auto-created default role for mxcli document access"
+
+// remapDocumentAccessRoles carries a moved document's allowed roles to the
+// same-named roles of its target module (a document can only reference its own
+// module's roles — CE0148). A role the target does not have is dropped, never
+// created.
 func remapDocumentAccessRoles(ctx *ExecContext, targetModule *model.Module, currentRoles []model.ID) []model.ID {
 	if targetModule == nil {
 		return nil
@@ -63,8 +89,8 @@ func remapDocumentAccessRoles(ctx *ExecContext, targetModule *model.Module, curr
 	if err != nil || ms == nil {
 		return nil
 	}
-	if len(ms.ModuleRoles) == 0 || moduleUsesAutoDocumentRole(ms) {
-		return defaultDocumentAccessRoles(ctx, targetModule)
+	if len(ms.ModuleRoles) == 0 {
+		return nil
 	}
 
 	targetRoleNames := make(map[string]bool, len(ms.ModuleRoles))

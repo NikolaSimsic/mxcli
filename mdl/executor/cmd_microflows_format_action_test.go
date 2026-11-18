@@ -3,15 +3,18 @@
 package executor
 
 import (
+	"github.com/mendixlabs/mxcli/mdl/langver"
 	"strings"
 	"testing"
 
+	"github.com/mendixlabs/mxcli/mdl/ast"
 	"github.com/mendixlabs/mxcli/mdl/backend/mock"
 	mdltypes "github.com/mendixlabs/mxcli/mdl/types"
+	"github.com/mendixlabs/mxcli/mdl/visitor"
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 	"github.com/mendixlabs/mxcli/sdk/microflows"
-	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // =============================================================================
@@ -132,39 +135,81 @@ func TestFormatAction_DeleteObject(t *testing.T) {
 	}
 }
 
-func TestFormatAction_CommitObjects_WithEvents(t *testing.T) {
+// TestFormatAction_CommitObjects covers all four stored combinations of the two
+// Commit-activity flags.
+//
+// The asymmetry is the point (#895): events ON is Mendix's default and renders
+// as nothing, events OFF is the deviation and must be spelled out. Rendering it
+// the other way round is what let a Studio Pro default commit describe as
+// something that re-executed into its opposite.
+func TestFormatAction_CommitObjects(t *testing.T) {
 	e := newTestExecutor()
-	action := &microflows.CommitObjectsAction{CommitVariable: "Order", WithEvents: true}
-	got := e.formatAction(action, nil, nil)
-	if got != "commit $Order with events;" {
-		t.Errorf("got %q", got)
+	tests := []struct {
+		name   string
+		action *microflows.CommitObjectsAction
+		want   string
+	}{
+		{
+			name:   "default (events on) renders bare",
+			action: &microflows.CommitObjectsAction{CommitVariable: "Order", WithEvents: true},
+			want:   "commit $Order;",
+		},
+		{
+			name:   "events off is spelled out",
+			action: &microflows.CommitObjectsAction{CommitVariable: "Order"},
+			want:   "commit $Order without events;",
+		},
+		{
+			name:   "events on with refresh",
+			action: &microflows.CommitObjectsAction{CommitVariable: "Order", WithEvents: true, RefreshInClient: true},
+			want:   "commit $Order refresh;",
+		},
+		{
+			name:   "events off with refresh",
+			action: &microflows.CommitObjectsAction{CommitVariable: "Order", RefreshInClient: true},
+			want:   "commit $Order without events refresh;",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := e.formatAction(tt.action, nil, nil); got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
-func TestFormatAction_CommitObjects_WithoutEvents(t *testing.T) {
+// TestFormatAction_RefreshInClient_AllActivities guards the #407 sibling: the
+// REFRESH modifier existed on change and rollback but not on delete or create,
+// so a Studio Pro activity carrying the flag described without it and lost it on
+// the next exec. Measured before the fix on a real 11.13 project: stored
+// refresh=true -> `delete $Obj;` -> re-exec -> refresh=false.
+func TestFormatAction_RefreshInClient_AllActivities(t *testing.T) {
 	e := newTestExecutor()
-	action := &microflows.CommitObjectsAction{CommitVariable: "Order"}
-	got := e.formatAction(action, nil, nil)
-	if got != "commit $Order;" {
-		t.Errorf("got %q", got)
+	tests := []struct {
+		name   string
+		action microflows.MicroflowAction
+		want   string
+	}{
+		{"delete", &microflows.DeleteObjectAction{DeleteVariable: "Customer", RefreshInClient: true}, "delete $Customer refresh;"},
+		{"rollback", &microflows.RollbackObjectAction{RollbackVariable: "Order", RefreshInClient: true}, "rollback $Order refresh;"},
+		{
+			"create",
+			&microflows.CreateObjectAction{OutputVariable: "New", EntityQualifiedName: "Mod.Order", RefreshInClient: true},
+			"$New = create Mod.Order refresh;",
+		},
+		{
+			"change",
+			&microflows.ChangeObjectAction{ChangeVariable: "Order", RefreshInClient: true},
+			"change $Order refresh;",
+		},
 	}
-}
-
-func TestFormatAction_CommitObjects_Refresh(t *testing.T) {
-	e := newTestExecutor()
-	action := &microflows.CommitObjectsAction{CommitVariable: "Order", RefreshInClient: true}
-	got := e.formatAction(action, nil, nil)
-	if got != "commit $Order refresh;" {
-		t.Errorf("got %q", got)
-	}
-}
-
-func TestFormatAction_CommitObjects_WithEventsAndRefresh(t *testing.T) {
-	e := newTestExecutor()
-	action := &microflows.CommitObjectsAction{CommitVariable: "Order", WithEvents: true, RefreshInClient: true}
-	got := e.formatAction(action, nil, nil)
-	if got != "commit $Order with events refresh;" {
-		t.Errorf("got %q", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := e.formatAction(tt.action, nil, nil); got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -326,7 +371,7 @@ func TestFormatAction_AggregateList_Count(t *testing.T) {
 		Function:       microflows.AggregateFunctionCount,
 	}
 	got := e.formatAction(action, nil, nil)
-	if got != "$Total = count($Orders);" {
+	if got != "$Total = count $Orders;" {
 		t.Errorf("got %q", got)
 	}
 }
@@ -340,7 +385,7 @@ func TestFormatAction_AggregateList_Sum(t *testing.T) {
 		AttributeQualifiedName: "MyModule.Order.Amount",
 	}
 	got := e.formatAction(action, nil, nil)
-	if got != "$TotalAmount = sum($Orders.Amount);" {
+	if got != "$TotalAmount = sum $Orders by Amount;" {
 		t.Errorf("got %q", got)
 	}
 }
@@ -355,7 +400,7 @@ func TestFormatAction_AggregateList_SumExpression(t *testing.T) {
 		Expression:     "$currentObject/Amount * 0.21",
 	}
 	got := e.formatAction(action, nil, nil)
-	if got != "$TotalTax = sum($Orders, $currentObject/Amount * 0.21);" {
+	if got != "$TotalTax = sum $Orders of $currentObject/Amount * 0.21;" {
 		t.Errorf("got %q", got)
 	}
 }
@@ -483,9 +528,56 @@ func TestFormatAction_ShowPage_WithParams(t *testing.T) {
 		},
 	}
 	got := e.formatAction(action, nil, nil)
-	want := "show page MyModule.OrderDetail($Order = $Order);"
+	want := "show page MyModule.OrderDetail(Order = $Order);"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// A page title override is described, so describe -> exec keeps it and taking
+// it out of a create or modify is a difference (ako/mxcli#869).
+func TestFormatAction_ShowPage_WithTitle(t *testing.T) {
+	e := newTestExecutor()
+	action := &microflows.ShowPageAction{
+		PageName: "MyModule.OrderDetail",
+		PageParameterMappings: []*microflows.PageParameterMapping{
+			{Parameter: "MyModule.OrderDetail.Order", Argument: "$Order"},
+		},
+		OverridePageTitle: &model.Text{Translations: map[string]string{"en_US": "Order's details"}},
+	}
+	got := e.formatAction(action, nil, nil)
+	want := "show page MyModule.OrderDetail(Order = $Order) with title = 'Order''s details';"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	// An override with no text states nothing the statement can carry.
+	action.OverridePageTitle = &model.Text{}
+	if got := e.formatAction(action, nil, nil); got != "show page MyModule.OrderDetail(Order = $Order);" {
+		t.Errorf("empty override: got %q", got)
+	}
+}
+
+// "Number of pages to close" is described, so an action that closes the
+// current page before opening reads differently from one that closes none,
+// and describe -> exec keeps it (mendixlabs/mxcli#1617).
+func TestFormatAction_ShowPage_NumberOfPagesToClose(t *testing.T) {
+	e := newTestExecutor()
+	action := &microflows.ShowPageAction{PageName: "MyFirstModule.Booking_Overview", NumberOfPagesToClose: "1"}
+	if got, want := e.formatAction(action, nil, nil),
+		"show page MyFirstModule.Booking_Overview with NumberOfPagesToClose = 1;"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	// With a title, both settings share the one `with` list.
+	action.OverridePageTitle = &model.Text{Translations: map[string]string{"en_US": "Bookings"}}
+	action.NumberOfPagesToClose = "$Count + 1"
+	if got, want := e.formatAction(action, nil, nil),
+		"show page MyFirstModule.Booking_Overview with title = 'Bookings', NumberOfPagesToClose = $Count + 1;"; got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	// CONTROL: the stored default, "", closes nothing and says nothing.
+	action.OverridePageTitle, action.NumberOfPagesToClose = nil, ""
+	if got := e.formatAction(action, nil, nil); got != "show page MyFirstModule.Booking_Overview;" {
+		t.Errorf("no pages to close: got %q", got)
 	}
 }
 
@@ -543,9 +635,14 @@ func TestFormatAction_ShowMessage_EscapesMultiline(t *testing.T) {
 			Translations: map[string]string{"en_US": "Line 1\nLine 2\tTabbed"},
 		},
 	}
-	got := e.formatAction(action, nil, nil)
-	if got != "show message 'Line 1\\nLine 2\\tTabbed' type Information;" {
-		t.Errorf("got %q", got)
+	// mdl 1, the default since the freeze: the break is in the literal.
+	if got := e.formatAction(action, nil, nil); got != "show message 'Line 1\nLine 2\tTabbed' type Information;" {
+		t.Errorf("mdl 1: got %q", got)
+	}
+	// Asked for mdl 0 (`describe --mdl 0`): the mdl 0 escapes.
+	e.SetDescribeLanguage(langver.V0)
+	if got := e.formatAction(action, nil, nil); got != "show message 'Line 1\\nLine 2\\tTabbed' type Information;" {
+		t.Errorf("mdl 0: got %q", got)
 	}
 }
 
@@ -589,6 +686,35 @@ func TestFormatAction_ValidationFeedback(t *testing.T) {
 	want := "validation feedback $Customer/Email message 'Email is required';"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// What describe writes for a validation feedback on an attribute named Error
+// must parse back: `$E/Error message` used to lex as the `error message` clause
+// keyword, so describe output for such a microflow failed `check` with "missing
+// MESSAGE" (mendixlabs/mxcli#1720).
+func TestFormatAction_ValidationFeedback_MemberNamedErrorReparses(t *testing.T) {
+	e := newTestExecutor()
+	for _, attr := range []string{"Error", "error", "Message", "ErrorMessage"} {
+		action := &microflows.ValidationFeedbackAction{
+			ObjectVariable: "Entity2",
+			AttributeName:  "ExamplesModule.Entity2." + attr,
+			Template: &model.Text{
+				Translations: map[string]string{"en_US": "not good"},
+			},
+		}
+		line := e.formatAction(action, nil, nil)
+		src := "create or modify microflow ExamplesModule.ACT ($Entity2: ExamplesModule.Entity2)\nbegin\n  " +
+			line + "\n  return;\nend;"
+		prog, errs := visitor.Build(src)
+		if len(errs) > 0 {
+			t.Fatalf("%s: describe output does not parse: %v\n%s", attr, errs, src)
+		}
+		vf := prog.Statements[0].(*ast.CreateMicroflowStmt).Body[0].(*ast.ValidationFeedbackStmt)
+		segs := vf.AttributePath.Segments
+		if len(segs) != 1 || segs[0].Name != attr {
+			t.Errorf("%s: read back as %v", attr, segs)
+		}
 	}
 }
 
@@ -650,7 +776,7 @@ func TestFormatAction_LogMessage_WithTemplateParams(t *testing.T) {
 		TemplateParameters: []string{"$OrderNumber", "$CustomerName"},
 	}
 	got := e.formatAction(action, nil, nil)
-	want := "log info node 'App' 'Order {1} for {2}' with ({1} = $OrderNumber, {2} = $CustomerName);"
+	want := "log node 'App' 'Order {1} for {2}' with ({1} = $OrderNumber, {2} = $CustomerName);"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -665,10 +791,12 @@ func TestFormatAction_LogMessage_EscapesMultiline(t *testing.T) {
 			Translations: map[string]string{"en_US": "Line 1\nLine 2"},
 		},
 	}
-	got := e.formatAction(action, nil, nil)
-	want := "log info node 'App' 'Line 1\\nLine 2';"
-	if got != want {
-		t.Errorf("got %q, want %q", got, want)
+	if got, want := e.formatAction(action, nil, nil), "log node 'App' 'Line 1\nLine 2';"; got != want {
+		t.Errorf("mdl 1: got %q, want %q", got, want)
+	}
+	e.SetDescribeLanguage(langver.V0)
+	if got, want := e.formatAction(action, nil, nil), "log node 'App' 'Line 1\\nLine 2';"; got != want {
+		t.Errorf("mdl 0: got %q, want %q", got, want)
 	}
 }
 
@@ -682,7 +810,7 @@ func TestFormatAction_LogMessage_NodeExpression(t *testing.T) {
 		},
 	}
 	got := e.formatAction(action, nil, nil)
-	want := "log info node @MyModule.SecurityLogNode 'User added';"
+	want := "log node @MyModule.SecurityLogNode 'User added';"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -749,7 +877,7 @@ func TestFormatAction_Retrieve_WithLimit(t *testing.T) {
 		},
 	}
 	got := e.formatAction(action, nil, nil)
-	want := "retrieve $First from MyModule.Customer\n    limit 1;"
+	want := "retrieve $First from MyModule.Customer\n    first;" // the object range (#734)
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -790,7 +918,11 @@ func TestFormatAction_Retrieve_Association(t *testing.T) {
 	}
 }
 
-func TestFormatAction_Retrieve_ReverseAssociationDatabaseSourceUsesCompactForm(t *testing.T) {
+// A DatabaseRetrieveSource always renders in database form, even when its XPath
+// is a reverse-association constraint — it must NOT collapse to the association
+// shorthand `from $var/Assoc`, which is the in-memory retrieve form. Rendering a
+// database retrieve that way made the two indistinguishable (issue #726).
+func TestFormatAction_Retrieve_ReverseAssociationDatabaseSourceUsesDatabaseForm(t *testing.T) {
 	e := newTestExecutor()
 	e.backend = reverseAssociationBackend(t)
 	action := &microflows.RetrieveAction{
@@ -803,7 +935,7 @@ func TestFormatAction_Retrieve_ReverseAssociationDatabaseSourceUsesCompactForm(t
 	}
 
 	got := e.formatAction(action, nil, nil)
-	want := "retrieve $Domains from $Runtime/SampleRuntime.Domain_Runtime;"
+	want := "retrieve $Domains from SampleRuntime.Domain\n    where SampleRuntime.Domain_Runtime = $Runtime;"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -822,7 +954,7 @@ func TestFormatAction_Retrieve_ReverseAssociationRequiresSimpleAllRange(t *testi
 	}
 
 	got := e.formatAction(action, nil, nil)
-	want := "retrieve $Domains from SampleRuntime.Domain\n    where SampleRuntime.Domain_Runtime = $Runtime\n    limit 1;"
+	want := "retrieve $Domains from SampleRuntime.Domain\n    where SampleRuntime.Domain_Runtime = $Runtime\n    first;"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -1224,76 +1356,64 @@ func TestGetActionErrorHandlingType_JavaScriptActionCallAction(t *testing.T) {
 	}
 }
 
-func TestFormatAction_WebServiceCallResolvesKnownReferences(t *testing.T) {
-	moduleID := mkID("soap-module")
-	serviceID := mkID("soap-service")
-	sendMappingID := mkID("soap-send")
-	receiveMappingID := mkID("soap-receive")
-	serviceContents, err := bson.Marshal(bson.M{"Name": "OrderService"})
-	if err != nil {
-		t.Fatal(err)
-	}
-
+// TestFormatAction_WebServiceCallRendersStoredQualifiedNames pins that DESCRIBE
+// prints the three names a SOAP call stores, verbatim, and consults nothing.
+//
+// All three are BY_NAME_REFERENCE properties — qualified-name strings, never
+// element ids. Measured on ako/TestApp (11.14.0), Clients.GetOrders stores
+// ImportedService "Clients.OrderSoapClient" and ReturnValueMapping
+// "Clients.SoapOrdersImportMapping"; modelsdk/gen agrees, registering
+// ImportedWebService and ImportMappingCall.Mapping as codec.RefByName.
+//
+// Three resolvers used to sit here turning those strings into qualified names
+// by looking each one up in the project. They could not match on two counts at
+// once — the id compared was already a qualified name, and the unit type asked
+// for ("WebServices$ImportedWebService") is stored as
+// "WebServices$ImportedServiceImpl" — so every call fell through to its
+// fallback, which returned the stored string. The right answer, by accident.
+//
+// The backend below fails the test if it is asked anything: a lookup returning
+// the correct value is indistinguishable from no lookup at all in the output,
+// which is precisely how this survived.
+func TestFormatAction_WebServiceCallRendersStoredQualifiedNames(t *testing.T) {
 	backend := &mock.MockBackend{
 		IsConnectedFunc: func() bool { return true },
 		ListRawUnitsByTypeFunc: func(typePrefix string) ([]*mdltypes.RawUnit, error) {
-			if typePrefix != "WebServices$ImportedWebService" {
-				t.Fatalf("unexpected type prefix %q", typePrefix)
-			}
-			return []*mdltypes.RawUnit{{
-				ID:          serviceID,
-				ContainerID: moduleID,
-				Type:        "WebServices$ImportedWebService",
-				Contents:    serviceContents,
-			}}, nil
+			t.Fatalf("DESCRIBE consulted the project for %q; the stored names are already qualified", typePrefix)
+			return nil, nil
 		},
 		ListExportMappingsFunc: func() ([]*model.ExportMapping, error) {
-			return []*model.ExportMapping{{
-				BaseElement: model.BaseElement{ID: sendMappingID},
-				ContainerID: moduleID,
-				Name:        "OrderRequest",
-			}}, nil
+			t.Fatal("DESCRIBE listed export mappings; the send mapping is stored by qualified name")
+			return nil, nil
 		},
 		ListImportMappingsFunc: func() ([]*model.ImportMapping, error) {
-			return []*model.ImportMapping{{
-				BaseElement: model.BaseElement{ID: receiveMappingID},
-				ContainerID: moduleID,
-				Name:        "OrderResponse",
-			}}, nil
+			t.Fatal("DESCRIBE listed import mappings; the receive mapping is stored by qualified name")
+			return nil, nil
 		},
 	}
-	h := mkHierarchy(&model.Module{BaseElement: model.BaseElement{ID: moduleID}, Name: "SyntheticSOAP"})
-	ctx, _ := newMockCtx(t, withBackend(backend), withHierarchy(h))
+	ctx, _ := newMockCtx(t, withBackend(backend), withHierarchy(mkHierarchy()))
 
 	action := &microflows.WebServiceCallAction{
-		ServiceID:         serviceID,
-		OperationName:     "FetchOrders",
-		SendMappingID:     sendMappingID,
-		ReceiveMappingID:  receiveMappingID,
-		OutputVariable:    "Root",
+		ServiceID:         "Clients.OrderSoapClient",
+		OperationName:     "GetOrder",
+		SendMappingID:     "Clients.SoapOrderExportMapping",
+		ReceiveMappingID:  "Clients.SoapOrdersImportMapping",
+		OutputVariable:    "Orders",
 		UseReturnVariable: true,
 	}
 	got := formatAction(ctx, action, nil, nil)
-	want := "$Root = call web service SyntheticSOAP.OrderService\noperation FetchOrders\nsend mapping SyntheticSOAP.OrderRequest\nreceive mapping SyntheticSOAP.OrderResponse;"
+	want := "$Orders = call web service Clients.OrderSoapClient\noperation GetOrder\n" +
+		"send mapping Clients.SoapOrderExportMapping\nreceive mapping Clients.SoapOrdersImportMapping;"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
-func TestFormatAction_WebServiceCallKeepsRawReferencesWhenUnknown(t *testing.T) {
-	backend := &mock.MockBackend{
-		IsConnectedFunc: func() bool { return true },
-		ListRawUnitsByTypeFunc: func(typePrefix string) ([]*mdltypes.RawUnit, error) {
-			return nil, nil
-		},
-		ListExportMappingsFunc: func() ([]*model.ExportMapping, error) {
-			return nil, nil
-		},
-		ListImportMappingsFunc: func() ([]*model.ImportMapping, error) {
-			return nil, nil
-		},
-	}
-	ctx, _ := newMockCtx(t, withBackend(backend), withHierarchy(mkHierarchy()))
+// TestFormatAction_WebServiceCallQuotesNamesThatAreNotIdentifiers — a dangling
+// or malformed reference is still printed, quoted so the line parses back.
+func TestFormatAction_WebServiceCallQuotesNamesThatAreNotIdentifiers(t *testing.T) {
+	ctx, _ := newMockCtx(t, withBackend(&mock.MockBackend{IsConnectedFunc: func() bool { return true }}),
+		withHierarchy(mkHierarchy()))
 
 	action := &microflows.WebServiceCallAction{
 		ServiceID:        "dangling-service-id",
@@ -1324,5 +1444,240 @@ func TestFormatAction_WebServiceCallRaw(t *testing.T) {
 	}, nil, nil)
 	if !strings.HasPrefix(got, "$Root = call web service raw '") {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// TestFormatAction_WebServiceCallArgumentsAndSendMapping — DESCRIBE renders both
+// request-body forms, and renders them so they parse back.
+//
+// The argument list shows only the parameter NAME; the stored ParameterPath
+// ("http%3A//www.example.com/:GetOrder|OrderId") is rebuilt from the operation
+// document on the way back in. Putting the path in the script would fail every
+// readability test the language is held to — and `send rest request` already
+// makes the same move, showing `code` where the model holds Mod.Svc.Op.code.
+func TestFormatAction_WebServiceCallArgumentsAndSendMapping(t *testing.T) {
+	ctx, _ := newMockCtx(t, withBackend(&mock.MockBackend{IsConnectedFunc: func() bool { return true }}),
+		withHierarchy(mkHierarchy()))
+
+	args := formatAction(ctx, &microflows.WebServiceCallAction{
+		ServiceID:     "Clients.OrderSoapClient",
+		OperationName: "GetOrder",
+		Arguments: []microflows.WebServiceArgument{
+			{Name: "OrderId", Path: "http%3A//www.example.com/:GetOrder|OrderId", Expression: "$Customer/OrderId", Checked: true},
+			{Name: "Verbose", Path: "http%3A//www.example.com/:GetOrder|Verbose", Expression: "true", Checked: true},
+		},
+		ReceiveMappingID: "Clients.SoapOrdersImportMapping",
+		OutputVariable:   "Orders",
+	}, nil, nil)
+	want := "$Orders = call web service Clients.OrderSoapClient\n" +
+		"operation GetOrder (OrderId = $Customer/OrderId, Verbose = true)\n" +
+		"receive mapping Clients.SoapOrdersImportMapping;"
+	if args != want {
+		t.Errorf("arguments form:\n got %q\nwant %q", args, want)
+	}
+
+	send := formatAction(ctx, &microflows.WebServiceCallAction{
+		ServiceID:           "Clients.OrderSoapClient",
+		OperationName:       "SaveOrder",
+		SendMappingID:       "Clients.SoapOrderExportMapping",
+		SendMappingVariable: "NewSaveOrder",
+	}, nil, nil)
+	wantSend := "call web service Clients.OrderSoapClient\n" +
+		"operation SaveOrder\n" +
+		"send mapping Clients.SoapOrderExportMapping from $NewSaveOrder;"
+	if send != wantSend {
+		t.Errorf("send mapping form:\n got %q\nwant %q", send, wantSend)
+	}
+}
+
+// TestFormatAction_WebServiceCallArgumentWithoutAName renders no argument list
+// at all rather than a partial one.
+//
+// A ParameterPath with no "|" yields no name on the way in — a shape no
+// reference document carries — and emitting `operation X ( = expr)` would write
+// a DIFFERENT path back. The action keeps the raw fallback instead, which is
+// decided by the reader; this is the belt to that braces.
+func TestFormatAction_WebServiceCallArgumentWithoutAName(t *testing.T) {
+	ctx, _ := newMockCtx(t, withBackend(&mock.MockBackend{IsConnectedFunc: func() bool { return true }}),
+		withHierarchy(mkHierarchy()))
+
+	got := formatAction(ctx, &microflows.WebServiceCallAction{
+		ServiceID:     "M.S",
+		OperationName: "Op",
+		Arguments:     []microflows.WebServiceArgument{{Path: "no-separator", Expression: "1"}},
+	}, nil, nil)
+	if strings.Contains(got, "(") {
+		t.Errorf("emitted a partial argument list: %q", got)
+	}
+}
+
+// TestFormatAction_ShowMessageBlocking — DESCRIBE has to emit `blocking`, or the
+// round trip turns a blocking message box into a non-blocking one.
+//
+// The model carried Blocking on both engines all along; the loss was here, in
+// the one layer that had no word for it.
+func TestFormatAction_ShowMessageBlocking(t *testing.T) {
+	e := newTestExecutor()
+	msg := func(blocking bool) *microflows.ShowMessageAction {
+		return &microflows.ShowMessageAction{
+			Type:     microflows.MessageTypeInformation,
+			Blocking: blocking,
+			Template: &model.Text{Translations: map[string]string{"en_US": "Saved."}},
+		}
+	}
+	if got := e.formatAction(msg(true), nil, nil); got != "show message 'Saved.' type Information blocking;" {
+		t.Errorf("blocking message = %q", got)
+	}
+	if got := e.formatAction(msg(false), nil, nil); got != "show message 'Saved.' type Information;" {
+		t.Errorf("non-blocking message = %q", got)
+	}
+}
+
+// ako/mxcli#859 (rehearsal S8): a lone XPath group with a predicate on a path
+// step was described without its outer brackets, `where A/B[Name = empty]`,
+// which describe's own parser rejects — so create or modify could not compare
+// the stored flow and refused it under mdl 1 on an identical re-run. Such a
+// group keeps its brackets; one without a nested predicate still does not.
+func TestFormatAction_Retrieve_NestedPredicateReparses(t *testing.T) {
+	for _, c := range []struct{ xpath, where string }{
+		{"[M.Timeline_Emp/M.Timeline[Name = empty]]", "where [M.Timeline_Emp/M.Timeline[Name = empty]]"},
+		{"[M.A_B/M.B[Name = 'x[1]'] and Active = true()]", "where [M.A_B/M.B[Name = 'x[1]'] and Active = true()]"},
+		// Controls: brackets only inside a string, and no brackets at all.
+		{"[Name = 'x[1]']", "where Name = 'x[1]'"},
+		{"[IsActive = true()]", "where IsActive = true()"},
+	} {
+		e := newTestExecutor()
+		action := &microflows.RetrieveAction{
+			OutputVariable: "Rows",
+			Source: &microflows.DatabaseRetrieveSource{
+				EntityQualifiedName: "M.Emp",
+				XPathConstraint:     c.xpath,
+			},
+		}
+		got := e.formatAction(action, nil, nil)
+		if !strings.Contains(got, "\n    "+c.where+";") {
+			t.Errorf("%s: got %q, want %q", c.xpath, got, c.where)
+		}
+		for _, header := range []string{"", "mdl 1;\n"} {
+			src := header + "create microflow M.F ()\nbegin\n  " + got + "\nend;\n"
+			if _, errs := visitor.Build(src); len(errs) > 0 {
+				t.Errorf("%s: the description does not parse (header %q): %v\n%s", c.xpath, header, errs[0], src)
+			}
+		}
+	}
+}
+
+// ako/mxcli#950 item 2: the `$` prefix is for a bare variable name a legacy
+// writer stored without one, and nothing else. It used to go on anything
+// without + ' " ( ), so `[%CurrentUser%]` became `$[%CurrentUser%]`, which does
+// not parse — and so did an `if … then … else …` or a bare `and` expression.
+// Each case below must describe as stored and parse back as a return value.
+func TestFormatActivity_ReturnExpressionIsNotPrefixed(t *testing.T) {
+	e := newTestExecutor()
+	for _, v := range []string{
+		"[%CurrentUser%]",
+		"[%CurrentDateTime%]",
+		"if $Ok then 1 else 2",
+		"$A and $B",
+		"empty",
+		"MyModule.Status.Open",
+	} {
+		got := e.formatActivity(&microflows.EndEvent{ReturnValue: v}, nil, nil)
+		if want := "return " + v + ";"; got != want {
+			t.Errorf("ReturnValue %q: got %q, want %q", v, got, want)
+		}
+		script := "create microflow M.F () returns String begin\n  " + got + "\nend;"
+		if _, errs := visitor.Build(script); len(errs) > 0 {
+			t.Errorf("%q does not parse: %v", got, errs[0])
+		}
+	}
+	// The control: a bare (legacy) variable name is still prefixed, and a
+	// bare one with an attribute path too.
+	for in, want := range map[string]string{"MyVar": "return $MyVar;", "Order/Total": "return $Order/Total;"} {
+		if got := e.formatActivity(&microflows.EndEvent{ReturnValue: in}, nil, nil); got != want {
+			t.Errorf("ReturnValue %q: got %q, want %q", in, got, want)
+		}
+	}
+}
+
+// mendixlabs/mxcli#1288: a stored Add/Remove member change (Studio Pro's Add
+// and Remove buttons on a reference set) used to describe as `Assoc = $X`,
+// which re-executes as a set assignment and drops the rest of the set.
+func TestFormatAction_ChangeObject_AssociationAddRemove(t *testing.T) {
+	e := newTestExecutor()
+	cases := []struct {
+		name   string
+		action *microflows.ChangeObjectAction
+		want   string
+	}{
+		{"add", &microflows.ChangeObjectAction{
+			ChangeVariable: "Order",
+			Changes: []*microflows.MemberChange{
+				{AssociationQualifiedName: "Sales.Order_Line", Type: microflows.MemberChangeTypeAdd, Value: "$Line"},
+			},
+		}, "add $Line to $Order/Sales.Order_Line;"},
+		{"remove with modifiers", &microflows.ChangeObjectAction{
+			ChangeVariable:  "Order",
+			Commit:          microflows.CommitTypeYesWithoutEvents,
+			RefreshInClient: true,
+			Changes: []*microflows.MemberChange{
+				{AssociationQualifiedName: "Sales.Order_Line", Type: microflows.MemberChangeTypeRemove, Value: "$Line"},
+			},
+		}, "remove $Line from $Order/Sales.Order_Line commit without events refresh;"},
+		{"set stays a change", &microflows.ChangeObjectAction{
+			ChangeVariable: "Order",
+			Changes: []*microflows.MemberChange{
+				{AssociationQualifiedName: "Sales.Order_Line", Type: microflows.MemberChangeTypeSet, Value: "$Line"},
+			},
+		}, "change $Order (Sales.Order_Line = $Line);"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := e.formatAction(tc.action, nil, nil); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// mendixlabs/mxcli#1473: an activity mixing Add/Remove with other members
+// used to describe its Add as `=` plus a trailing WARNING, because the only
+// Add/Remove spelling was the sole-member `add … to $Obj/Assoc`. `+=` and `-=`
+// are the member operators, so the activity describes as one statement that
+// re-executes to the same Add/Remove members.
+func TestFormatAction_ChangeObject_MixedAddRemoveUsesOperators(t *testing.T) {
+	e := newTestExecutor()
+	action := &microflows.ChangeObjectAction{
+		ChangeVariable: "Order",
+		Changes: []*microflows.MemberChange{
+			{AttributeQualifiedName: "Sales.Order.Number", Type: microflows.MemberChangeTypeSet, Value: "1"},
+			{AssociationQualifiedName: "Sales.Order_Line", Type: microflows.MemberChangeTypeAdd, Value: "$Line"},
+			{AssociationQualifiedName: "Sales.Order_OldLine", Type: microflows.MemberChangeTypeRemove, Value: "$Old"},
+		},
+	}
+	got := e.formatAction(action, nil, nil)
+	want := "change $Order (Number = 1, Sales.Order_Line += $Line, Sales.Order_OldLine -= $Old);"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// A sole Remove whose value is not a bare variable has no `remove … from`
+// spelling (that form takes a variable); it describes with `-=`, not `=`.
+func TestFormatAction_ChangeObject_RemoveExpressionUsesOperator(t *testing.T) {
+	e := newTestExecutor()
+	action := &microflows.ChangeObjectAction{
+		ChangeVariable: "Order",
+		Changes: []*microflows.MemberChange{
+			{AssociationQualifiedName: "Sales.Order_Line", Type: microflows.MemberChangeTypeRemove, Value: "$Lines"},
+		},
+	}
+	if got := e.formatAction(action, nil, nil); got != "remove $Lines from $Order/Sales.Order_Line;" {
+		t.Errorf("control: bare-variable remove = %q", got)
+	}
+	action.Changes[0].Value = "$Batch/Sales.Batch_Line"
+	got := e.formatAction(action, nil, nil)
+	if want := "change $Order (Sales.Order_Line -= $Batch/Sales.Batch_Line);"; got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }

@@ -136,6 +136,30 @@ func (b *Backend) UpdateModule(m *model.Module) error {
 	return b.persistUnit(m.ID, gm)
 }
 
+// SetModuleUIResources sets IsThemeModule on an existing module unit and
+// nothing else, as UpdateModule sets only the name (ako/mxcli#1286). It is a
+// method of its own because UpdateModule's callers hold a module read with
+// Name and ID only: a flag carried through it would be reset by every rename.
+func (b *Backend) SetModuleUIResources(id model.ID, on bool) error {
+	if b.writer == nil {
+		return fmt.Errorf("SetModuleUIResources: not connected for writing")
+	}
+	raw, err := b.reader.GetRawUnitBytes(string(id))
+	if err != nil {
+		return fmt.Errorf("SetModuleUIResources: read unit %s: %w", id, err)
+	}
+	el, err := codec.NewDecoder(codec.DefaultRegistry).Decode(raw)
+	if err != nil {
+		return fmt.Errorf("SetModuleUIResources: decode unit %s: %w", id, err)
+	}
+	gm, ok := el.(*genProj.Module)
+	if !ok {
+		return fmt.Errorf("SetModuleUIResources: unit %s is not a Module (%s)", id, el.TypeName())
+	}
+	gm.SetIsThemeModule(on)
+	return b.persistUnit(id, gm)
+}
+
 // DeleteModule deletes a module and every unit transitively contained in it
 // (DomainModel, ModuleSecurity, ModuleSettings, Folders, Documents). Orphaned
 // child units would crash Studio Pro (KeyNotFoundException in LoadChildUnits), so
@@ -168,24 +192,34 @@ func (b *Backend) DeleteModuleWithCleanup(id model.ID, moduleName string) error 
 	if err := b.DeleteModule(id); err != nil {
 		return err
 	}
+	b.removeModuleSourceDirs(moduleName)
+	return nil
+}
+
+// removeModuleSourceDirs removes a module's source folders beside the model.
+func (b *Backend) removeModuleSourceDirs(moduleName string) {
 	if b.path == "" {
-		return nil
+		return
 	}
 	projectDir := filepath.Dir(b.path)
 	lower := strings.ToLower(moduleName)
 	// themesource and javasource use the lowercased module name; javascriptsource
 	// uses the original casing (with a lowercase fallback).
-	for _, dir := range []string{
-		filepath.Join(projectDir, "themesource", lower),
-		filepath.Join(projectDir, "javasource", lower),
-		filepath.Join(projectDir, "javascriptsource", moduleName),
-		filepath.Join(projectDir, "javascriptsource", lower),
+	for _, d := range []struct{ dir, what string }{
+		{filepath.Join(projectDir, "themesource", lower), "module theme source"},
+		{filepath.Join(projectDir, "javasource", lower), "module Java source"},
+		{filepath.Join(projectDir, "javascriptsource", moduleName), "module JavaScript source"},
+		{filepath.Join(projectDir, "javascriptsource", lower), "module JavaScript source"},
 	} {
-		if stat, err := os.Stat(dir); err == nil && stat.IsDir() {
-			_ = os.RemoveAll(dir)
+		if stat, err := os.Stat(d.dir); err == nil && stat.IsDir() {
+			// Recorded only once gone: a folder that is still there needs no
+			// staging. On a case-insensitive filesystem the two javascriptsource
+			// spellings are one folder, and the second stat finds nothing.
+			if os.RemoveAll(d.dir) == nil {
+				b.noteSourceFile(d.dir+string(filepath.Separator), "", true, d.what)
+			}
 		}
 	}
-	return nil
 }
 
 // collectDescendantUnitIDs returns every unit ID transitively contained under

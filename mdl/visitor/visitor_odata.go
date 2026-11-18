@@ -3,10 +3,12 @@
 package visitor
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
+	"github.com/mendixlabs/mxcli/mdl/deprecation"
 	"github.com/mendixlabs/mxcli/mdl/grammar/parser"
 )
 
@@ -19,9 +21,14 @@ func (b *Builder) ExitCreateODataClientStatement(ctx *parser.CreateODataClientSt
 	stmt := &ast.CreateODataClientStmt{
 		Name: buildQualifiedName(ctx.QualifiedName()),
 	}
+	// `folder '…'` after the name (R9); `Folder:` in the list is its alias.
+	folderClause := ctx.STRING_LITERAL() != nil
+	if folderClause {
+		stmt.Folder = unquoteStringLit(ctx.STRING_LITERAL())
+	}
 
 	// Parse property assignments
-	for _, propCtx := range ctx.AllOdataPropertyAssignment() {
+	for i, propCtx := range ctx.AllOdataPropertyAssignment() {
 		prop := propCtx.(*parser.OdataPropertyAssignmentContext)
 		name := identifierOrKeywordText(prop.IdentifierOrKeyword())
 		value := odataAssignmentValueText(prop)
@@ -43,23 +50,22 @@ func (b *Builder) ExitCreateODataClientStatement(ctx *parser.CreateODataClientSt
 			stmt.ServiceUrl = value
 		case "useauthentication":
 			stmt.UseAuthentication = strings.EqualFold(value, "true") || strings.EqualFold(value, "yes")
+		// Expression-typed: the expression as written, not an unquoted value.
 		case "httpusername":
-			stmt.HttpUsername = value
+			stmt.HttpUsername, stmt.HttpUsernameIsLiteral = b.odataExpressionValue(prop.OdataPropertyValue(), prop.Expression())
 		case "httppassword":
-			stmt.HttpPassword = value
+			stmt.HttpPassword, stmt.HttpPasswordIsLiteral = b.odataExpressionValue(prop.OdataPropertyValue(), prop.Expression())
 		case "clientcertificate":
-			stmt.ClientCertificate = value
-		case "configurationmicroflow", "headersmicroflow":
-			// Both MDL property names map to the same BSON field
-			// `ConfigurationMicroflow`. Studio Pro distinguishes the
-			// "Configuration microflow" and "Headers microflow"
-			// dropdown options by the microflow's return type:
-			//   - returns System.ConsumedODataConfiguration -> Config
-			//   - returns list of System.HttpHeader         -> Headers
-			// The `HeadersMicroflow` keyword stays for ergonomic MDL
-			// (so the example MDL can self-document which signature
-			// the referenced microflow is expected to have).
+			stmt.ClientCertificate, _ = b.odataExpressionValue(prop.OdataPropertyValue(), prop.Expression())
+		case "configurationmicroflow":
+			// "Configuration microflow" — returns System.ConsumedODataConfiguration.
 			stmt.ConfigurationMicroflow = value
+		case "headersmicroflow":
+			// "Headers microflow" — returns list of System.HttpHeader. A distinct
+			// storage slot from the configuration microflow on Mendix >= 11.10
+			// (HeaderListMicroflow vs ConfigurationEntityMicroflow); conflating
+			// them triggers CE6808.
+			stmt.HeadersMicroflow = value
 		case "errorhandlingmicroflow":
 			stmt.ErrorHandlingMicroflow = value
 		case "proxyhost":
@@ -71,13 +77,18 @@ func (b *Builder) ExitCreateODataClientStatement(ctx *parser.CreateODataClientSt
 		case "proxypassword":
 			stmt.ProxyPassword = value
 		case "folder":
-			stmt.Folder = value
+			if !folderClause {
+				stmt.Folder = value
+			}
+			b.recordFolderProperty(ctx.QualifiedName(), ruleContexts(ctx.AllOdataPropertyAssignment()), i, value, folderClause, nil)
+		default:
+			stmt.UnknownProperties = append(stmt.UnknownProperties, name)
 		}
 	}
 
 	// Parse HEADERS clause
 	if headersCtx := ctx.OdataHeadersClause(); headersCtx != nil {
-		stmt.Headers = parseODataHeaders(headersCtx)
+		stmt.Headers = b.parseODataHeaders(headersCtx)
 	}
 
 	// Check for CREATE OR MODIFY
@@ -87,7 +98,7 @@ func (b *Builder) ExitCreateODataClientStatement(ctx *parser.CreateODataClientSt
 			stmt.CreateOrModify = true
 		}
 	}
-	stmt.Documentation = findDocCommentText(ctx)
+	stmt.Documentation, stmt.DocumentationSet = findDocComment(ctx)
 
 	b.statements = append(b.statements, stmt)
 }
@@ -97,9 +108,14 @@ func (b *Builder) ExitCreateODataServiceStatement(ctx *parser.CreateODataService
 	stmt := &ast.CreateODataServiceStmt{
 		Name: buildQualifiedName(ctx.QualifiedName()),
 	}
+	// `folder '…'` after the name (R9); `Folder:` in the list is its alias.
+	folderClause := ctx.STRING_LITERAL() != nil
+	if folderClause {
+		stmt.Folder = unquoteStringLit(ctx.STRING_LITERAL())
+	}
 
 	// Parse property assignments
-	for _, propCtx := range ctx.AllOdataPropertyAssignment() {
+	for i, propCtx := range ctx.AllOdataPropertyAssignment() {
 		prop := propCtx.(*parser.OdataPropertyAssignmentContext)
 		name := identifierOrKeywordText(prop.IdentifierOrKeyword())
 		value := odataAssignmentValueText(prop)
@@ -121,14 +137,44 @@ func (b *Builder) ExitCreateODataServiceStatement(ctx *parser.CreateODataService
 			stmt.Description = value
 		case "publishassociations":
 			stmt.PublishAssociations = strings.EqualFold(value, "true") || strings.EqualFold(value, "yes")
+			stmt.PublishAssociationsSet = true
+		case "supportsgraphql":
+			stmt.SupportsGraphQL = strings.EqualFold(value, "true") || strings.EqualFold(value, "yes")
+			stmt.SupportsGraphQLSet = true
+		case "authentication":
+			if types, mf, ok := b.odataAuthenticationProperty(prop); ok {
+				stmt.AuthenticationTypes, stmt.AuthMicroflow, stmt.AuthenticationSet = types, mf, true
+			}
 		case "folder":
-			stmt.Folder = value
+			if !folderClause {
+				stmt.Folder = value
+			}
+			b.recordFolderProperty(ctx.QualifiedName(), ruleContexts(ctx.AllOdataPropertyAssignment()), i, value, folderClause, nil)
+		default:
+			stmt.UnknownProperties = append(stmt.UnknownProperties, name)
 		}
 	}
 
-	// Parse authentication clause
-	if authCtx := ctx.OdataAuthenticationClause(); authCtx != nil {
-		stmt.AuthenticationTypes = parseODataAuthTypes(authCtx)
+	// The trailing `authentication …` clause: the old spelling of the
+	// Authentication property (MDL-DEPR139).
+	if authCtx, ok := ctx.OdataAuthenticationClause().(*parser.OdataAuthenticationClauseContext); ok && authCtx != nil {
+		if stmt.AuthenticationSet {
+			b.addError(fmt.Errorf("line %d: authentication is stated both as the Authentication property and as "+
+				"the trailing authentication clause; keep the property", authCtx.GetStart().GetLine()))
+		} else {
+			stmt.AuthenticationTypes, stmt.AuthMicroflow = parseODataAuthTypes(authCtx.AllOdataAuthType())
+			stmt.AuthenticationSet = true
+			b.recordDeprecation(deprecation.ODataAuthenticationClause, authCtx.AUTHENTICATION().GetSymbol(), "")
+			fix, noFix := odataAuthenticationClauseFix(ctx, authCtx)
+			b.fixLastDeprecation(deprecation.ODataAuthenticationClause, fix, noFix)
+		}
+	}
+
+	// Parse PUBLISH MICROFLOW blocks (OData actions)
+	for _, blockCtx := range ctx.AllPublishMicroflowBlock() {
+		if mf := parsePublishMicroflowBlock(blockCtx); mf != nil {
+			stmt.Microflows = append(stmt.Microflows, mf)
+		}
 	}
 
 	// Parse PUBLISH ENTITY blocks
@@ -146,7 +192,7 @@ func (b *Builder) ExitCreateODataServiceStatement(ctx *parser.CreateODataService
 			stmt.CreateOrModify = true
 		}
 	}
-	stmt.Documentation = findDocCommentText(ctx)
+	stmt.Documentation, stmt.DocumentationSet = findDocComment(ctx)
 
 	b.statements = append(b.statements, stmt)
 }
@@ -190,6 +236,8 @@ func (b *Builder) ExitCreateExternalEntityStatement(ctx *parser.CreateExternalEn
 			stmt.Updatable = &boolVal
 		case "allowcreatechangelocally", "allowcreatingandchanginglocally", "createchangelocally":
 			stmt.AllowCreateChangeLocally = &boolVal
+		default:
+			stmt.UnknownProperties = append(stmt.UnknownProperties, name)
 		}
 	}
 
@@ -205,7 +253,7 @@ func (b *Builder) ExitCreateExternalEntityStatement(ctx *parser.CreateExternalEn
 			stmt.CreateOrModify = true
 		}
 	}
-	stmt.Documentation = findDocCommentText(ctx)
+	stmt.Documentation, stmt.DocumentationSet = findDocComment(ctx)
 
 	b.statements = append(b.statements, stmt)
 }
@@ -263,7 +311,12 @@ func (b *Builder) ExitCreateExternalEntitiesStatement(ctx *parser.CreateExternal
 // odataValueText extracts the string value from an OData property value context.
 func odataValueText(val *parser.OdataPropertyValueContext) string {
 	if sl := val.STRING_LITERAL(); sl != nil {
-		return unquoteString(sl.GetText())
+		return unquoteStringLit(sl)
+	}
+	// A $$…$$ block: a consumed business event service's AsyncAPI Contract
+	// (#2384 §5.1). Taken verbatim — it is YAML, and its own quoting is content.
+	if ds := val.DOLLAR_STRING(); ds != nil {
+		return unquoteDollarString(ds.GetText())
 	}
 	if nl := val.NUMBER_LITERAL(); nl != nil {
 		return nl.GetText()
@@ -300,12 +353,15 @@ func odataAssignmentValueText(prop *parser.OdataPropertyAssignmentContext) strin
 	return odataValueText(valCtx.(*parser.OdataPropertyValueContext))
 }
 
-// parseODataAuthTypes extracts authentication types from the clause.
-func parseODataAuthTypes(authCtx parser.IOdataAuthenticationClauseContext) []string {
-	clause := authCtx.(*parser.OdataAuthenticationClauseContext)
-	var types []string
-
-	for _, atCtx := range clause.AllOdataAuthType() {
+// parseODataAuthTypes extracts authentication types from the clause, and the
+// microflow named by `authentication microflow X`.
+//
+// The grammar has always accepted the qualified name; only the name was
+// discarded, so `authentication microflow M.Auth` parsed, checked and executed
+// while the model got a Microflow auth type with no microflow — a service that
+// then failed to build with CE0333 (mxcli-formula1 §40).
+func parseODataAuthTypes(methods []parser.IOdataAuthTypeContext) (types []string, microflow string) {
+	for _, atCtx := range methods {
 		at := atCtx.(*parser.OdataAuthTypeContext)
 		if at.BASIC() != nil {
 			types = append(types, "Basic")
@@ -315,12 +371,15 @@ func parseODataAuthTypes(authCtx parser.IOdataAuthenticationClauseContext) []str
 			types = append(types, "Guest")
 		} else if at.MICROFLOW() != nil {
 			types = append(types, "Microflow")
+			if qn := at.QualifiedName(); qn != nil {
+				microflow = buildQualifiedName(qn).String()
+			}
 		} else if at.IDENTIFIER() != nil {
 			types = append(types, at.IDENTIFIER().GetText())
 		}
 	}
 
-	return types
+	return types, microflow
 }
 
 // parsePublishEntityBlock converts a PUBLISH ENTITY parse context into an AST node.
@@ -333,7 +392,7 @@ func parsePublishEntityBlock(ctx parser.IPublishEntityBlockContext) *ast.Publish
 
 	// Optional AS 'ExposedName'
 	if sl := block.STRING_LITERAL(); sl != nil {
-		entity.ExposedName = unquoteString(sl.GetText())
+		entity.ExposedName = unquoteStringLit(sl)
 	}
 
 	// Parse entity-level properties (ReadMode, InsertMode, etc.)
@@ -357,6 +416,14 @@ func parsePublishEntityBlock(ctx parser.IPublishEntityBlockContext) *ast.Publish
 			if n, err := strconv.Atoi(value); err == nil {
 				entity.PageSize = n
 			}
+		case "countable":
+			entity.Countable = odataBoolPtr(value)
+		case "skipsupported":
+			entity.SkipSupported = odataBoolPtr(value)
+		case "topsupported":
+			entity.TopSupported = odataBoolPtr(value)
+		default:
+			entity.UnknownProperties = append(entity.UnknownProperties, name)
 		}
 	}
 
@@ -369,21 +436,65 @@ func parsePublishEntityBlock(ctx parser.IPublishEntityBlockContext) *ast.Publish
 }
 
 // parseODataHeaders converts a HEADERS clause into header definitions.
-func parseODataHeaders(ctx parser.IOdataHeadersClauseContext) []ast.HeaderDef {
+func (b *Builder) parseODataHeaders(ctx parser.IOdataHeadersClauseContext) []ast.HeaderDef {
 	clause := ctx.(*parser.OdataHeadersClauseContext)
 	var headers []ast.HeaderDef
 
 	for _, entryCtx := range clause.AllOdataHeaderEntry() {
 		entry := entryCtx.(*parser.OdataHeaderEntryContext)
-		key := unquoteString(entry.STRING_LITERAL().GetText())
-		value := ""
-		if valCtx := entry.OdataPropertyValue(); valCtx != nil {
-			value = odataValueText(valCtx.(*parser.OdataPropertyValueContext))
-		}
-		headers = append(headers, ast.HeaderDef{Key: key, Value: value})
+		key := unquoteStringLit(entry.STRING_LITERAL())
+		// A header value is a Mendix expression, kept as written.
+		value, isLiteral := b.odataExpressionValue(entry.OdataPropertyValue(), entry.Expression())
+		headers = append(headers, ast.HeaderDef{Key: key, Value: value, ValueIsLiteral: isLiteral})
 	}
 
 	return headers
+}
+
+// parsePublishMicroflowBlock converts a PUBLISH MICROFLOW block (an OData
+// action) into an AST node. Parameter types and the return type are not read
+// here: they come off the microflow at execution time, so the two cannot drift.
+func parsePublishMicroflowBlock(ctx parser.IPublishMicroflowBlockContext) *ast.PublishedMicroflowDef {
+	block := ctx.(*parser.PublishMicroflowBlockContext)
+	if block.QualifiedName() == nil {
+		return nil
+	}
+	def := &ast.PublishedMicroflowDef{
+		Microflow: buildQualifiedName(block.QualifiedName()),
+	}
+	if sl := block.STRING_LITERAL(); sl != nil {
+		def.ExposedName = unquoteStringLit(sl)
+	}
+	if exposeCtx := block.ExposeClause(); exposeCtx != nil {
+		expose := exposeCtx.(*parser.ExposeClauseContext)
+		if expose.STAR() != nil {
+			def.ExposeAll = true
+		}
+		for _, memberCtx := range expose.AllExposeMember() {
+			member := memberCtx.(*parser.ExposeMemberContext)
+			if member.IdentifierOrKeyword() == nil {
+				continue
+			}
+			p := &ast.PublishedParamDef{Name: identifierOrKeywordText(member.IdentifierOrKeyword())}
+			if sl := member.STRING_LITERAL(); sl != nil {
+				p.ExposedName = unquoteStringLit(sl)
+			}
+			if opts := member.ExposeMemberOptions(); opts != nil {
+				optsCtx := opts.(*parser.ExposeMemberOptionsContext)
+				for _, id := range optsCtx.AllIdentifierOrKeyword() {
+					if strings.EqualFold(id.GetText(), "canbeempty") ||
+						strings.EqualFold(id.GetText(), "optional") {
+						p.CanBeEmpty = true
+					}
+				}
+			}
+			def.Parameters = append(def.Parameters, p)
+		}
+	} else {
+		// No clause at all means every parameter, under its own name.
+		def.ExposeAll = true
+	}
+	return def
 }
 
 // parseExposeMembers converts an EXPOSE clause into AST member definitions.
@@ -405,12 +516,12 @@ func parseExposeMembers(ctx parser.IExposeClauseContext) []*ast.PublishedMemberD
 		}
 
 		m := &ast.PublishedMemberDef{
-			Name: member.IdentifierOrKeyword().GetText(),
+			Name: identifierOrKeywordText(member.IdentifierOrKeyword()),
 		}
 
 		// Optional AS 'ExposedName'
 		if sl := member.STRING_LITERAL(); sl != nil {
-			m.ExposedName = unquoteString(sl.GetText())
+			m.ExposedName = unquoteStringLit(sl)
 		}
 
 		// Optional options (Filterable, Sortable, IsPartOfKey)
@@ -432,4 +543,103 @@ func parseExposeMembers(ctx parser.IExposeClauseContext) []*ast.PublishedMemberD
 	}
 
 	return members
+}
+
+// odataBoolPtr parses an OData property value as a bool, keeping "specified"
+// distinct from "true": these properties default to true, so only an explicit
+// value may turn one off.
+func odataBoolPtr(value string) *bool {
+	b := strings.EqualFold(value, "true") || strings.EqualFold(value, "yes")
+	return &b
+}
+
+// odataAuthenticationProperty reads a published OData service's
+// `Authentication: none | ( method, … )`. The methods keep the order written.
+// Unlike the clause it replaces, the property takes only the methods MDL has a
+// keyword for: an arbitrary identifier wrote an unknown method into the model.
+// ok is false when the value has another shape (reported) or error recovery
+// left it empty.
+func (b *Builder) odataAuthenticationProperty(prop *parser.OdataPropertyAssignmentContext) (types []string, microflow string, ok bool) {
+	line := prop.GetStart().GetLine()
+	switch {
+	case prop.NONE() != nil, isBareNone(prop):
+		return nil, "", true
+	case prop.LPAREN() != nil && len(prop.AllOdataAuthType()) > 0:
+	default:
+		b.addError(fmt.Errorf("line %d: Authentication takes none or a method list "+
+			"(basic, session, guest, microflow Module.Name), not %s", line, odataPropertyValueSource(prop)))
+		return nil, "", false
+	}
+	seen := map[string]bool{}
+	for _, atCtx := range prop.AllOdataAuthType() {
+		at := atCtx.(*parser.OdataAuthTypeContext)
+		if at.IDENTIFIER() != nil {
+			b.addError(fmt.Errorf("line %d: '%s' is not an authentication method: write basic, session, guest "+
+				"or microflow Module.Name", at.GetStart().GetLine(), at.IDENTIFIER().GetText()))
+			return nil, "", false
+		}
+		t, mf := parseODataAuthTypes([]parser.IOdataAuthTypeContext{at})
+		if len(t) == 0 {
+			continue
+		}
+		if seen[t[0]] {
+			b.addError(fmt.Errorf("line %d: authentication method '%s' listed twice", at.GetStart().GetLine(), strings.ToLower(t[0])))
+			continue
+		}
+		seen[t[0]] = true
+		types = append(types, t[0])
+		if mf != "" {
+			microflow = mf
+		}
+	}
+	return types, microflow, true
+}
+
+// isBareNone reports a value of `none` that parsed as a bare name: the first
+// alternative of odataPropertyAssignment takes it before the NONE one does.
+func isBareNone(prop *parser.OdataPropertyAssignmentContext) bool {
+	v, ok := prop.OdataPropertyValue().(*parser.OdataPropertyValueContext)
+	return ok && v != nil && v.QualifiedName() != nil && v.MICROFLOW() == nil && v.AT() == nil &&
+		strings.EqualFold(v.GetText(), "none")
+}
+
+// odataPropertyValueSource is a property's value as written, for a message.
+func odataPropertyValueSource(prop *parser.OdataPropertyAssignmentContext) string {
+	if prop.COLON() == nil || prop.GetStop() == nil {
+		return "that"
+	}
+	in := prop.GetStart().GetInputStream()
+	return strings.TrimSpace(in.GetText(prop.COLON().GetSymbol().GetStop()+1, prop.GetStop().GetStop()))
+}
+
+// odataAuthenticationClauseFix moves a trailing `authentication m1, m2` clause
+// into the property list as its last property, `Authentication: (m1, m2)`, the
+// methods as written. A method MDL has no keyword for has no property spelling,
+// so that clause is reported and left alone.
+func odataAuthenticationClauseFix(ctx *parser.CreateODataServiceStatementContext, clause *parser.OdataAuthenticationClauseContext) (*ast.Fix, string) {
+	props := ctx.AllOdataPropertyAssignment()
+	if len(props) == 0 || clause.AUTHENTICATION() == nil || clause.GetStop() == nil {
+		return nil, "the statement did not parse completely"
+	}
+	in := clause.GetStart().GetInputStream()
+	var items []string
+	for _, atCtx := range clause.AllOdataAuthType() {
+		at := atCtx.(*parser.OdataAuthTypeContext)
+		if at.IDENTIFIER() != nil {
+			return nil, "'" + at.IDENTIFIER().GetText() + "' is not an authentication method MDL has a keyword for"
+		}
+		items = append(items, in.GetText(at.GetStart().GetStart(), at.GetStop().GetStop()))
+	}
+	// A list written one property per line gets the new one on its own line,
+	// indented like the last; a one-line list gets it inline.
+	lastProp := props[len(props)-1]
+	last := lastProp.GetStop()
+	sep := ", "
+	if lp := ctx.LPAREN(); lp != nil && lastProp.GetStart().GetLine() > lp.GetSymbol().GetLine() {
+		sep = ",\n" + strings.Repeat(" ", lastProp.GetStart().GetColumn())
+	}
+	return &ast.Fix{Edits: []ast.TextEdit{
+		insertAt(last.GetStop()+1, sep+"Authentication: ("+strings.Join(items, ", ")+")"),
+		{Start: startAfterSpace(clause.AUTHENTICATION().GetSymbol()), Stop: clause.GetStop().GetStop() + 1},
+	}}, ""
 }

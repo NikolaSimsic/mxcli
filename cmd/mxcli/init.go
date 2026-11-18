@@ -10,8 +10,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"sort"
 	"strings"
 
+	"github.com/mendixlabs/mxcli/mdl/linter"
 	"github.com/spf13/cobra"
 )
 
@@ -20,6 +22,8 @@ var (
 	initAllTools         bool
 	initListTools        bool
 	initContainerRuntime string
+	initSyncSkills       bool
+	initSync             bool
 )
 
 const mendixGitignore = `# Mendix project
@@ -32,11 +36,16 @@ const mendixGitignore = `# Mendix project
 /deployment/
 /javasource/*/proxies/
 /javasource/system/
+# Generated while 'mxcli run --test-endpoint' hosts the test endpoint (ako/mxcli#2033).
+/javasource/mxtest/
 /modeler-merge-marker
 /nativemobile/builds/
 /packages/
 /project-settings.user.json
 /releases/
+# Compiled theme output. MxBuild regenerates it on every build, so tracking it
+# means a fresh clone goes dirty the first time anyone builds. (mxcli-todo #7)
+/theme-cache/
 *.mpr.lock
 *.mpr.bak
 /vendorlib/temp/
@@ -130,12 +139,68 @@ Container Runtime:
 			os.Exit(1)
 		}
 
-		// Find .mpr file
-		mprFile := findMprFile(absDir)
-		if mprFile == "" {
-			mprFile = "project.mpr" // Default if not found
+		// --sync-skills: refresh only the embedded skills and exit. The rest of
+		// init is interactive-ish and writes tool configs; this is the part that
+		// must follow a binary upgrade, and the SessionStart bootstrap runs it
+		// unattended on every session (mxcli-formula1 §16).
+		//
+		// It also refreshes the bundled lint rules and the mxcli section of
+		// CLAUDE.md / AGENTS.md, and stamps the version that did it — and
+		// refuses when this binary is older than that stamp (ako/mxcli#952).
+		if initSyncSkills || initSync {
+			res, err := syncProjectTooling(absDir)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error syncing project tooling: %v\n", err)
+				os.Exit(1)
+			}
+			reportToolingSync(os.Stdout, os.Stderr, res)
+			return
 		}
-		projectName := filepath.Base(absDir)
+
+		// An explicit init from an older binary still runs — the user asked for
+		// it — but not silently: it rewrites the tooling a newer mxcli wrote.
+		if s := staleBinaryStamp(absDir); s != nil {
+			writeStaleBinaryWarning(os.Stderr, *s)
+			fmt.Fprintln(os.Stderr, "  Continuing: 'mxcli init' will rewrite that tooling with this older version.")
+		}
+
+		// Find .mpr file. With none here, look one level down: a solution repo
+		// keeps each app in its own folder, and running `mxcli init` from the
+		// root used to write everything at the root against an invented
+		// `project.mpr` that does not exist — silently wrong, and in a two-app
+		// repo the odds of it being what you meant are zero.
+		// (mxcli-formula1 findings #3.)
+		mprFile := findMprFile(absDir)
+		mprPlaceholder := false
+		if mprFile == "" {
+			candidates := findMprFilesInSubdirs(absDir)
+			switch len(candidates) {
+			case 0:
+				fmt.Fprintf(os.Stderr, "Warning: no .mpr file found in %s.\n", absDir)
+				fmt.Fprintln(os.Stderr, "  Generated files will refer to 'project.mpr'; run this from the app folder to get real paths.")
+				mprFile = "project.mpr"
+				mprPlaceholder = true
+			case 1:
+				absDir = filepath.Dir(candidates[0])
+				mprFile = filepath.Base(candidates[0])
+				fmt.Printf("No .mpr here; initializing the project found below: %s\n", candidates[0])
+			default:
+				fmt.Fprintf(os.Stderr, "Error: %d Mendix projects found below %s:\n", len(candidates), absDir)
+				for _, c := range candidates {
+					fmt.Fprintf(os.Stderr, "  %s\n", c)
+				}
+				fmt.Fprintln(os.Stderr, "\nName the one you mean, so a solution repo does not get one app's tooling by coin flip:")
+				fmt.Fprintf(os.Stderr, "  mxcli init %s\n", filepath.Dir(candidates[0]))
+				os.Exit(1)
+			}
+		}
+		// The app's name (from the .mpr), not the folder's: a cloud session
+		// clones into a folder named after the repository. Every use below is
+		// a display name; paths use absDir/mprFile directly.
+		projectName := projectDisplayName(absDir, mprFile)
+		if mprPlaceholder {
+			projectName = filepath.Base(absDir)
+		}
 
 		// Determine which tools to initialize
 		tools := initTools
@@ -168,18 +233,13 @@ Container Runtime:
 		}
 
 		// Create .claude directory for Claude-specific content (if Claude is selected)
-		var claudeDir, commandsDir, lintRulesDir string
+		var claudeDir, commandsDir string
 		if slices.Contains(tools, "claude") {
 			claudeDir = filepath.Join(absDir, ".claude")
 			commandsDir = filepath.Join(claudeDir, "commands")
-			lintRulesDir = filepath.Join(claudeDir, "lint-rules")
 
 			if err := os.MkdirAll(commandsDir, 0755); err != nil {
 				fmt.Fprintf(os.Stderr, "Error creating .claude/commands directory: %v\n", err)
-				os.Exit(1)
-			}
-			if err := os.MkdirAll(lintRulesDir, 0755); err != nil {
-				fmt.Fprintf(os.Stderr, "Error creating .claude/lint-rules directory: %v\n", err)
 				os.Exit(1)
 			}
 		}
@@ -199,47 +259,49 @@ Container Runtime:
 				fmt.Fprintf(os.Stderr, "Error creating .opencode/skills directory: %v\n", err)
 				os.Exit(1)
 			}
-
-			// Lint rules stay in .claude/lint-rules/ (read by mxcli lint).
-			// Ensure that directory exists even when claude tool is not selected.
-			if !slices.Contains(tools, "claude") {
-				if lintRulesDir == "" {
-					lintRulesDir = filepath.Join(absDir, ".claude", "lint-rules")
-				}
-				if err := os.MkdirAll(lintRulesDir, 0755); err != nil {
-					fmt.Fprintf(os.Stderr, "Error creating .claude/lint-rules directory: %v\n", err)
-					os.Exit(1)
-				}
-			}
 		}
 
-		// Write universal skills to .ai-context/skills/
-		skillCount := 0
-		err = fs.WalkDir(skillsFS, "skills", func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			if d.IsDir() {
-				return nil
-			}
-			// Read from embedded FS
-			content, err := skillsFS.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			// Write to target directory
-			targetPath := filepath.Join(skillsDir, d.Name())
-			if err := os.WriteFile(targetPath, content, 0644); err != nil {
-				return err
-			}
-			skillCount++
-			return nil
-		})
+		// Seed the lint config. `mxcli lint` reads this regardless of which AI
+		// tool was selected, so it is written outside the per-tool branches.
+		if path, created := writeDefaultLintConfig(absDir); created {
+			fmt.Printf("  Created %s (System module excluded from lint)\n", filepath.Base(path))
+		}
+
+		// The bundled Starlark rules, for the same reason. Only claude and
+		// opencode wrote them, so `init --tool cursor` left lint running the Go
+		// rules alone — 17 rules instead of 49 on one project, silently
+		// (ako/mxcli#1292).
+		lintRulesDir := filepath.Join(absDir, ".claude", "lint-rules")
+		if err := os.MkdirAll(lintRulesDir, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating .claude/lint-rules directory: %v\n", err)
+			os.Exit(1)
+		}
+		initBundledLintRules(lintRulesDir)
+
+		// Write the skills. One code path with the SessionStart refresh, so a
+		// fresh init and an upgraded project end up with byte-identical trees —
+		// including the `.claude/skills/` copy Claude Code actually scans.
+		skillRes, err := syncAIContextSkills(absDir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing skills: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Printf("  Created %d skill files in .ai-context/skills/\n", skillCount)
+		for _, dest := range skillDests(absDir) {
+			rel, relErr := filepath.Rel(absDir, dest)
+			if relErr != nil {
+				rel = dest
+			}
+			fmt.Printf("  Created %d skills in %s/\n", skillRes.Total, filepath.ToSlash(rel))
+		}
+
+		// The companion mod (a Claude Code pane), beside the skills. Same
+		// code path as the SessionStart refresh, and only for Claude projects.
+		if written, err := syncCompanion(absDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Error writing the companion mod: %v\n", err)
+			os.Exit(1)
+		} else if len(written) > 0 {
+			fmt.Printf("  Created the mxcli companion in .claude/skills/%s/ (/mxcli-project opens the Project pane)\n", companionFolder)
+		}
 
 		// Write tool-specific configurations
 		for _, toolName := range tools {
@@ -263,8 +325,14 @@ Container Runtime:
 				// Generate content
 				content := file.Content(projectName, mprFile)
 
-				// Write file
-				if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+				// Write file. CLAUDE.md goes through the mxcli markers so a
+				// later sync can refresh it without touching project notes.
+				if isOwnedDoc(file.Path) {
+					if _, err := writeOwnedDoc(filePath, content, true); err != nil {
+						fmt.Fprintf(os.Stderr, "  Error writing %s: %v\n", file.Path, err)
+						continue
+					}
+				} else if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
 					fmt.Fprintf(os.Stderr, "  Error writing %s: %v\n", file.Path, err)
 					continue
 				}
@@ -272,7 +340,7 @@ Container Runtime:
 				fmt.Printf("  Created %s\n", file.Path)
 			}
 
-			// Claude-specific: write commands and lint rules
+			// Claude-specific: write commands
 			if toolName == "claude" && commandsDir != "" {
 				cmdCount := 0
 				err = fs.WalkDir(commandsFS, "commands", func(path string, d fs.DirEntry, err error) error {
@@ -298,34 +366,9 @@ Container Runtime:
 				} else {
 					fmt.Printf("  Created %d command files in .claude/commands/\n", cmdCount)
 				}
-
-				lintRuleCount := 0
-				err = fs.WalkDir(lintRulesFS, "lint-rules", func(path string, d fs.DirEntry, err error) error {
-					if err != nil {
-						return err
-					}
-					if d.IsDir() {
-						return nil
-					}
-					content, err := lintRulesFS.ReadFile(path)
-					if err != nil {
-						return err
-					}
-					targetPath := filepath.Join(lintRulesDir, d.Name())
-					if err := os.WriteFile(targetPath, content, 0644); err != nil {
-						return err
-					}
-					lintRuleCount++
-					return nil
-				})
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "  Error writing lint rules: %v\n", err)
-				} else {
-					fmt.Printf("  Created %d lint rule files in .claude/lint-rules/\n", lintRuleCount)
-				}
 			}
 
-			// OpenCode-specific: write commands, lint rules, and skills
+			// OpenCode-specific: write commands and skills
 			if toolName == "opencode" && opencodeCommandsDir != "" {
 				cmdCount := 0
 				err = fs.WalkDir(commandsFS, "commands", func(path string, d fs.DirEntry, err error) error {
@@ -352,68 +395,7 @@ Container Runtime:
 					fmt.Printf("  Created %d command files in .opencode/commands/\n", cmdCount)
 				}
 
-				lintRuleCount := 0
-				// Only write lint rules from the OpenCode path when Claude is not also
-				// being initialised — the Claude path already writes the same files to
-				// .claude/lint-rules/ and we don't want duplicate log output or writes.
-				if !slices.Contains(tools, "claude") {
-					err = fs.WalkDir(lintRulesFS, "lint-rules", func(path string, d fs.DirEntry, err error) error {
-						if err != nil {
-							return err
-						}
-						if d.IsDir() {
-							return nil
-						}
-						content, err := lintRulesFS.ReadFile(path)
-						if err != nil {
-							return err
-						}
-						targetPath := filepath.Join(lintRulesDir, d.Name())
-						if err := os.WriteFile(targetPath, content, 0644); err != nil {
-							return err
-						}
-						lintRuleCount++
-						return nil
-					})
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "  Error writing lint rules: %v\n", err)
-					} else {
-						fmt.Printf("  Created %d lint rule files in .claude/lint-rules/\n", lintRuleCount)
-					}
-				}
-
-				skillCount2 := 0
-				err = fs.WalkDir(skillsFS, "skills", func(path string, d fs.DirEntry, err error) error {
-					if err != nil {
-						return err
-					}
-					if d.IsDir() {
-						return nil
-					}
-					// Skip README
-					if d.Name() == "README.md" {
-						return nil
-					}
-					content, err := skillsFS.ReadFile(path)
-					if err != nil {
-						return err
-					}
-					// Derive skill name from filename (strip .md)
-					skillName := strings.TrimSuffix(d.Name(), ".md")
-					// Create per-skill subdirectory
-					skillDir := filepath.Join(opencodeSkillsDir, skillName)
-					if err := os.MkdirAll(skillDir, 0755); err != nil {
-						return err
-					}
-					// Wrap content with OpenCode frontmatter
-					wrapped := wrapSkillContent(skillName, content)
-					targetPath := filepath.Join(skillDir, "SKILL.md")
-					if err := os.WriteFile(targetPath, wrapped, 0644); err != nil {
-						return err
-					}
-					skillCount2++
-					return nil
-				})
+				skillCount2, err := writeWrappedSkills(opencodeSkillsDir, wrapSkillContent)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "  Error writing OpenCode skills: %v\n", err)
 				} else {
@@ -423,34 +405,7 @@ Container Runtime:
 			// Vibe-specific: write all skills as .vibe/skills/<name>/SKILL.md
 			if toolName == "vibe" {
 				vibeSkillsDir := filepath.Join(absDir, ".vibe", "skills")
-				vibeSkillCount := 0
-				err = fs.WalkDir(skillsFS, "skills", func(path string, d fs.DirEntry, err error) error {
-					if err != nil {
-						return err
-					}
-					if d.IsDir() {
-						return nil
-					}
-					if d.Name() == "README.md" {
-						return nil
-					}
-					content, err := skillsFS.ReadFile(path)
-					if err != nil {
-						return err
-					}
-					skillName := strings.TrimSuffix(d.Name(), ".md")
-					skillDir := filepath.Join(vibeSkillsDir, skillName)
-					if err := os.MkdirAll(skillDir, 0755); err != nil {
-						return err
-					}
-					wrapped := wrapSkillForVibe(skillName, content)
-					targetPath := filepath.Join(skillDir, "SKILL.md")
-					if err := os.WriteFile(targetPath, wrapped, 0644); err != nil {
-						return err
-					}
-					vibeSkillCount++
-					return nil
-				})
+				vibeSkillCount, err := writeWrappedSkills(vibeSkillsDir, wrapSkillForVibe)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "  Error writing Vibe skills: %v\n", err)
 				} else {
@@ -465,7 +420,7 @@ Container Runtime:
 			filePath := filepath.Join(absDir, file.Path)
 			content := file.Content(projectName, mprFile)
 
-			if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+			if _, err := writeOwnedDoc(filePath, content, true); err != nil {
 				fmt.Fprintf(os.Stderr, "  Error writing %s: %v\n", file.Path, err)
 				os.Exit(1)
 			}
@@ -505,6 +460,16 @@ Container Runtime:
 			}
 		}
 
+		// Emit a Claude Code SessionStart hook so a fresh/reaped web session
+		// self-bootstraps (cache MxBuild+runtime, provision the DB) before use.
+		if slices.Contains(tools, "claude") && claudeDir != "" {
+			if changed, err := ensureSessionStartHook(claudeDir, mprFile); err != nil {
+				fmt.Fprintf(os.Stderr, "  Warning: SessionStart hook: %v\n", err)
+			} else if changed {
+				fmt.Println("\nAdded SessionStart hook to .claude/settings.json (self-bootstrap on session start)")
+			}
+		}
+
 		// Create .gitignore if it doesn't exist
 		gitignorePath := filepath.Join(absDir, ".gitignore")
 		if _, err := os.Stat(gitignorePath); os.IsNotExist(err) {
@@ -512,6 +477,15 @@ Container Runtime:
 				fmt.Fprintf(os.Stderr, "  Error writing .gitignore: %v\n", err)
 			} else {
 				fmt.Println("\nCreated .gitignore")
+			}
+		} else if mprFile != "" {
+			// A project that already has a .gitignore keeps it — but .mxcli/ has to
+			// be in there regardless, because it holds machine-local constant values
+			// (which may be secrets), the run/test handshake and its token, and
+			// runtime logs. Only the create-if-missing branch above covered it.
+			// The same goes for the test endpoint's generated Java source.
+			if err := ensureTestEndpointIgnored(filepath.Join(absDir, mprFile)); err != nil {
+				fmt.Fprintf(os.Stderr, "  Warning: could not ensure .mxcli/ and javasource/mxtest/ are git-ignored: %v\n", err)
 			}
 		}
 
@@ -545,6 +519,20 @@ Container Runtime:
 			}
 		}
 
+		// The directory the generated CLAUDE.md tells the agent to put scripts
+		// in; it used to be named and never created (ako/mxcli#952).
+		if created, err := ensureMdlsourceDir(absDir); err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: creating mdlsource/: %v\n", err)
+		} else if created {
+			fmt.Println("\nCreated mdlsource/ (MDL scripts)")
+		}
+
+		// Record which mxcli wrote all of the above, so an older binary
+		// opening the project later can say so (ako/mxcli#952).
+		if _, err := writeToolingStamp(absDir); err != nil {
+			fmt.Fprintf(os.Stderr, "  Warning: writing %s: %v\n", toolingStampRel, err)
+		}
+
 		fmt.Println("\n✓ Initialization complete!")
 		fmt.Println("\nWhat was created:")
 		fmt.Println("  • .gitignore - Mendix project ignore patterns")
@@ -567,6 +555,77 @@ Container Runtime:
 		fmt.Println("  ./mxcli search \"pattern\"       - Search project")
 		fmt.Println("  ./mxcli lint                   - Check for issues")
 	},
+}
+
+// initBundledLintRules writes the bundled lint rules for an explicit init,
+// keeping the ones the project edited or moved to a new name
+// (mendixlabs/mxcli#1615), and says which.
+func initBundledLintRules(lintRulesDir string) {
+	res, err := writeBundledLintRules(lintRulesDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  Error writing lint rules: %v\n", err)
+	}
+	printBundledLintRuleWrite(os.Stdout, res)
+}
+
+// defaultLintConfig is the lint configuration written into a freshly
+// initialised project. System is excluded because its contents are Mendix's,
+// not the developer's: you cannot document its entities, give them access
+// rules, or rename their members. Linting it produced ~100 un-actionable
+// findings on a blank app, which buried the handful about the developer's own
+// code (issuetracker finding #9).
+const defaultLintConfig = `# mxcli lint configuration.
+# Docs: mxcli lint --help
+
+# Modules that 'mxcli lint' skips entirely.
+#
+# System is Mendix's own platform module — its entities, members and access
+# rules are not yours to change, so findings against it are noise. On a blank
+# app it accounts for the large majority of all issues.
+#
+# Marketplace modules (Atlas_Core, Atlas_Web_Content, Administration, …) are
+# equally read-only in practice; add them here if their findings distract you.
+#
+# NOTE: this list always wins. It is merged with '--exclude', and a module
+# listed here is skipped even if you ask for it with '--modules'. To lint
+# System, remove it from this list (or delete this file).
+excludeModules:
+  - System
+
+# Per-rule overrides. Examples:
+#
+# rules:
+#   QUAL002:            # missing documentation
+#     enabled: false
+#   CONV009:            # max microflow objects
+#     severity: warning
+#     options:
+#       maxObjects: 20
+#   QUAL004:            # orphaned elements: name prefixes of entry points
+#     options:
+#       entry_point_prefixes: [ACT_, SCH_, WS_, REST_, OData_]
+rules: {}
+`
+
+// writeDefaultLintConfig creates .claude/lint-config.yaml unless the project
+// already has a lint config in any of the locations linter.FindConfigFile
+// searches. Never overwrites: init is re-runnable, and the config is meant to
+// be edited.
+func writeDefaultLintConfig(projectDir string) (string, bool) {
+	if existing := linter.FindConfigFile(projectDir); existing != "" {
+		return existing, false
+	}
+	claudeDir := filepath.Join(projectDir, ".claude")
+	if err := os.MkdirAll(claudeDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "  Error creating .claude directory for lint config: %v\n", err)
+		return "", false
+	}
+	path := filepath.Join(claudeDir, "lint-config.yaml")
+	if err := os.WriteFile(path, []byte(defaultLintConfig), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "  Error writing lint config: %v\n", err)
+		return "", false
+	}
+	return path, true
 }
 
 func findMprFile(dir string) string {
@@ -595,4 +654,29 @@ func init() {
 	initCmd.Flags().BoolVar(&initAllTools, "all-tools", false, "Initialize for all supported AI tools")
 	initCmd.Flags().BoolVar(&initListTools, "list-tools", false, "List supported AI tools and exit")
 	initCmd.Flags().StringVar(&initContainerRuntime, "container-runtime", "docker", "Container runtime for devcontainer (docker or podman)")
+	initCmd.Flags().BoolVar(&initSyncSkills, "sync-skills", false, "Refresh the project's mxcli tooling from this binary and exit: skills, bundled lint rules, the mxcli section of CLAUDE.md/AGENTS.md, and the version stamp (quiet when already current; refuses when this binary is older than the stamp)")
+	initCmd.Flags().BoolVar(&initSync, "sync", false, "Same as --sync-skills")
+}
+
+// findMprFilesInSubdirs returns the .mpr files one level below dir, sorted, so
+// the choice is deterministic and the error message lists them in a stable
+// order. One level only: a Mendix app keeps its .mpr at its root, and walking
+// deeper would find deployment copies and backups.
+func findMprFilesInSubdirs(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		sub := filepath.Join(dir, e.Name())
+		if mpr := findMprFile(sub); mpr != "" {
+			out = append(out, filepath.Join(sub, mpr))
+		}
+	}
+	sort.Strings(out)
+	return out
 }

@@ -13,20 +13,25 @@ import (
 )
 
 func init() {
-	// A consumed REST service's Operations list and each operation's Headers /
-	// Parameters / QueryParameters use the typed-array marker 2; Tags is a marker-1
-	// string array. BaseUrlParameter is always null; AuthenticationScheme is null
-	// when there is no authentication.
-	codec.RegisterListMarker("Rest$RestOperation", 2)
-	codec.RegisterListMarker("Rest$HeaderWithValueTemplate", 2)
-	codec.RegisterListMarker("Rest$OperationParameter", 2)
+	// A consumed REST service's Operations list and each operation's Headers and
+	// Parameters use the typed-array marker 3, its QueryParameters 2, and Tags is
+	// a marker-1 string array — measured on the Studio Pro-authored services in
+	// TestApp (11.14.0) and on `mx convert -p` of mxcli-written ones (11.6.6),
+	// which agree. The first three were 2, copied from the legacy serializer and
+	// never measured, so a rewrite of a Studio Pro-authored service changed its
+	// markers even when nothing else changed (mendixlabs/mxcli#1608).
+	// BaseUrlParameter is always null; AuthenticationScheme is null when there is
+	// no authentication.
+	codec.RegisterListMarker("Rest$RestOperation", 3)
+	codec.RegisterListMarker("Rest$HeaderWithValueTemplate", 3)
+	codec.RegisterListMarker("Rest$OperationParameter", 3)
 	codec.RegisterListMarker("Rest$QueryParameter", 2)
 	codec.RegisterTypeDefaults("Rest$ConsumedRestService", codec.TypeDefaults{
-		MandatoryListMarkers: map[string]int32{"Operations": 2},
+		MandatoryListMarkers: map[string]int32{"Operations": 3},
 		NullFields:           []string{"BaseUrlParameter", "AuthenticationScheme"},
 	})
 	codec.RegisterTypeDefaults("Rest$RestOperation", codec.TypeDefaults{
-		MandatoryListMarkers: map[string]int32{"Tags": 1, "Headers": 2, "Parameters": 2, "QueryParameters": 2},
+		MandatoryListMarkers: map[string]int32{"Tags": 1, "Headers": 3, "Parameters": 3, "QueryParameters": 2},
 	})
 }
 
@@ -43,7 +48,7 @@ func (b *Backend) CreateConsumedRestService(svc *model.ConsumedRestService) erro
 		svc.ID = model.ID(mmpr.GenerateID())
 	}
 	svc.TypeName = "Rest$ConsumedRestService"
-	contents, err := (&codec.Encoder{}).Encode(consumedRestServiceToGen(svc))
+	contents, err := (&codec.Encoder{}).Encode(consumedRestServiceToGen(svc, b.restBodyForms()))
 	if err != nil {
 		return fmt.Errorf("CreateConsumedRestService: encode: %w", err)
 	}
@@ -58,9 +63,14 @@ func (b *Backend) UpdateConsumedRestService(svc *model.ConsumedRestService) erro
 	if b.writer == nil {
 		return fmt.Errorf("UpdateConsumedRestService: not connected for writing")
 	}
-	contents, err := (&codec.Encoder{}).Encode(consumedRestServiceToGen(svc))
+	contents, err := (&codec.Encoder{}).Encode(consumedRestServiceToGen(svc, b.restBodyForms()))
 	if err != nil {
 		return fmt.Errorf("UpdateConsumedRestService: encode: %w", err)
+	}
+	// consumedRestServiceToGen writes ExportLevel "Hidden" as a constant (#816).
+	contents, err = b.keepStoredExportLevel(string(svc.ID), contents)
+	if err != nil {
+		return fmt.Errorf("UpdateConsumedRestService: %w", err)
 	}
 	return b.writer.UpdateRawUnit(string(svc.ID), contents)
 }
@@ -73,7 +83,7 @@ func (b *Backend) DeleteConsumedRestService(id model.ID) error {
 	return b.writer.DeleteUnit(string(id))
 }
 
-func consumedRestServiceToGen(svc *model.ConsumedRestService) element.Element {
+func consumedRestServiceToGen(svc *model.ConsumedRestService, forms restBodyForms) element.Element {
 	g := newElem("Rest$ConsumedRestService", string(svc.ID))
 	addStr(g, "Name", svc.Name)
 	addStr(g, "Documentation", svc.Documentation)
@@ -92,7 +102,7 @@ func consumedRestServiceToGen(svc *model.ConsumedRestService) element.Element {
 	}
 	ops := make([]element.Element, 0, len(svc.Operations))
 	for _, op := range svc.Operations {
-		ops = append(ops, restOperationToGen(op))
+		ops = append(ops, restOperationToGen(op, forms))
 	}
 	if len(ops) > 0 {
 		addPartList(g, "Operations", ops)
@@ -127,7 +137,7 @@ func restValueElem(value string) element.Element {
 	return g
 }
 
-func restOperationToGen(op *model.RestClientOperation) element.Element {
+func restOperationToGen(op *model.RestClientOperation, forms restBodyForms) element.Element {
 	g := newElem("Rest$RestOperation", "")
 	addStr(g, "Name", op.Name)
 	timeout := int64(op.Timeout)
@@ -138,7 +148,7 @@ func restOperationToGen(op *model.RestClientOperation) element.Element {
 	if len(op.Tags) > 0 {
 		addByNameRefList(g, "Tags", "", op.Tags)
 	}
-	addPart(g, "Method", restMethodToGen(op))
+	addPart(g, "Method", restMethodToGen(op, forms))
 	addPart(g, "Path", valueTemplateElem(op.Path))
 
 	headers := make([]element.Element, 0, len(op.Headers)+1)
@@ -177,7 +187,10 @@ func restOperationToGen(op *model.RestClientOperation) element.Element {
 		addPartList(g, "QueryParameters", queryParams)
 	}
 
-	if op.ResponseType == "MAPPING" && op.ResponseEntity != "" && len(op.ResponseMappings) > 0 {
+	// Case-insensitive on purpose: the else-branch silently downgrades to
+	// Rest$NoResponseHandling, so a producer that spells the token differently
+	// loses the mapping with no error anywhere. That is how #843 happened.
+	if strings.EqualFold(op.ResponseType, "MAPPING") && op.ResponseEntity != "" && len(op.ResponseMappings) > 0 {
 		addPart(g, "ResponseHandling", restImplicitMappingResponseToGen(op.ResponseEntity, op.ResponseMappings))
 	} else {
 		addPart(g, "ResponseHandling", restResponseHandlingToGen(op.ResponseType))
@@ -187,7 +200,7 @@ func restOperationToGen(op *model.RestClientOperation) element.Element {
 
 // restMethodToGen builds the polymorphic Method field. POST/PUT/PATCH always
 // carry a body (CE7064); GET/DELETE/etc. use the without-body form.
-func restMethodToGen(op *model.RestClientOperation) element.Element {
+func restMethodToGen(op *model.RestClientOperation, forms restBodyForms) element.Element {
 	httpMethod := httpMethodToMendix(op.HttpMethod)
 	upper := strings.ToUpper(op.HttpMethod)
 	withBody := op.BodyType != "" || upper == "POST" || upper == "PUT" || upper == "PATCH"
@@ -198,29 +211,59 @@ func restMethodToGen(op *model.RestClientOperation) element.Element {
 	}
 	g := newElem("Rest$RestOperationMethodWithBody", "")
 	addStr(g, "HttpMethod", httpMethod)
-	if op.BodyType == "EXPORT_MAPPING" && len(op.BodyMappings) > 0 {
+	if strings.EqualFold(op.BodyType, "EXPORT_MAPPING") && len(op.BodyMappings) > 0 {
 		addPart(g, "Body", restImplicitMappingBodyToGen(op.BodyVariable, op.BodyMappings))
 	} else {
 		bodyType := op.BodyType
 		if bodyType == "" {
 			bodyType = "JSON"
 		}
-		addPart(g, "Body", restBodyToGen(bodyType, op.BodyVariable))
+		addPart(g, "Body", restBodyToGen(bodyType, op.BodyVariable, forms))
 	}
 	return g
 }
 
-func restBodyToGen(bodyType, bodyExpr string) element.Element {
-	switch strings.ToUpper(bodyType) {
-	case "FILE", "TEMPLATE":
-		g := newElem("Rest$StringBody", "")
-		addPart(g, "ValueTemplate", valueTemplateElem(bodyExpr))
-		return g
-	default: // JSON
+// restBodyForms says which request-body element shapes the project's Mendix
+// version has. Measured with `mx convert`, which refuses to load a project
+// holding a type its version does not know (TypeCacheUnknownTypeException —
+// Studio Pro cannot open it either, while `mx check` passes):
+//
+//   - Rest$JsonBody exists from 11.0.0: 10.24.24 refuses it, 11.0.0 loads it.
+//   - Rest$StringBody stores its text as ValueTemplate from 10.11.0, as the
+//     string Value before (modelsdk/gen/rest/version.go).
+type restBodyForms struct {
+	jsonBody      bool
+	valueTemplate bool
+}
+
+// restBodyForms reads the forms off the project version. An unreadable version
+// gets the current forms, as every other consumed-REST write does.
+func (b *Backend) restBodyForms() restBodyForms {
+	pv := b.ProjectVersion()
+	if pv == nil || pv.MajorVersion == 0 {
+		return restBodyForms{jsonBody: true, valueTemplate: true}
+	}
+	return restBodyForms{jsonBody: pv.IsAtLeast(11, 0), valueTemplate: pv.IsAtLeast(10, 11)}
+}
+
+// restBodyToGen builds the operation's request body. A JSON body on a project
+// older than Rest$JsonBody is written as the string body Mendix 10 has: both
+// hold the same body text, and a Mendix 10 consumed REST operation has no
+// other kind. It reads back as a template body, which is what it is there.
+func restBodyToGen(bodyType, bodyExpr string, forms restBodyForms) element.Element {
+	upper := strings.ToUpper(bodyType)
+	if upper != "FILE" && upper != "TEMPLATE" && forms.jsonBody {
 		g := newElem("Rest$JsonBody", "")
 		addStr(g, "Value", bodyExpr)
 		return g
 	}
+	g := newElem("Rest$StringBody", "")
+	if forms.valueTemplate {
+		addPart(g, "ValueTemplate", valueTemplateElem(bodyExpr))
+	} else {
+		addStr(g, "Value", bodyExpr)
+	}
+	return g
 }
 
 func restHeaderToGen(h *model.RestClientHeader) element.Element {
@@ -241,6 +284,14 @@ func restResponseHandlingToGen(responseType string) element.Element {
 		addStr(g, "ContentType", "text/plain")
 	case "FILE":
 		addStr(g, "ContentType", "application/octet-stream")
+	default:
+		// `Response: none` is an EMPTY content type, written. Leaving the key
+		// out meant "none" only to mxcli's reader: Mendix fills an absent
+		// ContentType with application/json (measured with `mx convert`), so
+		// Studio Pro's next save — and since mendixlabs/mxcli#1373 the
+		// property-set completion at the write choke point — turned it into
+		// `Response: json`.
+		addStr(g, "ContentType", "")
 	}
 	return g
 }
@@ -280,21 +331,42 @@ func restImplicitMappingResponseToGen(entity string, mappings []*model.RestRespo
 	return g
 }
 
+// nestedInlineHandling / nestedInlineBackup: see the identical pair in
+// sdk/mpr/writer_rest.go. An export object element must not be "Create" —
+// mxbuild refuses to LOAD the project ("Export Object Mappings cannot have
+// ObjectHandling set to 'Create'"), so this is a correctness rule, not a
+// fidelity preference.
+func nestedInlineHandling(namespace string) string {
+	if namespace == "ExportMappings" {
+		return "Find"
+	}
+	return "Create"
+}
+
+func nestedInlineBackup(namespace string) string {
+	if namespace == "ExportMappings" {
+		return "Error"
+	}
+	return "Create"
+}
+
 func restInlineMappingElementToGen(entity, association, exposedName, jsonPath string, mappings []*model.RestResponseMapping, namespace, objectHandling string) element.Element {
 	children := make([]element.Element, 0, len(mappings))
 	for _, m := range mappings {
 		if m.Entity != "" {
-			childJSONPath := jsonPath + "|" + m.ExposedName
-			children = append(children, restInlineMappingElementToGen(m.Entity, m.Association, m.ExposedName, childJSONPath, m.Children, namespace, "Create"))
+			childJSONPath := model.InlineMappingPath(jsonPath, m.ExposedName)
+			children = append(children, restInlineMappingElementToGen(m.Entity, m.Association,
+				model.InlineMappingExposedName(m.ExposedName), childJSONPath, m.Children,
+				namespace, nestedInlineHandling(namespace)))
 			continue
 		}
 		valueJSONPath := m.JsonPath
 		if valueJSONPath == "" {
-			valueJSONPath = jsonPath + "|" + m.ExposedName
+			valueJSONPath = model.InlineMappingPath(jsonPath, m.ExposedName)
 		}
 		v := newElem(namespace+"$ValueMappingElement", "")
 		addStr(v, "Attribute", entity+"."+m.Attribute)
-		addStr(v, "ExposedName", m.ExposedName)
+		addStr(v, "ExposedName", model.InlineMappingExposedName(m.ExposedName))
 		addStr(v, "JsonPath", valueJSONPath)
 		addStr(v, "XmlPath", "")
 		addBool(v, "IsKey", false)
@@ -302,7 +374,8 @@ func restInlineMappingElementToGen(entity, association, exposedName, jsonPath st
 		addInt32(v, "MinOccurs", 0)
 		addInt32(v, "MaxOccurs", 1)
 		addBool(v, "Nillable", true)
-		addBool(v, "IsDefaultType", false)
+		// No IsDefaultType: Mendix declares it on the object mapping element
+		// only, and mx diff/merge throws on it here (#1097; see #882).
 		addStr(v, "ElementType", "Value")
 		addStr(v, "Documentation", "")
 		addStr(v, "Converter", "")
@@ -326,7 +399,7 @@ func restInlineMappingElementToGen(entity, association, exposedName, jsonPath st
 	addStr(g, "JsonPath", jsonPath)
 	addStr(g, "XmlPath", "")
 	addStr(g, "ObjectHandling", objectHandling)
-	addStr(g, "ObjectHandlingBackup", "Create")
+	addStr(g, "ObjectHandlingBackup", nestedInlineBackup(namespace))
 	addBool(g, "ObjectHandlingBackupAllowOverride", false)
 	addStr(g, "Association", association)
 	if len(children) > 0 {

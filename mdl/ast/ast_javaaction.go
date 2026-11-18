@@ -11,6 +11,11 @@ type JavaActionParam struct {
 	Name       string   // Parameter name
 	Type       DataType // Parameter type
 	IsRequired bool     // NOT NULL constraint
+	// Description is the `/** … */` doc comment written before the parameter.
+	// DescriptionSet says one was written: an absent comment keeps the stored
+	// description, an empty one clears it (mendixlabs/mxcli#1588).
+	Description    string
+	DescriptionSet bool
 }
 
 // CreateJavaActionStmt represents:
@@ -18,28 +23,82 @@ type JavaActionParam struct {
 //	CREATE JAVA ACTION Module.Name(
 //	  EntityType: ENTITY <pEntity> NOT NULL,
 //	  Source: pEntity NOT NULL
-//	) RETURNS type
+//	) RETURNS type [AS $ReturnName]
 //	EXPOSED AS 'caption' IN 'category'
 //	AS $$ ... $$;
 type CreateJavaActionStmt struct {
-	Name            QualifiedName     // Qualified name (Module.ActionName)
-	Parameters      []JavaActionParam // Input parameters
-	ReturnType      DataType          // Return type (can be nil for void)
-	JavaCode        string            // The executeAction() body
-	ExtraCode       string            // Optional extra code section
-	Imports         []string          // Optional additional imports
-	Documentation   string            // Optional documentation comment
-	TypeParameters  []string          // Type parameter names (e.g., ["pEntity"])
-	ExposedCaption  string            // EXPOSED AS 'caption'
-	ExposedCategory string            // IN 'category'
-	CreateOrModify  bool              // true for CREATE OR MODIFY / CREATE OR REPLACE
+	CreateGuard                        // `create … if not exists` (ako/mxcli#731)
+	Folder           string            // Folder path within module (empty = leave placement alone)
+	Name             QualifiedName     // Qualified name (Module.ActionName)
+	Parameters       []JavaActionParam // Input parameters
+	ReturnType       DataType          // Return type (can be nil for void)
+	ReturnName       string            // `returns T as $Name`: the return value's name; "" keeps the stored one (mendixlabs/mxcli#1588)
+	JavaCode         string            // The executeAction() body
+	ExtraCode        string            // `extra code $$ … $$`: the EXTRA CODE section
+	ExtraCodeSet     bool              // the clause was written: absent keeps the stored section, empty clears it (ako/mxcli#1702)
+	Imports          []string          // Optional additional imports
+	Documentation    string            // Optional documentation comment
+	DocumentationSet bool              // see mendixlabs/mxcli#1018: absent preserves, empty clears
+	TypeParameters   []string          // Type parameter names (e.g., ["pEntity"])
+	ExposedCaption   string            // EXPOSED AS 'caption'
+	ExposedCategory  string            // IN 'category'
+	// NotExposed is NOT EXPOSED: remove the toolbox entry. Distinct from an
+	// absent clause, which preserves whatever is stored.
+	NotExposed bool
+	// ExposedBitmaps are the ICON/IMAGE clauses. An omitted one is preserved.
+	ExposedBitmaps []ExposeBitmap
+	CreateOrModify bool // true for CREATE OR MODIFY / CREATE OR REPLACE
 }
 
 func (s *CreateJavaActionStmt) isStatement() {}
 
 // DropJavaActionStmt represents: DROP JAVA ACTION Module.Name
 type DropJavaActionStmt struct {
+	DropGuard
 	Name QualifiedName
 }
 
 func (s *DropJavaActionStmt) isStatement() {}
+
+// CreateJavaScriptActionStmt represents:
+//
+//	CREATE JAVASCRIPT ACTION Module.Name(
+//	  Param: type NOT NULL
+//	) RETURNS type [AS $ReturnName]
+//	EXPOSED AS 'caption' IN 'category'
+//	PLATFORM Web
+//	AS $$ ... $$;
+//
+// It mirrors CreateJavaActionStmt with an added Platform (Web/Native/Hybrid/All,
+// default Web). The inline source is JavaScript rather than Java.
+type CreateJavaScriptActionStmt struct {
+	CreateGuard                        // `create … if not exists` (ako/mxcli#731)
+	Folder           string            // Folder path within module (empty = leave placement alone)
+	Name             QualifiedName     // Qualified name (Module.ActionName)
+	Parameters       []JavaActionParam // Input parameters
+	ReturnType       DataType          // Return type (can be nil for void)
+	ReturnName       string            // `returns T as $Name`; "" keeps the stored one (mendixlabs/mxcli#1588)
+	JavaScriptCode   string            // The exported function body (user code)
+	Documentation    string            // Optional documentation comment
+	DocumentationSet bool              // see mendixlabs/mxcli#1018: absent preserves, empty clears
+	TypeParameters   []string          // Type parameter names (e.g., ["pEntity"])
+	ExposedCaption   string            // EXPOSED AS 'caption'
+	ExposedCategory  string            // IN 'category'
+	// NotExposed is NOT EXPOSED: remove the toolbox entry. Distinct from an
+	// absent clause, which preserves whatever is stored.
+	NotExposed bool
+	// ExposedBitmaps are the ICON/IMAGE clauses. An omitted one is preserved.
+	ExposedBitmaps []ExposeBitmap
+	Platform       string // PLATFORM Web|Native|Hybrid|All (default Web)
+	CreateOrModify bool   // true for CREATE OR MODIFY / CREATE OR REPLACE
+}
+
+func (s *CreateJavaScriptActionStmt) isStatement() {}
+
+// DropJavaScriptActionStmt represents: DROP JAVASCRIPT ACTION Module.Name
+type DropJavaScriptActionStmt struct {
+	DropGuard
+	Name QualifiedName
+}
+
+func (s *DropJavaScriptActionStmt) isStatement() {}

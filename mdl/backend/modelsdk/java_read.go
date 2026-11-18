@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"strings"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
+
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/modelsdk/element"
 	genCa "github.com/mendixlabs/mxcli/modelsdk/gen/codeactions"
 	genJa "github.com/mendixlabs/mxcli/modelsdk/gen/javaactions"
-	"github.com/mendixlabs/mxcli/modelsdk/mprread"
+	"github.com/mendixlabs/mxcli/modelsdk/meta"
 	"github.com/mendixlabs/mxcli/sdk/javaactions"
 )
 
@@ -26,10 +28,13 @@ func (b *Backend) ReadJavaActionByName(qualifiedName string) (*javaactions.JavaA
 	moduleName, actionName := qualifiedName[:dot], qualifiedName[dot+1:]
 	mod, err := b.GetModuleByName(moduleName)
 	if err != nil || mod == nil {
+		if ja := systemJavaActionByName(moduleName, actionName); ja != nil {
+			return ja, nil
+		}
 		return nil, fmt.Errorf("java action not found: %s", qualifiedName)
 	}
 	containers := b.containerSetForModule(string(mod.ID)) // module + nested folders
-	units, err := mprread.ListUnitsWithContainer[*genJa.JavaAction](b.reader)
+	units, err := listUnits[*genJa.JavaAction](b)
 	if err != nil {
 		return nil, err
 	}
@@ -38,7 +43,27 @@ func (b *Backend) ReadJavaActionByName(qualifiedName string) (*javaactions.JavaA
 			return javaActionFromGen(u.Element, u.ContainerID), nil
 		}
 	}
+	if ja := systemJavaActionByName(moduleName, actionName); ja != nil {
+		return ja, nil
+	}
 	return nil, fmt.Errorf("java action not found: %s", qualifiedName)
+}
+
+// systemJavaActionByName resolves a System-module platform built-in (e.g.
+// System.VerifyPassword), which has no stored unit. The list paths already
+// synthesize these, so the by-name read must too or a listed action cannot be
+// described or called (mendixlabs/mxcli#1445). Stored units win; this is only
+// the fallback.
+func systemJavaActionByName(moduleName, actionName string) *javaactions.JavaAction {
+	if moduleName != "System" {
+		return nil
+	}
+	for _, ja := range meta.BuildSystemJavaActionsFull() {
+		if ja.Name == actionName {
+			return ja
+		}
+	}
+	return nil
 }
 
 // ListJavaActionsFull reads every Java action unit into the fully-parsed semantic
@@ -47,7 +72,7 @@ func (b *Backend) ReadJavaActionByName(qualifiedName string) (*javaactions.JavaA
 // legacy reader appends are not yet modelled in modelsdk/meta, so they're omitted;
 // the catalog simply indexes fewer rows, it does not error.)
 func (b *Backend) ListJavaActionsFull() ([]*javaactions.JavaAction, error) {
-	units, err := mprread.ListUnitsWithContainer[*genJa.JavaAction](b.reader)
+	units, err := listUnits[*genJa.JavaAction](b)
 	if err != nil {
 		return nil, err
 	}
@@ -55,6 +80,9 @@ func (b *Backend) ListJavaActionsFull() ([]*javaactions.JavaAction, error) {
 	for _, u := range units {
 		out = append(out, javaActionFromGen(u.Element, u.ContainerID))
 	}
+	// Same reason as ListJavaActions: the System module's are platform built-ins
+	// with no stored unit, so they have to be synthesized or they vanish.
+	out = append(out, meta.BuildSystemJavaActionsFull()...)
 	return out, nil
 }
 
@@ -93,13 +121,58 @@ func javaActionFromGen(g *genJa.JavaAction, containerID model.ID) *javaactions.J
 		d.ID = model.ID(tp.ID())
 		out.TypeParameters = append(out.TypeParameters, d)
 	}
-	if mai, ok := g.MicroflowActionInfo().(*genJa.MicroflowActionInfo); ok && mai != nil {
+	// The MicroflowActionInfo sub-document may decode as either gen type: the
+	// legacy JavaActions$ shape or the current CodeActions$ shape we now write
+	// (#656). Both expose Caption/Category/ID, so read via a shared interface.
+	if mai, ok := g.MicroflowActionInfo().(interface {
+		Caption() string
+		Category() string
+		ID() element.ID
+		Raw() bson.Raw
+	}); ok && mai != nil {
 		m := &javaactions.MicroflowActionInfo{Caption: mai.Caption(), Category: mai.Category()}
 		m.ID = model.ID(mai.ID())
+		readActionInfoBitmaps(mai.Raw(), m)
 		out.MicroflowActionInfo = m
 	}
 	out.ReturnType = codeActionReturnTypeFromGen(g.JavaReturnType())
+	resolveJavaActionTypeParameterNames(out)
 	return out
+}
+
+// resolveJavaActionTypeParameterNames fills the display names of type-parameter
+// references. The stored types hold only a BY_ID pointer to the TypeParameter,
+// and the name is all DESCRIBE prints — unresolved, `entity <pEntity>` came back
+// as `entity <>` and the description no longer round-tripped (#1034).
+func resolveJavaActionTypeParameterNames(ja *javaactions.JavaAction) {
+	for _, p := range ja.Parameters {
+		switch pt := p.ParameterType.(type) {
+		case *javaactions.EntityTypeParameterType:
+			if pt.TypeParameterName == "" {
+				pt.TypeParameterName = ja.FindTypeParameterName(pt.TypeParameterID)
+			}
+		case *javaactions.TypeParameter:
+			if pt.TypeParameter == "" {
+				pt.TypeParameter = ja.FindTypeParameterName(pt.TypeParameterID)
+			}
+		case *javaactions.ListType:
+			resolveListTypeParameterName(ja, pt)
+		}
+	}
+	switch rt := ja.ReturnType.(type) {
+	case *javaactions.TypeParameter:
+		if rt.TypeParameter == "" {
+			rt.TypeParameter = ja.FindTypeParameterName(rt.TypeParameterID)
+		}
+	case *javaactions.ListType:
+		resolveListTypeParameterName(ja, rt)
+	}
+}
+
+func resolveListTypeParameterName(ja *javaactions.JavaAction, l *javaactions.ListType) {
+	if l.TypeParameterID != "" && l.TypeParameter == "" {
+		l.TypeParameter = ja.FindTypeParameterName(l.TypeParameterID)
+	}
 }
 
 // codeActionParamTypeFromGen converts a gen parameter-type element to the semantic
@@ -116,6 +189,17 @@ func codeActionParamTypeFromGen(el element.Element) javaactions.CodeActionParame
 		e := &javaactions.EntityTypeParameterType{TypeParameterID: model.ID(t.TypeParameterRefID())}
 		e.ID = model.ID(t.ID())
 		return e
+	// A document of a custom (extension-defined) type — AgentEditorCommons'
+	// `Agent` parameter. It fell to the default below and read back as a
+	// String, so describe printed `Agent: String` and a call bound it as an
+	// expression: CE0115 (ako/mxcli#1451).
+	case *genCa.CustomBlobDocumentParameterType:
+		c := &javaactions.CustomBlobDocumentType{
+			DocumentType: t.CustomDocumentTypeName(),
+			ReadableName: t.CustomDocumentReadableTypeName(),
+		}
+		c.ID = model.ID(t.ID())
+		return c
 	default:
 		return codeActionBasicFromGen(el)
 	}
@@ -125,10 +209,26 @@ func codeActionParamTypeFromGen(el element.Element) javaactions.CodeActionParame
 // directly-typed element) to the semantic parameter type.
 func codeActionBasicFromGen(el element.Element) javaactions.CodeActionParameterType {
 	switch t := el.(type) {
+	// A microflow-typed parameter (a java action that takes a microflow to call
+	// back into — MCPServer.AddTool's ExecutingMicroflow, and every "register a
+	// handler" action). Missing here, it fell through to the default and read
+	// back as a String, so the microflow builder authored a
+	// BasicCodeActionParameterValue holding the microflow's name as a literal
+	// and `mx check` reported CE0115. mxcli-chat FINDINGS §36.
+	case *genJa.MicroflowJavaActionParameterType:
+		m := &javaactions.MicroflowType{}
+		m.ID = model.ID(t.ID())
+		return m
+	case *genJa.MicroflowParameterType:
+		m := &javaactions.MicroflowType{}
+		m.ID = model.ID(t.ID())
+		return m
+	case *genCa.EnumerationType:
+		return &javaactions.EnumerationType{Enumeration: t.EnumerationQualifiedName()}
 	case *genCa.ConcreteEntityType:
 		return &javaactions.EntityType{Entity: t.EntityQualifiedName()}
 	case *genCa.ListType:
-		return &javaactions.ListType{Entity: listElementEntity(t)}
+		return listTypeFromGen(t)
 	case *genCa.ParameterizedEntityType:
 		return &javaactions.TypeParameter{TypeParameterID: model.ID(t.TypeParameterRefID())}
 	case *genCa.BooleanType:
@@ -150,10 +250,12 @@ func codeActionReturnTypeFromGen(el element.Element) javaactions.CodeActionRetur
 	switch t := el.(type) {
 	case nil, *genCa.VoidType:
 		return nil
+	case *genCa.EnumerationType:
+		return &javaactions.EnumerationType{Enumeration: t.EnumerationQualifiedName()}
 	case *genCa.ConcreteEntityType:
 		return &javaactions.EntityType{Entity: t.EntityQualifiedName()}
 	case *genCa.ListType:
-		return &javaactions.ListType{Entity: listElementEntity(t)}
+		return listTypeFromGen(t)
 	case *genCa.ParameterizedEntityType:
 		return &javaactions.TypeParameter{TypeParameterID: model.ID(t.TypeParameterRefID())}
 	case *genCa.BooleanType:
@@ -169,11 +271,69 @@ func codeActionReturnTypeFromGen(el element.Element) javaactions.CodeActionRetur
 	}
 }
 
-// listElementEntity extracts the entity qualified name from a gen ListType's
-// element parameter (a ConcreteEntityType).
-func listElementEntity(l *genCa.ListType) string {
-	if ce, ok := l.Parameter().(*genCa.ConcreteEntityType); ok {
-		return ce.EntityQualifiedName()
+// listTypeFromGen converts a gen ListType. Its element is a ConcreteEntityType
+// or, for Studio Pro's "List of <type parameter>", a ParameterizedEntityType —
+// read as Entity "" before #1183, which described as a bare `List` and rewrote
+// as a list of an unnamed entity. The type-parameter name is resolved later by
+// resolveJavaActionTypeParameterNames.
+func listTypeFromGen(l *genCa.ListType) *javaactions.ListType {
+	switch el := l.Parameter().(type) {
+	case *genCa.ConcreteEntityType:
+		return &javaactions.ListType{Entity: el.EntityQualifiedName()}
+	case *genCa.ParameterizedEntityType:
+		return &javaactions.ListType{TypeParameterID: model.ID(el.TypeParameterRefID())}
 	}
-	return ""
+	return &javaactions.ListType{}
+}
+
+// readActionInfoBitmaps fills the four toolbox bitmaps from the sub-document's
+// raw BSON.
+//
+// They cannot come from the gen accessors: gen declares IconData, IconDataDark,
+// ImageData and ImageDataDark as `string`, and Mendix stores them as BSON
+// *binary*, so gen's DecodeString returns "" for every real icon — the same
+// class of gen/storage mismatch CLAUDE.md records for scheduled events and
+// regular expressions. The write side already goes to raw BSON for exactly this
+// reason (microflowActionInfoBSON, #656); the read side did not, which is what
+// let a rewrite carry an icon it had never actually loaded.
+//
+// An absent or non-binary field yields nil, which the writer emits as an empty
+// binary — never BSON null, which crashes Studio Pro's UnitWriter.
+func readActionInfoBitmaps(raw bson.Raw, m *javaactions.MicroflowActionInfo) {
+	if raw == nil || m == nil {
+		return
+	}
+	get := func(key string) []byte {
+		val, err := raw.LookupErr(key)
+		if err != nil {
+			return nil
+		}
+		if _, data, ok := val.BinaryOK(); ok {
+			return data
+		}
+		return nil
+	}
+	m.IconData = get("IconData")
+	m.IconDataDark = get("IconDataDark")
+	m.ImageData = get("ImageData")
+	m.ImageDataDark = get("ImageDataDark")
+}
+
+// actionInfoFromGen converts a toolbox-entry element to the semantic type,
+// bitmaps included. Shared by the Java-action and microflow readers; nil in,
+// nil out.
+func actionInfoFromGen(el element.Element) *javaactions.MicroflowActionInfo {
+	info, ok := el.(interface {
+		Caption() string
+		Category() string
+		ID() element.ID
+		Raw() bson.Raw
+	})
+	if !ok || info == nil {
+		return nil
+	}
+	m := &javaactions.MicroflowActionInfo{Caption: info.Caption(), Category: info.Category()}
+	m.ID = model.ID(info.ID())
+	readActionInfoBitmaps(info.Raw(), m)
+	return m
 }

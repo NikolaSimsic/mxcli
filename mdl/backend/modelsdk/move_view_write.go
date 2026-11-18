@@ -10,8 +10,9 @@ import (
 	"github.com/mendixlabs/mxcli/modelsdk/codec"
 	"github.com/mendixlabs/mxcli/modelsdk/element"
 	genDm "github.com/mendixlabs/mxcli/modelsdk/gen/domainmodels"
+	"github.com/mendixlabs/mxcli/modelsdk/meta"
 	mmpr "github.com/mendixlabs/mxcli/modelsdk/mpr"
-	"github.com/mendixlabs/mxcli/modelsdk/mprread"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // MoveEnumeration reparents an enumeration unit to its (already-updated) target
@@ -37,7 +38,6 @@ func (b *Backend) MoveConstant(c *model.Constant) error {
 	return b.writer.MoveUnit(string(c.ID), string(c.ContainerID))
 }
 
-
 // UpdateOqlQueriesForMovedEntity rewrites every ViewEntitySourceDocument whose
 // OQL text references oldQualifiedName to newQualifiedName. Used after a MOVE
 // ENTITY so view sources joining through the moved entity still resolve (CE0174).
@@ -46,7 +46,7 @@ func (b *Backend) UpdateOqlQueriesForMovedEntity(oldQualifiedName, newQualifiedN
 	if b.writer == nil {
 		return 0, fmt.Errorf("UpdateOqlQueriesForMovedEntity: not connected for writing")
 	}
-	units, err := mprread.ListUnitsWithContainer[*genDm.ViewEntitySourceDocument](b.reader)
+	units, err := listUnits[*genDm.ViewEntitySourceDocument](b)
 	if err != nil {
 		return 0, fmt.Errorf("UpdateOqlQueriesForMovedEntity: list source docs: %w", err)
 	}
@@ -66,6 +66,52 @@ func (b *Backend) UpdateOqlQueriesForMovedEntity(oldQualifiedName, newQualifiedN
 		}
 		updated++
 	}
+
+	// Mendix < 11 also stores the OQL inline on the entity's OqlViewEntitySource
+	// (see entityToGen), a second copy the ViewEntitySourceDocument sweep above
+	// does not touch. Without this the moved-entity reference stays stale there and
+	// `mx check` on 10.x reports CE0174 (11.x keeps the OQL only on the source
+	// document, so it isn't affected). Rewrite the inline copy in every domain model.
+	dms, err := b.ListDomainModels()
+	if err != nil {
+		return updated, fmt.Errorf("UpdateOqlQueriesForMovedEntity: list domain models: %w", err)
+	}
+	for _, info := range dms {
+		// The System module's domain model is virtual (not stored in mprcontents),
+		// so it can't be re-loaded from disk — and it holds no view entities with
+		// inline OQL. Skip it; otherwise loadDomainModelGen fails with a spurious
+		// "no such file or directory" warning.
+		if string(info.ID) == meta.SystemDomainModelID {
+			continue
+		}
+		gdm, err := b.loadDomainModelGen(info.ID)
+		if err != nil {
+			return updated, err
+		}
+		changed := false
+		for _, el := range gdm.EntitiesItems() {
+			ent, ok := el.(*genDm.Entity)
+			if !ok {
+				continue
+			}
+			src, ok := ent.Source().(*genDm.OqlViewEntitySource)
+			if !ok {
+				continue
+			}
+			oql := src.Oql()
+			if oql == "" || !strings.Contains(oql, oldQualifiedName) {
+				continue
+			}
+			src.SetOql(strings.ReplaceAll(oql, oldQualifiedName, newQualifiedName))
+			changed = true
+			updated++
+		}
+		if changed {
+			if err := b.persistDM(info.ID, gdm); err != nil {
+				return updated, err
+			}
+		}
+	}
 	return updated, nil
 }
 
@@ -77,6 +123,82 @@ func (b *Backend) CreateViewEntitySourceDocument(moduleID model.ID, moduleName, 
 		return "", fmt.Errorf("CreateViewEntitySourceDocument: not connected for writing")
 	}
 	docID := model.ID(mmpr.GenerateID())
+	contents, err := encodeViewEntitySourceDocument(docID, docName, oqlQuery, documentation)
+	if err != nil {
+		return "", fmt.Errorf("CreateViewEntitySourceDocument: %w", err)
+	}
+	if err := b.writer.InsertUnit(string(docID), string(moduleID), "Documents", "DomainModels$ViewEntitySourceDocument", contents); err != nil {
+		return "", fmt.Errorf("CreateViewEntitySourceDocument: insert: %w", err)
+	}
+	return docID, nil
+}
+
+// WriteViewEntitySourceDocument stores the OQL source document backing a view
+// entity, KEEPING the unit already there when there is one.
+//
+// The executor used to delete the stored document and insert a fresh one on every
+// CREATE OR MODIFY, which cost two things at once (ako/mxcli#583):
+//
+//   - the unit was replaced under a new GUID on every run, even when the query
+//     was byte-identical, so an MDL-generated project could never come back clean
+//     in version control (#556 counted these units among the four that are
+//     replaced rather than rewritten);
+//   - an InsertUnit is not one of the write choke points WriteStats counts, so
+//     `exec` reported `Unchanged view entity: …` for a statement that had just
+//     rewritten the OQL — the domain-model unit was genuinely unchanged (the
+//     attribute list did not move) and the only write that landed was invisible.
+//
+// Updating in place puts the write back on the reconciling path (ADR-0008): an
+// identical query is elided, a changed one lands and is counted, and the unit id
+// survives either way.
+//
+// Extra documents under the same name — which the old delete-then-create existed
+// to clear up — are removed, keeping the oldest as the one to update. A duplicate
+// OQL document is a real hazard: the entity references its source by qualified
+// name, so a second one under that name is ambiguous.
+func (b *Backend) WriteViewEntitySourceDocument(moduleID model.ID, moduleName, docName, oqlQuery, documentation string) (model.ID, error) {
+	if b.writer == nil {
+		return "", fmt.Errorf("WriteViewEntitySourceDocument: not connected for writing")
+	}
+
+	ids, err := b.FindAllViewEntitySourceDocumentIDs(moduleName, docName)
+	if err != nil {
+		return "", fmt.Errorf("WriteViewEntitySourceDocument: find existing: %w", err)
+	}
+	if len(ids) == 0 {
+		return b.CreateViewEntitySourceDocument(moduleID, moduleName, docName, oqlQuery, documentation)
+	}
+	for _, extra := range ids[1:] {
+		if err := b.DeleteViewEntitySourceDocument(extra); err != nil {
+			return "", fmt.Errorf("WriteViewEntitySourceDocument: remove duplicate %s: %w", extra, err)
+		}
+	}
+
+	docID := ids[0]
+	contents, err := encodeViewEntitySourceDocument(docID, docName, oqlQuery, documentation)
+	if err != nil {
+		return "", err
+	}
+	// encodeViewEntitySourceDocument writes ExportLevel "Hidden" as a constant (#816).
+	if contents, err = b.keepStoredExportLevel(string(docID), contents); err != nil {
+		return "", fmt.Errorf("WriteViewEntitySourceDocument: %w", err)
+	}
+	// ...and Excluded false: exclusion is model state, not script state (#914),
+	// and MDL has no spelling for it here, so the stored value is kept
+	// (ako/mxcli#827).
+	if contents, err = b.keepStoredExcluded(string(docID), contents); err != nil {
+		return "", fmt.Errorf("WriteViewEntitySourceDocument: %w", err)
+	}
+	if err := b.writer.UpdateRawUnit(string(docID), contents); err != nil {
+		return "", fmt.Errorf("WriteViewEntitySourceDocument: update: %w", err)
+	}
+	return docID, nil
+}
+
+// encodeViewEntitySourceDocument builds the stored form of an OQL source
+// document. Shared by the create and update paths so the two cannot drift into
+// writing different documents for the same query.
+func encodeViewEntitySourceDocument(docID model.ID, docName, oqlQuery, documentation string) ([]byte, error) {
 	d := genDm.NewViewEntitySourceDocument()
 	d.SetID(element.ID(docID))
 	d.SetName(docName)
@@ -86,12 +208,9 @@ func (b *Backend) CreateViewEntitySourceDocument(moduleID model.ID, moduleName, 
 	d.SetOql(oqlQuery)
 	contents, err := (&codec.Encoder{}).Encode(d)
 	if err != nil {
-		return "", fmt.Errorf("CreateViewEntitySourceDocument: encode: %w", err)
+		return nil, fmt.Errorf("encode view entity source document: %w", err)
 	}
-	if err := b.writer.InsertUnit(string(docID), string(moduleID), "Documents", "DomainModels$ViewEntitySourceDocument", contents); err != nil {
-		return "", fmt.Errorf("CreateViewEntitySourceDocument: insert: %w", err)
-	}
-	return docID, nil
+	return contents, nil
 }
 
 // MoveViewEntitySourceDocument reparents the OQL source document backing a moved
@@ -108,6 +227,39 @@ func (b *Backend) MoveViewEntitySourceDocument(sourceModuleName string, targetMo
 	return b.writer.MoveUnit(string(docID), string(targetModuleID))
 }
 
+// RenameViewEntitySourceDocument renames a view entity's OQL source document,
+// found by $Type as well as name — a lookup by name alone matches any unit with
+// that name, and a microflow, page or folder may share it (ako/mxcli#1443). A
+// view entity's document must carry the entity's name (CE6784 otherwise).
+func (b *Backend) RenameViewEntitySourceDocument(moduleName, oldName, newName string) error {
+	if b.writer == nil {
+		return fmt.Errorf("RenameViewEntitySourceDocument: not connected for writing")
+	}
+	docID, err := b.FindViewEntitySourceDocumentID(moduleName, oldName)
+	if err != nil || docID == "" {
+		return err // nil docID → nothing to rename
+	}
+	raw, err := b.reader.GetRawUnitBytes(string(docID))
+	if err != nil {
+		return fmt.Errorf("RenameViewEntitySourceDocument: read: %w", err)
+	}
+	var doc bson.D
+	if err := bson.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("RenameViewEntitySourceDocument: decode: %w", err)
+	}
+	for i, elem := range doc {
+		if elem.Key == "Name" {
+			doc[i].Value = newName
+			contents, err := bson.Marshal(doc)
+			if err != nil {
+				return fmt.Errorf("RenameViewEntitySourceDocument: marshal: %w", err)
+			}
+			return b.writer.UpdateRawUnit(string(docID), contents)
+		}
+	}
+	return fmt.Errorf("RenameViewEntitySourceDocument: %s.%s has no Name", moduleName, oldName)
+}
+
 // FindAllViewEntitySourceDocumentIDs returns every ViewEntitySourceDocument unit
 // named docName in the given module.
 func (b *Backend) FindAllViewEntitySourceDocumentIDs(moduleName, docName string) ([]model.ID, error) {
@@ -115,7 +267,7 @@ func (b *Backend) FindAllViewEntitySourceDocumentIDs(moduleName, docName string)
 	if err != nil || mod == nil {
 		return nil, nil
 	}
-	units, err := mprread.ListUnitsWithContainer[*genDm.ViewEntitySourceDocument](b.reader)
+	units, err := listUnits[*genDm.ViewEntitySourceDocument](b)
 	if err != nil {
 		return nil, err
 	}

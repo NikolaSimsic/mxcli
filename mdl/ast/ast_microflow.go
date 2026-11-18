@@ -2,6 +2,8 @@
 
 package ast
 
+import "strings"
+
 // ============================================================================
 // Microflow Statements
 // ============================================================================
@@ -33,8 +35,15 @@ type ErrorHandlingClause struct {
 
 // MicroflowParam represents a microflow parameter.
 type MicroflowParam struct {
-	Name string   // Parameter name (without $ prefix)
-	Type DataType // Parameter type
+	Name     string    // Parameter name (without $ prefix)
+	Type     DataType  // Parameter type
+	Position *Position // @position(x, y) on the parameter; nil to let the layout place it
+	// UnknownAnnotations holds annotation names written on the parameter that
+	// mxcli does not implement there. Collected rather than dropped so MDL059
+	// can refuse them: an annotation that parses and does nothing loses whatever
+	// it was meant to express, silently (#884, the same reasoning one node
+	// family over).
+	UnknownAnnotations []string
 }
 
 // MicroflowReturnType represents a microflow return type.
@@ -45,21 +54,105 @@ type MicroflowReturnType struct {
 
 // CreateMicroflowStmt represents: CREATE MICROFLOW Module.Name (params) RETURNS type BEGIN body END
 type CreateMicroflowStmt struct {
-	Name           QualifiedName
-	Parameters     []MicroflowParam
-	ReturnType     *MicroflowReturnType
-	Body           []MicroflowStatement
-	Documentation  string
-	Comment        string
-	Folder         string // Folder path within module (e.g., "Resources/Images")
-	CreateOrModify bool
-	Excluded       bool // @excluded — document excluded from project
+	CreateGuard   // `create … if not exists` (ako/mxcli#731)
+	Name          QualifiedName
+	Parameters    []MicroflowParam
+	ReturnType    *MicroflowReturnType
+	Body          []MicroflowStatement
+	Documentation string
+	// DocumentationSet records whether the statement carried a `/** … */`
+	// comment at all, as opposed to carrying an empty one. A rewrite that did
+	// not mention documentation preserves the stored value; an explicitly empty
+	// comment clears it (mendixlabs/mxcli#1018).
+	DocumentationSet bool
+	Folder           string // Folder path within module (e.g., "Resources/Images")
+	CreateOrModify   bool
+	// CreateOrReplace records that CreateOrModify was spelled `create or
+	// replace`, which splices the same way, so a message names the statement
+	// as written (ako/mxcli#1681).
+	CreateOrReplace bool
+	Excluded        bool // @excluded — document excluded from project
+	// ApplyEntityAccess is Studio Pro's "apply entity access" checkbox, set by
+	// `@applyentityaccess` / `@applyentityaccess(false)`.
+	//
+	// A POINTER because absent and false are different answers: an absent
+	// annotation preserves what is stored (the setting is model state, like
+	// @excluded), while an explicit false clears it. A plain bool would make
+	// every rewrite that did not mention it turn the setting off, which is the
+	// bug this field exists to fix.
+	ApplyEntityAccess *bool
+	// Expose holds the EXPOSED AS … ACTION clauses. A microflow has two toolbox
+	// entries — one for the microflow editor, one for the workflow editor — so
+	// there can be one of each.
+	Expose []ExposeActionClause
+
+	// URL is the deep link (Mendix 10.6+), e.g. `item/{Key}`. A POINTER for the
+	// same reason as ApplyEntityAccess: absent means "the script does not say",
+	// which preserves what is stored, while DROP URL sets an explicit empty.
+	URL *string
+	// URLSearchParameters are the parameter names named by `URL SEARCH
+	// PARAMETERS (...)`, without the `$`. Nil means the clause was absent;
+	// non-nil and empty means it was stated with an empty list, which clears.
+	URLSearchParameters *[]string
+	// ExportLevel is "API" or "Hidden"; nil preserves.
+	ExportLevel *string
+	// Concurrency is the DISALLOW/ALLOW CONCURRENT EXECUTION clause; nil
+	// preserves what is stored.
+	Concurrency *ConcurrencyClause
+}
+
+// ConcurrencyClause is one DISALLOW/ALLOW CONCURRENT EXECUTION clause.
+//
+// Mendix requires an error message or an error microflow when execution is
+// disallowed (CE4899). The grammar accepts the bare DISALLOW so that the
+// omission is reported by name rather than as a parse error; the check is
+// types.CheckMicroflowConcurrency.
+type ConcurrencyClause struct {
+	// Allow is true for ALLOW CONCURRENT EXECUTION.
+	Allow bool
+	// ErrorMessage is the text shown to the second caller. Only one of
+	// ErrorMessage / ErrorMicroflow is set.
+	ErrorMessage string
+	// ErrorMessageSet distinguishes an omitted message from an empty one, so a
+	// stored message with translations is not silently replaced by "".
+	ErrorMessageSet bool
+	// ErrorMicroflow is the qualified name of the microflow that handles it.
+	ErrorMicroflow string
+}
+
+// ExposeActionClause is one EXPOSED AS <kind> ACTION clause, or its NOT form.
+//
+// An absent clause is neither: it preserves what is stored, including the icon
+// and image bitmaps MDL cannot express. Removal is explicit.
+type ExposeActionClause struct {
+	// Workflow selects WorkflowActionInfo over MicroflowActionInfo.
+	Workflow bool
+	Caption  string
+	Category string
+	Remove   bool // NOT EXPOSED AS … ACTION
+	Bitmaps  []ExposeBitmap
+}
+
+// ExposeBitmap is one ICON/IMAGE clause on an exposed clause.
+//
+// An omitted bitmap is preserved rather than cleared, so Clear (DROP ICON) is
+// how a script asks for one to go away — the same shape as the clause itself.
+type ExposeBitmap struct {
+	// Image selects the 256x192 toolbox image over the 64x64 icon.
+	Image bool
+	// Dark selects the dark-mode variant.
+	Dark bool
+	// Path is the PNG file to read, resolved against the working directory.
+	// Empty when Clear is set.
+	Path  string
+	Clear bool
 }
 
 func (s *CreateMicroflowStmt) isStatement() {}
 
 // DropMicroflowStmt represents: DROP MICROFLOW Module.Name
 type DropMicroflowStmt struct {
+	DropGuard
 	Name QualifiedName
 }
 
@@ -67,21 +160,75 @@ func (s *DropMicroflowStmt) isStatement() {}
 
 // CreateNanoflowStmt represents: CREATE NANOFLOW Module.Name (params) RETURNS type BEGIN body END
 type CreateNanoflowStmt struct {
-	Name           QualifiedName
-	Parameters     []MicroflowParam
-	ReturnType     *MicroflowReturnType
-	Body           []MicroflowStatement
-	Documentation  string
-	Comment        string
-	Folder         string // Folder path within module
-	CreateOrModify bool
-	Excluded       bool // @excluded — document excluded from project
+	CreateGuard      // `create … if not exists` (ako/mxcli#731)
+	Name             QualifiedName
+	Parameters       []MicroflowParam
+	ReturnType       *MicroflowReturnType
+	Body             []MicroflowStatement
+	Documentation    string
+	DocumentationSet bool   // see mendixlabs/mxcli#1018: absent preserves, empty clears
+	Folder           string // Folder path within module
+	CreateOrModify   bool
+	CreateOrReplace  bool // spelled `create or replace` (see CreateMicroflowStmt)
+	Excluded         bool // @excluded — document excluded from project
+	// No ApplyEntityAccess: a nanoflow runs in the CLIENT and Mendix stores no
+	// such property on Nanoflows$Nanoflow (modelsdk/gen declares the accessor
+	// on Microflow and Rule only). Carrying it here would give the annotation
+	// somewhere to parse and nothing to do.
+	//
+	// Expose is parsed but refused: only Microflows$Microflow carries the toolbox
+	// properties. Accepting it in the grammar and explaining the refusal beats a
+	// parse error that says only "no viable alternative".
+	Expose []ExposeActionClause
+	// ExportLevel is "API" or "Hidden"; nil preserves. Nanoflows$Nanoflow
+	// stores it like a microflow does (mendixlabs/mxcli#1498).
+	ExportLevel *string
 }
 
 func (s *CreateNanoflowStmt) isStatement() {}
 
+// CreateRuleStmt represents: CREATE RULE Module.Name (params) RETURNS type BEGIN body END
+//
+// Mirrors CreateNanoflowStmt: a rule shares a microflow's body, so the fields
+// are the same minus the ones a rule document has no property for (a rule stores
+// no AllowedModuleRoles, so there is nothing to grant).
+type CreateRuleStmt struct {
+	CreateGuard      // `create … if not exists` (ako/mxcli#731)
+	Name             QualifiedName
+	Parameters       []MicroflowParam
+	ReturnType       *MicroflowReturnType
+	Body             []MicroflowStatement
+	Documentation    string
+	DocumentationSet bool   // see mendixlabs/mxcli#1018: absent preserves, empty clears
+	Folder           string // Folder path within module
+	CreateOrModify   bool
+	Excluded         bool // @excluded — document excluded from project
+	// ApplyEntityAccess is Studio Pro's "apply entity access" checkbox, set by
+	// `@applyentityaccess` / `@applyentityaccess(false)`.
+	//
+	// A POINTER because absent and false are different answers: an absent
+	// annotation preserves what is stored (the setting is model state, like
+	// @excluded), while an explicit false clears it. A plain bool would make
+	// every rewrite that did not mention it turn the setting off, which is the
+	// bug this field exists to fix.
+	ApplyEntityAccess *bool
+	// Expose is parsed but refused — see CreateNanoflowStmt.Expose.
+	Expose []ExposeActionClause
+}
+
+func (s *CreateRuleStmt) isStatement() {}
+
+// DropRuleStmt represents: DROP RULE Module.Name
+type DropRuleStmt struct {
+	DropGuard
+	Name QualifiedName
+}
+
+func (s *DropRuleStmt) isStatement() {}
+
 // DropNanoflowStmt represents: DROP NANOFLOW Module.Name
 type DropNanoflowStmt struct {
+	DropGuard
 	Name QualifiedName
 }
 
@@ -93,10 +240,11 @@ func (s *DropNanoflowStmt) isStatement() {}
 
 // DeclareStmt represents: DECLARE $Var Type = expr
 type DeclareStmt struct {
-	Variable     string               // Variable name (without $ prefix)
-	Type         DataType             // Variable type
-	InitialValue Expression           // Optional initial value
-	Annotations  *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	Variable      string               // Variable name (without $ prefix)
+	Type          DataType             // Variable type
+	InitialValue  Expression           // Optional initial value
+	Annotations   *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling *ErrorHandlingClause // Optional ON ERROR clause
 }
 
 func (s *DeclareStmt) isMicroflowStatement() {}
@@ -110,7 +258,12 @@ type EnumSplitCase struct {
 
 // EnumSplitStmt represents: CASE $Var WHEN value THEN body ... END CASE
 type EnumSplitStmt struct {
-	Variable    string // Variable or attribute path without $ prefix (e.g. EventType or Event/EventType)
+	Variable string // Variable or attribute path without $ prefix (e.g. EventType or Event/EventType)
+	// Condition is set instead of Variable when the split decides on a RULE
+	// call that returns an enumeration: `case Mod.Rule(Param = $x)`. It is the
+	// same FunctionCallExpr an `if Mod.Rule(...)` holds, and builds as a
+	// Microflows$RuleSplitCondition (mendixlabs/mxcli#1414).
+	Condition   Expression
 	Cases       []EnumSplitCase
 	ElseBody    []MicroflowStatement
 	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
@@ -123,11 +276,23 @@ type InheritanceSplitCase struct {
 }
 
 // InheritanceSplitStmt represents: SPLIT TYPE $Var ... END SPLIT
+//
+// ElseBody is Mendix's `(empty)` outgoing flow — the branch taken when the
+// object is NULL. It is NOT a default for unmatched types: mxbuild demands a
+// flow for every subtype and for the base entity regardless (CE0090), and
+// omitting this one is CE0089. It is spelled `when (empty) then`; `else` is
+// the legacy spelling that reads as a default and is not one (mxcli #913).
 type InheritanceSplitStmt struct {
 	Variable    string // Variable name without $ prefix
 	Cases       []InheritanceSplitCase
 	ElseBody    []MicroflowStatement
 	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+
+	// Which spelling the source used, for the MDL065 deprecation warning only.
+	// Both build the identical flow, so nothing downstream of the validator
+	// may branch on these.
+	LegacyCaseKeyword bool // at least one branch used `case X` instead of `when X then`
+	LegacyElseKeyword bool // the empty branch used `else` instead of `when (empty) then`
 }
 
 func (s *EnumSplitStmt) isMicroflowStatement()        {}
@@ -138,6 +303,7 @@ type CastObjectStmt struct {
 	OutputVariable string               // Output variable name without $ prefix
 	ObjectVariable string               // Source object variable name without $ prefix
 	Annotations    *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling  *ErrorHandlingClause // Optional ON ERROR clause
 }
 
 func (s *CastObjectStmt) isMicroflowStatement() {}
@@ -145,9 +311,10 @@ func (s *CastObjectStmt) isMicroflowStatement() {}
 // MfSetStmt represents: SET $Var = expr or SET $Var/Attr = expr
 // (Named MfSetStmt to avoid conflict with existing SetStmt for SET key = value)
 type MfSetStmt struct {
-	Target      string               // Variable name or attribute path
-	Value       Expression           // Value to assign
-	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	Target        string               // Variable name or attribute path
+	Value         Expression           // Value to assign
+	Annotations   *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling *ErrorHandlingClause // Optional ON ERROR clause
 }
 
 func (s *MfSetStmt) isMicroflowStatement() {}
@@ -180,24 +347,51 @@ const (
 	AnchorSideLeft   AnchorSide = 3
 )
 
-// FlowAnchors captures the origin/destination anchors for a single
-// SequenceFlow. Each side is independently optional: Unset means the builder
-// should derive the anchor from the visual direction.
+// FlowAnchors captures the sides a statement's flows attach at. Each side is
+// independently optional: Unset means the builder should derive the anchor
+// from the visual direction.
+//
+// The two halves name two DIFFERENT flows when written on a statement: From is
+// the side the flow leaving it leaves by, To the side the flow arriving at it
+// enters by. Nested in a branch form (`true: (from: …, to: …)`) both describe
+// that one branch's edge.
 type FlowAnchors struct {
 	From AnchorSide // OriginConnectionIndex on the outgoing SequenceFlow
-	To   AnchorSide // DestinationConnectionIndex on the outgoing SequenceFlow
+	To   AnchorSide // DestinationConnectionIndex on the INCOMING SequenceFlow
+}
+
+// CaseAnchor is one outcome's entry in a CASE's @anchor: the WHEN value, as
+// written ("(empty)" for the empty value), and the sides of its flow.
+type CaseAnchor struct {
+	Value   string
+	Anchors *FlowAnchors
+}
+
+// HasCaption reports whether the statement states a caption, empty or not.
+func (a *ActivityAnnotations) HasCaption() bool {
+	return a != nil && (a.CaptionSet || a.Caption != "")
 }
 
 // ActivityAnnotations holds metadata annotations for microflow activities.
 // These are emitted as @position, @caption, @color, @annotation, @excluded, @anchor lines in MDL.
 type ActivityAnnotations struct {
-	Position        *Position    // @position(x, y)
-	Caption         string       // @caption 'text'
-	Color           string       // @color Green
-	AnnotationText  string       // @annotation 'text'
-	FreeAnnotations []string     // Multiple free-floating @annotation lines in source order
-	Excluded        bool         // @excluded
-	Anchor          *FlowAnchors // @anchor(from: X, to: Y) — anchors of the flow leaving this statement
+	Position *Position // @position(x, y)
+	Caption  string    // @caption 'text'
+	Color    string    // @color Green
+	// CaptionSet records that @caption was written, so `@caption ''` is told
+	// apart from no @caption at all. A decision with no @caption is captioned
+	// with its condition; an empty one is what Studio Pro stores when the
+	// caption is cleared, and must survive describe -> exec (#1254).
+	CaptionSet bool
+	// Notes are the @annotation lines attached to this statement, in source
+	// order. A SLICE, not one string: see MicroflowAnnotation.
+	Notes []MicroflowAnnotation
+
+	// FreeNotes are @annotation lines that stand on their own — a note on the
+	// canvas wired to nothing.
+	FreeNotes []MicroflowAnnotation
+	Excluded  bool         // @excluded
+	Anchor    *FlowAnchors // @anchor(from: X, to: Y) — From for the flow leaving, To for the flow arriving
 
 	// Split-specific anchors for IF statements. When the statement is not an
 	// IF these remain nil. The grammar accepts them on IfStmt only:
@@ -211,51 +405,216 @@ type ActivityAnnotations struct {
 	// populated on LoopStmt/WhileStmt.
 	IteratorAnchor *FlowAnchors
 	BodyTailAnchor *FlowAnchors
+
+	// CaseAnchors are a CASE's per-outcome anchors, keyed by the WHEN value,
+	// in source order:
+	//   @anchor(A: (from: right), (empty): (from: bottom, to: top))
+	// Each names the sides of the one flow that leaves the split for that
+	// value. Only a CASE takes them (mendixlabs/mxcli#1587).
+	CaseAnchors []CaseAnchor
+
+	// Curve is the bezier geometry of the flow LEAVING this statement:
+	// @curve(from: (40, -90), to: (-40, 90)).
+	//
+	// Mendix stores no waypoints. A sequence flow's shape is two control
+	// vectors on its Microflows$BezierCurve line — the tangent handles at each
+	// end — so a hand-curved edge is a pair of (x, y) offsets, not a polyline.
+	// Both writers already emit them; before #884 nothing could set them, so
+	// they defaulted to "0;0" and any rewrite flattened a curve drawn in Studio
+	// Pro. (upstream #884)
+	Curve *FlowCurve
+
+	// Merge positions the implicit merge node that closes a split — the end-if
+	// join, or an enum/inheritance split's rejoin: @merge(x, y).
+	//
+	// The statement's own @position belongs to the SPLIT, so the merge needs its
+	// own annotation. Before #884 it was placed by the layout pass alone and was
+	// unaddressable, and it routinely landed on top of a neighbouring activity.
+	Merge *Position
+
+	// Start positions the StartEvent — the implicit node every flow begins at:
+	// @start(x, y), written on the FIRST statement, the one the start flows into.
+	//
+	// Same shape and same reason as Merge: the node has no statement of its own,
+	// so it is annotated on the statement it belongs to. Without it the start's
+	// placement was inferred rather than stated, and the two things an inference
+	// has to serve pull apart — a start a person dragged somewhere must survive a
+	// rebuild (#884), while one mxcli derived must follow the activities when
+	// they move (#951). An explicit position settles both by not guessing.
+	//
+	// DESCRIBE emits it only for a start that is not where the layout would have
+	// put it, so a described flow round-trips exactly without every description
+	// growing a line that just restates the arithmetic. (upstream #951)
+	Start *Position
+
+	// InvalidCurves holds the raw text of any @curve parameter whose coordinates
+	// were not a whole-number (x, y) pair, so validation can refuse it rather
+	// than silently straightening the edge.
+	InvalidCurves []string
+
+	// InvalidAnchors holds the raw text of any @anchor parameter the visitor
+	// could not use — an unknown key, or a side that is not top/right/bottom/
+	// left — so validation can refuse it rather than leave the edge on the
+	// builder's default sides in silence (mendixlabs/mxcli#992).
+	InvalidAnchors []string
+
+	// InvalidNotes holds the raw text of any `@annotation(...)` parameter
+	// the visitor could not use — an unknown key, or a malformed `position:`/`size:`
+	// pair — so validation can refuse it. Dropping it would lose the note
+	// itself, not just the parameter.
+	InvalidNotes []string
+
+	// UnknownNames holds annotation names the visitor did not recognise, in
+	// source order, so validation can refuse them.
+	//
+	// The visitor's switch has no default: an unrecognised name used to be
+	// dropped in silence, which is benign for an annotation mxcli does not
+	// implement (@size) and NOT benign for a typo of one it does — `@postion(10,
+	// 20)` passed `check` and silently discarded the layout the author asked
+	// for. Layout is the whole point of these annotations, so a name that does
+	// nothing has to say so. (upstream #884)
+	UnknownNames []string
 }
 
-// ChangeItem represents a single assignment in CREATE/CHANGE: Attr = expr
+// MicroflowAnnotation is one `@annotation` line — the yellow note Studio Pro
+// draws beside an activity.
+//
+// In Mendix's model a note is a NODE with edges (`Microflows$Annotation` joined
+// to activities by `Microflows$AnnotationFlow`), not a property of the activity
+// it documents: one note can be wired to several activities, and several notes
+// to one activity. MDL modelled it as a single string per activity, which lost
+// both directions — a shared note came back copied once per target, and a
+// second note on one activity overwrote the first, silently
+// (mendixlabs/mxcli#1077). Hence a slice, and hence Label.
+type MicroflowAnnotation struct {
+	// Label is the `id:` in `@annotation(id: n1, text: '…')`. It exists only so
+	// a later `@annotation(id: n1)` can attach the SAME note to another
+	// activity instead of creating a second one. It is scoped to the flow being
+	// authored and is NOT stored in the model — the describer re-derives labels
+	// from scratch, so they are stable across a round trip by construction
+	// rather than by being remembered.
+	Label string
+
+	// Text is the note's caption. Empty on a pure reference
+	// (`@annotation(id: n1)`), which attaches a note already declared above.
+	Text string
+
+	// Existing is the `existing:` in `@annotation(existing: '…')`: the text of
+	// a note already STORED in the flow, which the statement is attached to
+	// instead of getting a note of its own. Only an `alter microflow|nanoflow`
+	// fragment has a stored flow to look in; the text has to match exactly one
+	// of its notes (ako/mxcli#1695). It stands alone — a stored note keeps its
+	// own text and place, so `text:`, `id:`, `position:` and `size:` are
+	// refused beside it rather than half-applied.
+	Existing string
+
+	// Position and Size are the note's own canvas geometry, which Mendix stores per
+	// annotation and MDL had no way to spell. Nil means "let the writer place
+	// it" — see defaultAnnotationGeometry in mdl/executor, which the builder and
+	// the describer both consult so a round trip need not spell out a position
+	// that can be re-derived.
+	Position *Position
+	Size     *BoxSize
+}
+
+// BoxSize is a width/height pair in canvas pixels.
+type BoxSize struct {
+	Width  int
+	Height int
+}
+
+// FlowCurve is the pair of bezier control vectors on a sequence flow. Either end
+// may be nil, which leaves that end straight.
+type FlowCurve struct {
+	From *Position // control vector at the origin end
+	To   *Position // control vector at the destination end
+}
+
+// ChangeItem represents a single assignment in CREATE/CHANGE: Attr = expr,
+// or in CHANGE also Assoc += expr / Assoc -= expr.
 type ChangeItem struct {
-	Attribute string     // Attribute name
-	Value     Expression // Value expression
+	Attribute string         // Attribute name
+	Op        MemberChangeOp // = (zero value), += or -=
+	Value     Expression     // Value expression
 }
 
-// CreateObjectStmt represents: $Var = CREATE Entity (assignments) [ON ERROR ...]
+// MemberChangeOp is the operation a CHANGE member performs, matching Mendix's
+// MemberChange Type: Set assigns, Add and Remove append to or take from a
+// reference set (mendixlabs/mxcli#1473). The zero value is Set, which is what
+// `=` and every CREATE member mean.
+type MemberChangeOp int
+
+const (
+	MemberSet    MemberChangeOp = iota // =
+	MemberAdd                          // +=
+	MemberRemove                       // -=
+)
+
+// CommitFlag is the Commit setting on a create/change activity, matching Mendix's
+// Microflows$Commit enum. The zero value is CommitNo, which is Mendix's default and
+// is therefore omitted from DESCRIBE output.
+type CommitFlag int
+
+const (
+	CommitNo               CommitFlag = iota // no COMMIT clause
+	CommitYes                                // COMMIT
+	CommitYesWithoutEvents                   // COMMIT WITHOUT EVENTS
+)
+
+// CreateObjectStmt represents: $Var = CREATE Entity (assignments) [COMMIT [WITHOUT EVENTS]] [REFRESH] [ON ERROR ...]
 type CreateObjectStmt struct {
-	Variable      string               // Variable name (without $ prefix)
-	EntityType    QualifiedName        // Entity type
-	Changes       []ChangeItem         // SET assignments
-	ErrorHandling *ErrorHandlingClause // Optional ON ERROR clause
-	Annotations   *ActivityAnnotations // Optional @position, @caption, @color, @annotation
-}
-
-func (s *CreateObjectStmt) isMicroflowStatement() {}
-
-// ChangeObjectStmt represents: CHANGE $Var (assignments)
-type ChangeObjectStmt struct {
-	Variable        string               // Variable name
+	Variable        string               // Variable name (without $ prefix)
+	EntityType      QualifiedName        // Entity type
 	Changes         []ChangeItem         // SET assignments
-	RefreshInClient bool                 // Whether to refresh in client
-	Annotations     *ActivityAnnotations // Optional @position, @caption, @color, @annotation
-}
-
-func (s *ChangeObjectStmt) isMicroflowStatement() {}
-
-// MfCommitStmt represents: COMMIT $Var [WITH EVENTS] [REFRESH] [ON ERROR ...]
-type MfCommitStmt struct {
-	Variable        string               // Variable to commit
-	WithEvents      bool                 // Whether to trigger events
+	Commit          CommitFlag           // Commit setting (default CommitNo)
 	RefreshInClient bool                 // Whether to refresh in client
 	ErrorHandling   *ErrorHandlingClause // Optional ON ERROR clause
 	Annotations     *ActivityAnnotations // Optional @position, @caption, @color, @annotation
 }
 
+func (s *CreateObjectStmt) isMicroflowStatement() {}
+
+// ChangeObjectStmt represents: CHANGE $Var (assignments) [COMMIT [WITHOUT EVENTS]] [REFRESH]
+type ChangeObjectStmt struct {
+	Variable        string               // Variable name
+	Changes         []ChangeItem         // SET assignments
+	Commit          CommitFlag           // Commit setting (default CommitNo)
+	RefreshInClient bool                 // Whether to refresh in client
+	Annotations     *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling   *ErrorHandlingClause // Optional ON ERROR clause
+}
+
+func (s *ChangeObjectStmt) isMicroflowStatement() {}
+
+// MfCommitStmt represents: COMMIT $Var [WITHOUT EVENTS] [REFRESH] [ON ERROR ...]
+//
+// The flag is WithoutEvents, not WithEvents, so that the zero value is what a
+// bare `commit $Var;` means — Mendix's default, which is events ON (#895). Every
+// other modifier on every other activity holds to that same invariant (absent
+// modifier = zero value = Mendix default), and inverting this one field is what
+// keeps it true here: a WithEvents bool would default to the one value Studio
+// Pro never writes for a fresh Commit activity.
+type MfCommitStmt struct {
+	Variable      string // Variable to commit
+	WithoutEvents bool   // WITHOUT EVENTS was written (absent = events on)
+	// ExplicitWithEvents records that the redundant `WITH EVENTS` was written.
+	// It changes nothing about the stored activity — both spellings mean events
+	// on — and exists only so MDL067 can tell "the author said what they wanted"
+	// from "the author said nothing", which is the whole question that note asks.
+	ExplicitWithEvents bool
+	RefreshInClient    bool                 // Whether to refresh in client
+	ErrorHandling      *ErrorHandlingClause // Optional ON ERROR clause
+	Annotations        *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+}
+
 func (s *MfCommitStmt) isMicroflowStatement() {}
 
-// DeleteObjectStmt represents: DELETE $Var [ON ERROR ...]
+// DeleteObjectStmt represents: DELETE $Var [REFRESH] [ON ERROR ...]
 type DeleteObjectStmt struct {
-	Variable      string               // Variable to delete
-	ErrorHandling *ErrorHandlingClause // Optional ON ERROR clause
-	Annotations   *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	Variable        string               // Variable to delete
+	RefreshInClient bool                 // Whether to refresh in client
+	ErrorHandling   *ErrorHandlingClause // Optional ON ERROR clause
+	Annotations     *ActivityAnnotations // Optional @position, @caption, @color, @annotation
 }
 
 func (s *DeleteObjectStmt) isMicroflowStatement() {}
@@ -265,20 +624,39 @@ type RollbackStmt struct {
 	Variable        string               // Variable to rollback
 	RefreshInClient bool                 // Whether to refresh in client
 	Annotations     *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling   *ErrorHandlingClause // Optional ON ERROR clause
 }
 
 func (s *RollbackStmt) isMicroflowStatement() {}
 
-// RetrieveStmt represents: RETRIEVE $Var FROM Entity [WHERE condition] [SORT BY ...] [LIMIT n] [OFFSET n] [ON ERROR ...]
+// ExternalObjectStmt represents: SEND EXTERNAL OBJECT $Var [REFRESH] or
+// DELETE EXTERNAL OBJECT $Var [REFRESH] — Studio Pro's "Send external object"
+// and "Delete external object" activities (mendixlabs/mxcli#1735).
+type ExternalObjectStmt struct {
+	Delete          bool                 // DELETE EXTERNAL OBJECT; otherwise SEND
+	Variable        string               // The external object
+	RefreshInClient bool                 // Whether to refresh in client
+	Annotations     *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling   *ErrorHandlingClause // Optional ON ERROR clause
+}
+
+func (s *ExternalObjectStmt) isMicroflowStatement() {}
+
+// RetrieveStmt represents: RETRIEVE $Var FROM Entity [WHERE condition] [SORT BY ...] [FIRST | [LIMIT n] [OFFSET n]] [ON ERROR ...]
 // or: RETRIEVE $Var FROM $Parent/Module.Association (association retrieve)
 type RetrieveStmt struct {
-	Variable      string               // Output variable
-	Source        QualifiedName        // Entity (database) or Association (association retrieve)
-	StartVariable string               // Non-empty for association retrieve: the starting variable name
-	Where         Expression           // Optional WHERE condition
-	SortColumns   []SortColumnDef      // Optional SORT BY columns
-	Limit         string               // Optional LIMIT expression (empty = no limit)
-	Offset        string               // Optional OFFSET expression (empty = no offset)
+	Variable      string          // Output variable
+	Source        QualifiedName   // Entity (database) or Association (association retrieve)
+	StartVariable string          // Non-empty for association retrieve: the starting variable name
+	Where         Expression      // Optional WHERE condition
+	SortColumns   []SortColumnDef // Optional SORT BY columns
+	// First is Mendix's "First object" range: the output is ONE object, not a
+	// list. It is set by `first`, and by `limit 1` without offset in an mdl 0
+	// script (the alpha meaning, ako/mxcli#734); Limit and Offset are then empty.
+	// Everything downstream reads this, never the limit text.
+	First         bool
+	Limit         string               // Optional LIMIT expression of the Custom range (empty = no limit)
+	Offset        string               // Optional OFFSET expression of the Custom range (empty = no offset)
 	ErrorHandling *ErrorHandlingClause // Optional ON ERROR clause
 	Annotations   *ActivityAnnotations // Optional @position, @caption, @color, @annotation
 }
@@ -298,10 +676,15 @@ func (s *IfStmt) isMicroflowStatement() {}
 
 // LoopStmt represents: LOOP $Var IN $List BEGIN body END LOOP
 type LoopStmt struct {
-	LoopVariable string               // Iterator variable name
-	ListVariable string               // List variable name
-	Body         []MicroflowStatement // Loop body
-	Annotations  *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	LoopVariable string // Iterator variable name
+	ListVariable string // List variable name
+	// ListPath is the source of a list written as a path, `$Parent/Mod.Assoc`.
+	// The model's loop iterates over a variable, so no path can be stored;
+	// the validator refuses it (MDL094) rather than the builder writing a loop
+	// over nothing (mendixlabs/mxcli#199).
+	ListPath    string
+	Body        []MicroflowStatement // Loop body
+	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
 }
 
 func (s *LoopStmt) isMicroflowStatement() {}
@@ -361,13 +744,15 @@ func (p *TemplateParam) IsDataSourceRef() bool {
 	return p.DataSourceName != ""
 }
 
-// LogStmt represents: LOG LEVEL [NODE expr] message [WITH params]
+// LogStmt represents: LOG LEVEL [NODE expr] message [WITH params] [WITH STACKTRACE]
 type LogStmt struct {
-	Level       LogLevel             // Log level (INFO, WARNING, etc.)
-	Node        Expression           // Optional log node expression
-	Message     Expression           // Message expression
-	Template    []TemplateParam      // Optional WITH template params
-	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	Level                   LogLevel             // Log level (INFO, WARNING, etc.)
+	Node                    Expression           // Optional log node expression
+	Message                 Expression           // Message expression
+	Template                []TemplateParam      // Optional WITH template params
+	IncludeLatestStackTrace bool                 // WITH STACKTRACE — Studio Pro's "Include latest stack trace"
+	Annotations             *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling           *ErrorHandlingClause // Optional ON ERROR clause
 }
 
 func (s *LogStmt) isMicroflowStatement() {}
@@ -376,6 +761,45 @@ func (s *LogStmt) isMicroflowStatement() {}
 type CallArgument struct {
 	Name  string     // Parameter name
 	Value Expression // Value expression
+	// TemplateParams fills the {n} placeholders of Value when it is the text of
+	// a Java action's text-template parameter: `Subject = 'Order {1}' with
+	// ({1} = $Order/Number)` (ako/mxcli#1451). Only call java action takes it.
+	TemplateParams []TemplateParam
+	// IncludeAssociations is a call external action argument's Associations to
+	// include, `include associations ( … )` (ako/mxcli#1914). nil when the
+	// clause is not written; a non-nil empty clause states "none".
+	IncludeAssociations *IncludeAssociationsClause
+}
+
+// IncludeAssociationsClause is `include associations (M.A (M.B), M.C)`: the
+// tree of associations whose objects an OData external action call serialises
+// with the argument. Each node's children are reached from the entity at its
+// association's far end.
+type IncludeAssociationsClause struct {
+	Associations []*IncludedAssociationDef
+}
+
+// IncludedAssociationDef is one node of the tree.
+type IncludedAssociationDef struct {
+	Name     QualifiedName
+	Children []*IncludedAssociationDef
+}
+
+// QueueRetry is the retry policy of a queued call (mendixlabs/mxcli#1729):
+//
+//	IN QUEUE Mod.Q RETRY FIXED (Retries: 5, Interval: 10, IntervalType: Minutes)
+//	IN QUEUE Mod.Q RETRY EXPONENTIAL (Retries: 20, InitialInterval: 1,
+//	                                  MaximumInterval: 60, IntervalType: Minutes)
+//
+// Kind is "Fixed" or "Exponential"; IntervalType is Seconds, Minutes or Hours.
+// The visitor requires every property of the kind, so nothing is defaulted.
+type QueueRetry struct {
+	Kind            string
+	Retries         int
+	Interval        int
+	InitialInterval int
+	MaximumInterval int
+	IntervalType    string
 }
 
 // CallMicroflowStmt represents: [$Result =] CALL MICROFLOW Name (args) [ON ERROR ...]
@@ -383,6 +807,8 @@ type CallMicroflowStmt struct {
 	OutputVariable string               // Optional output variable
 	MicroflowName  QualifiedName        // Microflow to call
 	Arguments      []CallArgument       // Arguments
+	Queue          *QualifiedName       // Optional IN QUEUE clause (task queue to run the call on)
+	QueueRetry     *QueueRetry          // Optional RETRY clause after IN QUEUE
 	ErrorHandling  *ErrorHandlingClause // Optional ON ERROR clause
 	Annotations    *ActivityAnnotations // Optional @position, @caption, @color, @annotation
 }
@@ -405,6 +831,8 @@ type CallJavaActionStmt struct {
 	OutputVariable string               // Optional output variable
 	ActionName     QualifiedName        // Java action name
 	Arguments      []CallArgument       // Arguments
+	Queue          *QualifiedName       // Optional IN QUEUE clause (task queue to run the call on)
+	QueueRetry     *QueueRetry          // Optional RETRY clause after IN QUEUE
 	ErrorHandling  *ErrorHandlingClause // Optional ON ERROR clause
 	Annotations    *ActivityAnnotations // Optional @position, @caption, @color, @annotation
 }
@@ -424,28 +852,38 @@ func (s *CallJavaScriptActionStmt) isMicroflowStatement() {}
 
 // CallWebServiceStmt represents a legacy SOAP web service call.
 type CallWebServiceStmt struct {
-	OutputVariable   string               // Optional output variable
-	RawBSONBase64    string               // Raw Microflows$CallWebServiceAction BSON for lossless roundtrip
-	ServiceID        string               // Consumed web service ID or qualified name
-	OperationName    string               // Operation name
-	SendMappingID    string               // Optional export mapping ID or qualified name
-	ReceiveMappingID string               // Optional import mapping ID or qualified name
-	Timeout          Expression           // Optional timeout expression
-	ErrorHandling    *ErrorHandlingClause // Optional ON ERROR clause
-	Annotations      *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	OutputVariable string         // Optional output variable
+	RawBSONBase64  string         // Raw Microflows$CallWebServiceAction BSON for lossless roundtrip
+	ServiceID      string         // Consumed web service ID or qualified name
+	OperationName  string         // Operation name
+	Arguments      []CallArgument // Optional operation arguments — Microflows$SimpleRequestHandling
+	SendMappingID  string         // Optional export mapping ID or qualified name
+	// SendMappingVariable is the variable the export mapping maps FROM. An
+	// export mapping always maps an object, so a send mapping without one is
+	// incomplete — Mendix stores it as MappingRequestHandling.MappingVariableName.
+	SendMappingVariable string
+	ReceiveMappingID    string               // Optional import mapping ID or qualified name
+	Timeout             Expression           // Optional timeout expression
+	ErrorHandling       *ErrorHandlingClause // Optional ON ERROR clause
+	Annotations         *ActivityAnnotations // Optional @position, @caption, @color, @annotation
 }
 
 func (s *CallWebServiceStmt) isMicroflowStatement() {}
 
 // ExecuteDatabaseQueryStmt represents: EXECUTE DATABASE QUERY Module.Connection.QueryName ...
 type ExecuteDatabaseQueryStmt struct {
-	OutputVariable      string               // Optional output variable
-	QueryName           string               // Full 3-part identifier: Module.Connection.QueryName
-	DynamicQuery        string               // Optional dynamic SQL override
-	Arguments           []CallArgument       // Parameter mappings (query parameters)
-	ConnectionArguments []CallArgument       // Connection parameter mappings (runtime connection override)
-	ErrorHandling       *ErrorHandlingClause // Optional ON ERROR clause
-	Annotations         *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	OutputVariable string // Optional output variable
+	QueryName      string // Full 3-part identifier: Module.Connection.QueryName
+	DynamicQuery   string // Optional dynamic SQL override
+	// DynamicQueryIsExpression distinguishes `dynamic $Sql` from `dynamic 'SELECT …'`.
+	// Both reach the executor as a bare string, and the builder has to quote one
+	// and not the other: quoting an expression sends the literal text `$Sql` to
+	// the database, which is a syntax error at the far end, not a Mendix one.
+	DynamicQueryIsExpression bool
+	Arguments                []CallArgument       // Parameter mappings (query parameters)
+	ConnectionArguments      []CallArgument       // Connection parameter mappings (runtime connection override)
+	ErrorHandling            *ErrorHandlingClause // Optional ON ERROR clause
+	Annotations              *ActivityAnnotations // Optional @position, @caption, @color, @annotation
 }
 
 func (s *ExecuteDatabaseQueryStmt) isMicroflowStatement() {}
@@ -475,6 +913,30 @@ type ContinueStmt struct {
 }
 
 func (s *ContinueStmt) isMicroflowStatement() {}
+
+// MergeStmt represents: MERGE <label>
+//
+// Declares an ExclusiveMerge that other paths reach with JoinStmt. The label is
+// an MDL-only handle — Mendix stores no name on a merge — so it lives no longer
+// than one build or one describe.
+type MergeStmt struct {
+	Label       string
+	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+}
+
+func (s *MergeStmt) isMicroflowStatement() {}
+
+// JoinStmt represents: JOIN <label>
+//
+// Ends this path at the merge declared under Label. Forward and backward
+// references both resolve, so a join may precede its merge (crossed branches)
+// or follow it (a retry loop).
+type JoinStmt struct {
+	Label       string
+	Annotations *ActivityAnnotations
+}
+
+func (s *JoinStmt) isMicroflowStatement() {}
 
 // ============================================================================
 // List Operations
@@ -532,24 +994,73 @@ type SortSpec struct {
 	Ascending bool   // True for ASC, false for DESC
 }
 
-// ListOperationStmt represents list operations like HEAD, TAIL, FIND, etc.
-// $Var = HEAD($List)
-// $Var = FIND($List, condition)
-// $Var = SORT($List, attr ASC)
-// $Var = UNION($List1, $List2)
+// ListOperationStmt is one Studio Pro List operation activity:
+// $Var = head $List
+// $Var = find $List by Member = value | where condition
+// $Var = sort $List by attr asc
+// $Var = union $List1 with $List2
+// The call forms ($Var = HEAD($List), …) build the same node.
 type ListOperationStmt struct {
-	OutputVariable string               // Output variable name
-	Operation      ListOperationType    // Operation type
-	InputVariable  string               // Input list variable (first operand)
-	SecondVariable string               // Second operand for UNION, INTERSECT, SUBTRACT, CONTAINS, EQUALS
-	Condition      Expression           // Condition for FIND/FILTER
-	SortSpecs      []SortSpec           // Sort specifications for SORT
-	OffsetExpr     Expression           // Offset expression for RANGE
-	LimitExpr      Expression           // Limit expression for RANGE
-	Annotations    *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	OutputVariable string            // Output variable name
+	Operation      ListOperationType // Operation type
+	InputVariable  string            // Input list variable (first operand)
+	SecondVariable string            // Second operand for UNION, INTERSECT, SUBTRACT, CONTAINS, EQUALS
+	Condition      Expression        // Condition for FIND/FILTER
+	// ByExpression is set for FIND/FILTER whose condition is an expression over
+	// $currentObject (Studio Pro's "Find by expression" / "Filter by
+	// expression"). When false, a condition of the shape `Member = value` (see
+	// IsMemberEquality) is the "by member" operation, and any other condition
+	// falls back to the expression operation, which is what the function form
+	// has always done. The statement form sets it from the linking word: `where`
+	// sets it, `by` does not.
+	ByExpression  bool
+	SortSpecs     []SortSpec           // Sort specifications for SORT
+	OffsetExpr    Expression           // Offset expression for RANGE
+	LimitExpr     Expression           // Limit expression for RANGE
+	Annotations   *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling *ErrorHandlingClause // Optional ON ERROR clause (mendixlabs/mxcli#1252)
+	// UnresolvedOperands holds the list operands that did not reduce to a
+	// variable name — see UnresolvedOperand. Empty on every well-formed statement.
+	UnresolvedOperands []UnresolvedOperand
 }
 
 func (s *ListOperationStmt) isMicroflowStatement() {}
+
+// IsMemberEquality reports whether a FIND/FILTER condition names a member of
+// the list's entity and a value, `Member = value` — the shape Studio Pro's Find
+// and Filter operations take (an attribute or association, and the value it must
+// have). It is the single test both the visitor (which linking word a function
+// form is a respelling of) and the flow builder (which operation to write) use,
+// so the two cannot disagree.
+func IsMemberEquality(cond Expression) bool {
+	binary, ok := cond.(*BinaryExpr)
+	if !ok || binary.Operator != "=" {
+		return false
+	}
+	switch binary.Left.(type) {
+	case *IdentifierExpr, *QualifiedNameExpr:
+		return true
+	}
+	return false
+}
+
+// UnresolvedOperand is a list operand that the visitor could not reduce to a
+// variable name.
+//
+// A Mendix list-operation or aggregate activity stores its list as a VARIABLE
+// REFERENCE — there is no slot for a nested computation. So MDL's expression
+// grammar accepts `count(filter($l, …))`, which looks composable, but the model
+// has nowhere to put the inner call. The conversion used to drop it silently and
+// write the activity with an empty List, which passes `check`, execs with a
+// success message, and fails the build with CE0012 / CE0096 (mendixlabs/mxcli#1101).
+//
+// Recording what was dropped — rather than leaving an empty InputVariable behind
+// — is what lets the validator name the operand and print the two-statement
+// rewrite. Expr is nil when the operand was absent altogether.
+type UnresolvedOperand struct {
+	Index int        // 0 = the list; 1 = the second list of UNION/INTERSECT/SUBTRACT/CONTAINS/EQUALS
+	Expr  Expression // what was written there, for the diagnostic
+}
 
 // AggregateListOperationType represents the type of aggregate operation.
 type AggregateListOperationType int
@@ -561,6 +1072,8 @@ const (
 	AggregateMinimum
 	AggregateMaximum
 	AggregateReduce
+	AggregateAll
+	AggregateAny
 )
 
 func (t AggregateListOperationType) String() string {
@@ -577,15 +1090,20 @@ func (t AggregateListOperationType) String() string {
 		return "MAXIMUM"
 	case AggregateReduce:
 		return "REDUCE"
+	case AggregateAll:
+		return "ALL"
+	case AggregateAny:
+		return "ANY"
 	default:
 		return "UNKNOWN"
 	}
 }
 
-// AggregateListStmt represents aggregate operations: COUNT, SUM, AVERAGE, etc.
-// $Count = COUNT($List)
-// $Sum = SUM($List/Attr)
-// $Sum = SUM($List, $currentObject/Price * 2)  // expression form
+// AggregateListStmt is one Studio Pro Aggregate list activity:
+// $Count = count $List
+// $Sum = sum $List by Attr
+// $Sum = sum $List of $currentObject/Price * 2  // expression form
+// The call forms ($Count = COUNT($List), …) build the same node.
 type AggregateListStmt struct {
 	OutputVariable string                     // Output variable name
 	Operation      AggregateListOperationType // Operation type
@@ -593,38 +1111,72 @@ type AggregateListStmt struct {
 	Attribute      string                     // Attribute name for SUM/AVG/MIN/MAX (empty for COUNT or expression form)
 	IsExpression   bool                       // true when Expression is used instead of Attribute
 	Expression     Expression                 // Mendix expression (when IsExpression=true)
-	Annotations    *ActivityAnnotations       // Optional @position, @caption, @color, @annotation
+
+	// REDUCE only. InitialValue seeds $currentResult; ReturnType is the type the
+	// fold produces. Mendix requires both and neither can be inferred from the
+	// expression, so REDUCE names them and the other functions leave them zero.
+	InitialValue Expression
+	ReturnType   *DataType
+
+	Annotations   *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling *ErrorHandlingClause // Optional ON ERROR clause (mendixlabs/mxcli#1252)
+	// UnresolvedOperands holds the list operand that did not reduce to a variable
+	// name — see UnresolvedOperand. Empty on every well-formed statement.
+	UnresolvedOperands []UnresolvedOperand
 }
 
 func (s *AggregateListStmt) isMicroflowStatement() {}
 
 // CreateListStmt represents: $Var = CREATE LIST OF Entity
 type CreateListStmt struct {
-	Variable    string               // Output variable name
-	EntityType  QualifiedName        // Entity type for the list
-	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	Variable      string               // Output variable name
+	EntityType    QualifiedName        // Entity type for the list
+	Annotations   *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling *ErrorHandlingClause // Optional ON ERROR clause
 }
 
 func (s *CreateListStmt) isMicroflowStatement() {}
 
-// AddToListStmt represents: ADD expr TO $List
+// AddToListStmt represents: ADD expr TO $List, or ADD expr TO $Obj/Module.Assoc.
+//
+// With Association set, List is the object variable and the statement is the
+// Add member change of a Change object activity on that association
+// (mendixlabs/mxcli#1288); Commit and RefreshInClient are that activity's.
 type AddToListStmt struct {
-	Item        string               // Item variable to add, kept for simple $Var compatibility
-	Value       Expression           // Item expression to add
-	List        string               // Target list variable
-	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	Item            string               // Item variable to add, kept for simple $Var compatibility
+	Value           Expression           // Item expression to add
+	List            string               // Target list variable, or the object variable when Association is set
+	Association     string               // Association member to add to ("" for a list target)
+	Commit          CommitFlag           // Association target only
+	RefreshInClient bool                 // Association target only
+	Annotations     *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling   *ErrorHandlingClause // Optional ON ERROR clause
 }
 
 func (s *AddToListStmt) isMicroflowStatement() {}
 
-// RemoveFromListStmt represents: REMOVE $Item FROM $List
+// RemoveFromListStmt represents: REMOVE $Item FROM $List, or
+// REMOVE $Item FROM $Obj/Module.Assoc (see AddToListStmt).
 type RemoveFromListStmt struct {
-	Item        string               // Item variable to remove
-	List        string               // Source list variable
-	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	Item            string               // Item variable to remove
+	List            string               // Source list variable, or the object variable when Association is set
+	Association     string               // Association member to remove from ("" for a list target)
+	Commit          CommitFlag           // Association target only
+	RefreshInClient bool                 // Association target only
+	Annotations     *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling   *ErrorHandlingClause // Optional ON ERROR clause
 }
 
 func (s *RemoveFromListStmt) isMicroflowStatement() {}
+
+// ClearListStmt represents: CLEAR $List — the Clear operation of a Change list
+// activity (Microflows$ChangeListAction, Type "Clear"), which stores no value.
+type ClearListStmt struct {
+	List        string               // List variable to empty
+	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+}
+
+func (s *ClearListStmt) isMicroflowStatement() {}
 
 // ============================================================================
 // Page Actions
@@ -638,13 +1190,17 @@ type ShowPageArg struct {
 
 // ShowPageStmt represents: SHOW PAGE Module.Page($param = $value) [FOR $obj] [WITH (settings)]
 type ShowPageStmt struct {
-	PageName    QualifiedName        // Page to show
-	Arguments   []ShowPageArg        // Page parameter arguments
-	ForObject   string               // Optional FOR variable (without $ prefix)
-	Title       string               // Optional title override
-	Location    string               // Optional location: Content, Popup, Modal (default: Content)
-	ModalForm   bool                 // Whether to show as modal
-	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	PageName      QualifiedName        // Page to show
+	Arguments     []ShowPageArg        // Page parameter arguments
+	ForObject     string               // Optional FOR variable (without $ prefix)
+	Title         string               // Optional title override
+	Location      string               // Optional location: Content, Popup, Modal (default: Content)
+	ModalForm     bool                 // Whether to show as modal
+	Annotations   *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling *ErrorHandlingClause // Optional ON ERROR clause
+	// NumberOfPagesToClose is `with NumberOfPagesToClose = <expr>`: how many
+	// pages to close before the page opens; nil closes none (mendixlabs/mxcli#1617).
+	NumberOfPagesToClose Expression
 }
 
 func (s *ShowPageStmt) isMicroflowStatement() {}
@@ -653,23 +1209,27 @@ func (s *ShowPageStmt) isMicroflowStatement() {}
 type ClosePageStmt struct {
 	NumberOfPages int                  // Number of pages to close (default 1)
 	Annotations   *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling *ErrorHandlingClause // Optional ON ERROR clause
 }
 
 func (s *ClosePageStmt) isMicroflowStatement() {}
 
 // ShowHomePageStmt represents: SHOW HOME PAGE
 type ShowHomePageStmt struct {
-	Annotations *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	Annotations   *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling *ErrorHandlingClause // Optional ON ERROR clause
 }
 
 func (s *ShowHomePageStmt) isMicroflowStatement() {}
 
 // ShowMessageStmt represents: SHOW MESSAGE 'text' TYPE Information OBJECTS [$Var1, $Var2];
 type ShowMessageStmt struct {
-	Message      Expression           // The message text (string template)
-	Type         string               // Information, Warning, Error (default: Information)
-	TemplateArgs []Expression         // Template arguments for message placeholders {1}, {2}, etc.
-	Annotations  *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	Message       Expression           // The message text (string template)
+	Type          string               // Information, Warning, Error (default: Information)
+	TemplateArgs  []Expression         // Template arguments for message placeholders {1}, {2}, etc.
+	Blocking      bool                 // BLOCKING — the message halts the client until dismissed
+	Annotations   *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling *ErrorHandlingClause // Optional ON ERROR clause
 }
 
 func (s *ShowMessageStmt) isMicroflowStatement() {}
@@ -684,12 +1244,27 @@ type DownloadFileStmt struct {
 
 func (s *DownloadFileStmt) isMicroflowStatement() {}
 
+// SynchronizeStmt represents: SYNCHRONIZE ALL | UNSYNCHRONIZED | $Var[, $Var...]
+//
+// Nanoflow-only — Mendix rejects the activity in a (server-side) microflow.
+type SynchronizeStmt struct {
+	// SyncType is the platform enum value: All, Unsynchronized or Specific.
+	SyncType string
+	// Variables holds the object/list variable names (no $) for Specific mode.
+	Variables     []string
+	ErrorHandling *ErrorHandlingClause // Optional ON ERROR clause
+	Annotations   *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+}
+
+func (s *SynchronizeStmt) isMicroflowStatement() {}
+
 // ValidationFeedbackStmt represents: VALIDATION FEEDBACK $Var/Attr MESSAGE 'message' OBJECTS [$Var1, $Var2];
 type ValidationFeedbackStmt struct {
 	AttributePath *AttributePathExpr   // The attribute to associate with the feedback
 	Message       Expression           // The feedback message (string template)
 	TemplateArgs  []Expression         // Template arguments for message placeholders
 	Annotations   *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+	ErrorHandling *ErrorHandlingClause // Optional ON ERROR clause
 }
 
 func (s *ValidationFeedbackStmt) isMicroflowStatement() {}
@@ -728,11 +1303,15 @@ const (
 	RestBodyNone    RestBodyType = iota // No body
 	RestBodyCustom                      // Custom body template
 	RestBodyMapping                     // Export mapping
+	RestBodyBinary                      // Binary body: the raw bytes of an expression
 )
 
 // RestBody represents the request body configuration.
 type RestBody struct {
-	Type           RestBodyType    // Body type
+	Type RestBodyType // Body type
+	// Template is the body template for Custom, and for Binary the expression
+	// yielding the bytes to send — Studio Pro stores a FileDocument's Contents
+	// member there, e.g. `$Doc/Contents`.
 	Template       Expression      // Body template (for Custom type)
 	TemplateParams []TemplateParam // Template parameters for placeholders
 	MappingName    QualifiedName   // Export mapping name (for Mapping type)
@@ -747,13 +1326,17 @@ const (
 	RestResultResponse                       // Return HttpResponse object
 	RestResultMapping                        // Use import mapping
 	RestResultNone                           // Ignore response
+	// RestResultFileDocument stores the response in a file document. Mendix
+	// requires a SPECIALIZATION here: `System.FileDocument` itself is rejected
+	// as a return type with CE0362, so ResultEntity always names a subclass.
+	RestResultFileDocument
 )
 
 // RestResult represents the response handling configuration.
 type RestResult struct {
 	Type         RestResultType // Result type
 	MappingName  QualifiedName  // Import mapping name (for Mapping type)
-	ResultEntity QualifiedName  // Result entity type (for Mapping type)
+	ResultEntity QualifiedName  // Result entity type (for Mapping and FileDocument types)
 	// IsList distinguishes `as Module.Entity` (single object) from
 	// `as list of Module.Entity` (list). Studio Pro stores this on the
 	// microflow's ImportMappingCall (Range.SingleObject /
@@ -779,6 +1362,81 @@ type RestCallStmt struct {
 }
 
 func (s *RestCallStmt) isMicroflowStatement() {}
+
+// SendEmailStmt is the built-in Send Email activity (Microflows$SendEmailAction,
+// 11.13+): `send email from … to … subject … host … port … [on error …]`.
+type SendEmailStmt struct {
+	From    Expression
+	To      Expression
+	Cc      Expression // optional
+	Bcc     Expression // optional
+	Subject EmailTemplateClause
+	// BodyText and BodyHTML are nil when the clause is absent.
+	BodyText   *EmailTemplateClause
+	BodyHTML   *EmailTemplateClause
+	Headers    []EmailHeader
+	Attachment string // variable name without $; empty when absent
+	Host       Expression
+	Port       Expression
+	// Security is the mode word as written (none/ssl/tls, any case); empty when
+	// the clause is absent. The executor validates it.
+	Security            string
+	CheckServerIdentity bool
+	// Timeout is the connection timeout in milliseconds; 0 when absent.
+	Timeout       int
+	Auth          *RestAuth // optional `auth basic … password …`
+	ErrorHandling *ErrorHandlingClause
+	Annotations   *ActivityAnnotations
+}
+
+func (s *SendEmailStmt) isMicroflowStatement() {}
+
+// Expressions returns every expression the statement holds — addresses,
+// template texts and parameters, host, port and credentials — skipping absent
+// ones. Walkers that collect variable references use it so a new slot cannot
+// be missed by one of them.
+func (s *SendEmailStmt) Expressions() []Expression {
+	var out []Expression
+	add := func(es ...Expression) {
+		for _, e := range es {
+			if e != nil {
+				out = append(out, e)
+			}
+		}
+	}
+	addTemplate := func(t *EmailTemplateClause) {
+		if t == nil {
+			return
+		}
+		add(t.Text)
+		for _, p := range t.Params {
+			add(p.Value)
+		}
+	}
+	add(s.From, s.To, s.Cc, s.Bcc)
+	addTemplate(&s.Subject)
+	addTemplate(s.BodyText)
+	addTemplate(s.BodyHTML)
+	add(s.Host, s.Port)
+	if s.Auth != nil {
+		add(s.Auth.Username, s.Auth.Password)
+	}
+	return out
+}
+
+// EmailTemplateClause is a subject or body: template text plus optional
+// `with ({1} = …)` parameters. Text is a string literal for a template, or any
+// other expression, which the builder wraps as `{1}`.
+type EmailTemplateClause struct {
+	Text   Expression
+	Params []TemplateParam
+}
+
+// EmailHeader is one `header 'Name' = 'value'` line; both are plain strings.
+type EmailHeader struct {
+	Name  string
+	Value string
+}
 
 // SendRestRequestStmt represents: [$Var =] SEND REST REQUEST Module.Service.Operation [BODY $var] [ON ERROR ...]
 // Calls a consumed REST service operation defined via CREATE REST CLIENT.
@@ -806,6 +1464,29 @@ type ImportFromMappingStmt struct {
 	SourceVariable string               // Input string variable (without $)
 	ErrorHandling  *ErrorHandlingClause // Optional ON ERROR clause
 	Annotations    *ActivityAnnotations // Optional @position, @caption, @color, @annotation
+
+	// Range — how much of the mapping's result to bind. Mendix stores this on
+	// the ImportMappingCall as ConstantRange{SingleObject} or
+	// CustomRange{LimitExpression, OffsetExpression}; before #881 MDL could say
+	// none of it, so all three settings described identically and a
+	// describe→edit→exec cycle silently changed the activity's meaning.
+	//
+	// All fields unset = the range was not authored, and the builder keeps
+	// inferring cardinality from the mapping's own root shape, as it always has.
+	// DESCRIBE always emits one of All/First/Limit so a round trip cannot fall
+	// back on that inference and change the activity's meaning.
+	All        bool       // ALL   — bind the whole list, explicitly
+	First      bool       // FIRST — bind ONE object rather than a list
+	LimitExpr  Expression // LIMIT <expr>  — Custom range
+	OffsetExpr Expression // OFFSET <expr> — Custom range
+
+	// The activity's settings list, `( Parameter: $Obj, Commit: No )` (ADR-0013,
+	// ako/mxcli#1681). Parameter is the variable holding the mapping's input
+	// object (ImportMappingCall.ParameterVariableName, without $); Commit is
+	// Yes, YesWithoutEvents or No. Empty means not authored: no parameter, and
+	// the writer's YesWithoutEvents.
+	Parameter string
+	Commit    string
 }
 
 func (s *ImportFromMappingStmt) isMicroflowStatement() {}
@@ -831,3 +1512,28 @@ type TransformJsonStmt struct {
 }
 
 func (s *TransformJsonStmt) isMicroflowStatement() {}
+
+// MemberEqualityCondition returns cond in the shape IsMemberEquality tests for
+// when it is a `Member = value` condition wrapped whole in a SourceExpr.
+//
+// The visitor wraps an expression in a SourceExpr when its spelling differs
+// from the printed form — `$N-1`, `-1`, `$Item/Number-1` without the spaces
+// around the operator — so it is written back as the author spelled it. A
+// whole-condition wrapper hid the BinaryExpr from IsMemberEquality, and
+// `find $L by Number = $N-1` was written as the find-by-EXPRESSION operation
+// while `$N - 1` was a find by attribute (mendixlabs/mxcli#1740,
+// ako/mxcli#1943). The wrapper moves onto the value, which keeps its spelling;
+// any other condition is returned unchanged.
+func MemberEqualityCondition(cond Expression) Expression {
+	src, ok := cond.(*SourceExpr)
+	if !ok || !IsMemberEquality(src.Expression) {
+		return cond
+	}
+	binary := src.Expression.(*BinaryExpr)
+	_, value, found := strings.Cut(src.Source, "=")
+	value = strings.TrimSpace(value)
+	if !found || value == "" {
+		return src.Expression
+	}
+	return &BinaryExpr{Left: binary.Left, Operator: "=", Right: &SourceExpr{Expression: binary.Right, Source: value}}
+}

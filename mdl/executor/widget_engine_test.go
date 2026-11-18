@@ -210,7 +210,7 @@ func TestEvaluateCondition(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			result := engine.evaluateCondition(tc.condition, tc.widget)
+			result := engine.evaluateCondition(tc.condition, tc.widget, nil)
 			if result != tc.expected {
 				t.Errorf("evaluateCondition(%q) = %v, want %v", tc.condition, result, tc.expected)
 			}
@@ -384,6 +384,29 @@ func TestResolveMapping_GenericProp(t *testing.T) {
 	}
 }
 
+// A non-string property value (e.g. `gallery (DesktopColumns: 3)` parsed as an
+// int) must reach the generic source path instead of being silently dropped to
+// the schema default by GetStringProp, which only sees strings.
+func TestResolveMapping_GenericProp_NonStringValue(t *testing.T) {
+	engine := &PluggableWidgetEngine{}
+
+	mapping := PropertyMapping{
+		PropertyKey: "desktopItems",
+		Source:      "DesktopColumns",
+		Operation:   "primitive",
+		Default:     "1",
+	}
+	w := &ast.WidgetV3{Properties: map[string]any{"DesktopColumns": 3}}
+
+	ctx, err := engine.resolveMapping(mapping, w)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ctx.PrimitiveVal != "3" {
+		t.Errorf("expected PrimitiveVal='3' (not the default '1'), got %q", ctx.PrimitiveVal)
+	}
+}
+
 func TestResolveMapping_EmptySource(t *testing.T) {
 	engine := &PluggableWidgetEngine{}
 
@@ -454,5 +477,46 @@ func TestResolveMapping_Association(t *testing.T) {
 	}
 	if ctx.EntityName != "Module.Order" {
 		t.Errorf("expected EntityName='Module.Order', got %q", ctx.EntityName)
+	}
+}
+
+// TestResolveMapping_Association_QualifiesAgainstOuterContext pins issuetracker
+// #19's ComboBox half. A ComboBox's `DataSource:` mapping is applied before its
+// `Association:` mapping and moves pageBuilder.entityContext to the OPTION LIST
+// entity. A bare association name was then qualified with that module — for a
+// ComboBox over System.User it became `System.Issue_Assignee`, and mxbuild
+// failed CE1613 "The selected association … no longer exists". The association
+// belongs to the containing entity, so it must be qualified against the context
+// as it stood when the widget's Build started.
+func TestResolveMapping_Association_QualifiesAgainstOuterContext(t *testing.T) {
+	pb := &pageBuilder{
+		// Already moved to the option list by the DataSource mapping.
+		entityContext:    "System.User",
+		paramEntityNames: map[string]string{},
+		widgetScope:      map[string]model.ID{},
+	}
+	engine := &PluggableWidgetEngine{
+		pageBuilder: pb,
+		// The dataview the ComboBox sits in.
+		outerEntityContext: "IssueTracker.Issue",
+	}
+
+	mapping := PropertyMapping{
+		PropertyKey: "attributeAssociation",
+		Source:      "Association",
+		Operation:   "association",
+	}
+	w := &ast.WidgetV3{Properties: map[string]any{"Association": "Issue_Assignee"}}
+
+	ctx, err := engine.resolveMapping(mapping, w)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if want := "IssueTracker.Issue_Assignee"; ctx.AssocPath != want {
+		t.Errorf("AssocPath = %q, want %q (qualified with the option list's module is CE1613)", ctx.AssocPath, want)
+	}
+	// DestinationEntity still comes from the widget's own data source.
+	if ctx.EntityName != "System.User" {
+		t.Errorf("EntityName = %q, want System.User", ctx.EntityName)
 	}
 }

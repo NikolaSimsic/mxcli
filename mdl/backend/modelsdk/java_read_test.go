@@ -57,3 +57,161 @@ func TestReadJavaActionByName_RoundTrip(t *testing.T) {
 		t.Errorf("return type = %T, want *BooleanType", got.ReturnType)
 	}
 }
+
+// A microflow-typed parameter — the shape MCPServer.AddTool's ExecutingMicroflow
+// and every other "register a callback" java action uses — read back as a String,
+// because codeActionBasicFromGen had no case for it and fell through to the
+// default. The microflow builder then authored the callback as a
+// BasicCodeActionParameterValue holding 'Module.MyFlow' as a literal instead of a
+// MicroflowParameterValue, and `mx check` reported CE0115. mxcli-chat FINDINGS §36.
+func TestReadJavaActionByName_MicroflowParameterType(t *testing.T) {
+	proj := copyFixture(t)
+	b := New()
+	if err := b.Connect(proj); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Disconnect() })
+
+	mod, err := b.GetModuleByName("MyFirstModule")
+	if err != nil || mod == nil {
+		t.Fatalf("GetModuleByName: %v", err)
+	}
+	ja := &javaactions.JavaAction{
+		ContainerID: mod.ID,
+		Name:        "ZzRegisterTool",
+		Parameters: []*javaactions.JavaActionParameter{
+			{Name: "Name", IsRequired: true, ParameterType: &javaactions.StringType{}},
+			{Name: "ExecutingMicroflow", IsRequired: true, ParameterType: &javaactions.MicroflowType{}},
+		},
+	}
+	if err := b.CreateJavaAction(ja); err != nil {
+		t.Fatalf("CreateJavaAction: %v", err)
+	}
+
+	got, err := b.ReadJavaActionByName("MyFirstModule.ZzRegisterTool")
+	if err != nil {
+		t.Fatalf("ReadJavaActionByName: %v", err)
+	}
+	if len(got.Parameters) != 2 {
+		t.Fatalf("params = %d, want 2", len(got.Parameters))
+	}
+	if _, ok := got.Parameters[0].ParameterType.(*javaactions.StringType); !ok {
+		t.Errorf("param 0 type = %T, want *StringType", got.Parameters[0].ParameterType)
+	}
+	if _, ok := got.Parameters[1].ParameterType.(*javaactions.MicroflowType); !ok {
+		t.Fatalf("param 1 type = %T, want *MicroflowType — a microflow callback read back as this "+
+			"is what makes the caller author a literal string and fail CE0115",
+			got.Parameters[1].ParameterType)
+	}
+}
+
+// DESCRIBE JAVA ACTION printed `ContextObject: entity <>` for a parameter
+// declared `entity <pEntity> not null` (mendixlabs/mxcli#1034). The stored
+// parameter type holds only a BY_ID pointer to the TypeParameter; the reader
+// carried the ID across but never resolved it to the name, which is all the
+// describer prints. The JavaScript-action reader already did this resolution.
+func TestReadJavaActionByName_ResolvesTypeParameterNames(t *testing.T) {
+	proj := copyFixture(t)
+	b := New()
+	if err := b.Connect(proj); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Disconnect() })
+
+	mod, err := b.GetModuleByName("MyFirstModule")
+	if err != nil || mod == nil {
+		t.Fatalf("GetModuleByName: %v", err)
+	}
+	tp := &javaactions.TypeParameterDef{Name: "pEntity"}
+	tp.ID = model.ID("0b6f0d0e-1034-4a00-8000-000000000001")
+	ja := &javaactions.JavaAction{
+		ContainerID:    mod.ID,
+		Name:           "ZzJaTypeParam",
+		TypeParameters: []*javaactions.TypeParameterDef{tp},
+		Parameters: []*javaactions.JavaActionParameter{
+			{Name: "ContextObject", IsRequired: true,
+				ParameterType: &javaactions.EntityTypeParameterType{TypeParameterID: tp.ID, TypeParameterName: "pEntity"}},
+			{Name: "Obj", IsRequired: true,
+				ParameterType: &javaactions.TypeParameter{TypeParameterID: tp.ID, TypeParameter: "pEntity"}},
+		},
+		ReturnType: &javaactions.TypeParameter{TypeParameterID: tp.ID, TypeParameter: "pEntity"},
+	}
+	if err := b.CreateJavaAction(ja); err != nil {
+		t.Fatalf("CreateJavaAction: %v", err)
+	}
+
+	got, err := b.ReadJavaActionByName("MyFirstModule.ZzJaTypeParam")
+	if err != nil {
+		t.Fatalf("ReadJavaActionByName: %v", err)
+	}
+	if len(got.Parameters) != 2 {
+		t.Fatalf("params = %d, want 2", len(got.Parameters))
+	}
+	etp, ok := got.Parameters[0].ParameterType.(*javaactions.EntityTypeParameterType)
+	if !ok {
+		t.Fatalf("param 0 type = %T, want *EntityTypeParameterType", got.Parameters[0].ParameterType)
+	}
+	if etp.TypeParameterName != "pEntity" {
+		t.Errorf("entity type parameter name = %q, want %q (describe prints `entity <%s>`)",
+			etp.TypeParameterName, "pEntity", etp.TypeParameterName)
+	}
+	if p, ok := got.Parameters[1].ParameterType.(*javaactions.TypeParameter); !ok || p.TypeParameter != "pEntity" {
+		t.Errorf("param 1 type = %#v, want TypeParameter{pEntity}", got.Parameters[1].ParameterType)
+	}
+	if r, ok := got.ReturnType.(*javaactions.TypeParameter); !ok || r.TypeParameter != "pEntity" {
+		t.Errorf("return type = %#v, want TypeParameter{pEntity}", got.ReturnType)
+	}
+}
+
+// Studio Pro's "List of <type parameter>" is a ListType whose element is a
+// ParameterizedEntityType. The reader only knew a ConcreteEntityType element, so
+// this read back as ListType{Entity: ""}: DESCRIBE printed a bare `List`, the
+// catalog 'List', and any rewrite of the action serialized a list of an entity
+// with no name (mendixlabs/mxcli#1183).
+func TestReadJavaActionByName_ListOfTypeParameter(t *testing.T) {
+	proj := copyFixture(t)
+	b := New()
+	if err := b.Connect(proj); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	t.Cleanup(func() { _ = b.Disconnect() })
+
+	mod, err := b.GetModuleByName("MyFirstModule")
+	if err != nil || mod == nil {
+		t.Fatalf("GetModuleByName: %v", err)
+	}
+	tp := &javaactions.TypeParameterDef{Name: "String"}
+	tp.ID = model.ID("0b6f0d0e-1183-4a00-8000-000000000001")
+	ja := &javaactions.JavaAction{
+		ContainerID:    mod.ID,
+		Name:           "ZzJaListOfTypeParam",
+		TypeParameters: []*javaactions.TypeParameterDef{tp},
+		Parameters: []*javaactions.JavaActionParameter{
+			{Name: "EntityType", IsRequired: true,
+				ParameterType: &javaactions.EntityTypeParameterType{TypeParameterID: tp.ID, TypeParameterName: "String"}},
+			{Name: "Items", IsRequired: true,
+				ParameterType: &javaactions.ListType{TypeParameterID: tp.ID, TypeParameter: "String"}},
+		},
+		ReturnType: &javaactions.ListType{TypeParameterID: tp.ID, TypeParameter: "String"},
+	}
+	if err := b.CreateJavaAction(ja); err != nil {
+		t.Fatalf("CreateJavaAction: %v", err)
+	}
+
+	got, err := b.ReadJavaActionByName("MyFirstModule.ZzJaListOfTypeParam")
+	if err != nil {
+		t.Fatalf("ReadJavaActionByName: %v", err)
+	}
+	check := func(what string, typ any) {
+		l, ok := typ.(*javaactions.ListType)
+		if !ok {
+			t.Errorf("%s = %T, want *ListType", what, typ)
+			return
+		}
+		if l.Entity != "" || l.TypeParameterID != tp.ID || l.TypeParameter != "String" {
+			t.Errorf("%s = %+v, want a list of type parameter String (ID %s)", what, *l, tp.ID)
+		}
+	}
+	check("list parameter", got.Parameters[1].ParameterType)
+	check("return type", got.ReturnType)
+}

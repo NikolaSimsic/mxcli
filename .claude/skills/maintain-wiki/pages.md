@@ -1,0 +1,50 @@
+| Path | Category | Frames |
+|------|----------|--------|
+| `architecture/mdl-execution.md` | architecture | grammar → AST → visitor → executor → backend → MPR writer |
+| `architecture/mpr-read-write.md` | architecture | MPR v1/v2, BSON round-trip, write safety |
+| `architecture/widget-engine.md` | architecture | def.json, WidgetRegistry, V3 builders |
+| `architecture/mcp-backend.md` | architecture | the MCP/PED backend: hybrid local-read / live-PED-write, dirty-set router, session tracking |
+| `models/association-pointers.md` | mental-model | why `ParentPointer` = FROM, `ChildPointer` = TO |
+| `models/element-identity.md` | mental-model | `$ID` vs `GUID` vs `StableId`; the unit as identity boundary |
+| `models/ped-mutation-constraints.md` | mental-model | the counter-intuitive PED invariants: simplified constructors, leaf-only sets, acceptance is not validity |
+| `models/storage-vs-qualified-names.md` | mental-model | BSON `$type` vs SDK qualified name |
+| `models/version-gating.md` | mental-model | feature registry, `min_version`, `checkFeature()` |
+| `rationale/mdl-as-sql.md` | rationale | why MDL is SQL-shaped, design principles (cites ADRs) |
+| `rationale/backend-abstraction.md` | rationale | why the executor never reaches past `ctx.Backend` for writes (cites ADRs) |
+| `positioning/vs-typescript-sdk.md` | positioning | gap analysis, intentional differences |
+| `glossary.md` | glossary | Mendix ↔ mxcli ↔ BSON term bridge |
+| `bug-patterns/bson-numeric-width.md` | bug-pattern | int32/int64 mismatches (links #583, #585 findings) |
+| `bug-patterns/visitor-wiring-gaps.md` | bug-pattern | parsed-but-not-stored (links #393 finding) |
+| `bug-patterns/widget-type-object-drift.md` | bug-pattern | CE0463 family |
+| `bug-patterns/describe-round-trip-gaps.md` | bug-pattern | DESCRIBE as a second, unvalidated MDL implementation: won't-parse / drops / invents / destroys |
+| `bug-patterns/unloadable-model-writes.md` | bug-pattern | writes that break LOAD rather than validation — no CE code, whole project down |
+| `bug-patterns/silent-property-drop.md` | bug-pattern | a property parses, passes every check, and never reaches the model |
+| `bug-patterns/check-mxbuild-drift.md` | bug-pattern | `mxcli check` as a model of mxbuild, drifting in both directions |
+| `bug-patterns/platform-semantics-gaps.md` | bug-pattern | legal MDL, illegal Mendix — expression / XPath / variable-scope rules the grammar cannot carry |
+| `bug-patterns/diffs-narrower-than-the-change.md` | bug-pattern | `diff-local` compares rendered MDL, so it shows only what its renderer prints: "N modified" with no hunk, and the field-level fallback that closes the class |
+| `bug-patterns/duplicate-resolver-drift.md` | bug-pattern | one question answered in two places, and the two disagree |
+| `bug-patterns/rewrite-drops-unauthored-state.md` | bug-pattern | CREATE OR REPLACE losing what the statement did not mention |
+| `bug-patterns/flow-graph-geometry.md` | bug-pattern | generated microflow coordinates and sequence-flow wiring |
+| `bug-patterns/integration-contract-drift.md` | bug-pattern | OData / REST / mappings, where neither check nor mxbuild is an oracle |
+| `bug-patterns/test-runner-cannot-fail.md` | bug-pattern | `mxcli test` reporting PASS for what did not hold, run or get evaluated |
+| `bug-patterns/local-loop-silence.md` | bug-pattern | the warm loop failing quietly across processes mxcli does not own |
+| `bug-patterns/styling-compiles-to-nothing.md` | bug-pattern | SCSS and tokens written correctly, compiled nowhere, checked by nothing |
+| `bug-patterns/package-operations-damage.md` | bug-pattern | marketplace / `mx` operations that change the project and report success |
+| `bug-patterns/cli-contract-defects.md` | bug-pattern | flags, paths, stdout and help — the class with no Mendix document in it |
+| `bug-patterns/engine-divergence.md` | bug-pattern | two backend implementations, and a gap in one that is invisible from inside it |
+| `bug-patterns/mutator-addressing.md` | bug-pattern | in-place edits to nodes the model does not name |
+| `bug-patterns/access-rule-reconciliation.md` | bug-pattern | GRANT is a read-modify-write, and both directions of loss report success |
+| `bug-patterns/capability-gap-as-parse-error.md` | bug-pattern | an unspelled capability presenting as `no viable alternative`, and the workarounds that follow |
+| `bug-patterns/keyword-collisions.md` | bug-pattern | MDL's keyword set occupying positions where user data lives |
+| `bug-patterns/scripts-that-cannot-rerun.md` | bug-pattern | statement-level idempotence, and why it is not write-level idempotence |
+| `bug-patterns/expression-translation-drift.md` | bug-pattern | MDL expression to Mendix expression, where the translation changes the meaning |
+| `bug-patterns/misleading-diagnostics.md` | bug-pattern | hints that fire on the wrong thing and send the reader somewhere the problem is not |
+| `bug-patterns/absent-edge-reads-as-absent-fact.md` | bug-pattern | a reference the catalog never indexed, read back as "nothing uses this" — and the tools that phrase it as a recommendation to delete |
+| `bug-patterns/a-rule-that-cannot-fire.md` | bug-pattern | the two mirrored ways a lint rule's verdict stops meaning anything: silence that looks clean, and firing on correct code |
+| `bug-patterns/binding-context.md` | bug-pattern | which object an unqualified attribute name is read against, and the four layers that each keep their own answer |
+| `bug-patterns/reports-that-outrun-the-write.md` | bug-pattern | the sentence `exec` prints as a claim about storage, made by code that cannot see storage |
+| `bug-patterns/cost-scales-with-the-project.md` | bug-pattern | work proportional to the project for a request that is not — multiplier chains, and the guard that discards half-finished work |
+| `bug-patterns/generated-mdl-on-the-authors-lines.md` | bug-pattern | mxcli rendering a `.test.mdl` into MDL and then checking it — every wrapper defect arrives as a diagnostic on the author's line |
+| `bug-patterns/the-platform-ci-does-not-run.md` | bug-pattern | defects whose only habitat is a machine no automated run inhabits: an unprivileged Windows account, a non-root devcontainer, an unpinned Mendix version |
+| `bug-patterns/the-visitor-walks-a-failed-parse.md` | bug-pattern | `Build()` walks error-recovered trees on purpose, so a required grammar child is not a guarantee — the crash class that follows |
+| `bug-patterns/two-meanings-one-script.md` | bug-pattern | while ADR-0011 keeps two MDL meanings live: where the gate is consulted, what the upgrade can rewrite, and which spelling a value is read in |

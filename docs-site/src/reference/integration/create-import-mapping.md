@@ -3,7 +3,9 @@
 ## Synopsis
 
 ```sql
+[ /** description */ ]
 CREATE [ OR MODIFY ] IMPORT MAPPING module.Name
+    [ FOLDER 'folder_path' ]
     [ WITH JSON STRUCTURE module.JsonStructure ]
     [ WITH XML SCHEMA module.XmlSchema ]
 {
@@ -36,6 +38,27 @@ Each entity block specifies one of three strategies:
 
 Marking an attribute with `KEY` designates it as the lookup key for FIND and FIND OR CREATE.
 
+### Requirements for FIND
+
+An element that searches has two requirements, both refused by `mxcli check` and
+by `exec` rather than left to the build:
+
+| Rule | Requirement | Build error if ignored |
+|------|-------------|------------------------|
+| `MDL-MAP02` | At least one member marked `KEY`, on **each** searching element | CE0250 "Object element must have a key defined…" |
+| `MDL-MAP03` | The entity must be **persistable** | CE0251 "Searching for an object is not allowed for the entity 'X', because it is not persistable." |
+
+Persistability is taken from the **generalization chain**, not the entity's own
+setting: an entity declared with plain `CREATE ENTITY` that extends a
+non-persistent parent is still not searchable.
+
+An element with a custom handler (`FIND module.Entity BY module.Microflow(...)`)
+is exempt from both — the microflow *is* the find.
+
+`MDL-MAP02` needs no project. `MDL-MAP03` resolves the entity from the script
+when the script creates it, and from the project otherwise; an entity it cannot
+resolve is left alone rather than assumed non-persistable.
+
 ### Nested Objects and Arrays
 
 Child entities are nested inside the parent's `{ }` block using the association path:
@@ -55,11 +78,36 @@ If `OR MODIFY` is specified and the mapping already exists, it is updated in pla
 `module.Name`
 :   The qualified name of the import mapping.
 
+`FOLDER 'folder_path'`
+:   Optional. Places the document in the named module folder, creating missing folders in the path. On `CREATE OR MODIFY` this **moves** an existing document; omitting the clause leaves placement alone rather than returning the document to the module root. See [MOVE](../organization/move.md).
+
+`/** description */`
+:   Optional. The documentation of the import mapping, as a doc comment before the statement. `lint` QUAL002 reports a import mapping without it, and `DESCRIBE` prints it back. On `CREATE OR MODIFY`, no doc comment keeps the stored documentation and an empty `/** */` clears it.
+
 `WITH JSON STRUCTURE module.JsonStructure`
 :   Associates the mapping with the named JSON structure. The structure defines the JSON shape.
 
 `WITH XML SCHEMA module.XmlSchema`
 :   Associates the mapping with the named XML schema instead of a JSON structure.
+
+    The reference is **resolved** against the project: a name that matches no XML
+    schema is refused by `mxcli check -p` and by `exec`, naming the schemas that
+    exist. mxbuild otherwise reports it as CE1613 "The selected XML schema 'X' no
+    longer exists" at the end of a build.
+
+    A project holding **no** XML schemas disables the check rather than refusing
+    every mapping — there is no `CREATE XML SCHEMA` in MDL, so an XML schema is
+    only ever something imported into the project by hand, and having none is the
+    ordinary case. The same resolution applies to `WITH JSON STRUCTURE`.
+
+    MDL cannot state the XML half of such a mapping — the schema element it is
+    rooted at, or the schema path of each element — and mxcli does not read the
+    XSD to derive them. So `CREATE OR MODIFY` of an existing XML-schema mapping
+    that carries them is accepted only when the statement is the mapping's own
+    `DESCRIBE` output, which reports `Unchanged` and writes nothing; any other
+    rewrite is refused rather than written without its root element (which
+    mxbuild reports as CE0270 "No root element could be found in the schema").
+    Edit such a mapping in Studio Pro.
 
 `CREATE | FIND | FIND OR CREATE`
 :   Object handling strategy for each entity block.
@@ -140,6 +188,33 @@ CREATE OR MODIFY IMPORT MAPPING MyModule.IMM_Pet
 - The child entity must own the FK (`FROM child TO parent`). Using the wrong association direction causes validation errors at runtime.
 - Arrays in the JSON sample map directly to child entity objects — there is no intermediate container entity (unlike export mappings).
 - Import and export of the same JSON typically require different entity structures because of the FK direction difference.
+
+## Inherited attributes
+
+Mendix inheritance is multi-table: all of a parent's attributes are members of the
+child, so an entity declared with `EXTENDS` can map them. Name an inherited
+attribute exactly like one of the entity's own; mxcli resolves each to the entity
+that **declares** it.
+
+```sql
+mdl 1;
+CREATE PERSISTENT ENTITY Docs.DocumentBase (DocName: String(200), Confidential: Boolean);
+CREATE PERSISTENT ENTITY Docs.Contract EXTENDS Docs.DocumentBase (ContractNumber: String(50));
+
+CREATE IMPORT MAPPING Docs.IMM_Contract
+  WITH JSON STRUCTURE Docs.JSON_Contract
+{
+  create Docs.Contract {
+    ContractNumber = contractNumber,
+    DocName        = docName,
+    Confidential   = confidential
+  }
+};
+```
+
+Referencing an inherited attribute against the entity being mapped rather than its
+declaring entity is Mendix **CE1613** *"The selected attribute ... no longer
+exists"*, and Studio Pro shows the field unmapped.
 
 ## See Also
 

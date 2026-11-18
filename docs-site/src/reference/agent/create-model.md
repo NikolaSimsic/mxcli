@@ -1,24 +1,24 @@
-# CREATE MODEL
+# CREATE AI MODEL
 
 ## Synopsis
 
 ```sql
-CREATE [ OR MODIFY ] MODEL module.Name (
+CREATE [ OR MODIFY ] AI MODEL module.Name (
     Provider: MxCloudGenAI,
-    key: module.KeyConstant
+    key: @module.KeyConstant
     [, DisplayName: 'display name' ]
     [, KeyName: 'portal key name' ]
     [, Environment: 'environment' ]
 );
 
-DROP MODEL module.Name
+DROP AI MODEL module.Name;
 ```
 
 Requires Mendix 11.9+.
 
 ## Description
 
-Creates an agent-editor Model document. A model represents an LLM configuration in the Mendix Agent Editor. It references a String constant that holds the Mendix Cloud GenAI Portal resource key.
+Creates an agent-editor Model document, which Studio Pro calls an AI model. `MODEL` without `AI` is the old spelling: it still parses and warns `MDL-DEPR131`. A model represents an LLM configuration in the Mendix Agent Editor. It references a String constant that holds the Mendix Cloud GenAI Portal resource key.
 
 At runtime, the `ASU_AgentEditor` after-startup microflow reads the constant value and registers the corresponding `GenAICommons.DeployedModel`, making the model available to agents.
 
@@ -32,7 +32,7 @@ If `OR MODIFY` is specified and the model already exists, its properties are upd
 :   The qualified name of the model document.
 
 `Provider: MxCloudGenAI`
-:   The provider. `MxCloudGenAI` is the only supported value in current Mendix versions.
+:   The provider: `MxCloudGenAI`, `Azure` (Azure AI Foundry, through the OpenAI connector) or `Fuse` (Agent Editor 2.7+), the values Agent Editor's import accepts. `mxcli check` warns on any other value (MDL-AGENT01), and on a value in the wrong case, because the build does not read it and the import fails only at startup. It does not refuse it, because Agent Editor adds providers.
 
 `key: module.KeyConstant`
 :   A qualified reference to a String constant that holds the Portal resource key. The constant must exist before the model is created.
@@ -51,47 +51,46 @@ If `OR MODIFY` is specified and the model already exists, its properties are upd
 ### Minimal model
 
 ```sql
+mdl 1;
 CREATE CONSTANT MyModule."ModelKey"
-    TYPE String
-    DEFAULT '';
-/
+    ( Type: String, DefaultValue: '' );
 
-CREATE MODEL MyModule."GPT4Model" (
+CREATE AI MODEL MyModule."GPT4Model" (
     Provider: MxCloudGenAI,
-    key: MyModule.ModelKey
+    key: @MyModule.ModelKey
 );
-/
+
 ```
 
 ### Model with Portal metadata (for round-trip scripts)
 
 ```sql
-CREATE MODEL MyModule."ConfiguredModel" (
+CREATE AI MODEL MyModule."ConfiguredModel" (
     Provider: MxCloudGenAI,
-    key: MyModule.ModelKey,
+    key: @MyModule.ModelKey,
     DisplayName: 'GPT-4 Turbo (128K)',
     KeyName: 'prod-gpt4-turbo',
     Environment: 'production'
 );
-/
+
 ```
 
 ### Idempotent upsert
 
 ```sql
-CREATE OR MODIFY MODEL MyModule."GPT4Model" (
+CREATE OR MODIFY AI MODEL MyModule."GPT4Model" (
     Provider: MxCloudGenAI,
-    key: MyModule.ModelKey,
+    key: @MyModule.ModelKey,
     DisplayName: 'GPT-4 Turbo (Updated)'
 );
-/
+
 ```
 
 ### Cleanup
 
 ```sql
-DROP MODEL MyModule.GPT4Model;
-/
+DROP AI MODEL MyModule.GPT4Model;
+
 ```
 
 ## See Also

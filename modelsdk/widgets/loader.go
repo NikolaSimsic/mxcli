@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 
 	"log"
 	"sync"
@@ -351,9 +352,11 @@ func jsonToBSONWithMappingAndObjectType(data map[string]any, idMapping map[strin
 	var defaultValue string
 	var valueType string
 	var required bool
+	var isLinked bool
 	var dataSourceProp string
 	var nestedObjectTypeID string
 	var nestedPropertyIDs map[string]PropertyTypeIDEntry
+	var nestedKeyOrder []string
 
 	// First pass: detect type
 	if typeVal, ok := data["$Type"]; ok {
@@ -395,7 +398,7 @@ func jsonToBSONWithMappingAndObjectType(data map[string]any, idMapping map[strin
 		} else if key == "ValueType" && isPropertyType {
 			// For PropertyTypes, extract ValueType info including nested ObjectType, DefaultValue, Type, Required
 			nestedPropertyIDs = make(map[string]PropertyTypeIDEntry)
-			elem.Value = jsonValueToBSONWithNestedObjectType(val, idMapping, &valueTypeID, &nestedObjectTypeID, nestedPropertyIDs, &defaultValue, &valueType, &required, &dataSourceProp)
+			elem.Value = jsonValueToBSONWithNestedObjectType(val, idMapping, &valueTypeID, &nestedObjectTypeID, nestedPropertyIDs, &nestedKeyOrder, &defaultValue, &valueType, &required, &isLinked, &dataSourceProp)
 		} else {
 			elem.Value = jsonValueToBSONWithMappingAndObjectType(val, idMapping, propertyTypeIDs, &valueTypeID, key == "ValueType", objectTypeID)
 		}
@@ -411,11 +414,13 @@ func jsonToBSONWithMappingAndObjectType(data map[string]any, idMapping map[strin
 			DefaultValue:       defaultValue,
 			ValueType:          valueType,
 			Required:           required,
+			IsLinked:           isLinked,
 			DataSourceProperty: dataSourceProp,
 		}
 		if nestedObjectTypeID != "" {
 			entry.ObjectTypeID = nestedObjectTypeID
 			entry.NestedPropertyIDs = nestedPropertyIDs
+			entry.NestedKeyOrder = nestedKeyOrder
 		}
 		propertyTypeIDs[propertyKey] = entry
 	}
@@ -424,7 +429,7 @@ func jsonToBSONWithMappingAndObjectType(data map[string]any, idMapping map[strin
 }
 
 // jsonValueToBSONWithNestedObjectType extracts ValueType info including nested ObjectType, DefaultValue, and Type.
-func jsonValueToBSONWithNestedObjectType(val any, idMapping map[string]string, valueTypeID *string, nestedObjectTypeID *string, nestedPropertyIDs map[string]PropertyTypeIDEntry, defaultValue *string, valueType *string, required *bool, dataSourceProperty ...*string) any {
+func jsonValueToBSONWithNestedObjectType(val any, idMapping map[string]string, valueTypeID *string, nestedObjectTypeID *string, nestedPropertyIDs map[string]PropertyTypeIDEntry, nestedKeyOrder *[]string, defaultValue *string, valueType *string, required *bool, isLinked *bool, dataSourceProperty ...*string) any {
 	switch v := val.(type) {
 	case map[string]any:
 		result := make(bson.D, 0, len(v))
@@ -445,7 +450,7 @@ func jsonValueToBSONWithNestedObjectType(val any, idMapping map[string]string, v
 				}
 			} else if key == "ObjectType" {
 				// Extract nested ObjectType and its PropertyTypes
-				elem.Value = extractNestedObjectType(fieldVal, idMapping, nestedObjectTypeID, nestedPropertyIDs)
+				elem.Value = extractNestedObjectType(fieldVal, idMapping, nestedObjectTypeID, nestedPropertyIDs, nestedKeyOrder)
 			} else if key == "DefaultValue" {
 				// Extract default value
 				if dv, ok := fieldVal.(string); ok {
@@ -462,6 +467,13 @@ func jsonValueToBSONWithNestedObjectType(val any, idMapping map[string]string, v
 				// Extract required flag
 				if r, ok := fieldVal.(bool); ok {
 					*required = r
+				}
+				elem.Value = jsonValueToBSONSimple(fieldVal, idMapping)
+			} else if key == "IsLinked" {
+				// A datasource the platform wires from the containing widget, not
+				// one the developer sets. See types.PropertyTypeIDEntry.IsLinked.
+				if l, ok := fieldVal.(bool); ok && isLinked != nil {
+					*isLinked = l
 				}
 				elem.Value = jsonValueToBSONSimple(fieldVal, idMapping)
 			} else if key == "DataSourceProperty" && len(dataSourceProperty) > 0 && dataSourceProperty[0] != nil {
@@ -484,7 +496,7 @@ func jsonValueToBSONWithNestedObjectType(val any, idMapping map[string]string, v
 }
 
 // extractNestedObjectType extracts ObjectType ID and its PropertyType IDs.
-func extractNestedObjectType(val any, idMapping map[string]string, objectTypeID *string, nestedPropertyIDs map[string]PropertyTypeIDEntry) any {
+func extractNestedObjectType(val any, idMapping map[string]string, objectTypeID *string, nestedPropertyIDs map[string]PropertyTypeIDEntry, nestedKeyOrder *[]string) any {
 	if val == nil {
 		return nil
 	}
@@ -511,7 +523,7 @@ func extractNestedObjectType(val any, idMapping map[string]string, objectTypeID 
 			}
 		} else if key == "PropertyTypes" {
 			// Extract PropertyTypes within the nested ObjectType
-			elem.Value = extractNestedPropertyTypes(fieldVal, idMapping, nestedPropertyIDs)
+			elem.Value = extractNestedPropertyTypes(fieldVal, idMapping, nestedPropertyIDs, nestedKeyOrder)
 		} else {
 			elem.Value = jsonValueToBSONSimple(fieldVal, idMapping)
 		}
@@ -523,7 +535,7 @@ func extractNestedObjectType(val any, idMapping map[string]string, objectTypeID 
 }
 
 // extractNestedPropertyTypes extracts PropertyType IDs from a nested ObjectType's PropertyTypes array.
-func extractNestedPropertyTypes(val any, idMapping map[string]string, nestedPropertyIDs map[string]PropertyTypeIDEntry) any {
+func extractNestedPropertyTypes(val any, idMapping map[string]string, nestedPropertyIDs map[string]PropertyTypeIDEntry, nestedKeyOrder *[]string) any {
 	arr, ok := val.([]any)
 	if !ok {
 		return jsonValueToBSONSimple(val, idMapping)
@@ -569,6 +581,7 @@ func extractNestedPropertyTypes(val any, idMapping map[string]string, nestedProp
 					// Extract DefaultValue, Type, and Required from nested ValueType
 					var nestedDefaultValue, nestedValueType string
 					var nestedRequired bool
+					var nestedTranslations []types.PropertyTranslation
 					if vtVal, ok := propType["ValueType"]; ok {
 						if vt, ok := vtVal.(map[string]any); ok {
 							if dv, ok := vt["DefaultValue"].(string); ok {
@@ -580,17 +593,27 @@ func extractNestedPropertyTypes(val any, idMapping map[string]string, nestedProp
 							if r, ok := vt["Required"].(bool); ok {
 								nestedRequired = r
 							}
+							// Widget-shipped default text. A required TextTemplate
+							// must serialize with it, not empty and not null (#891).
+							nestedTranslations = readPropertyTranslations(vt["Translations"])
 						}
 					}
 
 					// Record the nested property type
 					if propKey != "" {
+						// Capture template PropertyTypes order (first occurrence) so the
+						// object-list item builder emits nested properties in schema order
+						// rather than alphabetical — Studio Pro raises CE0463 otherwise.
+						if _, exists := nestedPropertyIDs[propKey]; !exists && nestedKeyOrder != nil {
+							*nestedKeyOrder = append(*nestedKeyOrder, propKey)
+						}
 						nestedPropertyIDs[propKey] = PropertyTypeIDEntry{
-							PropertyTypeID: propTypeID,
-							ValueTypeID:    valueTypeID,
-							DefaultValue:   nestedDefaultValue,
-							ValueType:      nestedValueType,
-							Required:       nestedRequired,
+							PropertyTypeID:      propTypeID,
+							ValueTypeID:         valueTypeID,
+							DefaultValue:        nestedDefaultValue,
+							ValueType:           nestedValueType,
+							Required:            nestedRequired,
+							DefaultTranslations: nestedTranslations,
 						}
 					}
 				}
@@ -1020,8 +1043,33 @@ func isHexString(s string) bool {
 	return true
 }
 
-// augmentFromMPK deep-clones a template and augments it from the project's .mpk file.
-// Returns the original template if augmentation is not applicable or fails.
+// augmentedKey is what an augmented template is made from, and nothing else:
+// the embedded template and the parsed package, both by identity. Both come
+// from caches that live as long as the process, so the same pair is the same
+// input; a package parsed afresh is another pointer and is augmented again.
+type augmentedKey struct {
+	tmpl *WidgetTemplate
+	def  *mpk.WidgetDefinition
+}
+
+// augmentedCache holds the augmented template for each (template, package).
+var augmentedCache sync.Map // augmentedKey -> *WidgetTemplate
+
+// augmentCacheOn is off in a test that wants every call to augment.
+var augmentCacheOn = true
+
+// augmentations counts the templates cloned and augmented. For tests.
+var augmentations atomic.Int64
+
+// augmentFromMPK returns the template augmented from the project's .mpk file:
+// a deep clone of tmpl with the package's properties merged in, made once for
+// each template and parsed package and shared after that. The caller must
+// only read it, as it must only read tmpl. Returns the original template if
+// augmentation is not applicable or fails.
+//
+// Every pluggable widget instance of a script loads its template through
+// here. Cloning and augmenting per load was the same work for every data grid
+// and every filter (ako/mxcli#2160).
 func augmentFromMPK(tmpl *WidgetTemplate, widgetID string, projectPath string) *WidgetTemplate {
 	if projectPath == "" {
 		return tmpl
@@ -1041,7 +1089,15 @@ func augmentFromMPK(tmpl *WidgetTemplate, widgetID string, projectPath string) *
 		return tmpl
 	}
 
+	key := augmentedKey{tmpl: tmpl, def: def}
+	if augmentCacheOn {
+		if kept, ok := augmentedCache.Load(key); ok {
+			return kept.(*WidgetTemplate)
+		}
+	}
+
 	// Deep-clone so we don't mutate the cached template
+	augmentations.Add(1)
 	clone, err := deepCloneTemplate(tmpl)
 	if err != nil {
 		log.Printf("warning: failed to clone template for %s: %v", widgetID, err)
@@ -1052,6 +1108,10 @@ func augmentFromMPK(tmpl *WidgetTemplate, widgetID string, projectPath string) *
 		return tmpl
 	}
 
+	if augmentCacheOn {
+		kept, _ := augmentedCache.LoadOrStore(key, clone)
+		return kept.(*WidgetTemplate)
+	}
 	return clone
 }
 
@@ -1063,4 +1123,29 @@ func ListAvailableTemplates() []string {
 		result = append(result, widgetID)
 	}
 	return result
+}
+
+// readPropertyTranslations reads a template ValueType's widget-shipped
+// Translations array (marker-prefixed CustomWidgets$WidgetTranslation entries)
+// into the property entry. Used to serialize a required TextTemplate the author
+// left unset — see types.PropertyTypeIDEntry.DefaultTranslations (#891).
+func readPropertyTranslations(v any) []types.PropertyTranslation {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	var out []types.PropertyTranslation
+	for _, e := range arr {
+		m, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		lang, _ := m["LanguageCode"].(string)
+		if lang == "" {
+			continue
+		}
+		text, _ := m["Text"].(string)
+		out = append(out, types.PropertyTranslation{LanguageCode: lang, Text: text})
+	}
+	return out
 }

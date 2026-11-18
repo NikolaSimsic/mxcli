@@ -1,0 +1,62 @@
+-- ============================================================================
+-- mendixlabs/mxcli#1025 — a syntax topic must resolve however it is spelled
+-- ============================================================================
+--
+-- `mxcli syntax` advertises, in its own help:
+--
+--     mxcli syntax workflow user-task targeting     # Drill down to targeting
+--
+-- Handed over as ONE string — a quoted copy-paste, a tool wrapper, `sh -c` —
+-- that returned `Unknown topic: workflow user-task targeting`, spaces and all,
+-- on the reported v0.20.0 and on main. The CLI joined its arguments on "." and
+-- never split them, while the REPL's HELP had resolved multi-word topics since
+-- it was written: one question, two answers.
+--
+-- Both surfaces now share syntax.Lookup, and the grammar takes the spellings
+-- the registry PRINTS: `mxcli syntax workflow` lists `workflow.user-task`, and
+-- copying that into HELP used to be a parse error — a hyphen is its own token
+-- (HYPHENATED_ID) and a dot is DOT, and `helpStatement` named neither.
+--
+-- The CLI half is not MDL; it is pinned by cmd/mxcli/cmd_syntax_test.go and
+-- cmd/mxcli/syntax/topic_test.go, including a guard that every registered path
+-- is reachable by all three spellings.
+--
+-- No project needed: HELP reads the embedded syntax registry.
+-- ============================================================================
+
+-- Plain words — the spelling HELP has always taken.
+help workflow user task targeting;
+
+-- Hyphenated, as the listing prints each segment.
+help workflow user-task targeting;
+
+-- The dotted path, exactly as `mxcli syntax workflow` prints it.
+help workflow.user-task.targeting;
+
+-- A hyphen in the FIRST segment, and a dot after it.
+help domain-model.entity;
+
+-- The other two topics the report names.
+help workflow user-task;
+help workflow parallel-split;
+
+-- The second advertised example.
+help security entity-access;
+
+-- ----------------------------------------------------------------------------
+-- mendixlabs/mxcli#1389 — the same resolver, two more shapes. (Kept in this
+-- script rather than a new one: HELP is a session command, so a new script
+-- would need its own entry in the mdl 0 allowlists, which may only shrink.)
+--
+-- `mxcli syntax grant` answered `Unknown topic: grant` although `grant` is a
+-- listed keyword of security.entity-access: a verb is nobody's path segment,
+-- and Lookup never read the topics' keywords. It now falls back to them,
+-- whole words only, after the segment match.
+help grant;
+help revoke;
+help refresh;
+
+-- `No topic "integration.message-definition"`, recovered only by the
+-- fallback: a category word in front of a topic that lives elsewhere now
+-- resolves to it exactly (unless the category has its own match for the word).
+help integration message-definition;

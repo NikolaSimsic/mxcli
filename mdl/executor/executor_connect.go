@@ -12,7 +12,7 @@ import (
 
 func execConnect(ctx *ExecContext, s *ast.ConnectStmt) error {
 	if ctx.Backend != nil && ctx.Backend.IsConnected() {
-		if err := ctx.Backend.Disconnect(); err != nil {
+		if err := disconnectBackend(ctx.Backend); err != nil {
 			fmt.Fprintf(ctx.Output, "Warning: disconnect error: %v\n", err)
 		}
 	}
@@ -37,7 +37,7 @@ func execConnect(ctx *ExecContext, s *ast.ConnectStmt) error {
 	// Display connection info with version
 	pv := ctx.Backend.ProjectVersion()
 	if !ctx.Quiet {
-		fmt.Fprintf(ctx.Output, "Connected to: %s (Mendix %s)\n", s.Path, pv.ProductVersion)
+		fmt.Fprintf(ctx.progress(), "Connected to: %s (Mendix %s)\n", s.Path, pv.ProductVersion)
 	}
 	if ctx.Logger != nil {
 		ctx.Logger.Connect(s.Path, pv.ProductVersion, pv.FormatVersion)
@@ -54,7 +54,7 @@ func reconnect(ctx *ExecContext) error {
 
 	// Close existing connection
 	if ctx.Backend != nil && ctx.Backend.IsConnected() {
-		if err := ctx.Backend.Disconnect(); err != nil {
+		if err := disconnectBackend(ctx.Backend); err != nil {
 			fmt.Fprintf(ctx.Output, "Warning: disconnect error: %v\n", err)
 		}
 	}
@@ -91,7 +91,7 @@ func execDisconnect(ctx *ExecContext) error {
 		}
 	}
 
-	if err := ctx.Backend.Disconnect(); err != nil {
+	if err := disconnectBackend(ctx.Backend); err != nil {
 		fmt.Fprintf(ctx.Output, "Warning: disconnect error: %v\n", err)
 	}
 	fmt.Fprintf(ctx.Output, "Disconnected from: %s\n", ctx.MprPath)

@@ -4,6 +4,7 @@ package rules
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/mendixlabs/mxcli/mdl/linter"
 	"github.com/mendixlabs/mxcli/model"
@@ -41,7 +42,7 @@ func (r *ErrorHandlingOnCallsRule) Check(ctx *linter.LintContext) []linter.Viola
 			continue
 		}
 
-		fullMF, err := reader.GetMicroflow(model.ID(mf.ID))
+		fullMF, err := ctx.FullMicroflow(model.ID(mf.ID))
 		if err != nil || fullMF == nil || fullMF.ObjectCollection == nil {
 			continue
 		}
@@ -60,28 +61,38 @@ func findUnhandledCalls(objects []microflows.MicroflowObject, mf linter.Microflo
 				continue
 			}
 			actionName := ""
-			switch act.Action.(type) {
+			switch a := act.Action.(type) {
 			case *microflows.RestCallAction:
 				actionName = "REST call"
 			case *microflows.WebServiceCallAction:
 				actionName = "Web service call"
 			case *microflows.JavaActionCallAction:
+				if isThrowingJavaAction(a.JavaAction) {
+					continue
+				}
 				actionName = "Java action call"
 			default:
 				continue
 			}
 
-			// Check if error handling is not custom
-			if act.ErrorHandlingType != microflows.ErrorHandlingTypeCustom &&
-				act.ErrorHandlingType != microflows.ErrorHandlingTypeCustomWithoutRollback {
+			// The handling is stored on the ACTION; the activity field is never
+			// filled by the reader, and reading it reported "uses ''" on every
+			// call, handled or not (mendixlabs/mxcli#1202).
+			eh := microflows.ObjectErrorHandlingType(act)
+			if !microflows.IsCustomErrorHandling(eh) {
+				shown := string(eh)
+				if shown == "" {
+					// No stored value: the flow's default, which is Rollback in a microflow.
+					shown = string(microflows.ErrorHandlingTypeRollback)
+				}
 				*violations = append(*violations, linter.Violation{
 					RuleID:   r.ID(),
 					Severity: r.DefaultSeverity(),
 					Message: fmt.Sprintf("%s in '%s.%s' uses '%s' error handling instead of Custom.",
-						actionName, mf.ModuleName, mf.Name, act.ErrorHandlingType),
+						actionName, mf.ModuleName, mf.Name, shown),
 					Location: linter.Location{
 						Module:       mf.ModuleName,
-						DocumentType: "microflow",
+						DocumentType: mf.DocumentNoun(),
 						DocumentName: mf.Name,
 						DocumentID:   mf.ID,
 					},
@@ -89,11 +100,26 @@ func findUnhandledCalls(objects []microflows.MicroflowObject, mf linter.Microflo
 				})
 			}
 		case *microflows.LoopedActivity:
-			if act.ObjectCollection != nil {
-				findUnhandledCalls(act.ObjectCollection.Objects, mf, r, violations)
-			}
+			// Not descended into: inside a loop Mendix allows only Rollback
+			// (CE0644, which check reports as MDL006), so a finding there could
+			// not be acted on in place (ako/mxcli#1838). Custom handling for a
+			// call in a loop means moving it into a sub-microflow — a design
+			// choice, not a defect of the call.
 		}
 	}
+}
+
+// isThrowingJavaAction reports whether a Java action exists to throw, such as
+// CommunityCommons.ThrowException and ThrowWebserviceException. A flow calls
+// one to roll itself back — MDL refuses `raise error` in the main flow
+// (MDL084/CE0710) — so Rollback is the point of the call, not an omission
+// (ako/mxcli#1838).
+func isThrowingJavaAction(qualifiedName string) bool {
+	name := qualifiedName
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		name = name[i+1:]
+	}
+	return strings.HasPrefix(strings.ToLower(name), "throw")
 }
 
 // --- CONV014: NoContinueErrorHandling ---
@@ -129,7 +155,7 @@ func (r *NoContinueErrorHandlingRule) Check(ctx *linter.LintContext) []linter.Vi
 			continue
 		}
 
-		fullMF, err := reader.GetMicroflow(model.ID(mf.ID))
+		fullMF, err := ctx.FullMicroflow(model.ID(mf.ID))
 		if err != nil || fullMF == nil || fullMF.ObjectCollection == nil {
 			continue
 		}
@@ -144,7 +170,8 @@ func findContinueErrorHandling(objects []microflows.MicroflowObject, mf linter.M
 	for _, obj := range objects {
 		switch act := obj.(type) {
 		case *microflows.ActionActivity:
-			if act.ErrorHandlingType == microflows.ErrorHandlingTypeContinue {
+			// Read from the action, where Mendix stores it (mendixlabs/mxcli#1202).
+			if microflows.ObjectErrorHandlingType(act) == microflows.ErrorHandlingTypeContinue {
 				caption := act.Caption
 				if caption == "" {
 					caption = "(unnamed activity)"
@@ -156,7 +183,7 @@ func findContinueErrorHandling(objects []microflows.MicroflowObject, mf linter.M
 						caption, mf.ModuleName, mf.Name),
 					Location: linter.Location{
 						Module:       mf.ModuleName,
-						DocumentType: "microflow",
+						DocumentType: mf.DocumentNoun(),
 						DocumentName: mf.Name,
 						DocumentID:   mf.ID,
 					},
@@ -176,7 +203,7 @@ func findContinueErrorHandling(objects []microflows.MicroflowObject, mf linter.M
 						caption, mf.ModuleName, mf.Name),
 					Location: linter.Location{
 						Module:       mf.ModuleName,
-						DocumentType: "microflow",
+						DocumentType: mf.DocumentNoun(),
 						DocumentName: mf.Name,
 						DocumentID:   mf.ID,
 					},

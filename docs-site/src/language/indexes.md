@@ -12,7 +12,7 @@ Indexes are placed after the closing parenthesis of the attribute list:
 
 ```sql
 CREATE PERSISTENT ENTITY Sales.Order (
-  OrderId: AutoNumber NOT NULL UNIQUE,
+  OrderId: AutoNumber NOT NULL UNIQUE DEFAULT 1,
   OrderNumber: String(50) NOT NULL,
   CustomerId: Long,
   OrderDate: DateTime,
@@ -47,13 +47,14 @@ INDEX (Name, CreatedAt DESC)    -- mixed: Name ascending, CreatedAt descending
 Use `ALTER ENTITY` to add or remove indexes on existing entities:
 
 ```sql
--- Add an index
+mdl 1;
+-- Add a named index
 ALTER ENTITY Sales.Customer
-  ADD INDEX (Email);
+  ADD INDEX idx_customer_email (Email);
 
--- Remove an index
+-- Remove an index by name
 ALTER ENTITY Sales.Customer
-  DROP INDEX (Email);
+  DROP INDEX idx_customer_email;
 ```
 
 ## Guidelines

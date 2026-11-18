@@ -6,8 +6,8 @@
 CREATE [ OR MODIFY ] WORKFLOW module.Name
     PARAMETER $Variable: module.Entity
     [ OVERVIEW PAGE module.PageName ]
-    [ DISPLAY 'caption' ]
-    [ DESCRIPTION 'text' ]
+    [ DISPLAY 'caption' [ WITH ( {1} = expression, ... ) ] ]
+    [ DESCRIPTION 'text' [ WITH ( {1} = expression, ... ) ] ]
 BEGIN
     activities
 END WORKFLOW
@@ -30,12 +30,14 @@ The following activity types can appear inside a workflow body:
 USER TASK name 'caption'
     [ PAGE module.PageName ]
     [ TARGETING MICROFLOW module.MicroflowName ]
-    [ TARGETING XPATH 'expression' ]
+    [ TARGETING [ USERS | GROUPS ] XPATH [ xpath ] ]
     [ ENTITY module.Entity ]
-    [ DUE DATE 'expression' ]
+    [ DUE DATE expression ]
     [ DESCRIPTION 'text' ]
     OUTCOMES 'OutcomeName' { activities } [ 'OutcomeName' { activities } ... ]
 ```
+
+The targeting XPath is written in literal brackets, like every XPath in MDL, so quotes inside it are written once: `TARGETING USERS XPATH [System.UserRoles = '[%UserRole_Manager%]']`. The quoted form `XPATH '[...]'` still parses and warns `MDL-DEPR031`; `mxcli fmt --upgrade` rewrites it.
 
 **MULTI USER TASK**
 :   Same as USER TASK but assigned to multiple users. Uses the same syntax with `MULTI USER TASK` instead of `USER TASK`.
@@ -61,9 +63,11 @@ CALL WORKFLOW module.Name [ 'caption' ]
 :   A conditional branch based on an expression. Each outcome maps to a different execution path.
 
 ```sql
-DECISION [ 'caption' ]
-    OUTCOMES 'OutcomeName' { activities } [ 'OutcomeName' { activities } ... ]
+DECISION [ name ] expression [ COMMENT 'caption' ]
+    OUTCOMES TRUE -> { activities } FALSE -> { activities }
 ```
+
+Every workflow expression — a decision's condition, a timer's delay, a due date — is written bare: `DECISION $Context/Total > 1000`, `DUE DATE addDays([%CurrentDateTime%], 3)`. The string form (`DECISION '$Context/Total > 1000'`) still parses and warns `MDL-DEPR080`; `mxcli fmt --upgrade` rewrites it.
 
 **PARALLEL SPLIT**
 :   Splits the workflow into parallel paths that execute concurrently and rejoin before continuing.
@@ -86,7 +90,7 @@ JUMP TO activity_name [ 'caption' ]
 :   Pauses the workflow until a timer expression elapses.
 
 ```sql
-WAIT FOR TIMER [ 'duration_expression' ]
+WAIT FOR TIMER [ name ] [ datetime_expression ] [ COMMENT 'caption' ]
 ```
 
 **WAIT FOR NOTIFICATION**
@@ -111,9 +115,14 @@ User tasks, call microflow activities, and wait-for-notification activities supp
 USER TASK name 'caption'
     PAGE module.Page
     OUTCOMES 'Done' { }
-    BOUNDARY EVENT InterruptingTimer '${PT1H}' { activities }
-    BOUNDARY EVENT NonInterruptingTimer '${PT30M}' { activities }
+    BOUNDARY EVENT INTERRUPTING TIMER addHours([%CurrentDateTime%], 1) CAPTION 'Escalate' { activities }
+    BOUNDARY EVENT NON INTERRUPTING TIMER addMinutes([%CurrentDateTime%], 30) { activities }
+    BOUNDARY EVENT NON INTERRUPTING TIMER addDays([%CurrentDateTime%], 1) REPEAT EVERY 1 DAY AT MOST 5 TIMES { activities }
 ```
+
+`REPEAT EVERY <n> <unit> AT MOST <m> TIMES` makes a non-interrupting timer a repeating reminder: it fires at the delay, then every `<n>` minutes, hours, days, weeks or months, `<m>` times in all (the first firing counts, so `<m>` is at least 2). A timer-started event sub-process takes the same clause on Mendix 11.15 and later.
+
+`CAPTION '<caption>'` after the delay is the text Studio Pro shows on the timer; it is optional.
 
 ## Parameters
 
@@ -131,6 +140,9 @@ USER TASK name 'caption'
 
 `DESCRIPTION 'text'`
 :   Optional description of the workflow's purpose.
+
+`WITH ( {1} = expression, ... )`
+:   Fills the `{1}`, `{2}`, … placeholders of `DISPLAY` or `DESCRIPTION` from expressions over `$WorkflowContext`, as a log message's template does: `DISPLAY 'Approval for {1}' WITH ({1} = $WorkflowContext/Title)`. A user task's `TASK NAME '…'` (what the task inbox shows; the caption when omitted) and `DESCRIPTION '…'` take the same clause, and may also use `$WorkflowInstance`. A placeholder no parameter fills is CE0720, which `mxcli check` reports as MDL-WF21.
 
 ## Examples
 
@@ -183,7 +195,7 @@ BEGIN
     USER TASK AssignTask 'Handle ticket'
         PAGE Support.TicketPage
         OUTCOMES 'Resolved' { }
-        BOUNDARY EVENT InterruptingTimer '${PT24H}' {
+        BOUNDARY EVENT INTERRUPTING TIMER addHours([%CurrentDateTime%], 24) {
             CALL MICROFLOW Support.ACT_EscalateTicket;
         };
 END WORKFLOW;

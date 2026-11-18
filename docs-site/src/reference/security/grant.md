@@ -4,7 +4,7 @@
 
 ```sql
 -- Entity access
-GRANT module.Role ON module.Entity ( rights ) [ WHERE 'xpath' ]
+GRANT  rights  ON ENTITY module.Entity TO module.Role [, ...] [ WHERE [xpath] ]
 
 -- Microflow access
 GRANT EXECUTE ON MICROFLOW module.Name TO module.Role [, ...]
@@ -22,7 +22,9 @@ Grants access rights to module roles. There are four forms of the GRANT statemen
 
 ### Entity Access
 
-The entity access form creates or updates an access rule on an entity for a given module role. **GRANT is additive**: if the role already has an access rule on the entity, the new rights are merged with existing ones. Existing permissions are never downgraded by a GRANT.
+The entity access form creates or updates an access rule on an entity for a given module role. **GRANT is additive**: if the role already has an access rule on the entity, the new rights are merged with existing ones. Existing permissions are never downgraded by a GRANT — use [REVOKE](revoke.md) to take access away.
+
+A rule is identified by its role set **and** its `WHERE` constraint, so two GRANTs with different constraints produce two rules rather than overwriting one another. Mendix combines them: a role's effective access is the union of every rule naming it.
 
 Entity access rules control:
 - **CREATE** -- whether the role can create new instances
@@ -32,7 +34,9 @@ Entity access rules control:
 
 For READ and WRITE, use `*` to include all members (attributes and associations), or specify a parenthesized list of specific attribute names.
 
-The optional `WHERE` clause accepts an XPath expression that restricts which objects the role can access. The XPath is enclosed in single quotes. Use doubled single quotes to escape single quotes inside the expression.
+The optional `WHERE` clause accepts an XPath constraint that restricts which objects the role can access. It is written in brackets, as everywhere else in MDL, so quotes inside it are not doubled: `WHERE [Status = 'Open']`. Sibling groups (`WHERE [a][b]`) are one constraint.
+
+The older form `GRANT module.Role ON module.Entity (rights) WHERE '[xpath]'` — role first, XPath in a string — still parses, warns `MDL-DEPR030`, and `mxcli fmt --upgrade` rewrites it.
 
 ### Microflow Access
 
@@ -45,6 +49,23 @@ The page access form grants view permission on a page to one or more module role
 ### Nanoflow Access
 
 The nanoflow access form grants execute permission on a nanoflow to one or more module roles.
+
+### Default access of a new page, microflow or nanoflow
+
+Document grants are **additive** too: a GRANT adds roles to the document's allowed roles and never removes one.
+
+A newly created page, microflow or nanoflow starts with **no** allowed roles, whatever its module holds. mxcli never creates a module role on its own: which roles exist, and which documents they open, is the author's decision. Create the module role, map it into a user role, and grant the document in the same script:
+
+```sql
+mdl 1;
+create module role Shop.User;
+create or modify user role Customer ( ModuleRoles: (System.User, Shop.User) );
+grant view on page Shop.Overview to Shop.User;
+```
+
+Earlier versions of mxcli created a `<Module>.User` role (description "Auto-created default role for mxcli document access") in a module with no module roles and granted every new document to it. A project written by one of those versions still holds that role and those grants; mxcli leaves them as they are. Revoke them (`revoke view on page Shop.Stub from Shop.User;`) or drop the role if you did not intend them.
+
+A rewrite keeps the stored roles: `create or modify`, and `drop` followed by `create` of the same name **in one run**. A `create` in a *later* run than the `drop` is a new document and starts again with no access, which MxBuild reports as CE0106 when a page, nanoflow or navigation uses the flow. `mxcli check -p` reports that case as [MDL-SEC21](../../appendixes/error-messages.md#mdl-sec21-a-used-flow-left-without-access-ce0106).
 
 ## Parameters
 
@@ -63,8 +84,8 @@ The nanoflow access form grants execute permission on a nanoflow to one or more 
     - `WRITE *` -- write all members
     - `WRITE (Attr1, Attr2, ...)` -- write specific attributes
 
-`WHERE 'xpath'`
-:   Optional XPath constraint for entity access. Restricts which objects the rule applies to.
+`WHERE [xpath]`
+:   Optional XPath constraint for entity access, in brackets. Restricts which objects the rule applies to.
 
 `module.Name`
 :   The target microflow, nanoflow, or page.
@@ -77,26 +98,26 @@ The nanoflow access form grants execute permission on a nanoflow to one or more 
 Grant full entity access:
 
 ```sql
-GRANT Shop.Admin ON Shop.Customer (CREATE, DELETE, READ *, WRITE *);
+GRANT CREATE, DELETE, READ *, WRITE * ON ENTITY Shop.Customer TO Shop.Admin;
 ```
 
 Grant read-only access:
 
 ```sql
-GRANT Shop.Viewer ON Shop.Customer (READ *);
+GRANT READ * ON ENTITY Shop.Customer TO Shop.Viewer;
 ```
 
 Grant selective attribute access:
 
 ```sql
-GRANT Shop.User ON Shop.Customer (READ (Name, Email), WRITE (Email));
+GRANT READ (Name, Email), WRITE (Email) ON ENTITY Shop.Customer TO Shop.User;
 ```
 
 Grant entity access with an XPath constraint:
 
 ```sql
-GRANT Shop.User ON Shop.Order (READ *, WRITE *)
-    WHERE '[Status = ''Open'']';
+GRANT READ *, WRITE * ON ENTITY Shop.Order TO Shop.User
+    WHERE [Status = 'Open'];
 ```
 
 Grant microflow execution to multiple roles:
@@ -121,8 +142,49 @@ Additive grant -- add new attribute access without removing existing:
 
 ```sql
 -- Viewer already has READ (Name, Email)
-GRANT Shop.Viewer ON Shop.Customer (READ (Phone));
+GRANT READ (Phone) ON ENTITY Shop.Customer TO Shop.Viewer;
 -- Result: READ (Name, Email, Phone)
+```
+
+## Inherited members
+
+Mendix inheritance is multi-table: a child adds attributes to its parent's, and
+**all** the parent's members belong to the child. Name an inherited member in a
+GRANT exactly like one of the entity's own; `READ *` and `WRITE *` cover them too.
+
+```sql
+mdl 1;
+CREATE PERSISTENT ENTITY Docs.DocumentBase (DocName: String(200));
+CREATE PERSISTENT ENTITY Docs.Contract EXTENDS Docs.DocumentBase (ContractNumber: String(50));
+
+-- DocName inherited, ContractNumber own — no distinction at the call site
+GRANT READ (DocName, ContractNumber) ON ENTITY Docs.Contract TO Docs.Viewer;
+```
+
+An access rule must carry an entry for **every** member, own and inherited. mxcli
+writes the members you did not grant with rights `None`; omitting them entirely is
+Mendix **CE0066** *"Entity access is out of date"*, which masks the CE2729
+*"No read access to attribute"* errors beneath it until Studio Pro's
+**Update security** is clicked.
+
+A member name that matches nothing is rejected rather than skipped:
+
+```
+Error: entity Docs.Contract has no member(s) DocNam; grant only names members
+of the entity or of an entity it inherits from
+```
+
+### User entities are the exception
+
+An entity extending `System.User` is a *user entity*, and Mendix manages its
+inherited platform members (`Name`, `Password`, `Blocked`, …). Those must **not**
+appear in the access rule — listing them is CE0066. Grant only the entity's own
+members; mxcli excludes the platform ones automatically.
+
+```sql
+mdl 1;
+CREATE PERSISTENT ENTITY Docs.Employee EXTENDS System.User (EmployeeNo: String(20));
+GRANT READ (EmployeeNo) ON ENTITY Docs.Employee TO Docs.Viewer;
 ```
 
 ## See Also

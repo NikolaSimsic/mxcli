@@ -4,12 +4,14 @@ package modelsdkbackend
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/mendixlabs/mxcli/model"
 	"github.com/mendixlabs/mxcli/modelsdk/codec"
 	"github.com/mendixlabs/mxcli/modelsdk/element"
 	genDm "github.com/mendixlabs/mxcli/modelsdk/gen/domainmodels"
 	"github.com/mendixlabs/mxcli/modelsdk/meta"
+	mmpr "github.com/mendixlabs/mxcli/modelsdk/mpr"
 	"github.com/mendixlabs/mxcli/sdk/domainmodel"
 )
 
@@ -60,6 +62,43 @@ func removeAssocsReferencing(dm *genDm.DomainModel, entityID model.ID) bool {
 	return changed
 }
 
+// removeCrossAssocsReferencing drops every CROSS-MODULE association in dm that
+// ends at the deleted entity. Returns whether anything was removed.
+//
+// A cross-module association is stored in the FROM entity's module, in a separate
+// collection from the regular ones, and its two ends are addressed differently:
+// the FROM end by element id (local to this domain model) and the TO end by
+// qualified name (it lives in another module). So both have to be matched, and
+// they fail differently when they are not (ako/mxcli#553):
+//
+//   - a dangling BY-ID end is a 16-byte pointer to an element that is gone, and
+//     mxbuild cannot LOAD the project — KeyNotFoundException at
+//     StreamingBsonUnitReader.ResolvePostponedProperties(), with no CE code and
+//     no document named.
+//   - a dangling BY-NAME end is an ordinary model error, CE1613 at the
+//     cross-module association.
+//
+// qualifiedName may be empty when the module name could not be established; the
+// by-name sweep is then skipped rather than guessed at, since an empty name would
+// match nothing at best and everything at worst.
+func removeCrossAssocsReferencing(dm *genDm.DomainModel, entityID model.ID, qualifiedName string) bool {
+	changed := false
+	items := dm.CrossAssociationsItems()
+	for i := len(items) - 1; i >= 0; i-- {
+		ca, ok := items[i].(*genDm.CrossAssociation)
+		if !ok {
+			continue
+		}
+		byID := string(ca.ParentRefID()) == string(entityID)
+		byName := qualifiedName != "" && strings.EqualFold(ca.ChildQualifiedName(), qualifiedName)
+		if byID || byName {
+			dm.RemoveCrossAssociations(i)
+			changed = true
+		}
+	}
+	return changed
+}
+
 // DeleteAttribute removes an attribute from an entity. The remaining attributes
 // pass through the codec unchanged; only the Attributes list is rebuilt. Mirrors
 // legacy semantics (no cascade — dangling index/validation refs are left as-is,
@@ -98,6 +137,18 @@ func (b *Backend) DeleteAttribute(domainModelID, entityID, attrID model.ID) erro
 // original raw bytes. Mirrors legacy UpdateEntity (full re-serialize of the
 // replaced entity, siblings untouched).
 func (b *Backend) UpdateEntity(domainModelID model.ID, entity *domainmodel.Entity) error {
+	// Refuse rather than downgrade: a validation rule type this writer cannot
+	// reproduce (RegEx, Range) used to come back as Required, silently dropping
+	// the pattern reference — and mxbuild reports nothing, because a Required
+	// rule is perfectly valid (guard-don't-drop, ADR-0005).
+	if ruleType, ok := validationRulesAreReproducible(entity); !ok {
+		return fmt.Errorf(
+			"entity %s has a %s validation rule, which mxcli cannot rewrite without losing it — "+
+				"change this entity in Studio Pro, or remove the rule first.\n"+
+				"  (Rewriting would silently turn it into a Required rule: the constraint would be gone "+
+				"and the build would still pass.)",
+			entity.Name, ruleType)
+	}
 	if entity == nil {
 		return fmt.Errorf("UpdateEntity: nil entity")
 	}
@@ -109,13 +160,92 @@ func (b *Backend) UpdateEntity(domainModelID model.ID, entity *domainmodel.Entit
 		return err
 	}
 	order := dm.EntitiesItems()
-	if findGenEntity(dm, entity.ID) == nil {
+	orig := findGenEntity(dm, entity.ID)
+	if orig == nil {
 		return fmt.Errorf("entity not found: %s", entity.ID)
 	}
 
 	ge := entityToGen(entity, b.moduleNameFor(domainModelID), b.majorVersion())
 	ge.SetID(element.ID(entity.ID))
 	assignEntityIDs(ge)
+
+	// Carry the original raw bytes onto the rebuilt target so the codec treats it
+	// as an EXISTING element: dirty (re-encoded) properties come from ge, while
+	// unmodeled fields — notably the entity GUID — pass through verbatim from raw.
+	// Without this, entityToGen produces a fresh (raw==nil) element and the codec
+	// emits GUID = $ID (EmitGUID default), discarding the on-disk GUID. That GUID
+	// is the entity's stable cross-reference identity: pages/grids and inheriting
+	// entities in other modules resolve members through it, so changing it dangles
+	// those references (CE1613 — GitHub issue #657). Siblings are untouched (raw
+	// passthrough in the list rebuild below), so they already keep their GUID; this
+	// closes the same gap for the ALTER target itself.
+	//
+	// carryStoredEntity (below) does it, together with writing back what
+	// entityToGen resets to a constant: the export level, and the access rules the
+	// statement left alone (ako/mxcli#801).
+
+	// The same carry, one level down, for the entity's GUID-bearing CHILDREN.
+	// #657 closed this for the entity element and noted that siblings survive via
+	// the list-rebuild raw passthrough — but the target's own children do not:
+	// entityToGen rebuilds every attribute and index from the semantic model, so
+	// each arrives raw==nil and the codec's EmitGUID default writes GUID = $ID.
+	//
+	// For an attribute that GUID is the database's identity, not a cross-reference:
+	// the runtime keys mendixsystem$attribute.id on it, so re-minting it makes the
+	// synchroniser treat every column as deleted-and-re-added and DROP it on the
+	// next deploy. Measured on a real project: one ALTER, 0 of 28 GUIDs surviving,
+	// all 607 rows' attribute values gone (issue #1119). Nothing caught it — the
+	// model stays valid, mx check is clean, and because the new GUID is derived
+	// from a now-stable $ID the damage is idempotent, so a second run is elided
+	// and reports "Unchanged".
+	carryStoredEntity(ge, orig, entity)
+
+	// When an update empties a child list, the fresh (empty) list on ge is "clean"
+	// — entityToGen appended nothing to it — so the codec passes the STORED raw
+	// bytes through unchanged and the removal silently does not happen. Touching
+	// the list (append + remove) marks it dirty, so the codec re-emits it as empty
+	// and clears the raw. A list that still has members is already dirty from
+	// entityToGen's appends, which is why this is only needed for the last one out.
+	//
+	// That "last one out" is the whole trap: any test that removes one of two
+	// members passes against the broken code. Measured on 11.13.0, one member each:
+	//
+	//   Indexes          orphaned index → `mx check` dies with an unhandled
+	//                    AggregateException (ledger #39)
+	//   ValidationRules  rule outlives the attribute it constrains → CE1613
+	//   Attributes       DROP ATTRIBUTE reports success and writes nothing at all
+	//
+	// AccessRules and EventHandlers share the mechanism; they are covered here
+	// rather than left to be rediscovered one error code at a time.
+	for _, l := range []struct {
+		newLen, storedLen int
+		touch             func()
+	}{
+		{len(entity.Attributes), len(orig.AttributesItems()), func() {
+			ge.AddAttributes(genDm.NewAttribute())
+			ge.RemoveAttributes(0)
+		}},
+		{len(entity.ValidationRules), len(orig.ValidationRulesItems()), func() {
+			ge.AddValidationRules(genDm.NewValidationRule())
+			ge.RemoveValidationRules(0)
+		}},
+		{len(entity.Indexes), len(orig.IndexesItems()), func() {
+			ge.AddIndexes(genDm.NewIndex())
+			ge.RemoveIndexes(0)
+		}},
+		{len(entity.AccessRules), len(orig.AccessRulesItems()), func() {
+			ge.AddAccessRules(genDm.NewAccessRule())
+			ge.RemoveAccessRules(0)
+		}},
+		{len(entity.EventHandlers), len(orig.EventHandlersItems()), func() {
+			ge.AddEventHandlers(genDm.NewEventHandler())
+			ge.RemoveEventHandlers(0)
+		}},
+	} {
+		if l.newLen == 0 && l.storedLen > 0 {
+			l.touch()
+		}
+	}
 
 	// Rebuild the list in place: drop all, re-add in original order swapping the
 	// target. Re-added existing elements stay clean (only the list is dirtied),
@@ -136,10 +266,28 @@ func (b *Backend) UpdateEntity(domainModelID model.ID, entity *domainmodel.Entit
 // UpdateDomainModel persists a whole mutated domain model (the executor's
 // read-modify-write path for ALTER ASSOCIATION, CREATE OR MODIFY ASSOCIATION,
 // and RENAME). It rebuilds the Entities and Associations lists from the semantic
-// model via the byte-faithful converters, preserving each element's identity.
-// CrossAssociations and Annotations are NOT represented in domainmodel.DomainModel,
-// so they are left as gen passthrough rather than dropped (ADR-0005: guard
-// fidelity — the existing raw bytes carry forward unchanged).
+// model via the byte-faithful converters, carrying each element's stored identity
+// — both its $ID and its storage GUID — onto the rebuild.
+// Annotations are NOT represented in domainmodel.DomainModel, so they are left as
+// gen passthrough rather than dropped (ADR-0005: guard fidelity — the existing raw
+// bytes carry forward unchanged).
+//
+// CrossAssociations ARE represented (crossAssocFromGen fills them on every read),
+// and this used to treat them like Annotations anyway — so ALTER ASSOCIATION and
+// CREATE OR MODIFY ASSOCIATION on a cross-module association reported success and
+// wrote nothing (ako/mxcli#792). They are patched in place rather than rebuilt:
+// see patchCrossAssociations.
+//
+// The GUID half of that was missing until ako/mxcli#1169. Unlike UpdateEntity,
+// which swaps one entity into an otherwise raw-passthrough list, this rebuilds
+// EVERY entity and EVERY association — so every element arrived raw==nil and the
+// codec's EmitGUID default wrote GUID = $ID across the whole unit, including
+// elements the statement never named. The reporter measured 282 moved GUIDs in one
+// module. What that costs is in the carry comments below; the short version is
+// that the runtime keys the database on the GUID, so re-minting one drops a column
+// (an attribute) or a whole table (an entity, whose name is the table name — which
+// is why RENAME ENTITY routing through here was the worst of the affected
+// statements).
 func (b *Backend) UpdateDomainModel(dm *domainmodel.DomainModel) error {
 	if dm == nil {
 		return fmt.Errorf("UpdateDomainModel: nil domain model")
@@ -154,13 +302,52 @@ func (b *Backend) UpdateDomainModel(dm *domainmodel.DomainModel) error {
 	moduleName := b.moduleNameFor(dm.ID)
 	major := b.majorVersion()
 
+	// Index the stored elements by $ID BEFORE the removal loops empty the lists.
+	// The $ID is the right key because the read path round-trips it into the
+	// semantic model, so it is exact rather than structural: a RENAME keeps the ID
+	// and carries the identity forward (Studio Pro renames the table or column and
+	// keeps the data), while a genuinely new element arrives with an empty ID,
+	// matches nothing, and correctly gets a fresh GUID.
+	storedEntities := make(map[string]*genDm.Entity, len(gdm.EntitiesItems()))
+	for _, el := range gdm.EntitiesItems() {
+		if ge, ok := el.(*genDm.Entity); ok {
+			storedEntities[string(ge.ID())] = ge
+		}
+	}
+	storedAssociations := make(map[string]*genDm.Association, len(gdm.AssociationsItems()))
+	for _, el := range gdm.AssociationsItems() {
+		if ga, ok := el.(*genDm.Association); ok {
+			storedAssociations[string(ga.ID())] = ga
+		}
+	}
+
 	for i := len(gdm.EntitiesItems()) - 1; i >= 0; i-- {
 		gdm.RemoveEntities(i)
 	}
 	for _, e := range dm.Entities {
+		orig := storedEntities[string(e.ID)]
+		// An entity the statement did not change is not rebuilt: it passes through
+		// as its stored element, byte-for-byte. Rebuilding it reset everything the
+		// semantic model has no field for — every API entity in the module became
+		// Hidden and every access rule was rewritten, for a statement that named
+		// one association (ako/mxcli#801).
+		if entityUnchanged(e, orig) {
+			gdm.AddEntities(orig)
+			continue
+		}
 		ge := entityToGen(e, moduleName, major)
 		ge.SetID(element.ID(e.ID))
 		assignEntityIDs(ge)
+		// Carry the stored raw bytes so the codec treats the rebuild as an EXISTING
+		// element: the properties entityToGen set re-encode, while the ones the
+		// semantic model does not carry — the GUID above all — pass through verbatim.
+		// This is #657's carry (for the entity) and #1119's (for its attributes and
+		// indexes) applied to a path that had neither, because it rebuilds the whole
+		// list instead of swapping one member into it (#1169). carryStoredEntity also
+		// writes back what entityToGen SETS to a constant (#801).
+		if orig != nil {
+			carryStoredEntity(ge, orig, e)
+		}
 		gdm.AddEntities(ge)
 	}
 
@@ -168,15 +355,195 @@ func (b *Backend) UpdateDomainModel(dm *domainmodel.DomainModel) error {
 		gdm.RemoveAssociations(i)
 	}
 	for _, a := range dm.Associations {
+		orig := storedAssociations[string(a.ID)]
+		if assocUnchanged(a, orig) {
+			gdm.AddAssociations(orig) // byte-for-byte, as for entities (#801)
+			continue
+		}
 		ga := assocToGen(a)
 		if a.ID != "" {
 			ga.SetID(element.ID(a.ID))
 		}
 		assignAssociationIDs(ga)
+		// The same carry for associations. A direct SetRaw is enough here, where the
+		// cross-module MOVE needed a raw transform (crossAssocRawFromAssoc, #503):
+		// assocToGen is Association -> Association, so the stored $Type and the
+		// rebuilt one agree and nothing has to be rewritten on the way.
+		//
+		// It also subsumes the property-by-property patch #872 made for the line
+		// anchors: those were lost to this same "the rebuild only carries what the
+		// semantic model models" mechanism, and raw passthrough covers the whole
+		// class rather than one property of it.
+		// carryStoredAssociation adds the export level assocToGen resets to
+		// "Hidden", and the stored delete behaviour when it is unchanged (#801).
+		if orig != nil {
+			carryStoredAssociation(ga, orig, a)
+		}
 		gdm.AddAssociations(ga)
 	}
 
+	if err := patchCrossAssociations(gdm, dm.CrossAssociations); err != nil {
+		return err
+	}
+
 	return b.persistDM(dm.ID, gdm)
+}
+
+// patchCrossAssociations writes the semantic cross-module associations onto the
+// stored ones (ako/mxcli#792).
+//
+// Unlike the Entities and Associations lists above, this does not rebuild: each
+// stored element is edited in place, and a property is set only when the semantic
+// value differs from what is stored. Everything the semantic model does not carry
+// — the GUID above all, but also the capabilities and the remote-source name — is
+// never touched, so it cannot be lost, and an unchanged element stays clean and
+// passes through byte-for-byte. The export level is set only when it is set and
+// differs, so an unauthored one keeps the stored level (mendixlabs/mxcli#1498).
+//
+// A semantic association with no stored counterpart is new and is appended. A
+// stored one missing from the semantic model is REFUSED rather than silently kept
+// or dropped: every caller deletes through DeleteCrossAssociation, so reaching this
+// would mean a caller expecting a removal that this function does not perform.
+func patchCrossAssociations(gdm *genDm.DomainModel, cas []*domainmodel.CrossModuleAssociation) error {
+	stored := make(map[string]*genDm.CrossAssociation, len(gdm.CrossAssociationsItems()))
+	for _, el := range gdm.CrossAssociationsItems() {
+		if gca, ok := el.(*genDm.CrossAssociation); ok {
+			stored[string(gca.ID())] = gca
+		}
+	}
+	seen := make(map[string]bool, len(cas))
+	for _, ca := range cas {
+		if ca == nil {
+			continue
+		}
+		gca := stored[string(ca.ID)]
+		if gca == nil {
+			gca = crossAssocToGen(ca) // writes a restrict message itself (#803)
+			assignCrossAssocIDs(gca)
+			gdm.AddCrossAssociations(gca)
+			ca.ID = model.ID(gca.ID())
+			continue
+		}
+		seen[string(ca.ID)] = true
+		patchCrossAssociation(gca, ca)
+	}
+	for id, gca := range stored {
+		if !seen[id] {
+			return fmt.Errorf("UpdateDomainModel: cross-module association %s is stored but absent from the "+
+				"domain model being written; removing one goes through DeleteCrossAssociation", gca.Name())
+		}
+	}
+	return nil
+}
+
+// patchCrossAssociation sets on gca each property of ca that differs from it.
+func patchCrossAssociation(gca *genDm.CrossAssociation, ca *domainmodel.CrossModuleAssociation) {
+	if gca.Name() != ca.Name {
+		gca.SetName(ca.Name)
+	}
+	if gca.Documentation() != ca.Documentation {
+		gca.SetDocumentation(ca.Documentation)
+	}
+	if ca.ParentID != "" && string(gca.ParentRefID()) != string(ca.ParentID) {
+		gca.SetParentID(element.ID(string(ca.ParentID)))
+	}
+	if ca.ChildRef != "" && gca.ChildQualifiedName() != ca.ChildRef {
+		gca.SetChildQualifiedName(ca.ChildRef)
+	}
+	if ca.Type != "" && gca.Type() != string(ca.Type) {
+		gca.SetType(string(ca.Type))
+	}
+	if ca.Owner != "" && gca.Owner() != string(ca.Owner) {
+		gca.SetOwner(string(ca.Owner))
+	}
+	if ca.StorageFormat != "" && gca.StorageFormat() != string(ca.StorageFormat) {
+		gca.SetStorageFormat(string(ca.StorageFormat))
+	}
+	if ca.ExportLevel != "" && gca.ExportLevel() != ca.ExportLevel {
+		gca.SetExportLevel(ca.ExportLevel)
+	}
+
+	db, ok := gca.DeleteBehavior().(*genDm.AssociationDeleteBehavior)
+	if !ok || db == nil {
+		db = deleteBehaviorToGen(behaviorType(ca.ParentDeleteBehavior), behaviorType(ca.ChildDeleteBehavior))
+		assignID(db)
+		patchCrossDeleteErrorMessage(db, ca.ChildDeleteBehavior)
+		gca.SetDeleteBehavior(db)
+	} else {
+		// A nil semantic side is "not stated", not "reset to keep": leave it.
+		if ca.ParentDeleteBehavior != nil && ca.ParentDeleteBehavior.Type != "" &&
+			db.ParentDeleteBehavior() != string(ca.ParentDeleteBehavior.Type) {
+			db.SetParentDeleteBehavior(string(ca.ParentDeleteBehavior.Type))
+		}
+		if ca.ChildDeleteBehavior != nil && ca.ChildDeleteBehavior.Type != "" {
+			if db.ChildDeleteBehavior() != string(ca.ChildDeleteBehavior.Type) {
+				db.SetChildDeleteBehavior(string(ca.ChildDeleteBehavior.Type))
+			}
+			if ca.ChildDeleteBehavior.Type != domainmodel.DeleteBehaviorTypeDeleteMeIfNoReferences &&
+				db.ChildErrorMessage() != nil {
+				// Leaving restrict: the stored refusal message has to go, and
+				// Studio Pro writes the slot as null rather than omitting it. A
+				// cleared Part omits the key, while a FRESH delete behaviour gets
+				// the registered null defaults — so the element is rebuilt, under
+				// its stored $ID so nothing that points at it moves.
+				fresh := deleteBehaviorToGen(db.ParentDeleteBehavior(), db.ChildDeleteBehavior())
+				fresh.SetID(db.ID())
+				gca.SetDeleteBehavior(fresh)
+			} else {
+				patchCrossDeleteErrorMessage(db, ca.ChildDeleteBehavior)
+			}
+		}
+	}
+
+	if ca.Source == domainmodel.OqlViewAssociationSource {
+		if src, ok := gca.Source().(*genDm.OqlViewAssociationSource); ok && src != nil {
+			if src.Reference() != ca.ViewSourceReference {
+				src.SetReference(ca.ViewSourceReference)
+			}
+		} else {
+			gca.SetSource(oqlViewAssociationSourceToGen(ca.ViewSourceReference))
+		}
+	}
+}
+
+// patchCrossDeleteErrorMessage gives a "delete me if no references" child side
+// the refusal message Studio Pro writes there — without it the runtime does not
+// start (CapTrackV2 §1; see assocToGen for the census behind "only that side").
+// Any other behaviour carries no message (the census found every keep and cascade
+// side null); clearing one left over from a restrict is patchCrossAssociation's.
+func patchCrossDeleteErrorMessage(db *genDm.AssociationDeleteBehavior, child *domainmodel.DeleteBehavior) {
+	if child == nil || child.Type != domainmodel.DeleteBehaviorTypeDeleteMeIfNoReferences {
+		return
+	}
+	if db.ChildErrorMessage() != nil && deleteErrorMessageFromGen(db.ChildErrorMessage(), deleteErrorLanguage(child)) == child.ErrorMessage {
+		return
+	}
+	// Edit the translation in the written language and keep every other
+	// language's, as ALTER PAGE does for a caption — replacing the whole text
+	// would drop the Dutch the moment an English message was re-set, or the
+	// reverse.
+	sem := deleteErrorText(child)
+	for l, v := range deleteErrorTranslationsFromGen(db.ChildErrorMessage()) {
+		if _, ok := sem.Translations[l]; !ok {
+			sem.Translations[l] = v
+		}
+	}
+	txt := textToGen(sem)
+	assignID(txt)
+	for _, tr := range txt.TranslationsItems() {
+		assignID(tr)
+	}
+	db.SetChildErrorMessage(txt)
+}
+
+// deleteErrorLanguage is the language deleteErrorText stores db's message under:
+// the one the executor named, else the process's authoring language (see
+// model.AuthoringLanguage), which is en_US until a project's settings are read.
+func deleteErrorLanguage(db *domainmodel.DeleteBehavior) string {
+	if db == nil || db.ErrorMessageLanguage == "" {
+		return model.AuthoringLanguage()
+	}
+	return db.ErrorMessageLanguage
 }
 
 // DeleteAssociation removes an association from a domain model by ID. Used by
@@ -239,8 +606,18 @@ func (b *Backend) DeleteEntity(domainModelID, entityID model.ID) error {
 	if eidx < 0 {
 		return fmt.Errorf("entity not found: %s", entityID)
 	}
+	// The qualified name the OTHER modules' cross-module associations know this
+	// entity by. Read before the entity is removed, for obvious reasons.
+	qualifiedName := ""
+	if ge := findGenEntity(dm, entityID); ge != nil {
+		if moduleName := b.moduleNameFor(domainModelID); moduleName != "" {
+			qualifiedName = moduleName + "." + ge.Name()
+		}
+	}
+
 	dm.RemoveEntities(eidx)
 	removeAssocsReferencing(dm, entityID)
+	removeCrossAssocsReferencing(dm, entityID, qualifiedName)
 	if err := b.persistDM(domainModelID, dm); err != nil {
 		return err
 	}
@@ -263,11 +640,198 @@ func (b *Backend) DeleteEntity(domainModelID, entityID model.ID) error {
 		if err != nil {
 			return fmt.Errorf("DeleteEntity: cascade cleanup: load %s: %w", other.ID, err)
 		}
-		if removeAssocsReferencing(odm, entityID) {
+		// Two sweeps, not one: a regular association here can only reference the
+		// entity by id, while a cross-module one in ANOTHER module reaches it by
+		// qualified name — which is the half that leaves CE1613 behind.
+		removed := removeAssocsReferencing(odm, entityID)
+		if removeCrossAssocsReferencing(odm, entityID, qualifiedName) {
+			removed = true
+		}
+		if removed {
 			if err := b.persistDM(other.ID, odm); err != nil {
 				return fmt.Errorf("DeleteEntity: cascade cleanup: update %s: %w", other.ID, err)
 			}
 		}
 	}
 	return nil
+}
+
+// SetDomainModelAnnotations replaces the canvas notes on a domain model.
+//
+// Annotations are mutated in place on the gen document rather than rebuilt from
+// the semantic type: domainmodel.Annotation carries Caption, Location and Width,
+// while the stored element also has ExportLevel — and anything else a future
+// Mendix adds. Matching each note to the one already there and setting only the
+// three fields MDL owns means a property nobody has modelled yet rides along
+// untouched, which is the whole reason UpdateDomainModel leaves this collection
+// as passthrough (ADR-0005).
+//
+// A note with no stored counterpart is appended with the defaults Studio Pro
+// writes; a stored one with no counterpart in the new list is removed, which is
+// what makes DROP ANNOTATION work.
+func (b *Backend) SetDomainModelAnnotations(domainModelID model.ID, annotations []*domainmodel.Annotation) error {
+	if b.writer == nil {
+		return fmt.Errorf("SetDomainModelAnnotations: not connected for writing")
+	}
+	gdm, err := b.loadDomainModelGen(domainModelID)
+	if err != nil {
+		return err
+	}
+
+	// Index what is stored by element ID so an edit keeps its identity: minting a
+	// fresh one would make an otherwise-unchanged domain model differ (ADR-0008).
+	stored := map[model.ID]*genDm.Annotation{}
+	for _, el := range gdm.AnnotationsItems() {
+		if ga, ok := el.(*genDm.Annotation); ok {
+			stored[model.ID(ga.ID())] = ga
+		}
+	}
+
+	for i := len(gdm.AnnotationsItems()) - 1; i >= 0; i-- {
+		gdm.RemoveAnnotations(i)
+	}
+	for _, a := range annotations {
+		ga, ok := stored[a.ID]
+		if !ok {
+			ga = genDm.NewAnnotation()
+			if a.ID != "" {
+				ga.SetID(element.ID(a.ID))
+			} else {
+				ga.SetID(element.ID(mmpr.GenerateID()))
+			}
+			ga.SetExportLevel("Hidden")
+		}
+		ga.SetCaption(a.Caption)
+		ga.SetLocation(fmt.Sprintf("%d;%d", a.Location.X, a.Location.Y))
+		ga.SetWidth(int32(a.Width))
+		gdm.AddAnnotations(ga)
+	}
+	return b.persistDM(domainModelID, gdm)
+}
+
+// SetDomainModelDocumentation sets DomainModels$DomainModel.Documentation, the
+// domain model's own documentation and the only documentation a module has
+// (mendixlabs/mxcli#1314). It loads the stored unit and changes that one
+// property, so entities, associations and annotations pass through as stored.
+func (b *Backend) SetDomainModelDocumentation(domainModelID model.ID, documentation string) error {
+	if b.writer == nil {
+		return fmt.Errorf("SetDomainModelDocumentation: not connected for writing")
+	}
+	gdm, err := b.loadDomainModelGen(domainModelID)
+	if err != nil {
+		return err
+	}
+	gdm.SetDocumentation(documentation)
+	return b.persistDM(domainModelID, gdm)
+}
+
+// entityIsExternal reports whether a stored entity is an external (OData) one,
+// whose attributes carry mapped remote values rather than plain Mendix types.
+//
+// CreateEntity derives this from the semantic model it is given; here the entity
+// already exists, so it is read back off the stored document. Getting it wrong
+// would write a plain attribute into an external entity, which mxbuild accepts
+// and Studio Pro then shows with an empty remote mapping.
+func entityIsExternal(ent *genDm.Entity) bool {
+	src := ent.Source()
+	if src == nil {
+		return false
+	}
+	return src.TypeName() == "Rest$ODataRemoteEntitySource" ||
+		src.TypeName() == "DatabaseConnector$DatabaseRemoteEntitySource"
+}
+
+// AddAttribute appends an attribute to an existing entity.
+//
+// Implemented for the api/ package, which is its only caller: ALTER ENTITY
+// reaches the same result through the mutator. Until api/ was routed through the
+// backend abstraction this method was on FullBackend with no caller that used a
+// backend value, which is why it sat unimplemented here (see
+// unimplemented_reachability_test.go).
+func (b *Backend) AddAttribute(domainModelID, entityID model.ID, attr *domainmodel.Attribute) error {
+	if b.writer == nil {
+		return fmt.Errorf("AddAttribute: not connected for writing")
+	}
+	if attr == nil {
+		return fmt.Errorf("AddAttribute: nil attribute")
+	}
+	dm, err := b.loadDomainModelGen(domainModelID)
+	if err != nil {
+		return err
+	}
+	ent := findGenEntity(dm, entityID)
+	if ent == nil {
+		return fmt.Errorf("entity not found: %s", entityID)
+	}
+	for _, el := range ent.AttributesItems() {
+		if a, ok := el.(*genDm.Attribute); ok && a.Name() == attr.Name {
+			return fmt.Errorf("attribute %q already exists on entity %s", attr.Name, entityID)
+		}
+	}
+	ent.AddAttributes(attributeToGen(attr, entityIsExternal(ent)))
+	return b.persistDM(domainModelID, dm)
+}
+
+// UpdateAttribute replaces an existing attribute in place.
+//
+// Replaces rather than merges: the caller hands a whole Attribute, so a field it
+// leaves zero is a field it means to clear. Merging would make "set no
+// documentation" indistinguishable from "leave the documentation alone", and the
+// legacy writer this replaces did not merge either.
+//
+// The attribute keeps its stored $ID. Minting a fresh one would make the runtime
+// treat it as a different attribute — see CLAUDE.md on GUIDs and identity — and
+// would churn every reference to it in the same document.
+func (b *Backend) UpdateAttribute(domainModelID, entityID model.ID, attr *domainmodel.Attribute) error {
+	if b.writer == nil {
+		return fmt.Errorf("UpdateAttribute: not connected for writing")
+	}
+	if attr == nil {
+		return fmt.Errorf("UpdateAttribute: nil attribute")
+	}
+	dm, err := b.loadDomainModelGen(domainModelID)
+	if err != nil {
+		return err
+	}
+	ent := findGenEntity(dm, entityID)
+	if ent == nil {
+		return fmt.Errorf("entity not found: %s", entityID)
+	}
+	items := ent.AttributesItems()
+	idx := -1
+	for i, el := range items {
+		if string(el.ID()) == string(attr.ID) {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		return fmt.Errorf("attribute not found: %s", attr.ID)
+	}
+
+	next := attributeToGen(attr, entityIsExternal(ent))
+	next.SetID(items[idx].ID())
+	// attributeToGen returns raw == nil, which the codec reads as a NEW element
+	// and mints GUID = $ID for — the runtime keys mendixsystem$attribute.id on
+	// that GUID and would drop the column (ako/mxcli#627, the #1119 class).
+	// Attribute -> Attribute keeps the $Type, so carrying the stored raw bytes
+	// is enough; no raw transform is needed.
+	if stored, ok := items[idx].(*genDm.Attribute); ok {
+		carryStoredAttribute(next, stored, attr.ExportLevel)
+	}
+
+	// The generated list offers only Append and Remove, so an in-place replace
+	// means rebuilding it. Order is worth the rebuild: it is the order Studio
+	// Pro shows the attributes in, and appending instead would move the edited
+	// one to the bottom of every entity anyone touches.
+	replacement := make([]element.Element, len(items))
+	copy(replacement, items)
+	replacement[idx] = next
+	for i := len(items) - 1; i >= 0; i-- {
+		ent.RemoveAttributes(i)
+	}
+	for _, el := range replacement {
+		ent.AddAttributes(el)
+	}
+	return b.persistDM(domainModelID, dm)
 }

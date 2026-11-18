@@ -10,6 +10,8 @@ A user task pauses the workflow until a user completes it. Each outcome resumes 
 USER TASK <name> '<caption>'
   [PAGE <Module>.<Page>]
   [TARGETING MICROFLOW <Module>.<Microflow>]
+  [AUTO ASSIGN SINGLE USER]
+  [ON CREATED MICROFLOW <Module>.<Microflow>]
   OUTCOMES '<outcome>' { <activities> } ['<outcome>' { <activities> }] ...;
 ```
 
@@ -19,6 +21,8 @@ USER TASK <name> '<caption>'
 | `<caption>` | Display label shown to users |
 | `PAGE` | The page opened when the user acts on the task |
 | `TARGETING MICROFLOW` | Microflow that determines which users see the task |
+| `AUTO ASSIGN SINGLE USER` | Studio Pro's "Auto-assign when targeting results in one user": when the targeting yields exactly one user, the task is assigned to them. Off when omitted, as Studio Pro creates a task. Without it, that user cannot complete the task from a microflow until it is assigned to them. Valid on multi-user tasks too |
+| `ON CREATED MICROFLOW` | Microflow run when the task is created — for example to assign it. It takes exactly `System.WorkflowUserTask` and the workflow's context entity, in either order (else CE6683), and returns nothing (else CE5012) |
 | `OUTCOMES` | Named outcomes, each with a block of follow-up activities |
 
 Example:
@@ -27,62 +31,151 @@ Example:
 USER TASK ReviewTask 'Review the request'
   PAGE Approval.ReviewPage
   TARGETING MICROFLOW Approval.ACT_GetReviewers
+  ON CREATED MICROFLOW Approval.ACT_AssignReviewer
   OUTCOMES 'Approve' {
     CALL MICROFLOW Approval.ACT_Approve;
   } 'Reject' {
     CALL MICROFLOW Approval.ACT_Reject;
-    END;
+    END WORKFLOW;
   };
 ```
 
-## Call Microflow
+## Multi-User Task
 
-Execute a microflow as part of the workflow. Optionally specify a comment and outcomes:
+A multi-user task gives the same task to several users and combines their
+outcomes into one. Three clauses, before `OUTCOMES`, say how:
 
 ```sql
-CALL MICROFLOW <Module>.<Name> [COMMENT '<text>']
+MULTI USER TASK <name> '<caption>'
+  PAGE <Module>.<Page>
+  [PARTICIPANTS ALL | <n> | <n> PERCENT]
+  [DECIDE BY <rule>]
+  [AWAIT ALL USERS]
+  OUTCOMES '<outcome>' { <activities> } ...;
+```
+
+| Rule | Completes when | Needs |
+|------|----------------|-------|
+| `CONSENSUS` | everyone chose the same outcome | `FALLBACK '<outcome>'` |
+| `MAJORITY MORE THAN HALF` | more than half chose one outcome | `FALLBACK '<outcome>'` |
+| `MAJORITY MOST CHOSEN` | one outcome was chosen most | `FALLBACK '<outcome>'` |
+| `THRESHOLD <n> PERCENT` / `<n> VOTES` | an outcome reaches the threshold | `FALLBACK '<outcome>'` |
+| `VETO '<outcome>'` | anyone chooses the veto outcome | — |
+| `MICROFLOW <Module>.<Name>` | the microflow returns the outcome (String) | — |
+
+Example:
+
+```sql
+MULTI USER TASK Vote 'Vote on the request'
+  PAGE HR.VotePage
+  PARTICIPANTS 80 PERCENT
+  DECIDE BY THRESHOLD 60 PERCENT FALLBACK 'Reject'
+  AWAIT ALL USERS
+  OUTCOMES 'Approve' { } 'Reject' { };
+```
+
+Omitted, the task needs all participants, decides by consensus falling back to
+its first outcome, and does not wait for everyone. The fallback is required for
+consensus, majority and threshold, and the build does not check threshold or
+participant numbers against each other — `THRESHOLD 5 VOTES` with three users
+builds and never completes.
+
+## Call Microflow
+
+Execute a microflow as part of the workflow. Optionally specify a caption and outcomes:
+
+```sql
+CALL MICROFLOW <Module>.<Name> [(<Param> = <expression>, ...)] [CAPTION '<text>']
   [OUTCOMES '<outcome>' { <activities> } ...];
 ```
 
 Example:
 
 ```sql
-CALL MICROFLOW HR.ACT_SendNotification COMMENT 'Notify the applicant';
+CALL MICROFLOW HR.ACT_SendNotification CAPTION 'Notify the applicant';
+CALL MICROFLOW HR.ACT_Escalate(Request = $WorkflowContext) CAPTION 'Escalate';
 ```
+
+Arguments are bound like every other call in MDL: `Param = expression` right
+after the callee, the expression written bare. The older spelling after the
+caption, `WITH (Param = '<expression>')` with the expression inside a string,
+still parses with the same meaning but is deprecated (MDL-DEPR008);
+`mxcli fmt --upgrade` rewrites it.
+
+`CAPTION '…'` sets the caption Studio Pro shows on the activity, on every workflow
+activity. It used to be spelt `COMMENT '…'`, which still parses as a deprecated
+alias (MDL-DEPR104) — it was never a comment.
+
+## AI Agent Task
+
+A step that runs an AI agent (Mendix 11.9 or later). It is written like `CALL
+MICROFLOW` with `AGENT` added, and takes the same name, caption, parameter
+mappings, outcomes and boundary events. The microflow is where the agent is
+invoked — build agents with the Studio Pro Agent Editor, or `CREATE AGENT`.
+
+```sql
+CALL AGENT MICROFLOW <Module>.<Name> [(<Param> = <expression>, ...)] [AS <name>] [CAPTION '<text>']
+  [OUTCOMES <true|false|'Module.Enum.Value'|''> -> { <activities> } ...];
+```
+
+Example — branch on the agent's answer:
+
+```sql
+CALL AGENT MICROFLOW HR.ACT_ClassifyRequest(Request = $WorkflowContext) AS aiAgentTask1
+  CAPTION 'Classify the request'
+  OUTCOMES true -> {
+    USER TASK Expedite 'Expedite the request' PAGE HR.TaskPage OUTCOMES 'Done' { };
+  } false -> { };
+```
+
+The microflow must take at least one parameter — usually the workflow's context
+object — or the build fails with CE1590. Return Boolean or an enumeration to
+branch with `OUTCOMES`; return nothing for a single path.
 
 ## Call Workflow
 
 Start a sub-workflow:
 
 ```sql
-CALL WORKFLOW <Module>.<Name> [COMMENT '<text>'];
+CALL WORKFLOW <Module>.<Name> [(<Param> = <expression>, ...)] [AS <name>] [CAPTION '<text>']
+  [BOUNDARY EVENT ...];
 ```
 
 Example:
 
 ```sql
-CALL WORKFLOW HR.BackgroundCheck COMMENT 'Run background check sub-process';
+CALL WORKFLOW HR.BackgroundCheck CAPTION 'Run background check sub-process';
+```
+
+A call workflow takes the same boundary events as a user task or call microflow,
+so a parent can put a deadline on a child without moving the timer into it:
+
+```sql
+CALL WORKFLOW HR.BackgroundCheck AS callCheck
+  BOUNDARY EVENT INTERRUPTING TIMER addDays([%CurrentDateTime%], 5) { END WORKFLOW; };
 ```
 
 ## Decision
 
-Branch the workflow based on a condition. Each outcome contains a block of activities:
+Branch the workflow based on a condition. The condition is a bare expression, Boolean or enumeration; each outcome contains a block of activities:
 
 ```sql
-DECISION ['<caption>']
-  OUTCOMES '<outcome>' { <activities> } ['<outcome>' { <activities> }] ...;
+DECISION [<name>] <expression> [COMMENT '<caption>']
+  OUTCOMES TRUE -> { <activities> } FALSE -> { <activities> };
 ```
 
 Example:
 
 ```sql
-DECISION 'Order value over $1000?'
-  OUTCOMES 'Yes' {
+DECISION $WorkflowContext/Total > 1000 CAPTION 'Order value over $1000?'
+  OUTCOMES TRUE -> {
     USER TASK ManagerApproval 'Manager must approve'
       PAGE Shop.ApprovalPage
-      OUTCOMES 'Approved' { } 'Rejected' { END; };
-  } 'No' { };
+      OUTCOMES 'Approved' { } 'Rejected' { END WORKFLOW; };
+  } FALSE -> { };
 ```
+
+An enumeration decision has one outcome per qualified enumeration value, plus `''` for "none of the above". The expression used to be written in a string (`DECISION '$WorkflowContext/Total > 1000'`); that form still parses and warns `MDL-DEPR080`, and `mxcli fmt --upgrade` rewrites it.
 
 ## Parallel Split
 
@@ -130,13 +223,13 @@ JUMP TO ReviewTask;
 Pause the workflow until a timer expression evaluates:
 
 ```sql
-WAIT FOR TIMER ['<expression>'];
+WAIT FOR TIMER [<name>] [<expression>] [COMMENT '<caption>'];
 ```
 
 Example:
 
 ```sql
-WAIT FOR TIMER 'addDays([%CurrentDateTime%], 3)';
+WAIT FOR TIMER addDays([%CurrentDateTime%], 3);
 ```
 
 ## Wait for Notification
@@ -146,6 +239,64 @@ Pause the workflow until an external notification resumes it:
 ```sql
 WAIT FOR NOTIFICATION;
 ```
+
+## Notification
+
+An intermediate notification event (Mendix 11.11+): the point a `NOTIFY WORKFLOW` action targets by name.
+
+```sql
+NOTIFICATION [<name>] [CAPTION '<caption>'];
+```
+
+A **notification boundary event** attaches the same trigger to a user task, call microflow, call workflow or wait. It takes a name instead of a timer delay:
+
+```sql
+USER TASK Review 'Review'
+  PAGE HR.ReviewPage
+  OUTCOMES 'Approve' { } 'Reject' { }
+  BOUNDARY EVENT INTERRUPTING NOTIFICATION Withdrawn 'Request withdrawn' {
+    END WORKFLOW;
+  };
+```
+
+An activity may carry only one interrupting boundary event (CE6697). `ALTER WORKFLOW … { INSERT INTO <activity> { BOUNDARY EVENT … } }` cannot add a notification boundary event yet.
+
+A microflow reaches any of these with `NOTIFY WORKFLOW`, naming the element:
+
+```sql
+$Notified = NOTIFY WORKFLOW $Workflow TARGET HR.Leave.Withdrawn;
+```
+
+The target is required — a notify without one fails the build (CE0166). It may name a notification activity, a notification boundary event, a wait for notification, or the start of a notification-started event sub-process; mxcli works out which, and refuses anything a notification cannot reach.
+
+## Event Sub-Processes
+
+A flow outside the main flow, started by its own start event while the workflow runs. Written after the main body, before `END WORKFLOW`:
+
+```sql
+EVENT SUBPROCESS <name> ['<caption>']
+  ON (INTERRUPTING | NON INTERRUPTING) NOTIFICATION [<start>] ['<start caption>']
+  { <activities> };
+
+EVENT SUBPROCESS <name> ['<caption>']
+  ON (INTERRUPTING | NON INTERRUPTING) TIMER <first-execution-time> [AS <start>] [CAPTION '<start caption>']
+  { <activities> };
+```
+
+Example:
+
+```sql
+EVENT SUBPROCESS ESP_Cancel 'Cancel request'
+  ON INTERRUPTING NOTIFICATION espCancelStart 'Cancel received' {
+  CALL MICROFLOW HR.ACT_LogCancel;
+};
+```
+
+- **Interrupting** cancels every active path before the sub-process runs; **non-interrupting** runs alongside the main flow.
+- The body's End is implicit, as in the main flow. A body that already ends (in `END WORKFLOW`, a `JUMP TO`, or branches that all end) gets none.
+- A `JUMP TO` must stay inside its own sub-process (CE6682).
+- A timer start needs its expression (CE0126).
+- Versions: notification starts need Mendix 11.8+, timer starts 11.13+.
 
 ## End
 
@@ -157,18 +308,43 @@ END;
 
 Typically used inside an outcome block to stop the workflow after a rejection or cancellation.
 
+## Notes (annotations)
+
+Studio Pro's notes attach to an activity. Write one as `@annotation '…'` on the
+line before the activity, as in a microflow; an event sub-process takes it before
+`EVENT SUBPROCESS`, and the note on the workflow itself is the header clause
+`ANNOTATION '…'`:
+
+```sql
+CREATE WORKFLOW Module.Approve
+  PARAMETER $WorkflowContext: Module.Request
+  ANNOTATION 'Started from the request form'
+BEGIN
+  @annotation 'Escalates after two days'
+  USER TASK Review 'Review' PAGE Module.Review_Task OUTCOMES 'Done' { };
+END WORKFLOW;
+```
+
+An activity takes one note, and no other `@` annotation. `DESCRIBE WORKFLOW`
+writes them the same way, so a replay keeps them. A standalone
+`ANNOTATION '…';` statement in the body is refused (MDL-WF04): Mendix cannot
+load a note placed in the activity flow.
+
 ## Summary Table
 
 | Activity | Purpose | Pauses Workflow? |
 |----------|---------|-----------------|
 | `USER TASK` | Wait for human action | Yes |
 | `CALL MICROFLOW` | Execute server logic | No |
+| `CALL AGENT MICROFLOW` | Run an AI agent step (11.9+) | No |
 | `CALL WORKFLOW` | Start sub-workflow | Depends on sub-workflow |
 | `DECISION` | Branch on condition | No |
 | `PARALLEL SPLIT` | Concurrent execution | Yes (waits for all paths) |
 | `JUMP TO` | Go to named activity | No |
 | `WAIT FOR TIMER` | Delay execution | Yes |
 | `WAIT FOR NOTIFICATION` | Wait for external signal | Yes |
+| `NOTIFICATION` | Intermediate notification event (11.11+) | Yes |
+| `EVENT SUBPROCESS` | Flow started by a notification or timer (11.8+) | No (runs beside or replaces the main flow) |
 | `END` | Terminate path | N/A |
 
 ## See Also

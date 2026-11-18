@@ -23,6 +23,9 @@ Thank you for your interest in contributing to mxcli! This document explains wha
 - Go 1.26+
 - Git
 - Make
+- ANTLR4 and a JDK — `make build` regenerates the parser, and the generated
+  files in `mdl/grammar/parser/` are not committed. The dev container installs
+  both; on a local machine see "Option 2" below.
 - (Optional) Docker or Podman 4.7+ for dev container
 - (Optional) Claude Code / Cursor for agentic development
 
@@ -40,9 +43,23 @@ cd mxcli
 ```bash
 git clone https://github.com/mendixlabs/mxcli
 cd mxcli
+
+# ANTLR4 — required by `make grammar`, which `make build` always runs.
+# The version must match CI; the antlr4 wrapper reads it from this variable.
+pip install 'antlr4-tools==0.2.2'
+export ANTLR4_TOOLS_ANTLR_VERSION=4.13.2
+
 make build
 ./bin/mxcli --help
 ```
+
+**Option 3: Claude Code on the web**
+
+Web sessions do not use the dev container, so `.claude/hooks/session-start.sh`
+installs ANTLR4 and warms the Go module cache at session start. To also
+pre-cache MxBuild (needed for `mx check`), set
+`MXCLI_HOOK_MXBUILD_VERSION=11.13.0` in the environment; otherwise fetch it on
+demand with `mxcli setup mxbuild --version 11.13.0`.
 
 ### Common Tasks
 
@@ -133,6 +150,17 @@ make grammar                          # Regenerate parser
 ```
 
 Add working examples in `mdl-examples/doctype-tests/` for any new syntax.
+
+Docs, skills, `mxcli syntax` examples and `mdl-examples/` are held to the
+canonical spelling by `make check-conformance` (part of `make lint`): a
+deprecated spelling (`MDL-DEPRnnn`) or a block that does not parse fails it
+unless `mdl/conformance/allowlist.txt` tolerates it, and that list may only
+shrink. When you replace an old spelling in the docs — for instance after
+adding a new canonical form with the old one as a deprecated alias — run
+`make conformance-shrink` to lower the list. A block that is deliberately not
+MDL (a counterexample, a template) goes in a ```` ```text ```` fence. Scripts that
+must keep an old spelling, to prove `fmt --upgrade` on it, live in
+`mdl-examples/deprecated-aliases/` (see its README).
 
 #### 5c. Mendix Studio Pro Validation
 
@@ -297,6 +325,30 @@ mxcli's primary value is that AI agents (Claude Code, Cursor, etc.) can generate
 | Claude uses outdated patterns | Update CLI help text (`Short`/`long`/`Example` in Cobra) |
 | Error messages are unhelpful | Improve error text with hints |
 
+### End-to-end testing on the web (build a real app + keep a findings doc)
+
+The highest-signal way to exercise mxcli is to **build a real Mendix app with it in
+[Claude Code on the web](https://claude.ai/code)** and record what breaks. This is
+the same loop the maintainers dogfood with (e.g. the `mxcli-traceops` /
+`mxcli-timeregistration` test apps), and it works from a laptop or an iPad — no
+local install.
+
+1. Create an **empty GitHub repo** and a Claude Code environment on it (set
+   `MXCLI_HUB_KEY` for browser preview; allow outbound HTTPS to GitHub Releases,
+   Mendix's CDN, and `hub.mxcli.org`).
+2. Paste the **[bootstrap prompt](https://mendixlabs.github.io/mxcli/tools/bootstrap-prompt.html)**
+   — it installs the toolchain, creates the app, starts a `FINDINGS.md`, commits,
+   and boots the app.
+3. Ask the agent to build real features (a domain model, CRUD pages, microflows),
+   and verify with `mxcli run --local` + `mxcli oql` and a real `mx check`.
+
+**Keep a `FINDINGS.md`** at the repo root as you go — one entry per surprise or
+defect: the exact MDL, the command, the error, the Mendix + mxcli versions, and how
+you verified it. A finding that reproduces against a real `mx check` is often enough
+to drive a fix straight into a finding under `.claude/skills/fix-issue/findings/`. The full
+workflow is documented in
+**[Developing on the Web (Claude Code)](https://mendixlabs.github.io/mxcli/tutorial/claude-code-web.html)**.
+
 ### PR Section
 
 Include in your PR:
@@ -396,7 +448,8 @@ If you're contributing from a fork, this is the full cycle:
 | Directory | Purpose |
 |-----------|---------|
 | `cmd/mxcli/` | CLI commands (Cobra) |
-| `sdk/mpr/` | MPR file reading/writing, BSON parsing |
+| `modelsdk/` | MPR file reading/writing, BSON codec, canonical form |
+| `mdl/backend/modelsdk/` | Backend implementation: semantic model ↔ BSON |
 | `sdk/microflows/`, `sdk/pages/`, etc. | Domain types |
 | `mdl/grammar/` | ANTLR4 grammar (`MDLParser.g4`, `MDLLexer.g4`) |
 | `mdl/ast/` | AST node types |
@@ -409,7 +462,7 @@ If you're contributing from a fork, this is the full cycle:
 
 ### BSON Storage Names
 
-**Critical**: Mendix uses different storage names in BSON `$type` fields than the qualified names in SDK documentation. Always verify against `reference/mendixmodellib/reflection-data/` or existing MPR files. See the table in `CLAUDE.md` for common mismatches.
+**Critical**: Mendix uses different storage names in BSON `$type` fields than the qualified names in SDK documentation. Always verify against the vendored types in `modelsdk/gen/` or existing MPR files. See the table in `CLAUDE.md` for common mismatches.
 
 ### BSON Tooling
 

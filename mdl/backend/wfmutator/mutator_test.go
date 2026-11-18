@@ -7,8 +7,7 @@ import (
 	"testing"
 
 	"github.com/mendixlabs/mxcli/sdk/workflows"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/v2/bson"
 
 	"github.com/mendixlabs/mxcli/mdl/backend/bsonnav"
 )
@@ -20,7 +19,7 @@ type testWfDeps struct{}
 
 func (testWfDeps) SerializeWorkflowActivity(a workflows.WorkflowActivity) bson.D {
 	return bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: "Workflows$SingleUserTaskActivity"},
 		{Key: "Caption", Value: a.GetCaption()},
 		{Key: "Name", Value: a.GetName()},
@@ -36,21 +35,21 @@ func makeWorkflowDoc(activities ...bson.D) bson.D {
 		actArr = append(actArr, a)
 	}
 	return bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: "Workflows$Workflow"},
 		{Key: "Title", Value: "Test Workflow"},
 		{Key: "WorkflowName", Value: bson.D{
-			{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+			{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 			{Key: "$Type", Value: "Texts$Text"},
 			{Key: "Text", Value: "Test Workflow"},
 		}},
 		{Key: "WorkflowDescription", Value: bson.D{
-			{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+			{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 			{Key: "$Type", Value: "Texts$Text"},
 			{Key: "Text", Value: "Original description"},
 		}},
 		{Key: "Flow", Value: bson.D{
-			{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+			{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 			{Key: "$Type", Value: "Workflows$Flow"},
 			{Key: "Activities", Value: actArr},
 		}},
@@ -59,7 +58,7 @@ func makeWorkflowDoc(activities ...bson.D) bson.D {
 
 func makeWfActivity(typeName, caption, name string) bson.D {
 	return bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: typeName},
 		{Key: "Caption", Value: caption},
 		{Key: "Name", Value: name},
@@ -72,7 +71,7 @@ func makeWfActivityWithBoundaryEvents(caption string, events ...bson.D) bson.D {
 		evtArr = append(evtArr, e)
 	}
 	return bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: "Workflows$UserTask"},
 		{Key: "Caption", Value: caption},
 		{Key: "Name", Value: "task1"},
@@ -82,7 +81,7 @@ func makeWfActivityWithBoundaryEvents(caption string, events ...bson.D) bson.D {
 
 func makeWfBoundaryEvent(typeName string) bson.D {
 	return bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: typeName},
 		{Key: "Caption", Value: ""},
 	}
@@ -117,7 +116,7 @@ func TestWorkflowMutator_SetProperty_Display(t *testing.T) {
 
 func TestWorkflowMutator_SetProperty_Display_NilSubDoc(t *testing.T) {
 	doc := bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: "Workflows$Workflow"},
 		{Key: "Title", Value: "Old"},
 		{Key: "Flow", Value: bson.D{
@@ -161,7 +160,7 @@ func TestWorkflowMutator_SetProperty_Description(t *testing.T) {
 
 func TestWorkflowMutator_SetProperty_Description_NilSubDoc(t *testing.T) {
 	doc := bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: "Workflows$Workflow"},
 		{Key: "Title", Value: "Test"},
 		{Key: "Flow", Value: bson.D{
@@ -265,6 +264,45 @@ func TestWorkflowMutator_FindActivity_Ambiguous(t *testing.T) {
 	}
 }
 
+// A jump's caption defaults to its target's name (buildJumpTo), so a reference
+// to the target used to match both and fail as ambiguous. A name is an activity's
+// identity; a caption is a label — without @N the name wins, and captions are
+// only consulted when no name matches. With @N every match still counts.
+func TestWorkflowMutator_FindActivity_NameBeatsJumpCaption(t *testing.T) {
+	target := makeWfActivity("Workflows$UserTask", "Split the jump", "bugSplitJump")
+	jump := makeWfActivity("Workflows$JumpToActivity", "bugSplitJump", "JumpTo")
+	m := newMutator(makeWorkflowDoc(target, jump))
+
+	got, err := m.findActivityByCaption("bugSplitJump", 0)
+	if err != nil {
+		t.Fatalf("findActivityByCaption: %v", err)
+	}
+	if name := bsonnav.DGetString(got, "Name"); name != "bugSplitJump" {
+		t.Errorf("resolved to %q, want the named activity", name)
+	}
+	idx, _, _, err := m.findActivityIndex("bugSplitJump", 0)
+	if err != nil {
+		t.Fatalf("findActivityIndex: %v", err)
+	}
+	if idx != 0 {
+		t.Errorf("index = %d, want 0", idx)
+	}
+	// The caption still addresses an activity whose name does not match.
+	got, err = m.findActivityByCaption("Split the jump", 0)
+	if err != nil || bsonnav.DGetString(got, "Name") != "bugSplitJump" {
+		t.Errorf("caption fallback: got %v, %v", got, err)
+	}
+	// @N still counts every match in document order (24-workflow-examples.mdl
+	// relies on this with ACT_Process@2).
+	got, err = m.findActivityByCaption("bugSplitJump", 2)
+	if err != nil || bsonnav.DGetString(got, "Name") != "JumpTo" {
+		t.Errorf("bugSplitJump@2: got %v, %v", got, err)
+	}
+	if idx, _, _, err := m.findActivityIndex("bugSplitJump", 2); err != nil || idx != 1 {
+		t.Errorf("findActivityIndex bugSplitJump@2: index %d, err %v", idx, err)
+	}
+}
+
 func TestWorkflowMutator_FindActivity_AtPosition(t *testing.T) {
 	act1 := makeWfActivity("Workflows$UserTask", "Review", "task1")
 	act2 := makeWfActivity("Workflows$UserTask", "Review", "task2")
@@ -336,7 +374,7 @@ func TestWorkflowMutator_DropBoundaryEvent_Single(t *testing.T) {
 	act := makeWfActivityWithBoundaryEvents("Review", evt)
 	m := newMutator(makeWorkflowDoc(act))
 
-	if err := m.DropBoundaryEvent("Review", 0); err != nil {
+	if err := m.DropBoundaryEvent("Review", 0, 0); err != nil {
 		t.Fatalf("DropBoundaryEvent failed: %v", err)
 	}
 
@@ -353,7 +391,7 @@ func TestWorkflowMutator_DropBoundaryEvent_Multiple(t *testing.T) {
 	act := makeWfActivityWithBoundaryEvents("Review", evt1, evt2)
 	m := newMutator(makeWorkflowDoc(act))
 
-	if err := m.DropBoundaryEvent("Review", 0); err != nil {
+	if err := m.DropBoundaryEvent("Review", 0, 0); err != nil {
 		t.Fatalf("DropBoundaryEvent failed: %v", err)
 	}
 
@@ -372,7 +410,7 @@ func TestWorkflowMutator_DropBoundaryEvent_NoEvents(t *testing.T) {
 	act := makeWfActivityWithBoundaryEvents("Review")
 	m := newMutator(makeWorkflowDoc(act))
 
-	err := m.DropBoundaryEvent("Review", 0)
+	err := m.DropBoundaryEvent("Review", 0, 0)
 	if err == nil {
 		t.Fatal("Expected error when dropping from activity with no boundary events")
 	}
@@ -521,7 +559,7 @@ func makeWfActivityWithOutcomes(caption, name string, outcomes ...bson.D) bson.D
 		arr = append(arr, o)
 	}
 	return bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: "Workflows$UserTask"},
 		{Key: "Caption", Value: caption},
 		{Key: "Name", Value: name},
@@ -531,7 +569,7 @@ func makeWfActivityWithOutcomes(caption, name string, outcomes ...bson.D) bson.D
 
 func makeOutcome(typeName, value string) bson.D {
 	d := bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: typeName},
 	}
 	if value != "" {
@@ -542,7 +580,7 @@ func makeOutcome(typeName, value string) bson.D {
 
 func makeBoolOutcome(val bool) bson.D {
 	return bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: "Workflows$BooleanConditionOutcome"},
 		{Key: "Value", Value: val},
 	}
@@ -550,7 +588,7 @@ func makeBoolOutcome(val bool) bson.D {
 
 func makeVoidConditionOutcome() bson.D {
 	return bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: "Workflows$VoidConditionOutcome"},
 	}
 }
@@ -800,11 +838,11 @@ func TestWorkflowMutator_InsertPath_WithActivities(t *testing.T) {
 
 func TestWorkflowMutator_DropPath_ByCaption(t *testing.T) {
 	path1 := bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: "Workflows$ParallelSplitOutcome"},
 	}
 	path2 := bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: "Workflows$ParallelSplitOutcome"},
 	}
 	act := makeWfActivityWithOutcomes("Split", "split1", path1, path2)
@@ -822,45 +860,17 @@ func TestWorkflowMutator_DropPath_ByCaption(t *testing.T) {
 	}
 }
 
-func TestWorkflowMutator_DropPath_EmptyCaption_DropsLast(t *testing.T) {
-	path1 := bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
-		{Key: "$Type", Value: "Workflows$ParallelSplitOutcome"},
-		{Key: "Tag", Value: "first"},
-	}
-	path2 := bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
-		{Key: "$Type", Value: "Workflows$ParallelSplitOutcome"},
-		{Key: "Tag", Value: "second"},
-	}
-	act := makeWfActivityWithOutcomes("Split", "split1", path1, path2)
-	m := newMutator(makeWorkflowDoc(act))
-
-	if err := m.DropPath("Split", 0, ""); err != nil {
-		t.Fatalf("DropPath empty caption failed: %v", err)
-	}
-
-	actDoc, _ := m.findActivityByCaption("Split", 0)
-	outcomes := bsonnav.DGetArrayElements(bsonnav.DGet(actDoc, "Outcomes"))
-	if len(outcomes) != 1 {
-		t.Fatalf("Expected 1 remaining path, got %d", len(outcomes))
-	}
-	oDoc := outcomes[0].(bson.D)
-	if got := bsonnav.DGetString(oDoc, "Tag"); got != "first" {
-		t.Errorf("Remaining path Tag = %q, want first", got)
-	}
-}
-
 func TestWorkflowMutator_DropPath_NotFound(t *testing.T) {
 	act := makeWfActivityWithOutcomes("Split", "split1")
+	act[1] = bson.E{Key: "$Type", Value: "Workflows$ParallelSplitActivity"}
 	m := newMutator(makeWorkflowDoc(act))
 
 	err := m.DropPath("Split", 0, "Path 99")
 	if err == nil {
 		t.Fatal("Expected error for missing path")
 	}
-	if !strings.Contains(err.Error(), "not found") {
-		t.Errorf("Error = %q, want 'not found'", err.Error())
+	if !strings.Contains(err.Error(), "no path 99") {
+		t.Errorf("Error = %q, want 'no path 99'", err.Error())
 	}
 }
 
@@ -891,8 +901,31 @@ func TestWorkflowMutator_InsertBranch_True(t *testing.T) {
 	}
 }
 
+// mendixlabs/mxcli#1373: Studio Pro stores a Flow and a PersistentId on every
+// outcome, so a branch inserted without them is one Mendix's merge engine
+// cannot compare with Studio Pro's next save of the workflow — for each kind of
+// branch, empty or not.
+func TestWorkflowMutator_InsertBranch_WritesStudioProPropertySet(t *testing.T) {
+	for _, cond := range []string{"true", "false", "default", "SomeEnumValue"} {
+		act := makeWfActivityWithOutcomes("Decision", "dec1")
+		act[1] = bson.E{Key: "$Type", Value: "Workflows$ExclusiveSplitActivity"}
+		m := newMutator(makeWorkflowDoc(act))
+		if err := m.InsertBranch("Decision", 0, cond, nil); err != nil {
+			t.Fatalf("%s: InsertBranch: %v", cond, err)
+		}
+		actDoc, _ := m.findActivityByCaption("Decision", 0)
+		oDoc := bsonnav.DGetArrayElements(bsonnav.DGet(actDoc, "Outcomes"))[0].(bson.D)
+		for _, key := range []string{"Flow", "PersistentId"} {
+			if bsonnav.DGet(oDoc, key) == nil {
+				t.Errorf("%s branch: no %s", cond, key)
+			}
+		}
+	}
+}
+
 func TestWorkflowMutator_InsertBranch_False(t *testing.T) {
 	act := makeWfActivityWithOutcomes("Decision", "dec1")
+	act[1] = bson.E{Key: "$Type", Value: "Workflows$ExclusiveSplitActivity"}
 	m := newMutator(makeWorkflowDoc(act))
 
 	if err := m.InsertBranch("Decision", 0, "false", nil); err != nil {
@@ -909,6 +942,7 @@ func TestWorkflowMutator_InsertBranch_False(t *testing.T) {
 
 func TestWorkflowMutator_InsertBranch_Default(t *testing.T) {
 	act := makeWfActivityWithOutcomes("Decision", "dec1")
+	act[1] = bson.E{Key: "$Type", Value: "Workflows$ExclusiveSplitActivity"}
 	m := newMutator(makeWorkflowDoc(act))
 
 	if err := m.InsertBranch("Decision", 0, "default", nil); err != nil {
@@ -925,6 +959,7 @@ func TestWorkflowMutator_InsertBranch_Default(t *testing.T) {
 
 func TestWorkflowMutator_InsertBranch_Enum(t *testing.T) {
 	act := makeWfActivityWithOutcomes("Decision", "dec1")
+	act[1] = bson.E{Key: "$Type", Value: "Workflows$ExclusiveSplitActivity"}
 	m := newMutator(makeWorkflowDoc(act))
 
 	if err := m.InsertBranch("Decision", 0, "MyModule.Status.Active", nil); err != nil {
@@ -944,6 +979,7 @@ func TestWorkflowMutator_InsertBranch_Enum(t *testing.T) {
 
 func TestWorkflowMutator_InsertBranch_WithActivities(t *testing.T) {
 	act := makeWfActivityWithOutcomes("Decision", "dec1")
+	act[1] = bson.E{Key: "$Type", Value: "Workflows$ExclusiveSplitActivity"}
 	m := newMutator(makeWorkflowDoc(act))
 
 	subAct := makeTestWorkflowActivity("branch_act", "BranchAct")
@@ -1066,7 +1102,7 @@ func TestWorkflowMutator_InsertBoundaryEvent_InterruptingTimer(t *testing.T) {
 	act = append(act, bson.E{Key: "BoundaryEvents", Value: bson.A{int32(3)}})
 	m := newMutator(makeWorkflowDoc(act))
 
-	if err := m.InsertBoundaryEvent("Review", 0, "InterruptingTimer", "PT1H", nil); err != nil {
+	if err := m.InsertBoundaryEvent("Review", 0, "InterruptingTimer", "PT1H", "", nil, nil); err != nil {
 		t.Fatalf("InsertBoundaryEvent failed: %v", err)
 	}
 
@@ -1084,12 +1120,29 @@ func TestWorkflowMutator_InsertBoundaryEvent_InterruptingTimer(t *testing.T) {
 	}
 }
 
+// ako/mxcli#1715: ALTER's insert writes a timer's caption; it was always "".
+func TestWorkflowMutator_InsertBoundaryEvent_Caption(t *testing.T) {
+	for _, caption := range []string{"Escalate", ""} {
+		act := makeWfActivity("Workflows$UserTask", "Review", "task1")
+		act = append(act, bson.E{Key: "BoundaryEvents", Value: bson.A{int32(3)}})
+		m := newMutator(makeWorkflowDoc(act))
+		if err := m.InsertBoundaryEvent("Review", 0, "InterruptingTimer", "PT1H", caption, nil, nil); err != nil {
+			t.Fatalf("InsertBoundaryEvent failed: %v", err)
+		}
+		actDoc, _ := m.findActivityByCaption("Review", 0)
+		eDoc := bsonnav.DGetArrayElements(bsonnav.DGet(actDoc, "BoundaryEvents"))[0].(bson.D)
+		if got := bsonnav.DGetString(eDoc, "Caption"); got != caption {
+			t.Errorf("Caption = %q, want %q", got, caption)
+		}
+	}
+}
+
 func TestWorkflowMutator_InsertBoundaryEvent_NonInterruptingTimer(t *testing.T) {
 	act := makeWfActivity("Workflows$UserTask", "Review", "task1")
 	act = append(act, bson.E{Key: "BoundaryEvents", Value: bson.A{int32(3)}})
 	m := newMutator(makeWorkflowDoc(act))
 
-	if err := m.InsertBoundaryEvent("Review", 0, "NonInterruptingTimer", "PT30M", nil); err != nil {
+	if err := m.InsertBoundaryEvent("Review", 0, "NonInterruptingTimer", "PT30M", "", nil, nil); err != nil {
 		t.Fatalf("InsertBoundaryEvent NonInterrupting failed: %v", err)
 	}
 
@@ -1117,7 +1170,7 @@ func TestWorkflowMutator_InsertBoundaryEvent_WithActivities(t *testing.T) {
 	m := newMutator(makeWorkflowDoc(act))
 
 	subAct := makeTestWorkflowActivity("evt_act", "EventAct")
-	if err := m.InsertBoundaryEvent("Review", 0, "Timer", "", []workflows.WorkflowActivity{subAct}); err != nil {
+	if err := m.InsertBoundaryEvent("Review", 0, "Timer", "", "", nil, []workflows.WorkflowActivity{subAct}); err != nil {
 		t.Fatalf("InsertBoundaryEvent with activities failed: %v", err)
 	}
 
@@ -1135,7 +1188,7 @@ func TestWorkflowMutator_InsertBoundaryEvent_NoDelay(t *testing.T) {
 	act = append(act, bson.E{Key: "BoundaryEvents", Value: bson.A{int32(3)}})
 	m := newMutator(makeWorkflowDoc(act))
 
-	if err := m.InsertBoundaryEvent("Review", 0, "Timer", "", nil); err != nil {
+	if err := m.InsertBoundaryEvent("Review", 0, "Timer", "", "", nil, nil); err != nil {
 		t.Fatalf("InsertBoundaryEvent no delay failed: %v", err)
 	}
 
@@ -1199,8 +1252,8 @@ func TestWorkflowMutator_SetActivityProperty_Page_MissingKey_NestedSubFlow(t *te
 	// Exercises the recursive replaceActivity path: the target activity lives
 	// inside an outcome's sub-flow, not at the top level.
 	// Use distinct $IDs so replaceActivity cannot accidentally match the parent.
-	parentID := primitive.Binary{Subtype: 0x04, Data: []byte{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
-	nestedID := primitive.Binary{Subtype: 0x04, Data: []byte{2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
+	parentID := bson.Binary{Subtype: 0x04, Data: []byte{1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
+	nestedID := bson.Binary{Subtype: 0x04, Data: []byte{2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
 
 	nestedAct := bson.D{
 		{Key: "$ID", Value: nestedID},
@@ -1211,10 +1264,10 @@ func TestWorkflowMutator_SetActivityProperty_Page_MissingKey_NestedSubFlow(t *te
 	// No TaskPage field at all on the nested activity.
 
 	outcome := bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: "Workflows$BooleanOutcome"},
 		{Key: "Flow", Value: bson.D{
-			{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+			{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 			{Key: "$Type", Value: "Workflows$Flow"},
 			{Key: "Activities", Value: bson.A{int32(3), nestedAct}},
 		}},
@@ -1254,7 +1307,7 @@ func TestWorkflowMutator_SetActivityProperty_Page_MissingKey_NestedSubFlow(t *te
 func TestWorkflowMutator_SetActivityProperty_Page_Existing(t *testing.T) {
 	act := makeWfActivity("Workflows$UserTask", "Review", "task1")
 	act = append(act, bson.E{Key: "TaskPage", Value: bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: "Workflows$PageReference"},
 		{Key: "Page", Value: "OldModule.OldPage"},
 	}})
@@ -1274,7 +1327,7 @@ func TestWorkflowMutator_SetActivityProperty_Page_Existing(t *testing.T) {
 func TestWorkflowMutator_SetActivityProperty_Description(t *testing.T) {
 	act := makeWfActivity("Workflows$UserTask", "Review", "task1")
 	act = append(act, bson.E{Key: "TaskDescription", Value: bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: "Texts$Text"},
 		{Key: "Text", Value: "old"},
 	}})
@@ -1391,7 +1444,7 @@ func TestWorkflowMutator_SetPropertyWithEntity_Parameter_New(t *testing.T) {
 func TestWorkflowMutator_SetPropertyWithEntity_Parameter_Update(t *testing.T) {
 	doc := makeWorkflowDoc()
 	doc = append(doc, bson.E{Key: "Parameter", Value: bson.D{
-		{Key: "$ID", Value: primitive.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
+		{Key: "$ID", Value: bson.Binary{Subtype: 0x04, Data: make([]byte, 16)}},
 		{Key: "$Type", Value: "Workflows$Parameter"},
 		{Key: "Entity", Value: "OldModule.OldEntity"},
 		{Key: "Name", Value: "WorkflowContext"},
@@ -1429,5 +1482,142 @@ func TestWorkflowMutator_SetPropertyWithEntity_Unsupported(t *testing.T) {
 	err := m.SetPropertyWithEntity("INVALID", "x", "y")
 	if err == nil {
 		t.Fatal("Expected error for unsupported property")
+	}
+}
+
+// ALTER WORKFLOW … INSERT PATH builds the path's BSON itself, so it must end the
+// path with Mendix's marker too — an empty path included — or the runtime skips
+// the path's contents (ako/view-entity-examples §6).
+func TestWorkflowMutator_InsertPath_EndsWithMarker(t *testing.T) {
+	for name, acts := range map[string][]workflows.WorkflowActivity{
+		"with activities": {makeTestWorkflowActivity("path_act", "PathAct")},
+		"empty":           nil,
+	} {
+		act := makeWfActivityWithOutcomes("Split", "split1")
+		act[1] = bson.E{Key: "$Type", Value: "Workflows$ParallelSplitActivity"}
+		m := newMutator(makeWorkflowDoc(act))
+		if err := m.InsertPath("Split", 0, "", acts); err != nil {
+			t.Fatalf("%s: InsertPath: %v", name, err)
+		}
+		actDoc, _ := m.findActivityByCaption("Split", 0)
+		outcomes := bsonnav.DGetArrayElements(bsonnav.DGet(actDoc, "Outcomes"))
+		flow := bsonnav.DGetDoc(outcomes[len(outcomes)-1].(bson.D), "Flow")
+		if flow == nil {
+			t.Fatalf("%s: path has no Flow", name)
+		}
+		items := bsonnav.DGetArrayElements(bsonnav.DGet(flow, "Activities"))
+		// testWfDeps stamps one $Type on every activity it serializes, so the
+		// $Type is the stub's, not the mutator's. What the mutator controls is
+		// that the marker is appended last: count and caption say so.
+		if want := len(acts) + 1; len(items) != want {
+			t.Fatalf("%s: path flow has %d activities, want %d (the path's plus the marker)", name, len(items), want)
+		}
+		last := items[len(items)-1].(bson.D)
+		if got := bsonnav.DGetString(last, "Caption"); got != "End of parallel split path" {
+			t.Errorf("%s: last activity caption = %q, want the end-of-path marker", name, got)
+		}
+	}
+}
+
+// ALTER WORKFLOW … INSERT BOUNDARY EVENT builds the event's flow itself, so it
+// must end the path with Mendix's marker too — an unterminated non-interrupting
+// path builds and then stops the runtime from starting. testWfDeps stamps one
+// $Type on everything, so the assertion is on count and caption.
+func TestWorkflowMutator_InsertBoundaryEvent_EndsWithMarker(t *testing.T) {
+	for name, tc := range map[string]struct {
+		eventType string
+		acts      []workflows.WorkflowActivity
+	}{
+		"interrupting with activities":     {"InterruptingTimer", []workflows.WorkflowActivity{makeTestWorkflowActivity("esc", "Escalate")}},
+		"non-interrupting with activities": {"NonInterruptingTimer", []workflows.WorkflowActivity{makeTestWorkflowActivity("esc", "Escalate")}},
+		"no body":                          {"InterruptingTimer", nil},
+	} {
+		act := makeWfActivity("Workflows$UserTask", "Review", "task1")
+		act = append(act, bson.E{Key: "BoundaryEvents", Value: bson.A{int32(3)}})
+		m := newMutator(makeWorkflowDoc(act))
+		if err := m.InsertBoundaryEvent("Review", 0, tc.eventType, "addHours([%CurrentDateTime%], 1)", "", nil, tc.acts); err != nil {
+			t.Fatalf("%s: InsertBoundaryEvent: %v", name, err)
+		}
+		actDoc, _ := m.findActivityByCaption("Review", 0)
+		events := bsonnav.DGetArrayElements(bsonnav.DGet(actDoc, "BoundaryEvents"))
+		flow := bsonnav.DGetDoc(events[len(events)-1].(bson.D), "Flow")
+		if flow == nil {
+			t.Fatalf("%s: boundary event has no Flow", name)
+		}
+		items := bsonnav.DGetArrayElements(bsonnav.DGet(flow, "Activities"))
+		if want := len(tc.acts) + 1; len(items) != want {
+			t.Fatalf("%s: flow has %d activities, want %d", name, len(items), want)
+		}
+		if got := bsonnav.DGetString(items[len(items)-1].(bson.D), "Caption"); got != "End of boundary event path" {
+			t.Errorf("%s: last activity caption = %q, want the end-of-path marker", name, got)
+		}
+	}
+}
+
+// ako/mxcli#808: a value is an outcome's only address and Mendix does not keep
+// it unique, so two outcomes with the same value make the drop a guess. It is
+// refused, and the document is left as it was.
+func TestWorkflowMutator_DropOutcome_DuplicateValueRefused(t *testing.T) {
+	act := makeWfActivityWithOutcomes("Review", "task1",
+		makeOutcome("Workflows$UserTaskOutcome", "Approve"),
+		makeOutcome("Workflows$UserTaskOutcome", "Approve"))
+	m := newMutator(makeWorkflowDoc(act))
+	err := m.DropOutcome("Review", 0, "Approve")
+	if err == nil || !strings.Contains(err.Error(), "ambiguous: 2 outcomes") {
+		t.Fatalf("want an ambiguity refusal, got %v", err)
+	}
+	actDoc, _ := m.findActivityByCaption("Review", 0)
+	if n := len(bsonnav.DGetArrayElements(bsonnav.DGet(actDoc, "Outcomes"))); n != 2 {
+		t.Errorf("refused drop changed the outcomes: %d left", n)
+	}
+}
+
+func TestWorkflowMutator_DropBranch_DuplicateValueRefused(t *testing.T) {
+	act := makeWfActivityWithOutcomes("Decision", "dec1",
+		makeOutcome("Workflows$EnumerationValueConditionOutcome", "Active"),
+		makeOutcome("Workflows$EnumerationValueConditionOutcome", "Active"))
+	m := newMutator(makeWorkflowDoc(act))
+	err := m.DropBranch("Decision", 0, "Active")
+	if err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("want an ambiguity refusal, got %v", err)
+	}
+}
+
+// ako/mxcli#808: `boundary event N` drops the N-th event (describe order).
+func TestWorkflowMutator_DropBoundaryEvent_ByIndex(t *testing.T) {
+	evt1 := makeWfBoundaryEvent("Workflows$InterruptingTimerBoundaryEvent")
+	evt2 := makeWfBoundaryEvent("Workflows$NonInterruptingTimerBoundaryEvent")
+	m := newMutator(makeWorkflowDoc(makeWfActivityWithBoundaryEvents("Review", evt1, evt2)))
+	if err := m.DropBoundaryEvent("Review", 0, 2); err != nil {
+		t.Fatal(err)
+	}
+	actDoc, _ := m.findActivityByCaption("Review", 0)
+	events := bsonnav.DGetArrayElements(bsonnav.DGet(actDoc, "BoundaryEvents"))
+	if len(events) != 1 || bsonnav.DGetString(events[0].(bson.D), "$Type") != "Workflows$InterruptingTimerBoundaryEvent" {
+		t.Fatalf("boundary event 2 did not drop the second event: %v", events)
+	}
+	if err := m.DropBoundaryEvent("Review", 0, 2); err == nil {
+		t.Fatal("boundary event 2 of 1 accepted")
+	}
+}
+
+// ako/mxcli#2242: a sixth boundary event is CE6696 in mx check. Only the
+// mutator sees the stored count, so it refuses the insert; five is the control.
+func TestWorkflowMutator_InsertBoundaryEvent_RefusesASixth(t *testing.T) {
+	act := makeWfActivity("Workflows$UserTask", "Review", "task1")
+	act = append(act, bson.E{Key: "BoundaryEvents", Value: bson.A{int32(3)}})
+	m := newMutator(makeWorkflowDoc(act))
+	for i := 1; i <= 5; i++ {
+		if err := m.InsertBoundaryEvent("Review", 0, "InterruptingTimer", "PT1H", "", nil, nil); err != nil {
+			t.Fatalf("insert %d of 5 refused: %v", i, err)
+		}
+	}
+	err := m.InsertBoundaryEvent("Review", 0, "InterruptingTimer", "PT1H", "", nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "CE6696") {
+		t.Fatalf("sixth insert: err = %v, want a CE6696 refusal", err)
+	}
+	actDoc, _ := m.findActivityByCaption("Review", 0)
+	if n := len(bsonnav.DGetArrayElements(bsonnav.DGet(actDoc, "BoundaryEvents"))); n != 5 {
+		t.Errorf("activity holds %d boundary events after the refusal, want 5", n)
 	}
 }

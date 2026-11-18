@@ -1,0 +1,51 @@
+mdl 1;
+-- ============================================================================
+-- Ledger finding #52: `break`/`continue` inside a conditional in a loop
+-- ============================================================================
+--
+-- History:
+--   * Originally, a `break` nested in an `if` within a loop passed
+--     `mxcli check` but serialized a DANGLING sequence-flow reference, and
+--     `mx check` CRASHED loading the project (unrecoverable AggregateException).
+--   * mendixlabs/mxcli#791 fixed the serialization (the Break/Continue event was
+--     being dropped); MDL051 (an interim reject-at-check guard) was then removed.
+--   * This finding surfaced the remaining gap: when the `if <cond> then break`
+--     was the LAST statement in the loop body, the decision was built with only
+--     its TRUE outgoing flow (→ break) — the FALSE case was deferred to a
+--     following statement that never came, so `mx check` reported CE0079
+--     ("the 'false' condition value should be configured on an outgoing
+--     sequence flow"). Recoverable, but the microflow would not deploy.
+--
+-- Fix: the loop-body builder now honours the deferred FALSE case and, when it
+-- falls off the end of the loop body, wires it to a Continue event — the valid
+-- Mendix representation of "didn't break, so continue to the next iteration".
+--
+-- Verified: exec -> raw `mx check` (Mendix 11.12.1) = 0 errors; the decision
+-- carries both a `true` flow (→ Break) and a `false` flow (→ Continue).
+-- ============================================================================
+
+create entity Ledger52.Rule (Name: String, Active: Boolean);
+create module role Ledger52.User;
+
+-- break as the LAST statement in the loop (the CE0079 case)
+create microflow Ledger52.FirstActive ($Rules: list of Ledger52.Rule) returns Boolean
+begin
+  loop $R in $Rules begin
+    if $R/Active then
+      break;
+    end if;
+  end loop;
+  return true;
+end;
+
+-- continue in a conditional
+create microflow Ledger52.SkipInactive ($Rules: list of Ledger52.Rule) returns Boolean
+begin
+  loop $R in $Rules begin
+    if $R/Active then
+      continue;
+    end if;
+    commit $R;
+  end loop;
+  return true;
+end;

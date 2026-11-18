@@ -8,6 +8,7 @@ import (
 
 	"github.com/mendixlabs/mxcli/mdl/ast"
 	"github.com/mendixlabs/mxcli/mdl/backend/mock"
+	mdltypes "github.com/mendixlabs/mxcli/mdl/types"
 	"github.com/mendixlabs/mxcli/model"
 )
 
@@ -86,7 +87,8 @@ func TestDescribeExportMapping_Mock(t *testing.T) {
 
 	ctx, buf := newMockCtx(t, withBackend(mb), withHierarchy(h))
 	assertNoError(t, describeExportMapping(ctx, ast.QualifiedName{Module: "Integration", Name: "ExportOrders"}))
-	assertContainsStr(t, buf.String(), "create export mapping")
+	// Re-runnable header, as for import mappings (#915).
+	assertContainsStr(t, buf.String(), "create or modify export mapping")
 }
 
 func TestDescribeExportMapping_NotFound(t *testing.T) {
@@ -126,6 +128,12 @@ func TestCreateExportMapping_OrModify_PreservesID(t *testing.T) {
 			updatedID = em.ID
 			return nil
 		},
+		// The mapping names a schema source, so the backend has to KNOW it:
+		// an unresolvable source is refused rather than written through (#259),
+		// and a mock with no structures reads as a project with none.
+		GetJsonStructureByQualifiedNameFunc: func(_, name string) (*mdltypes.JsonStructure, error) {
+			return &mdltypes.JsonStructure{Name: name}, nil
+		},
 	}
 
 	ctx, buf := newMockCtx(t, withBackend(mb), withHierarchy(h))
@@ -163,4 +171,28 @@ func TestCreateExportMapping_AlreadyExists_NoOrModify(t *testing.T) {
 		Name: ast.QualifiedName{Module: "Integration", Name: "ExportOrders"},
 	})
 	assertError(t, err)
+}
+
+// The export twin of TestDescribeImportMapping_MessageDefinition2Source
+// (ako/mxcli#987).
+func TestDescribeExportMapping_MessageDefinition2Source(t *testing.T) {
+	mod := mkModule("MsgTest")
+	src := "MsgTest.OrderMessage"
+	em := &model.ExportMapping{
+		BaseElement:        model.BaseElement{ID: nextID("em")},
+		ContainerID:        mod.ID,
+		Name:               "EXM_Order",
+		MessageDefinition2: &src,
+	}
+	h := mkHierarchy(mod)
+	withContainer(h, em.ContainerID, mod.ID)
+	mb := &mock.MockBackend{
+		IsConnectedFunc: func() bool { return true },
+		GetExportMappingByQualifiedNameFunc: func(string, string) (*model.ExportMapping, error) {
+			return em, nil
+		},
+	}
+	ctx, buf := newMockCtx(t, withBackend(mb), withHierarchy(h))
+	assertNoError(t, describeExportMapping(ctx, ast.QualifiedName{Module: "MsgTest", Name: "EXM_Order"}))
+	assertContainsStr(t, buf.String(), "with message definition MsgTest.OrderMessage")
 }

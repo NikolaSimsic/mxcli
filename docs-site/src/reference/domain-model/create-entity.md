@@ -5,7 +5,8 @@
     CREATE [ OR MODIFY ] entity_type ENTITY module.name
         [ EXTENDS parent_module.parent_entity ]
     (
-        attribute_name : data_type [ NOT NULL [ ERROR 'message' ] ]
+        attribute_name : data_type [ NOT LOCALIZED | LOCALIZED ]
+                                   [ NOT NULL [ ERROR 'message' ] ]
                                    [ UNIQUE [ ERROR 'message' ] ]
                                    [ DEFAULT value ]
                                    [ CALCULATED [ BY module.microflow ] ]
@@ -36,7 +37,7 @@ Where *entity_type* is one of:
 
 If `OR MODIFY` is specified, the statement is idempotent: if an entity with the same qualified name already exists, its attributes are updated to match the definition. New attributes are added, and existing attributes have their types and constraints updated. This is useful for repeatable scripts.
 
-The optional `EXTENDS` clause establishes generalization (inheritance). The child entity inherits all attributes from the parent and can add its own. Common parent entities include `System.User`, `System.FileDocument`, and `System.Image`. The `EXTENDS` clause must appear **before** the opening parenthesis.
+The optional `EXTENDS` clause establishes generalization (inheritance). The child entity inherits all attributes from the parent and can add its own. Common parent entities include `System.User`, `System.FileDocument`, and `System.Image`. The `EXTENDS` clause must appear **before** the opening parenthesis. A specialization inherits its persistability from the root of the generalization chain, which is the only place Mendix stores it: `PERSISTENT` or `NON-PERSISTENT` on it may restate the inherited value, and one that contradicts it is an error from both `check` and `exec`. Leave the keyword out to take whatever the chain says.
 
 Each attribute definition specifies a name, a data type, and optional constraints. Attributes are separated by commas. The supported data types are:
 
@@ -48,7 +49,6 @@ Each attribute definition specifies a name, a data type, and optional constraint
 | Decimal | `Decimal` | Arbitrary-precision decimal |
 | Boolean | `Boolean` | `TRUE` or `FALSE`; defaults to `FALSE` when no `DEFAULT` is given |
 | DateTime | `DateTime` | Date and time combined |
-| Date | `Date` | Date only |
 | AutoNumber | `AutoNumber` | Auto-incrementing integer (persistent entities only) |
 | Binary | `Binary` | Binary data |
 | HashedString | `HashedString` | One-way hashed string (for passwords) |
@@ -79,6 +79,9 @@ One or more `INDEX` clauses may follow the attribute list to create database ind
 
 **data_type**
 : The attribute's data type. See the table above for all supported types. `String` requires an explicit length argument.
+
+**NOT LOCALIZED | LOCALIZED**
+: DateTime only: Studio Pro's **Localize** setting (`LocalizeDate`). `NOT LOCALIZED` stores and shows the value without time-zone conversion (a calendar date such as a birth date); `LOCALIZED` states the default. On a new attribute no clause means localized; with `OR MODIFY`, no clause keeps the stored value and a stated one wins. On any other type it is an error. See [Constraints](../../language/constraints.md#localized--not-localized-datetime-only).
 
 **NOT NULL**
 : Marks the attribute as required. An optional `ERROR 'message'` clause provides a custom validation message shown when the constraint is violated.
@@ -117,15 +120,15 @@ CREATE PERSISTENT ENTITY Sales.Customer (
     CustomerId: AutoNumber NOT NULL UNIQUE DEFAULT 1,
 
     /** Customer full name */
-    Name: String(200) NOT NULL ERROR 'Name is required',
+    Name: String(200) NOT NULL ERROR MESSAGE 'Name is required',
 
-    Email: String(200) UNIQUE ERROR 'Email must be unique',
+    Email: String(200) UNIQUE ERROR MESSAGE 'Email must be unique',
 
     Balance: Decimal DEFAULT 0,
 
     IsActive: Boolean DEFAULT TRUE,
 
-    CreatedDate: DateTime,
+    CreatedDate: AutoCreatedDate,
 
     Status: Enumeration(Sales.CustomerStatus) DEFAULT 'Active'
 )
@@ -140,13 +143,14 @@ INDEX (Email);
 CREATE PERSISTENT ENTITY HR.Employee EXTENDS System.User (
     EmployeeNumber: String(20) NOT NULL UNIQUE,
     Department: String(100),
-    HireDate: Date
+    HireDate: DateTime
 );
 ```
 
 ### File and image entities
 
 ```sql
+mdl 1;
 CREATE PERSISTENT ENTITY Catalog.ProductPhoto EXTENDS System.Image (
     Caption: String(200),
     SortOrder: Integer DEFAULT 0
@@ -172,7 +176,7 @@ CREATE NON-PERSISTENT ENTITY Sales.CustomerFilter (
 
 ```sql
 CREATE OR MODIFY PERSISTENT ENTITY Sales.Customer (
-    CustomerId: AutoNumber NOT NULL UNIQUE,
+    CustomerId: AutoNumber NOT NULL UNIQUE DEFAULT 1,
     Name: String(200) NOT NULL,
     Email: String(200),
     Phone: String(50)
@@ -213,7 +217,7 @@ CREATE PERSISTENT ENTITY Sales.Order (
 
 ```sql
 CREATE PERSISTENT ENTITY Sales.Order (
-    OrderId: AutoNumber NOT NULL UNIQUE,
+    OrderId: AutoNumber NOT NULL UNIQUE DEFAULT 1,
     OrderNumber: String(50) NOT NULL UNIQUE,
     CustomerId: Long,
     OrderDate: DateTime,
@@ -252,10 +256,11 @@ INDEX (OrderDate DESC);
 
 - `String` requires an explicit length: `String(200)`. Use `String(unlimited)` for unbounded text.
 - `EXTENDS` must appear **before** the opening parenthesis, not after the closing one.
+- A member name must be unique along the generalization chain: a specialization cannot declare an attribute or own an association named like a member it inherits (from `System.User` and the other System entities too), and a generalization cannot gain one a specialization already has. An entity's attributes and associations share that name space; names differing only in case do not collide. `mxcli check` refuses it (MDL-MEMBER01); Mendix reports it as CE0069 "Duplicate member name".
 - Boolean attributes without an explicit `DEFAULT` automatically default to `FALSE`.
 - `AutoNumber` attributes are only valid on persistent entities.
 - The `@Position` annotation is optional and only affects the visual layout in Mendix Studio Pro.
-- Statements can be terminated with `;` or `/` (Oracle-style).
+- Every statement ends with `;`.
 
 ## See Also
 

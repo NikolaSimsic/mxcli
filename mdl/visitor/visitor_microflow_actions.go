@@ -9,10 +9,11 @@ import (
 	"github.com/antlr4-go/antlr/v4"
 	"github.com/mendixlabs/mxcli/mdl/ast"
 	"github.com/mendixlabs/mxcli/mdl/grammar/parser"
+	"github.com/mendixlabs/mxcli/sdk/microflows"
 )
 
 // buildLogStatement converts LOG statement context to LogStmt.
-// Grammar: LOG logLevel? (NODE expression)? expression logTemplateParams?
+// Grammar: LOG logLevel? (NODE expression)? expression logTemplateParams? logStackTrace?
 func buildLogStatement(ctx parser.ILogStatementContext) *ast.LogStmt {
 	if ctx == nil {
 		return nil
@@ -53,9 +54,9 @@ func buildLogStatement(ctx parser.ILogStatementContext) *ast.LogStmt {
 	if logCtx.NODE() != nil && len(exprs) > 1 {
 		stmt.Node = buildSourceExpression(exprs[0])
 		stmt.Node = appendLogNodeTrailingWhitespace(exprs[0], exprs[1], stmt.Node)
-		stmt.Message = buildSourceExpression(exprs[1])
+		stmt.Message = buildTemplateMessage(exprs[1], logCtx.LogTemplateParams() != nil)
 	} else if len(exprs) > 0 {
-		stmt.Message = buildSourceExpression(exprs[0])
+		stmt.Message = buildTemplateMessage(exprs[0], logCtx.LogTemplateParams() != nil)
 	}
 
 	// Parse template parameters: WITH ({1} = expr, {2} = expr, ...)
@@ -64,6 +65,14 @@ func buildLogStatement(ctx parser.ILogStatementContext) *ast.LogStmt {
 		if tplParams := logParamsCtx.TemplateParams(); tplParams != nil {
 			stmt.Template = buildTemplateParams(tplParams)
 		}
+	}
+
+	// WITH STACKTRACE: "Include latest stack trace" (mendixlabs/mxcli#1543)
+	stmt.IncludeLatestStackTrace = logCtx.LogStackTrace() != nil
+
+	// Check for ON ERROR clause
+	if errClause := logCtx.OnErrorClause(); errClause != nil {
+		stmt.ErrorHandling = buildOnErrorClause(errClause)
 	}
 
 	return stmt
@@ -83,8 +92,16 @@ func buildTemplateParams(ctx parser.ITemplateParamsContext) []ast.TemplateParam 
 	allParams := paramsCtx.AllTemplateParam()
 	for i, param := range allParams {
 		paramCtx := param.(*parser.TemplateParamContext)
-		indexStr := paramCtx.NUMBER_LITERAL().GetText()
-		index, _ := strconv.Atoi(indexStr)
+		// The grammar requires at least one parameter, so `with ()` does not
+		// parse — but ANTLR error-recovers by handing the walker a templateParam
+		// with no index token rather than by skipping the rule. The syntax error
+		// is already reported; dereferencing here killed the whole process
+		// instead of failing the one statement (FINDINGS §55).
+		numTok := paramCtx.NUMBER_LITERAL()
+		if numTok == nil {
+			continue
+		}
+		index, _ := strconv.Atoi(numTok.GetText())
 
 		var tp ast.TemplateParam
 		tp.Index = index
@@ -343,13 +360,36 @@ func appendSourceExpressionSuffix(
 	expr ast.Expression,
 	suffix string,
 ) ast.Expression {
-	source := strings.TrimSpace(extractOriginalText(exprCtx.(antlr.ParserRuleContext)))
+	prc := exprCtx.(antlr.ParserRuleContext)
+	// Strip identifier quotes as buildSourceExpression does: this raw text is
+	// what gets stored, so $Other/"C" kept its quotes — CE0117, only on a slot
+	// with whitespace before its delimiter (mendixlabs/mxcli#1481).
+	source := stripExpressionIdentifierQuotes(storedExpressionSource(strings.TrimSpace(extractExpressionText(prc)), lexedWithStrictEscapes(prc)))
 	innerExpr := expr
 	if sourceExpr, ok := expr.(*ast.SourceExpr); ok {
 		source = sourceExpr.Source
 		innerExpr = sourceExpr.Expression
 	}
 	return &ast.SourceExpr{Expression: innerExpr, Source: source + suffix}
+}
+
+// buildQueueClause converts an `IN QUEUE Module.Name` clause into a qualified
+// name, or returns nil when the call is not queued. Shared by CALL MICROFLOW and
+// CALL JAVA ACTION — the only two activities Mendix can run on a task queue.
+func buildQueueClause(ctx parser.IQueueClauseContext) *ast.QualifiedName {
+	if ctx == nil {
+		return nil
+	}
+	qc, ok := ctx.(*parser.QueueClauseContext)
+	if !ok {
+		return nil
+	}
+	qn := qc.QualifiedName()
+	if qn == nil {
+		return nil
+	}
+	name := buildQualifiedName(qn)
+	return &name
 }
 
 // buildCallMicroflowStatement converts CALL MICROFLOW statement context to CallMicroflowStmt.
@@ -376,6 +416,10 @@ func buildCallMicroflowStatement(ctx parser.ICallMicroflowStatementContext) *ast
 	if argList := callCtx.CallArgumentList(); argList != nil {
 		stmt.Arguments = buildCallArgumentList(argList)
 	}
+
+	// IN QUEUE Module.Name [RETRY …] — runs the call on a task queue.
+	stmt.Queue = buildQueueClause(callCtx.QueueClause())
+	stmt.QueueRetry = buildQueueRetry(callCtx.QueueClause())
 
 	// Check for ON ERROR clause
 	if errClause := callCtx.OnErrorClause(); errClause != nil {
@@ -443,6 +487,10 @@ func buildCallJavaActionStatement(ctx parser.ICallJavaActionStatementContext) *a
 		stmt.Arguments = buildCallArgumentList(argList)
 	}
 
+	// IN QUEUE Module.Name [RETRY …] — runs the call on a task queue.
+	stmt.Queue = buildQueueClause(callCtx.QueueClause())
+	stmt.QueueRetry = buildQueueRetry(callCtx.QueueClause())
+
 	// Check for ON ERROR clause
 	if errClause := callCtx.OnErrorClause(); errClause != nil {
 		stmt.ErrorHandling = buildOnErrorClause(errClause)
@@ -492,13 +540,20 @@ func buildCallWebServiceStatement(ctx parser.ICallWebServiceStatementContext) *a
 	callCtx := ctx.(*parser.CallWebServiceStatementContext)
 
 	stmt := &ast.CallWebServiceStmt{}
-	if v := callCtx.VARIABLE(); v != nil {
-		stmt.OutputVariable = strings.TrimPrefix(v.GetText(), "$")
+	// Two VARIABLE positions now: the output variable before EQUALS, and the
+	// send mapping's source after FROM. Walk them positionally against the
+	// tokens that gate each, as the webServiceReference walk below does — with
+	// no output variable, the send variable IS the first one.
+	vars := callCtx.AllVARIABLE()
+	varIdx := 0
+	if callCtx.EQUALS() != nil && len(vars) > varIdx {
+		stmt.OutputVariable = strings.TrimPrefix(vars[varIdx].GetText(), "$")
+		varIdx++
 	}
 
 	if callCtx.RAW() != nil {
 		if lit := callCtx.STRING_LITERAL(); lit != nil {
-			stmt.RawBSONBase64 = unquoteString(lit.GetText())
+			stmt.RawBSONBase64 = unquoteStringLit(lit)
 		}
 		if errClause := callCtx.OnErrorClause(); errClause != nil {
 			stmt.ErrorHandling = buildOnErrorClause(errClause)
@@ -518,10 +573,16 @@ func buildCallWebServiceStatement(ctx parser.ICallWebServiceStatementContext) *a
 	if callCtx.OPERATION() != nil && len(refs) > idx {
 		stmt.OperationName = webServiceReferenceText(refs[idx])
 		idx++
+		if argList := callCtx.CallArgumentList(); argList != nil {
+			stmt.Arguments = buildCallArgumentList(argList)
+		}
 	}
 	if callCtx.SEND() != nil && len(refs) > idx {
 		stmt.SendMappingID = webServiceReferenceText(refs[idx])
 		idx++
+		if callCtx.FROM() != nil && len(vars) > varIdx {
+			stmt.SendMappingVariable = strings.TrimPrefix(vars[varIdx].GetText(), "$")
+		}
 	}
 	if callCtx.RECEIVE() != nil && len(refs) > idx {
 		stmt.ReceiveMappingID = webServiceReferenceText(refs[idx])
@@ -542,7 +603,7 @@ func webServiceReferenceText(ctx parser.IWebServiceReferenceContext) string {
 	}
 	refCtx := ctx.(*parser.WebServiceReferenceContext)
 	if lit := refCtx.STRING_LITERAL(); lit != nil {
-		return unquoteString(lit.GetText())
+		return unquoteStringLit(lit)
 	}
 	return getQualifiedNameText(refCtx.QualifiedName())
 }
@@ -569,11 +630,14 @@ func buildExecuteDatabaseQueryStatement(ctx parser.IExecuteDatabaseQueryStatemen
 	// Get dynamic query if present
 	if execCtx.DYNAMIC() != nil {
 		if sl := execCtx.STRING_LITERAL(); sl != nil {
-			stmt.DynamicQuery = unquoteString(sl.GetText())
+			stmt.DynamicQuery = unquoteStringLit(sl)
 		} else if ds := execCtx.DOLLAR_STRING(); ds != nil {
 			stmt.DynamicQuery = unquoteDollarString(ds.GetText())
 		} else if expr := execCtx.Expression(); expr != nil {
-			stmt.DynamicQuery = expr.GetText()
+			// A Mendix expression stored as written: a string in it stores
+			// its value, as in any other (storedExpressionSource, #825).
+			stmt.DynamicQuery = storedExpressionSource(expressionSourceText(expr), lexedWithStrictEscapes(expr))
+			stmt.DynamicQueryIsExpression = true
 		}
 	}
 
@@ -666,15 +730,51 @@ func buildCallArgumentList(ctx parser.ICallArgumentListContext) []ast.CallArgume
 		} else if pn := arg.ParameterName(); pn != nil {
 			ca.Name = parameterNameText(pn)
 		}
-		if expr := arg.Expression(); expr != nil {
+		if arg.NOTHING() != nil {
+			// `Param = nothing`: a blank argument, stored as "" (ExitCallArgument
+			// refuses it outside call microflow / call nanoflow / call external action).
+			ca.Value = &ast.BlankExpr{}
+		} else if expr := arg.Expression(); expr != nil {
 			value := buildSourceExpression(expr)
-			ca.Value = appendExpressionListTrailingWhitespace(listCtx, nextParserRuleContext(allArgs, i), expr, value)
+			if tp := arg.TemplateParams(); tp != nil {
+				// The template text ends at `with`, so there is no trailing
+				// whitespace before `)` to keep.
+				ca.Value = value
+				ca.TemplateParams = buildTemplateParams(tp)
+			} else if arg.IncludeAssociationsClause() != nil {
+				ca.Value = value // ends at `include`, as above
+			} else {
+				ca.Value = appendExpressionListTrailingWhitespace(listCtx, nextParserRuleContext(allArgs, i), expr, value)
+			}
+		}
+
+		if ic := arg.IncludeAssociationsClause(); ic != nil {
+			ca.IncludeAssociations = buildIncludeAssociationsClause(ic)
 		}
 
 		args = append(args, ca)
 	}
 
 	return args
+}
+
+// buildIncludeAssociationsClause converts `include associations ( … )`.
+func buildIncludeAssociationsClause(ctx parser.IIncludeAssociationsClauseContext) *ast.IncludeAssociationsClause {
+	c := ctx.(*parser.IncludeAssociationsClauseContext)
+	clause := &ast.IncludeAssociationsClause{Associations: []*ast.IncludedAssociationDef{}}
+	for _, n := range c.AllIncludedAssociation() {
+		clause.Associations = append(clause.Associations, buildIncludedAssociation(n))
+	}
+	return clause
+}
+
+func buildIncludedAssociation(ctx parser.IIncludedAssociationContext) *ast.IncludedAssociationDef {
+	n := ctx.(*parser.IncludedAssociationContext)
+	def := &ast.IncludedAssociationDef{Name: buildQualifiedName(n.QualifiedName())}
+	for _, c := range n.AllIncludedAssociation() {
+		def.Children = append(def.Children, buildIncludedAssociation(c))
+	}
+	return def
 }
 
 // buildMemberAssignmentList converts memberAssignmentList context to ChangeItem slice.
@@ -693,6 +793,40 @@ func buildMemberAssignmentList(ctx parser.IMemberAssignmentListContext) []ast.Ch
 		// Get attribute name (can be IDENTIFIER, keyword, or quoted identifier)
 		if name := assign.MemberAttributeName(); name != nil {
 			ci.Attribute = memberAttributeNameText(name)
+		}
+		if expr := assign.Expression(); expr != nil {
+			value := buildSourceExpression(expr)
+			ci.Value = appendExpressionListTrailingWhitespace(listCtx, nextParserRuleContext(allAssignments, i), expr, value)
+		}
+
+		items = append(items, ci)
+	}
+
+	return items
+}
+
+// buildChangeMemberAssignmentList converts a CHANGE statement's member list,
+// whose members may also be `+=` (Add) or `-=` (Remove), to ChangeItem slice.
+func buildChangeMemberAssignmentList(ctx parser.IChangeMemberAssignmentListContext) []ast.ChangeItem {
+	if ctx == nil {
+		return nil
+	}
+	listCtx := ctx.(*parser.ChangeMemberAssignmentListContext)
+	var items []ast.ChangeItem
+
+	allAssignments := listCtx.AllChangeMemberAssignment()
+	for i, assignCtx := range allAssignments {
+		assign := assignCtx.(*parser.ChangeMemberAssignmentContext)
+		ci := ast.ChangeItem{}
+
+		if name := assign.MemberAttributeName(); name != nil {
+			ci.Attribute = memberAttributeNameText(name)
+		}
+		switch {
+		case assign.PLUS() != nil:
+			ci.Op = ast.MemberAdd
+		case assign.MINUS() != nil:
+			ci.Op = ast.MemberRemove
 		}
 		if expr := assign.Expression(); expr != nil {
 			value := buildSourceExpression(expr)
@@ -751,7 +885,21 @@ func buildListOperationStatement(ctx parser.IListOperationStatementContext) *ast
 		stmt.OutputVariable = strings.TrimPrefix(v.GetText(), "$")
 	}
 
-	// Get the list operation
+	// The statement form: one Studio Pro activity (#733).
+	if act, ok := listOpCtx.ListOperationActivity().(*parser.ListOperationActivityContext); ok && act != nil {
+		buildListOperationActivity(act, stmt)
+		return stmt
+	}
+
+	// The call form. For find/filter it is a respelling of `by` when the
+	// condition reads `Member = value` and of `where` otherwise, so it records
+	// which, exactly as the flow builder has always decided (ast.IsMemberEquality).
+	defer func() {
+		if stmt.Operation == ast.ListOpFind || stmt.Operation == ast.ListOpFilter {
+			stmt.Condition = ast.MemberEqualityCondition(stmt.Condition) // ako/mxcli#1943
+			stmt.ByExpression = !ast.IsMemberEquality(stmt.Condition)
+		}
+	}()
 	if opCtx := listOpCtx.ListOperation(); opCtx != nil {
 		op := opCtx.(*parser.ListOperationContext)
 
@@ -865,9 +1013,7 @@ func buildSortSpecList(ctx parser.ISortSpecListContext) []ast.SortSpec {
 			Ascending: true, // Default to ascending
 		}
 
-		if id := spec.IDENTIFIER(); id != nil {
-			ss.Attribute = id.GetText()
-		}
+		ss.Attribute = identifierOrKeywordText(spec.IdentifierOrKeyword())
 		if spec.DESC() != nil {
 			ss.Ascending = false
 		}
@@ -893,7 +1039,13 @@ func buildAggregateListStatement(ctx parser.IAggregateListStatementContext) *ast
 		stmt.OutputVariable = strings.TrimPrefix(v.GetText(), "$")
 	}
 
-	// Get the aggregate operation
+	// The statement form: one Studio Pro Aggregate list activity (#733).
+	if act, ok := aggrCtx.AggregateListActivity().(*parser.AggregateListActivityContext); ok && act != nil {
+		buildAggregateListActivity(act, stmt)
+		return stmt
+	}
+
+	// The call form, a deprecated alias of the above.
 	if opCtx := aggrCtx.ListAggregateOperation(); opCtx != nil {
 		op := opCtx.(*parser.ListAggregateOperationContext)
 
@@ -947,6 +1099,41 @@ func buildAggregateListStatement(ctx parser.IAggregateListStatementContext) *ast
 			} else if path := op.AttributePath(); path != nil {
 				stmt.InputVariable, stmt.Attribute = parseAttributePath(path.GetText())
 			}
+		} else if op.REDUCE() != nil {
+			// REDUCE($list, expr, initial: seed, returns: Type). Expression(0) is
+			// the fold body; the seed lives inside reduceFoldOptions, which the
+			// grammar makes mandatory, so a well-formed parse always has both.
+			stmt.Operation = ast.AggregateReduce
+			stmt.IsExpression = true
+			if v := op.VARIABLE(); v != nil {
+				stmt.InputVariable = strings.TrimPrefix(v.GetText(), "$")
+			}
+			if exprCtx := op.Expression(); exprCtx != nil {
+				stmt.Expression = buildSourceExpression(exprCtx)
+			}
+			if opts, ok := op.ReduceFoldOptions().(*parser.ReduceFoldOptionsContext); ok && opts != nil {
+				if seed := opts.Expression(); seed != nil {
+					stmt.InitialValue = buildSourceExpression(seed)
+				}
+				if dt := opts.DataType(); dt != nil {
+					t := buildDataType(dt)
+					stmt.ReturnType = &t
+				}
+			}
+		} else if op.ALL() != nil || op.ANY() != nil {
+			// Boolean predicates over the list. No seed, and the return type is
+			// always Boolean, so neither is written in MDL.
+			stmt.Operation = ast.AggregateAll
+			if op.ANY() != nil {
+				stmt.Operation = ast.AggregateAny
+			}
+			stmt.IsExpression = true
+			if v := op.VARIABLE(); v != nil {
+				stmt.InputVariable = strings.TrimPrefix(v.GetText(), "$")
+			}
+			if exprCtx := op.Expression(); exprCtx != nil {
+				stmt.Expression = buildSourceExpression(exprCtx)
+			}
 		}
 	}
 
@@ -999,11 +1186,15 @@ func buildCreateListStatement(ctx parser.ICreateListStatementContext) *ast.Creat
 		stmt.EntityType = buildQualifiedName(qn)
 	}
 
+	if errClause := createCtx.OnErrorClause(); errClause != nil {
+		stmt.ErrorHandling = buildOnErrorClause(errClause)
+	}
+
 	return stmt
 }
 
 // buildAddToListStatement converts add to list statement context to AddToListStmt.
-// Grammar: ADD expression TO VARIABLE
+// Grammar: ADD expression TO (VARIABLE | associationMemberTarget)
 func buildAddToListStatement(ctx parser.IAddToListStatementContext) *ast.AddToListStmt {
 	if ctx == nil {
 		return nil
@@ -1021,12 +1212,20 @@ func buildAddToListStatement(ctx parser.IAddToListStatementContext) *ast.AddToLi
 	if v := addCtx.VARIABLE(); v != nil {
 		stmt.List = strings.TrimPrefix(v.GetText(), "$")
 	}
+	if target := addCtx.AssociationMemberTarget(); target != nil {
+		stmt.List, stmt.Association = associationMemberTargetParts(target)
+		stmt.Commit = buildCommitClause(addCtx.CommitClause())
+		stmt.RefreshInClient = addCtx.REFRESH() != nil
+	}
+	if errClause := addCtx.OnErrorClause(); errClause != nil {
+		stmt.ErrorHandling = buildOnErrorClause(errClause)
+	}
 
 	return stmt
 }
 
 // buildRemoveFromListStatement converts remove from list statement context to RemoveFromListStmt.
-// Grammar: REMOVE VARIABLE FROM VARIABLE
+// Grammar: REMOVE VARIABLE FROM (VARIABLE | associationMemberTarget)
 func buildRemoveFromListStatement(ctx parser.IRemoveFromListStatementContext) *ast.RemoveFromListStmt {
 	if ctx == nil {
 		return nil
@@ -1043,8 +1242,23 @@ func buildRemoveFromListStatement(ctx parser.IRemoveFromListStatementContext) *a
 	if len(vars) >= 2 {
 		stmt.List = strings.TrimPrefix(vars[1].GetText(), "$")
 	}
+	if target := removeCtx.AssociationMemberTarget(); target != nil {
+		stmt.List, stmt.Association = associationMemberTargetParts(target)
+		stmt.Commit = buildCommitClause(removeCtx.CommitClause())
+		stmt.RefreshInClient = removeCtx.REFRESH() != nil
+	}
+	if errClause := removeCtx.OnErrorClause(); errClause != nil {
+		stmt.ErrorHandling = buildOnErrorClause(errClause)
+	}
 
 	return stmt
+}
+
+// associationMemberTargetParts splits `$Obj/Module.Assoc` into the object
+// variable and the association name, unquoted like a CHANGE member.
+func associationMemberTargetParts(ctx parser.IAssociationMemberTargetContext) (string, string) {
+	t := ctx.(*parser.AssociationMemberTargetContext)
+	return strings.TrimPrefix(t.VARIABLE().GetText(), "$"), getQualifiedNameText(t.QualifiedName())
 }
 
 // ============================================================================
@@ -1106,9 +1320,16 @@ func buildShowPageStatement(ctx parser.IShowPageStatementContext) *ast.ShowPageS
 							stmt.ModalForm = b
 						}
 					}
+				case "numberofpagestoclose":
+					stmt.NumberOfPagesToClose = change.Value
 				}
 			}
 		}
+	}
+
+	// Check for ON ERROR clause
+	if errClause := showCtx.OnErrorClause(); errClause != nil {
+		stmt.ErrorHandling = buildOnErrorClause(errClause)
 	}
 
 	return stmt
@@ -1128,14 +1349,20 @@ func buildShowPageArgList(ctx parser.IShowPageArgListContext) []ast.ShowPageArg 
 		arg := argCtx.(*parser.ShowPageArgContext)
 		spa := ast.ShowPageArg{}
 
-		if iok := arg.IdentifierOrKeyword(); iok != nil {
-			// Widget-style: Param: $value
+		if pn := arg.ParameterName(); pn != nil {
+			// Canonical (R4): Param = $value
+			spa.ParamName = parameterNameText(pn)
+			if expr := arg.Expression(); expr != nil {
+				spa.Value = buildSourceExpression(expr)
+			}
+		} else if iok := arg.IdentifierOrKeyword(); iok != nil {
+			// Deprecated (MDL-DEPR007): Param: $value
 			spa.ParamName = identifierOrKeywordText(iok)
 			if expr := arg.Expression(); expr != nil {
 				spa.Value = buildSourceExpression(expr)
 			}
 		} else {
-			// Canonical: $Param = $value
+			// Deprecated (MDL-DEPR006): $Param = $value
 			vars := arg.AllVARIABLE()
 			if len(vars) >= 1 {
 				spa.ParamName = strings.TrimPrefix(vars[0].GetText(), "$")
@@ -1166,14 +1393,22 @@ func buildShowMessageStatement(ctx parser.IShowMessageStatementContext) *ast.Sho
 	}
 
 	if expr := smCtx.Expression(); expr != nil {
-		stmt.Message = buildSourceExpression(expr)
+		stmt.Message = buildTemplateMessage(expr, smCtx.TemplateParams() != nil || smCtx.OBJECTS() != nil)
 	}
 
 	if id := smCtx.IdentifierOrKeyword(); id != nil {
-		stmt.Type = id.GetText()
+		// Stored in the enumeration's spelling: `type error` stored as "error"
+		// showed an Information dialog (mendixlabs/mxcli#1280). A word that is
+		// no ShowMessageType is kept as written for check to name.
+		t, _ := microflows.CanonicalMessageType(unquoteIdentifier(id.GetText()))
+		stmt.Type = string(t)
 	}
 
-	// Build template arguments (optional)
+	// Build template arguments (optional): `with ({1} = e)`, or the deprecated
+	// positional `objects [e]` (MDL-DEPR009).
+	if tp := smCtx.TemplateParams(); tp != nil {
+		stmt.TemplateArgs = templateArgsByNumber(buildTemplateParams(tp))
+	}
 	if exprList := smCtx.ExpressionList(); exprList != nil {
 		listCtx := exprList.(*parser.ExpressionListContext)
 		allExprs := listCtx.AllExpression()
@@ -1182,6 +1417,17 @@ func buildShowMessageStatement(ctx parser.IShowMessageStatementContext) *ast.Sho
 			value = appendExpressionListTrailingWhitespace(listCtx, nextParserRuleContext(allExprs, i), expr, value)
 			stmt.TemplateArgs = append(stmt.TemplateArgs, value)
 		}
+	}
+
+	// BLOCKING — Studio Pro's "blocking" checkbox. The model carried this on
+	// both engines already; MDL had no word for it, so DESCRIBE could not emit
+	// it and a describe -> exec round trip turned a blocking message box into a
+	// non-blocking one (16 microflows measured across 4 projects).
+	stmt.Blocking = smCtx.BLOCKING() != nil
+
+	// Check for ON ERROR clause
+	if errClause := smCtx.OnErrorClause(); errClause != nil {
+		stmt.ErrorHandling = buildOnErrorClause(errClause)
 	}
 
 	return stmt
@@ -1199,6 +1445,34 @@ func buildDownloadFileStatement(ctx parser.IDownloadFileStatementContext) *ast.D
 	}
 	stmt.ShowInBrowser = dlCtx.BROWSER() != nil
 	if errClause := dlCtx.OnErrorClause(); errClause != nil {
+		stmt.ErrorHandling = buildOnErrorClause(errClause)
+	}
+	return stmt
+}
+
+// buildSynchronizeStatement converts synchronizeStatement context to SynchronizeStmt.
+// Grammar: SYNCHRONIZE (ALL | UNSYNCHRONIZED | VARIABLE (COMMA VARIABLE)*) onErrorClause?
+//
+// The mode words map to the platform's SynchronizationType values, which are NOT
+// Studio Pro's UI wording: the variable form is "Specific", not "Selected".
+func buildSynchronizeStatement(ctx parser.ISynchronizeStatementContext) *ast.SynchronizeStmt {
+	if ctx == nil {
+		return nil
+	}
+	syncCtx := ctx.(*parser.SynchronizeStatementContext)
+	stmt := &ast.SynchronizeStmt{}
+	switch {
+	case syncCtx.UNSYNCHRONIZED() != nil:
+		stmt.SyncType = "Unsynchronized"
+	case syncCtx.ALL() != nil:
+		stmt.SyncType = "All"
+	default:
+		stmt.SyncType = "Specific"
+		for _, v := range syncCtx.AllVARIABLE() {
+			stmt.Variables = append(stmt.Variables, strings.TrimPrefix(v.GetText(), "$"))
+		}
+	}
+	if errClause := syncCtx.OnErrorClause(); errClause != nil {
 		stmt.ErrorHandling = buildOnErrorClause(errClause)
 	}
 	return stmt
@@ -1225,10 +1499,14 @@ func buildValidationFeedbackStatement(ctx parser.IValidationFeedbackStatementCon
 
 	// Build message expression
 	if msgExpr := vfCtx.Expression(); msgExpr != nil {
-		stmt.Message = buildSourceExpression(msgExpr)
+		stmt.Message = buildTemplateMessage(msgExpr, vfCtx.TemplateParams() != nil || vfCtx.OBJECTS() != nil)
 	}
 
-	// Build template arguments (optional)
+	// Build template arguments (optional): `with ({1} = e)`, or the deprecated
+	// positional `objects [e]` (MDL-DEPR009).
+	if tp := vfCtx.TemplateParams(); tp != nil {
+		stmt.TemplateArgs = templateArgsByNumber(buildTemplateParams(tp))
+	}
 	if exprList := vfCtx.ExpressionList(); exprList != nil {
 		listCtx := exprList.(*parser.ExpressionListContext)
 		allExprs := listCtx.AllExpression()
@@ -1239,7 +1517,32 @@ func buildValidationFeedbackStatement(ctx parser.IValidationFeedbackStatementCon
 		}
 	}
 
+	// Check for ON ERROR clause
+	if errClause := vfCtx.OnErrorClause(); errClause != nil {
+		stmt.ErrorHandling = buildOnErrorClause(errClause)
+	}
+
 	return stmt
+}
+
+// attributePathTargetText reconstructs the normalized "$Variable<sep>Segment..."
+// text of an attribute path with each qualified-name segment unquoted. Used for
+// SET targets, whose string form is later split on '/' to derive the member
+// (attribute or association) name; carrying quotes through would corrupt the
+// serialized member identifier.
+func attributePathTargetText(ctx parser.IAttributePathContext) string {
+	ap := buildAttributePathFromContext(ctx)
+	if ap == nil {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("$")
+	sb.WriteString(ap.Variable)
+	for _, seg := range ap.Segments {
+		sb.WriteString(seg.Separator)
+		sb.WriteString(seg.Name)
+	}
+	return sb.String()
 }
 
 // buildAttributePathFromContext builds an AttributePathExpr from attributePath context.
@@ -1277,7 +1580,12 @@ func buildAttributePathFromContext(ctx parser.IAttributePathContext) *ast.Attrib
 				result.Segments = append(result.Segments, ast.PathSegment{Name: name, Separator: lastSep})
 			}
 		} else if qn, ok := child.(parser.IQualifiedNameContext); ok {
-			name := qn.GetText()
+			// Unquote each segment: a quoted member/association name like
+			// BuildScheduling."SkillProfile_Resource" must resolve to the bare
+			// identifier, otherwise the quotes leak into the serialized
+			// Change/Set member and produce an invalid AttributeIdentifier that
+			// passes `mxcli check` but fails to load in MxBuild/Studio Pro.
+			name := getQualifiedNameText(qn)
 			result.Path = append(result.Path, name)
 			result.Segments = append(result.Segments, ast.PathSegment{Name: name, Separator: lastSep})
 		}
@@ -1290,11 +1598,12 @@ func buildAttributePathFromContext(ctx parser.IAttributePathContext) *ast.Attrib
 // REST Call Statements
 // ============================================================================
 
-// buildRestCallStatement converts REST CALL statement context to RestCallStmt.
-// Grammar: (VARIABLE EQUALS)? REST CALL httpMethod restCallUrl restCallUrlParams?
+// buildRestCallStatement converts a call rest service statement to RestCallStmt.
+// Grammar: (VARIABLE EQUALS)? restCallKw httpMethod restCallUrl restCallUrlParams?
 //
-//	restCallHeaderClause* restCallAuthClause? restCallBodyClause?
-//	restCallTimeoutClause? restCallReturnsClause onErrorClause?
+//	( restCallSettings
+//	| restCallHeaderClause* restCallAuthClause? restCallBodyClause? restCallTimeoutClause? )
+//	restCallReturnsClause onErrorClause?
 func buildRestCallStatement(ctx parser.IRestCallStatementContext) *ast.RestCallStmt {
 	if ctx == nil {
 		return nil
@@ -1330,7 +1639,7 @@ func buildRestCallStatement(ctx parser.IRestCallStatementContext) *ast.RestCallS
 		if strLit := urlC.STRING_LITERAL(); strLit != nil {
 			stmt.URL = &ast.LiteralExpr{
 				Kind:  ast.LiteralString,
-				Value: unquoteString(strLit.GetText()),
+				Value: unquoteStringLit(strLit),
 			}
 		} else if expr := urlC.Expression(); expr != nil {
 			stmt.URL = buildSourceExpression(expr)
@@ -1345,6 +1654,12 @@ func buildRestCallStatement(ctx parser.IRestCallStatementContext) *ast.RestCallS
 		}
 	}
 
+	// The settings: one property list (ADR-0013), or the old clauses
+	// (MDL-DEPR720), which build the same statement.
+	if settings, ok := restCtx.RestCallSettings().(*parser.RestCallSettingsContext); ok && settings != nil {
+		restCallSettingsInto(stmt, settings)
+	}
+
 	// Get headers
 	for _, headerClause := range restCtx.AllRestCallHeaderClause() {
 		hdrCtx := headerClause.(*parser.RestCallHeaderClauseContext)
@@ -1353,7 +1668,7 @@ func buildRestCallStatement(ctx parser.IRestCallStatementContext) *ast.RestCallS
 			header.Name = id.GetText()
 		} else if strLit := hdrCtx.STRING_LITERAL(); strLit != nil {
 			// Handle quoted header names like 'Content-Type'
-			header.Name = unquoteString(strLit.GetText())
+			header.Name = unquoteStringLit(strLit)
 		}
 		if expr := hdrCtx.Expression(); expr != nil {
 			header.Value = buildSourceExpression(expr)
@@ -1378,7 +1693,15 @@ func buildRestCallStatement(ctx parser.IRestCallStatementContext) *ast.RestCallS
 		bodyCtx := bodyClause.(*parser.RestCallBodyClauseContext)
 		body := &ast.RestBody{}
 
-		if bodyCtx.MAPPING() != nil {
+		if bodyCtx.BINARY_TYPE() != nil {
+			// Binary body: BODY BINARY <expression>. Studio Pro stores the
+			// expression that yields the bytes — a FileDocument's Contents
+			// member, e.g. `$Doc/Contents` — as Microflows$BinaryRequestHandling.
+			body.Type = ast.RestBodyBinary
+			if expr := bodyCtx.Expression(); expr != nil {
+				body.Template = buildSourceExpression(expr)
+			}
+		} else if bodyCtx.MAPPING() != nil {
 			// Export mapping: BODY MAPPING QualifiedName FROM $Variable
 			body.Type = ast.RestBodyMapping
 			if qn := bodyCtx.QualifiedName(); qn != nil {
@@ -1393,7 +1716,7 @@ func buildRestCallStatement(ctx parser.IRestCallStatementContext) *ast.RestCallS
 			if strLit := bodyCtx.STRING_LITERAL(); strLit != nil {
 				body.Template = &ast.LiteralExpr{
 					Kind:  ast.LiteralString,
-					Value: unquoteString(strLit.GetText()),
+					Value: unquoteStringLit(strLit),
 				}
 			} else if expr := bodyCtx.Expression(); expr != nil {
 				body.Template = buildSourceExpression(expr)
@@ -1440,6 +1763,13 @@ func buildRestCallStatement(ctx parser.IRestCallStatementContext) *ast.RestCallS
 			}
 		} else if returnsCtx.NONE() != nil || returnsCtx.NOTHING() != nil {
 			result.Type = ast.RestResultNone
+		} else if qns := returnsCtx.AllQualifiedName(); len(qns) == 1 {
+			// `returns Module.Entity` — store the response in a file document.
+			// Reached only after the keyword alternatives, so a bare entity name
+			// can never shadow `String` / `response` / `none` / `nothing`, each
+			// of which is its own token.
+			result.Type = ast.RestResultFileDocument
+			result.ResultEntity = buildQualifiedName(qns[0])
 		}
 
 		stmt.Result = result
@@ -1481,9 +1811,11 @@ func buildSendRestRequestStatement(ctx parser.ISendRestRequestStatementContext) 
 			param := ast.SendRestParamDef{}
 			if v := pc.VARIABLE(); v != nil {
 				param.Name = strings.TrimPrefix(v.GetText(), "$")
+			} else if pn := pc.ParameterName(); pn != nil {
+				param.Name = parameterNameText(pn)
 			}
 			if expr := pc.Expression(); expr != nil {
-				param.Expression = expr.GetText()
+				param.Expression = storedExpressionSource(expressionSourceText(expr), lexedWithStrictEscapes(expr))
 			}
 			stmt.Parameters = append(stmt.Parameters, param)
 		}

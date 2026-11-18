@@ -21,7 +21,11 @@ func setupMicroflowsDB(t *testing.T, rows [][]any) catalog.CatalogDB {
 		t.Fatalf("failed to open in-memory db: %v", err)
 	}
 
-	_, err = db.Exec(`CREATE TABLE modules (Name TEXT PRIMARY KEY, Source TEXT)`)
+	// Id mirrors the real `modules` view. Platform filtering keys off the System
+	// module's sentinel Id — Source is empty for System exactly as it is for a
+	// user module — and these iterators swallow query errors, so a missing
+	// column shows up as "no rows" rather than "no such column".
+	_, err = db.Exec(`CREATE TABLE modules (Id TEXT, Name TEXT PRIMARY KEY, Source TEXT)`)
 	if err != nil {
 		t.Fatalf("failed to create modules table: %v", err)
 	}
@@ -29,21 +33,24 @@ func setupMicroflowsDB(t *testing.T, rows [][]any) catalog.CatalogDB {
 	_, err = db.Exec(`CREATE TABLE microflows (
 		Id TEXT, Name TEXT, QualifiedName TEXT, ModuleName TEXT, Folder TEXT,
 		MicroflowType TEXT, Description TEXT, ReturnType TEXT,
-		ParameterCount INTEGER, ActivityCount INTEGER, Complexity INTEGER
+		ParameterCount INTEGER, ActivityCount INTEGER, TotalActivityCount INTEGER DEFAULT 0, Complexity INTEGER,
+			Excluded INTEGER DEFAULT 0, ApplyEntityAccess INTEGER DEFAULT 0
 	)`)
 	if err != nil {
 		t.Fatalf("failed to create microflows table: %v", err)
 	}
 
 	for _, row := range rows {
-		_, err := db.Exec(`INSERT INTO microflows VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		_, err := db.Exec(`INSERT INTO microflows (Id, Name, QualifiedName, ModuleName, Folder,
+			MicroflowType, Description, ReturnType, ParameterCount, ActivityCount, Complexity)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			row...)
 		if err != nil {
 			t.Fatalf("failed to insert row: %v", err)
 		}
 		// Ensure module exists
 		moduleName := row[3].(string)
-		if _, err := db.Exec(`INSERT OR IGNORE INTO modules (Name, Source) VALUES (?, '')`, moduleName); err != nil {
+		if _, err := db.Exec(`INSERT OR IGNORE INTO modules (Id, Name, Source) VALUES (?, ?, '')`, moduleName+"-id", moduleName); err != nil {
 			t.Fatalf("failed to insert module: %v", err)
 		}
 	}
@@ -95,5 +102,102 @@ func TestEmptyMicroflowRule_Metadata(t *testing.T) {
 	}
 	if r.Category() != "quality" {
 		t.Errorf("Category = %q, want quality", r.Category())
+	}
+}
+
+// TestEmptyMicroflowRule_NamesTheDocumentType is the test this rule did not
+// have: LintContext.Microflows() yields microflows, nanoflows and rules alike
+// (one catalog table, three doctypes), and MPR002 called every one of them a
+// microflow — "Microflow 'Rule1' has no activities" about a rule.
+//
+// The fixtures use the catalog's own spellings, uppercase, rather than the
+// title-case ones the older tests in this file use. That difference is the
+// point: the old spellings never had to be right, because nothing read the
+// column. Now that the noun is derived from it, a fixture that does not match
+// what the catalog writes would test the fallback instead of the mapping.
+func TestEmptyMicroflowRule_NamesTheDocumentType(t *testing.T) {
+	db := setupMicroflowsDB(t, [][]any{
+		{"id1", "ACT_Process", "MyModule.ACT_Process", "MyModule", "", "MICROFLOW", "", "Void", 0, 0, 0},
+		{"id2", "NF_Refresh", "MyModule.NF_Refresh", "MyModule", "", "NANOFLOW", "", "Void", 0, 0, 0},
+		// No return type: a rule that returns a value is not empty (#953), so
+		// the noun is pinned on one that reads as returning nothing.
+		{"id3", "Rule1", "MyModule.Rule1", "MyModule", "", "RULE", "", "", 1, 0, 0},
+		// An unknown type must still be reported, under the generic noun: a
+		// finding with an imprecise label beats no finding at all.
+		{"id4", "Mystery", "MyModule.Mystery", "MyModule", "", "SOMETHING_NEW", "", "Void", 0, 0, 0},
+	})
+	defer db.Close()
+
+	violations := NewEmptyMicroflowRule().Check(linter.NewLintContextFromDB(db))
+	if len(violations) != 4 {
+		t.Fatalf("expected 4 violations, got %d", len(violations))
+	}
+
+	byName := map[string]linter.Violation{}
+	for _, v := range violations {
+		byName[v.Location.DocumentName] = v
+	}
+
+	for _, tc := range []struct{ doc, wantType, wantMessage string }{
+		{"ACT_Process", "microflow", "Microflow 'ACT_Process' has no activities"},
+		{"NF_Refresh", "nanoflow", "Nanoflow 'NF_Refresh' has no activities"},
+		{"Rule1", "rule", "Rule 'Rule1' has no activities"},
+		{"Mystery", "microflow", "Microflow 'Mystery' has no activities"},
+	} {
+		v, ok := byName[tc.doc]
+		if !ok {
+			t.Errorf("no violation for %s", tc.doc)
+			continue
+		}
+		if v.Message != tc.wantMessage {
+			t.Errorf("%s: message = %q, want %q", tc.doc, v.Message, tc.wantMessage)
+		}
+		// The doctype also reaches the JSON and SARIF output as documentType,
+		// where a wrong value is not merely cosmetic.
+		if v.Location.DocumentType != tc.wantType {
+			t.Errorf("%s: documentType = %q, want %q", tc.doc, v.Location.DocumentType, tc.wantType)
+		}
+	}
+}
+
+// TestDocumentNounCoversEveryCatalogType pins the mapping against the values
+// the catalog actually inserts (mdl/catalog/builder_microflows.go), so adding a
+// fourth flow flavour there fails here rather than silently reporting it as a
+// microflow.
+func TestDocumentNounCoversEveryCatalogType(t *testing.T) {
+	for stored, want := range map[string]string{
+		"MICROFLOW": "microflow",
+		"NANOFLOW":  "nanoflow",
+		"RULE":      "rule",
+	} {
+		mf := linter.Microflow{MicroflowType: stored}
+		if got := mf.DocumentNoun(); got != want {
+			t.Errorf("DocumentNoun(%q) = %q, want %q", stored, got, want)
+		}
+	}
+}
+
+// ako/mxcli#953 item 4: a flow whose only content is `return <expr>;` computes
+// a value in its end event and is not empty — ActivityCount excludes the start
+// and end events, so it reads 0. A non-Void return type is the catalog's
+// witness that the end event returns a value. The Void and unset rows are the
+// control: they stay reported.
+func TestEmptyMicroflowRule_SkipsReturnValueOnlyFlows(t *testing.T) {
+	db := setupMicroflowsDB(t, [][]any{
+		{"id1", "Logboek_Label", "M.Logboek_Label", "M", "", "MICROFLOW", "", "String", 1, 0, 1},
+		{"id2", "GetCurrentUser", "M.GetCurrentUser", "M", "", "NANOFLOW", "", "Object:System.User", 0, 0, 1},
+		{"id3", "IsValid", "M.IsValid", "M", "", "RULE", "", "Boolean", 1, 0, 1},
+		{"id4", "Empty", "M.Empty", "M", "", "MICROFLOW", "", "Void", 0, 0, 1},
+		{"id5", "EmptyUnset", "M.EmptyUnset", "M", "", "NANOFLOW", "", "", 0, 0, 1},
+	})
+	defer db.Close()
+
+	violations := NewEmptyMicroflowRule().Check(linter.NewLintContextFromDB(db))
+	got := map[string]bool{}
+	for _, v := range violations {
+		got[v.Location.DocumentName] = true
+	}
+	if len(violations) != 2 || !got["Empty"] || !got["EmptyUnset"] {
+		t.Fatalf("want only the Void/unset flows reported (Empty, EmptyUnset), got %v", got)
 	}
 }

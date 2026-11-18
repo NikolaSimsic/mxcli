@@ -31,7 +31,6 @@ coverage.out
 coverage.html
 reference/mendix-repl/
 reference/mxbuild/
-reference/mendixmodellib/
 reference/mdl-grammar/
 reference/mxbuild-11.6.0/
 /reference/
@@ -46,7 +45,9 @@ mdl/grammar/parser/
 *.tar
 *.tgz
 cmd/mxcli/skills/
+cmd/mxcli/skillpacks/
 cmd/mxcli/commands/
+cmd/mxcli/mods/
 cmd/mxcli/lint-rules/
 cmd/mxcli/changelog.md
 cmd/mxcli/vscode-mdl.vsix
@@ -63,3 +64,13 @@ grammardoc
 snap-bson
 .playwright-cli/
 .claude/worktrees/
+# Anchored: an unanchored "mprsnapshot" also matches the scripts/mprsnapshot/
+# source directory, which silently excludes it from `git add`.
+/mprsnapshot
+
+# CI test-output capture (.github/workflows/push-test.yml); also created if you
+# run those step bodies locally.
+go-test-output.txt
+# MPR v2 unit-type index, written next to any project mxcli opens — including
+# the testdata/ fixtures tests open in place.
+**/.mxcli/unit-types.idx

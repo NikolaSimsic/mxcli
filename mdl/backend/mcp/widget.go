@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -21,10 +22,16 @@ import (
 // widgets.def.json.
 const comboboxWidgetID = "com.mendix.widget.web.combobox.Combobox"
 
-// widgetsDefJSON is the MCP backend's pluggable-widget capability registry. It is
-// embedded and consumed ONLY by this package — deliberately not registered in the
-// shared widget registry — so it cannot change the MPR datagrid path while that
-// backend is being replaced. See the file's _comment for the rationale.
+// widgetsDefJSON is an auto-datasource HINT table for the built-in pluggable
+// widgets, no longer a capability whitelist (Phase 1 of
+// PROPOSAL_mcp_pluggable_widget_authoring.md). Acceptance is now registry-driven
+// in mapCustomWidget; this table only supplies which property of a built-in widget
+// is its DataSource so PropertyTypeIDs can report it and the engine's auto-
+// datasource pass fires (DataGrid 2 reaches its datasource that way). A widget
+// absent here is still authorable — it just can't use auto-datasource and must map
+// its datasource explicitly via the .def.json (which `mxcli widget extract`
+// produces). Embedded and consumed ONLY by this package so it cannot perturb the
+// MPR datagrid path while that backend is being replaced.
 //
 //go:embed widgets.def.json
 var widgetsDefJSON []byte
@@ -57,9 +64,14 @@ func (b *Backend) mapCustomWidget(wd *pages.CustomWidget) (map[string]any, error
 	if cw == nil {
 		return nil, fmt.Errorf("custom widget %q has no recorded properties (the MCP backend builds pluggable widgets via the widget engine)", wd.Name)
 	}
-	if _, ok := mcpWidgetDefs[cw.widgetID]; !ok {
-		return nil, fmt.Errorf("pluggable widget %q (%s) is not yet supported by the MCP backend (supported: %v)", wd.Name, cw.widgetID, supportedWidgetIDs())
-	}
+	// Acceptance is registry-driven, not a private whitelist: the pluggable widget
+	// engine only calls LoadWidgetTemplate for a widget it resolved a definition
+	// for (project .mxcli/widgets → global → embedded), so any widget reaching here
+	// is registered. We still refuse a widget that relied on a property operation
+	// the MCP builder can't faithfully emit (recorded in `unsupported`) — loud
+	// rejection over silent drop. Over pg_patch_page Studio Pro owns serialization
+	// and expands every default, so no per-widget template is needed (Phase 1 of
+	// PROPOSAL_mcp_pluggable_widget_authoring.md).
 	if len(cw.unsupported) > 0 {
 		return nil, fmt.Errorf("%s %q uses properties not yet supported by the MCP backend: %v", cw.widgetID, wd.Name, cw.unsupported)
 	}
@@ -104,7 +116,7 @@ func sortedKeys(m map[string][]pages.Widget) []string {
 }
 
 // mcpCustomWidget is the recorded high-level pg form of one pluggable widget:
-// its widget id and the `object` property bag that pg_write_page expands into a
+// its widget id and the `object` property bag that pg_patch_page expands into a
 // full widget (Studio Pro fills every default, so only the meaningful, MDL-
 // derived properties need to be set — this is what sidesteps the CE0463
 // template-mismatch class of bugs that the BSON writer path hits).
@@ -115,20 +127,10 @@ type mcpCustomWidget struct {
 	unsupported []string                  // property ops recorded for not-yet-supported widget shapes
 }
 
-// supportedWidgetIDs lists the pluggable widget ids the MCP backend can emit,
-// for use in error messages. Order is not significant.
-func supportedWidgetIDs() []string {
-	ids := make([]string, 0, len(mcpWidgetDefs))
-	for id := range mcpWidgetDefs {
-		ids = append(ids, id)
-	}
-	return ids
-}
-
 // LoadWidgetTemplate returns an MCP-specific pluggable-widget builder. Unlike the
 // MPR builder (which mutates an embedded BSON template), this one records the
 // engine's semantic property operations into a high-level pg `object` map. No
-// template BSON is needed — Studio Pro owns serialization over pg_write_page —
+// template BSON is needed — Studio Pro owns serialization over pg_patch_page —
 // so the projectPath is ignored and the CE0463 template-mismatch class of bugs
 // does not arise on the MCP path.
 func (b *Backend) LoadWidgetTemplate(widgetID string, _ string) (backend.WidgetObjectBuilder, error) {
@@ -163,6 +165,27 @@ func (w *mcpWidgetBuilder) SetAttribute(propertyKey, attributePath string) {
 	}
 }
 
+// SetAttributeWithSteps: the MCP payload's attribute has no association
+// steps, so a path over associations is reported unsupported rather than sent
+// as a direct attribute.
+func (w *mcpWidgetBuilder) SetAttributeWithSteps(propertyKey, attributePath string, steps []pages.AttributeRefStep) {
+	if len(steps) > 0 {
+		w.note("SetAttributeWithSteps(" + propertyKey + ")")
+		return
+	}
+	w.SetAttribute(propertyKey, attributePath)
+}
+
+// SetSourceVariable: the MCP widget payload has no slot for a property's
+// parameter source, so a `$Param.Attr` binding is reported unsupported rather
+// than sent as one read from the enclosing object.
+func (w *mcpWidgetBuilder) SetSourceVariable(propertyKey string, sv *pages.WidgetVariable) {
+	if sv == nil {
+		return
+	}
+	w.note("SetSourceVariable(" + propertyKey + ")")
+}
+
 func (w *mcpWidgetBuilder) SetAssociation(propertyKey, assocPath, entityName string) {
 	if assocPath == "" {
 		return
@@ -179,6 +202,31 @@ func (w *mcpWidgetBuilder) SetAssociation(propertyKey, assocPath, entityName str
 
 func (w *mcpWidgetBuilder) SetPrimitive(propertyKey, value string) {
 	w.object[propertyKey] = value
+}
+
+func (w *mcpWidgetBuilder) SetImage(propertyKey, imageQN string) {
+	if imageQN == "" {
+		return
+	}
+	w.object[propertyKey] = imageQN
+}
+
+// SetIcon has no PED spelling this backend knows of; it is recorded rather than
+// sent in a shape the Studio Pro side may not read.
+func (w *mcpWidgetBuilder) SetIcon(propertyKey string, icon *pages.Icon) {
+	if icon == nil {
+		return
+	}
+	w.note("SetIcon(" + propertyKey + ")")
+}
+
+// SetImageEntity has no PED spelling this backend knows of; it is recorded
+// rather than sent as a collection entry it is not.
+func (w *mcpWidgetBuilder) SetImageEntity(propertyKey, entityName string) {
+	if entityName == "" {
+		return
+	}
+	w.note("SetImageEntity(" + propertyKey + ")")
 }
 
 func (w *mcpWidgetBuilder) SetDataSource(propertyKey string, ds pages.DataSource) {
@@ -242,16 +290,23 @@ func gridSortBar(sorting []*pages.GridSort) map[string]any {
 // SetSelection sets a selection-typed property (e.g. a DataGrid's itemSelection).
 // In pg these are plain string enums ("None" / "Single" / "Multi"), so the value
 // is stored directly. (The MPR path's richer multi-selection cloning is not
-// needed — Studio Pro expands the rest on pg_write_page.)
+// needed — Studio Pro expands the rest on pg_patch_page.)
 func (w *mcpWidgetBuilder) SetSelection(propertyKey, value string) {
 	if value != "" {
 		w.object[propertyKey] = value
 	}
 }
 
-// Operations not needed by the supported widgets — recorded so a widget that
-// relies on them is rejected rather than emitted with missing properties.
-func (w *mcpWidgetBuilder) SetExpression(propertyKey, _ string) { w.note("expression:" + propertyKey) }
+// SetExpression stores an expression-typed property. In a pg custom-widget
+// `object` an expression is a plain string (verified live on Studio Pro 11.12:
+// ComboBox customEditabilityExpression round-trip, ped_check_errors clean —
+// Phase 2 of PROPOSAL_mcp_pluggable_widget_authoring.md).
+func (w *mcpWidgetBuilder) SetExpression(propertyKey, value string) {
+	if value == "" {
+		return
+	}
+	w.object[propertyKey] = value
+}
 
 // SetChildWidgets stores a Widgets-typed slot (e.g. a Gallery's `content`
 // template, emptyPlaceholder, filtersPlaceholder). The child widgets are mapped
@@ -265,14 +320,174 @@ func (w *mcpWidgetBuilder) SetChildWidgets(propertyKey string, children []pages.
 	}
 	w.childSlots[propertyKey] = children
 }
-func (w *mcpWidgetBuilder) SetTextTemplate(propertyKey, _ string) {
-	w.note("textTemplate:" + propertyKey)
+
+// SetTextTemplate stores a text-template property. pg keys these with a `ct:`
+// prefix and accepts a plain string, which Studio Pro expands into a full
+// Pages$ClientTemplate (verified live on 11.12: Image ct:imageUrl /
+// ct:alternativeText, ped_check_errors clean).
+func (w *mcpWidgetBuilder) SetTextTemplate(propertyKey, text string) {
+	if text == "" {
+		return
+	}
+	w.object["ct:"+propertyKey] = text
 }
-func (w *mcpWidgetBuilder) SetTextTemplateWithParams(propertyKey, _ string, _ string) {
-	w.note("textTemplate:" + propertyKey)
+
+// templateAttrPlaceholderRe matches `{AttrName}` placeholders in a text
+// template. Numeric placeholders (`{1}`) don't match and pass through verbatim.
+var templateAttrPlaceholderRe = regexp.MustCompile(`\{([A-Za-z][A-Za-z0-9_]*)\}`)
+
+// SetTextTemplateWithParams stores a text-template property whose text may
+// embed `{AttrName}` placeholders. Placeholders become `{1}`-style parameter
+// references backed by Pages$ClientTemplateParameter attributeRefs, resolved
+// against the page's entity context — the same semantics as the MPR builder
+// (widgetobj.createClientTemplateBSONWithParams). The parameterised
+// Pages$ClientTemplate shape was verified live on 11.12 (attributeRef
+// persisted, ped_check_errors clean).
+// SetTextTemplateWithClientParams stores a text template whose `{1}`-style
+// placeholders are backed by author-supplied parameters (MDL `contentparams:`).
+// Same stored shape as SetTextTemplateWithParams; only the source of the
+// parameters differs — there they are derived from `{AttrName}` placeholders,
+// here they are given. (#928)
+func (w *mcpWidgetBuilder) SetTextTemplateWithClientParams(propertyKey, text string, params []*pages.ClientTemplateParameter) {
+	if text == "" {
+		return
+	}
+	if len(params) == 0 {
+		w.object["ct:"+propertyKey] = text
+		return
+	}
+	out := make([]any, 0, len(params))
+	for _, p := range params {
+		if p == nil {
+			continue
+		}
+		out = append(out, map[string]any{
+			"$Type":        "Pages$ClientTemplateParameter",
+			"attributeRef": map[string]any{"$Type": "DomainModels$AttributeRef", "attribute": p.AttributeRef},
+			"formattingInfo": map[string]any{
+				"$Type":            "Pages$FormattingInfo",
+				"decimalPrecision": 2,
+				"groupDigits":      false,
+				"enumFormat":       "Text",
+				"dateFormat":       "Date",
+				"customDateFormat": "",
+			},
+		})
+	}
+	w.object["ct:"+propertyKey] = map[string]any{
+		"$Type":      "Pages$ClientTemplate",
+		"t:template": text,
+		"parameters": out,
+		"t:fallback": "",
+	}
 }
-func (w *mcpWidgetBuilder) SetAction(propertyKey string, _ pages.ClientAction) {
-	w.note("action:" + propertyKey)
+
+func (w *mcpWidgetBuilder) SetTextTemplateWithParams(propertyKey, text, entityContext string) {
+	if text == "" {
+		return
+	}
+	var attrNames []string
+	paramText := templateAttrPlaceholderRe.ReplaceAllStringFunc(text, func(s string) string {
+		name := s[1 : len(s)-1]
+		for i, an := range attrNames {
+			if an == name {
+				return fmt.Sprintf("{%d}", i+1)
+			}
+		}
+		attrNames = append(attrNames, name)
+		return fmt.Sprintf("{%d}", len(attrNames))
+	})
+	if len(attrNames) == 0 {
+		w.object["ct:"+propertyKey] = text
+		return
+	}
+	params := make([]any, 0, len(attrNames))
+	for _, attrName := range attrNames {
+		attrPath := attrName
+		if entityContext != "" && !strings.Contains(attrName, ".") {
+			attrPath = entityContext + "." + attrName
+		}
+		params = append(params, map[string]any{
+			"$Type":        "Pages$ClientTemplateParameter",
+			"attributeRef": map[string]any{"$Type": "DomainModels$AttributeRef", "attribute": attrPath},
+			"formattingInfo": map[string]any{
+				"$Type":            "Pages$FormattingInfo",
+				"decimalPrecision": 2,
+				"groupDigits":      false,
+				"enumFormat":       "Text",
+				"dateFormat":       "Date",
+				"customDateFormat": "",
+			},
+		})
+	}
+	w.object["ct:"+propertyKey] = map[string]any{
+		"$Type":      "Pages$ClientTemplate",
+		"t:template": paramText,
+		"parameters": params,
+		"t:fallback": "",
+	}
+}
+
+// SetAction stores an action-typed property using the documented
+// Pages$*ClientAction shapes. One deviation from the native LightPage widget
+// constructors: inside a custom widget's `object`, MicroflowClientAction must
+// nest the microflow reference in microflowSettings — pg silently drops a flat
+// `microflow` key there (verified live on 11.12: flat key → "Select a
+// microflow" consistency error; nested → clean). Actions with parameter
+// mappings need PageVariable-shaped values and fully-qualified parameter names
+// whose pg forms are not yet pinned live, so they are rejected loudly rather
+// than emitted with the mappings dropped.
+func (w *mcpWidgetBuilder) SetAction(propertyKey string, action pages.ClientAction) {
+	mapped, err := customWidgetClientAction(action)
+	if err != nil {
+		w.note(fmt.Sprintf("action:%s (%v)", propertyKey, err))
+		return
+	}
+	w.object[propertyKey] = mapped
+}
+
+// customWidgetClientAction maps a semantic client action onto the pg shape a
+// custom widget's `object` accepts. Kept separate from mapClientAction (the
+// native-widget mapper) because the accepted shapes differ — see SetAction.
+func customWidgetClientAction(a pages.ClientAction) (map[string]any, error) {
+	switch act := a.(type) {
+	case nil, *pages.NoClientAction:
+		return map[string]any{"$Type": "Pages$NoClientAction"}, nil
+	case *pages.MicroflowClientAction:
+		if len(act.ParameterMappings) > 0 {
+			return nil, fmt.Errorf("microflow action parameter mappings are not yet supported over MCP")
+		}
+		if len(act.OutputMappings) > 0 {
+			return nil, fmt.Errorf("microflow action output mappings (returns ( … )) are not yet supported over MCP")
+		}
+		return map[string]any{
+			"$Type": "Pages$MicroflowClientAction",
+			"microflowSettings": map[string]any{
+				"$Type":             "Pages$MicroflowSettings",
+				"microflow":         act.MicroflowName,
+				"parameterMappings": []any{},
+				"progressBar":       "None",
+				"asynchronous":      false,
+				"formValidations":   "All",
+			},
+			"disabledDuringExecution": true,
+		}, nil
+	case *pages.PageClientAction:
+		if len(act.ParameterMappings) > 0 {
+			return nil, fmt.Errorf("page action parameter mappings are not yet supported over MCP")
+		}
+		return map[string]any{
+			"$Type": "Pages$PageClientAction",
+			"pageSettings": map[string]any{
+				"$Type":             "Pages$PageSettings",
+				"page":              act.PageName,
+				"parameterMappings": []any{},
+			},
+			"disabledDuringExecution": true,
+		}, nil
+	default:
+		return nil, fmt.Errorf("client action %T is not yet supported over MCP", a)
+	}
 }
 
 // SetAttributeObjects is a deliberate no-op. The only widgets that use it are the
@@ -321,6 +536,21 @@ func (w *mcpWidgetBuilder) SetObjectList(propertyKey string, items []backend.Obj
 				if src := customWidgetXPathSource(p.DataSource); src != nil {
 					obj[p.PropertyKey] = src
 				}
+			case "action":
+				// An action on an object-list item (chart series
+				// staticOnClickAction, popupmenu item action, …) — #956. The
+				// same mapper the top-level slots use, so the shapes PED
+				// refuses (parameter mappings, nanoflow) are refused here too,
+				// recorded rather than silently dropped.
+				if p.Action == nil {
+					continue
+				}
+				mapped, err := customWidgetClientAction(p.Action)
+				if err != nil {
+					w.note(fmt.Sprintf("%s[].%s: %v", propertyKey, p.PropertyKey, err))
+					continue
+				}
+				obj[p.PropertyKey] = mapped
 			default:
 				w.note(fmt.Sprintf("%s[].%s (%s)", propertyKey, p.PropertyKey, p.Operation))
 			}
@@ -345,7 +575,7 @@ func (w *mcpWidgetBuilder) SetObjectList(propertyKey string, items []backend.Obj
 // widgets.def.json. The shared engine's auto-datasource pass reads this to route
 // the AST data source through SetDataSource (the MCP path has no template, so
 // this is the only metadata it needs). Other property types are not needed —
-// Studio Pro expands every default on pg_write_page.
+// Studio Pro expands every default on pg_patch_page.
 func (w *mcpWidgetBuilder) PropertyTypeIDs() map[string]pages.PropertyTypeIDEntry {
 	out := make(map[string]pages.PropertyTypeIDEntry, len(w.def.DataSourceProperties))
 	for _, key := range w.def.DataSourceProperties {
@@ -354,8 +584,16 @@ func (w *mcpWidgetBuilder) PropertyTypeIDs() map[string]pages.PropertyTypeIDEntr
 	return out
 }
 
+// PrimitiveValues has nothing to report: this backend records property SETS and
+// hands them to Studio Pro, which expands every default itself, so there is no
+// template object here to read a captured value out of. Empty is the honest
+// answer and leaves the caller on its declared-default fallback.
+func (w *mcpWidgetBuilder) PrimitiveValues() map[string]string { return nil }
+
 func (w *mcpWidgetBuilder) EnsureRequiredObjectLists()                             {}
 func (w *mcpWidgetBuilder) ApplyPropertyVisibility(_ []types.WidgetVisibilityRule) {}
+
+func (w *mcpWidgetBuilder) NullTemplatesOfUnsetDataSources() {}
 
 // Finalize builds the CustomWidget shell and registers its recorded pg object on
 // the backend, keyed by the widget's ID so mapPageWidget can find it.

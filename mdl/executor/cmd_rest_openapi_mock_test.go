@@ -43,15 +43,17 @@ const minimalOpenAPISpec = `{
 
 // newOpenAPIMockBackend returns a MockBackend pre-wired for OpenAPI import
 // tests: write-connected, a project version that satisfies the REST client
-// feature gate, and no pre-existing REST clients.
+// feature gates, and no pre-existing REST clients. 10.21 is the floor of the
+// stored OpenAPI document (Rest$OpenApiFile): the write refuses one on 10.6,
+// measured on a stamped project, and so does the gate (ako/mxcli#1811).
 func newOpenAPIMockBackend() *mock.MockBackend {
 	return &mock.MockBackend{
 		IsConnectedFunc: func() bool { return true },
 		ProjectVersionFunc: func() *types.ProjectVersion {
 			return &types.ProjectVersion{
-				ProductVersion: "10.6.0",
+				ProductVersion: "10.21.0",
 				MajorVersion:   10,
-				MinorVersion:   6,
+				MinorVersion:   21,
 				PatchVersion:   0,
 			}
 		},
@@ -181,6 +183,11 @@ func TestCreateRestClientFromSpec_OrModifyPreservesID(t *testing.T) {
 		created = svc
 		return nil
 	}
+	var updated *model.ConsumedRestService
+	mb.UpdateConsumedRestServiceFunc = func(svc *model.ConsumedRestService) error {
+		updated = svc
+		return nil
+	}
 
 	ctx, buf := newMockCtx(t, withBackend(mb), withHierarchy(h))
 	stmt := &ast.CreateRestClientStmt{
@@ -190,14 +197,23 @@ func TestCreateRestClientFromSpec_OrModifyPreservesID(t *testing.T) {
 	}
 	assertNoError(t, createRestClient(ctx, stmt))
 
-	if deletedID != existingID {
-		t.Errorf("expected existing service to be deleted, got deletedID=%v", deletedID)
+	// A re-import that leaves the service where it is now REWRITES the unit
+	// rather than deleting and re-inserting it. The insert path skips the
+	// storage layer's reconciliation, so the old shape re-minted every element
+	// $ID on every run (ako/mxcli#556); the update path is elided when nothing
+	// changed. The ID preservation this test was written for is unaffected — it
+	// is now preservation of the whole unit.
+	if deletedID != "" {
+		t.Errorf("the stored service was deleted (%v); a same-folder rewrite must update in place", deletedID)
 	}
-	if created == nil {
-		t.Fatal("CreateConsumedRestService was not called")
+	if created != nil {
+		t.Errorf("CreateConsumedRestService was called for an existing service")
 	}
-	if created.ID != existingID {
-		t.Errorf("expected recreated service to reuse existing ID %v, got %v", existingID, created.ID)
+	if updated == nil {
+		t.Fatal("UpdateConsumedRestService was not called")
+	}
+	if updated.ID != existingID {
+		t.Errorf("expected the rewrite to reuse existing ID %v, got %v", existingID, updated.ID)
 	}
 	assertContainsStr(t, buf.String(), "Modified rest client")
 }
@@ -275,7 +291,7 @@ func TestDescribeContractFromOpenAPI_Mock(t *testing.T) {
 	assertNoError(t, describeContractFromOpenAPI(ctx, stmt))
 
 	out := buf.String()
-	assertContainsStr(t, out, "create rest client")
+	assertContainsStr(t, out, "create or modify consumed rest service")
 	assertContainsStr(t, out, "https://api.example.com/v1")
 	assertContainsStr(t, out, "listPets")
 }

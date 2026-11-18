@@ -20,11 +20,18 @@ func (b *Builder) ExitCreateJsonStructureStatement(ctx *parser.CreateJsonStructu
 	allStrings := ctx.AllSTRING_LITERAL()
 	strIdx := 0
 	if ctx.FOLDER() != nil && strIdx < len(allStrings) {
-		stmt.Folder = unquoteString(allStrings[strIdx].GetText())
+		stmt.Folder = unquoteStringLit(allStrings[strIdx])
 		strIdx++
 	}
-	if ctx.COMMENT() != nil && strIdx < len(allStrings) {
-		stmt.Documentation = unquoteString(allStrings[strIdx].GetText())
+	// R9: documentation is a doc comment; `comment '…'` is its alias. The
+	// doc comment wins when a statement has both, as it always has.
+	stmt.Documentation, stmt.DocumentationSet = findDocComment(ctx)
+	if c := ctx.COMMENT(); c != nil && strIdx < len(allStrings) {
+		text := unquoteStringLit(allStrings[strIdx])
+		b.recordDocumentationClause(ctx, c.GetSymbol(), allStrings[strIdx].GetSymbol(), text, false)
+		if !stmt.DocumentationSet {
+			stmt.Documentation, stmt.DocumentationSet = text, true
+		}
 	}
 
 	// Parse SNIPPET value — can be STRING_LITERAL or DOLLAR_STRING.
@@ -34,19 +41,27 @@ func (b *Builder) ExitCreateJsonStructureStatement(ctx *parser.CreateJsonStructu
 		// SNIPPET is a STRING_LITERAL; it's the last one (after COMMENT if present)
 		idx := len(allStrings) - 1
 		if idx >= 0 {
-			stmt.JsonSnippet = unquoteString(allStrings[idx].GetText())
+			stmt.JsonSnippet = unquoteStringLit(allStrings[idx])
 		}
 	}
 
 	// Parse CUSTOM NAME MAP if present
 	if ctx.CUSTOM_NAME_MAP() != nil {
 		stmt.CustomNameMap = make(map[string]string)
+		stmt.CustomItemNameMap = make(map[string]string)
 		for _, mapping := range ctx.AllCustomNameMapping() {
 			mappingCtx := mapping.(*parser.CustomNameMappingContext)
 			strings := mappingCtx.AllSTRING_LITERAL()
-			if len(strings) == 2 {
-				jsonKey := unquoteString(strings[0].GetText())
-				customName := unquoteString(strings[1].GetText())
+			if len(strings) != 2 {
+				continue
+			}
+			jsonKey := unquoteStringLit(strings[0])
+			customName := unquoteStringLit(strings[1])
+			// `item of 'key' as 'Name'` names the array's ITEM element; the bare
+			// form names the element the key itself reaches.
+			if mappingCtx.ITEM() != nil {
+				stmt.CustomItemNameMap[jsonKey] = customName
+			} else {
 				stmt.CustomNameMap[jsonKey] = customName
 			}
 		}
@@ -58,9 +73,6 @@ func (b *Builder) ExitCreateJsonStructureStatement(ctx *parser.CreateJsonStructu
 		if createStmt.OR() != nil && (createStmt.REPLACE() != nil || createStmt.MODIFY() != nil) {
 			stmt.CreateOrModify = true
 		}
-	}
-	if doc := findDocCommentText(ctx); doc != "" {
-		stmt.Documentation = doc
 	}
 
 	b.statements = append(b.statements, stmt)

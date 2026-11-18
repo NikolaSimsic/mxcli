@@ -7,9 +7,71 @@ package executor
 import (
 	"strings"
 	"testing"
+
+	"github.com/mendixlabs/mxcli/mdl/visitor"
 )
 
 // --- V3 Page Syntax Tests ---
+
+// stripDescribeArtifacts removes the non-MDL lines from DESCRIBE output (the
+// `-- Page:` comment header and the SQL*Plus `/` terminator) so the body can be
+// fed back through the parser.
+func stripDescribeArtifacts(s string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(s, "\n") {
+		t := strings.TrimSpace(line)
+		if t == "/" || strings.HasPrefix(t, "-- Page:") {
+			continue
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// TestRoundtripPage_DescribeReparses guarantees DESCRIBE PAGE output re-parses
+// through the MDL parser — issue #626 (previously only substring-asserted). The
+// empty page is the regression case: a widget-less page used to describe without
+// a `{ }` body block, which the CREATE PAGE grammar rejects on re-parse.
+func TestRoundtripPage_DescribeReparses(t *testing.T) {
+	env := setupTestEnv(t)
+	defer env.teardown()
+
+	entityName := testModule + ".RtReparseEntity"
+	env.registerCleanup("entity", entityName)
+	if err := env.executeMDL(`create or modify persistent entity ` + entityName + ` ( Name: String(100) );`); err != nil {
+		t.Fatalf("create entity: %v", err)
+	}
+
+	emptyPage := testModule + ".RtEmptyPage"
+	widgetPage := testModule + ".RtWidgetPage"
+	env.registerCleanup("page", emptyPage)
+	env.registerCleanup("page", widgetPage)
+
+	// A widget-less page must still supply the `{ }` body block — the grammar
+	// requires it. This is exactly what DESCRIBE used to omit (#626).
+	if err := env.executeMDL(`create page ` + emptyPage + ` ( Title: 'Empty', Layout: Atlas_Core.Atlas_Default ) { }`); err != nil {
+		t.Fatalf("create empty page: %v", err)
+	}
+	if err := env.executeMDL(`create page ` + widgetPage + ` ( Title: 'Grid', Layout: Atlas_Core.Atlas_Default ) {
+		datagrid dg (DataSource: database ` + entityName + `) {
+			column colName (Attribute: Name, Caption: 'Name')
+		}
+	}`); err != nil {
+		t.Fatalf("create widget page: %v", err)
+	}
+
+	for _, pg := range []string{emptyPage, widgetPage} {
+		output, err := env.describeMDL(`describe page ` + pg + `;`)
+		if err != nil {
+			t.Fatalf("describe %s: %v", pg, err)
+		}
+		reparse := stripDescribeArtifacts(output)
+		if _, errs := visitor.Build(reparse); len(errs) > 0 {
+			t.Errorf("DESCRIBE PAGE %s does not re-parse (#626): %v\n--- output ---\n%s", pg, errs, reparse)
+		}
+	}
+}
 
 // TestRoundtripPage_V3DataGridColumns tests that DataGrid columns are correctly created with V3 syntax.
 // This is a regression test for the bug where user-defined columns were ignored and template columns were used.
@@ -535,7 +597,7 @@ func TestRoundtripPage_MicroflowButtonWithParams(t *testing.T) {
 	) {
 		dataview dv (DataSource: $Product) {
 			textbox txt (Label: 'Name', Attribute: Name)
-			actionbutton btnProcess (Caption: 'Process', Action: microflow ` + mfName + `(Product: $Product))
+			actionbutton btnProcess (Caption: 'Process', Action: microflow ` + mfName + `(Product = $Product))
 		}
 	}`
 
@@ -557,8 +619,8 @@ func TestRoundtripPage_MicroflowButtonWithParams(t *testing.T) {
 	if !strings.Contains(output, mfName) {
 		t.Errorf("Expected microflow name '%s' in describe output.\nOutput:\n%s", mfName, output)
 	}
-	if !strings.Contains(output, "Product: $Product") {
-		t.Errorf("Expected 'Product: $Product' parameter mapping in describe output.\nOutput:\n%s", output)
+	if !strings.Contains(output, "Product = $Product") {
+		t.Errorf("Expected 'Product = $Product' parameter mapping in describe output.\nOutput:\n%s", output)
 	}
 
 	t.Logf("Microflow button with params roundtrip successful:\n%s", output)
@@ -608,7 +670,7 @@ func TestRoundtripPage_MicroflowButtonWithCurrentObject(t *testing.T) {
 		datagrid dg (DataSource: database ` + entityName + `) {
 			column colName (Attribute: Name, Caption: 'Name')
 			column colActions (Attribute: Name, Caption: 'Actions', ShowContentAs: customContent) {
-				actionbutton btnProcess (Caption: 'Process', Action: microflow ` + mfName + `(Target: $currentObject))
+				actionbutton btnProcess (Caption: 'Process', Action: microflow ` + mfName + `(Target = $currentObject))
 			}
 		}
 	}`
@@ -631,8 +693,19 @@ func TestRoundtripPage_MicroflowButtonWithCurrentObject(t *testing.T) {
 	if !strings.Contains(output, mfName) {
 		t.Errorf("Expected microflow name '%s' in describe output.\nOutput:\n%s", mfName, output)
 	}
-	if !strings.Contains(output, "Target: $currentObject") {
-		t.Errorf("Expected 'Target: $currentObject' parameter mapping in describe output.\nOutput:\n%s", output)
+	// Quoting-agnostic on purpose. DESCRIBE emits an identifier through mdlIdent,
+	// which quotes anything that does not LEX as a bare identifier — so the day
+	// `TARGET` became a lexer token (the notify-workflow target clause, #476) this
+	// output went from `Target:` to `"Target":` and an exact-substring assertion
+	// started failing on a describe that had become MORE correct, not less.
+	//
+	// Both forms re-parse here (TARGET is non-reserved, so the unquoted spelling
+	// this test's own input uses is still accepted); what the assertion is for is
+	// the MAPPING surviving the roundtrip, which is independent of the quoting.
+	if !strings.Contains(output, "Target = $currentObject") &&
+		!strings.Contains(output, `"Target" = $currentObject`) {
+		t.Errorf("Expected a 'Target = $currentObject' parameter mapping (quoted or not) "+
+			"in describe output.\nOutput:\n%s", output)
 	}
 
 	t.Logf("Microflow button with $currentObject roundtrip successful:\n%s", output)

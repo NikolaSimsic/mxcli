@@ -10,7 +10,7 @@ import (
 	"github.com/mendixlabs/mxcli/sdk/pages"
 )
 
-// mapPageWidget maps one executor page widget onto its pg_write_page (Pages$*)
+// mapPageWidget maps one executor page widget onto its pg_patch_page (Pages$*)
 // form, then attaches any conditional-visibility setting (VISIBLE IF) uniformly.
 func (b *Backend) mapPageWidget(w pages.Widget) (map[string]any, error) {
 	m, err := b.mapPageWidgetBody(w)
@@ -109,6 +109,10 @@ func (b *Backend) mapPageWidgetBody(w pages.Widget) (map[string]any, error) {
 		if renderMode == "" {
 			renderMode = "Text"
 		}
+		nativeTextStyle := string(wd.NativeTextStyle)
+		if nativeTextStyle == "" {
+			nativeTextStyle = "Text"
+		}
 		return map[string]any{
 			"$Type":           "Pages$DynamicText",
 			"name":            wd.Name,
@@ -116,7 +120,7 @@ func (b *Backend) mapPageWidgetBody(w pages.Widget) (map[string]any, error) {
 			"ct:content":      content,
 			"tabIndex":        wd.TabIndex,
 			"renderMode":      renderMode,
-			"nativeTextStyle": "Text",
+			"nativeTextStyle": nativeTextStyle,
 		}, nil
 	case *pages.DataView:
 		src, err := mapDataViewSource(wd.DataSource)
@@ -158,21 +162,21 @@ func (b *Backend) mapPageWidgetBody(w pages.Widget) (map[string]any, error) {
 				}
 				cols = append(cols, map[string]any{
 					"$Type":             "Pages$LayoutGridColumn",
-					"appearance":        pageAppearance("", ""),
+					"appearance":        pageAppearance(c.Class, c.Style),
 					"weight":            weight,
 					"tabletWeight":      tablet,
 					"phoneWeight":       phone,
 					"previewWidth":      -1,
-					"verticalAlignment": "None",
+					"verticalAlignment": alignmentOrNone(c.VerticalAlignment),
 					"widgets":           kids,
 				})
 			}
 			rows = append(rows, map[string]any{
 				"$Type":                 "Pages$LayoutGridRow",
-				"appearance":            pageAppearance("", ""),
-				"verticalAlignment":     "None",
-				"horizontalAlignment":   "None",
-				"spacingBetweenColumns": true,
+				"appearance":            pageAppearance(r.Class, r.Style),
+				"verticalAlignment":     alignmentOrNone(r.VerticalAlignment),
+				"horizontalAlignment":   alignmentOrNone(r.HorizontalAlignment),
+				"spacingBetweenColumns": !r.NoSpacingBetweenColumns,
 				"columns":               cols,
 			})
 		}
@@ -181,7 +185,7 @@ func (b *Backend) mapPageWidgetBody(w pages.Widget) (map[string]any, error) {
 			"name":       wd.Name,
 			"appearance": pageAppearance(wd.Class, wd.Style),
 			"tabIndex":   wd.TabIndex,
-			"width":      "FullWidth",
+			"width":      layoutGridWidth(wd.Width),
 			"rows":       rows,
 		}, nil
 	case *pages.ListView:
@@ -234,17 +238,19 @@ func (b *Backend) mapPageWidgetBody(w pages.Widget) (map[string]any, error) {
 	case *pages.CustomWidget:
 		return b.mapCustomWidget(wd)
 	case *pages.DataGrid:
-		return nil, fmt.Errorf("legacy DataGrid is not supported by the MCP backend — pg_write_page has no Pages$DataGrid type (use a ListView, or DataGrid 2 which is a pluggable widget)")
+		return nil, fmt.Errorf("legacy DataGrid is not supported by the MCP backend — pg_patch_page has no Pages$DataGrid type (use a ListView, or DataGrid 2 which is a pluggable widget)")
 	case *pages.TextBox:
-		return inputWidget("Pages$TextBox", wd.Name, wd.Label, wd.AttributePath, wd.Class, wd.Style), nil
+		w := withFormattingInfo(inputWidget("Pages$TextBox", wd.Name, wd.Label, wd.AttributePath, wd.Class, wd.Style, wd.SourceVariable), wd.FormattingInfo)
+		return withSubmitBehaviour(w, wd.SubmitBehaviour, wd.SubmitOnInputDelay), nil
 	case *pages.CheckBox:
-		return inputWidget("Pages$CheckBox", wd.Name, wd.Label, wd.AttributePath, wd.Class, wd.Style), nil
+		return inputWidget("Pages$CheckBox", wd.Name, wd.Label, wd.AttributePath, wd.Class, wd.Style, wd.SourceVariable), nil
 	case *pages.DatePicker:
-		return inputWidget("Pages$DatePicker", wd.Name, wd.Label, wd.AttributePath, wd.Class, wd.Style), nil
+		return withFormattingInfo(inputWidget("Pages$DatePicker", wd.Name, wd.Label, wd.AttributePath, wd.Class, wd.Style, wd.SourceVariable), wd.FormattingInfo), nil
 	case *pages.TextArea:
-		return inputWidget("Pages$TextArea", wd.Name, wd.Label, wd.AttributePath, wd.Class, wd.Style), nil
+		w := inputWidget("Pages$TextArea", wd.Name, wd.Label, wd.AttributePath, wd.Class, wd.Style, wd.SourceVariable)
+		return withSubmitBehaviour(w, wd.SubmitBehaviour, wd.SubmitOnInputDelay), nil
 	case *pages.RadioButtons:
-		return inputWidget("Pages$RadioButtonGroup", wd.Name, wd.Label, wd.AttributePath, wd.Class, wd.Style), nil
+		return inputWidget("Pages$RadioButtonGroup", wd.Name, wd.Label, wd.AttributePath, wd.Class, wd.Style, wd.SourceVariable), nil
 	default:
 		return nil, fmt.Errorf("page widget type %s is not yet supported by the MCP backend", w.GetTypeName())
 	}
@@ -253,8 +259,11 @@ func (b *Backend) mapPageWidgetBody(w pages.Widget) (map[string]any, error) {
 // inputWidget builds a label+attribute input widget (TextBox/CheckBox/DatePicker).
 // The executor already resolves AttributePath to a fully-qualified
 // "Module.Entity.Attribute", which is exactly what pg's attributeRef wants.
-func inputWidget(typ, name, label, attribute, class, style string) map[string]any {
-	return map[string]any{
+//
+// sv is the widget-scoped variable an attribute read through a data view
+// carries (`Attribute: $dataView1.Name`, ako/mxcli#826), or nil.
+func inputWidget(typ, name, label, attribute, class, style string, sv *pages.WidgetVariable) map[string]any {
+	w := map[string]any{
 		"$Type":            typ,
 		"name":             name,
 		"appearance":       pageAppearance(class, style),
@@ -264,6 +273,69 @@ func inputWidget(typ, name, label, attribute, class, style string) map[string]an
 			"attribute": attribute,
 		},
 	}
+	if sv != nil && sv.Widget != "" {
+		w["sourceVariable"] = pageVariable(sv.Widget, sv.Variable, sv.Kind)
+	}
+	return w
+}
+
+// withFormattingInfo adds an input widget's authored FormattingInfo — a date
+// picker's DateFormat, a text box's precision — in the same Pages$FormattingInfo
+// shape the template parameters send. nil leaves the slot to Studio Pro's
+// defaults, as before; dropping an authored one silently turned a date-time
+// picker into a date picker (ako/mxcli#968).
+func withFormattingInfo(w map[string]any, fi *pages.FormattingInfo) map[string]any {
+	if fi == nil {
+		return w
+	}
+	w["formattingInfo"] = map[string]any{
+		"$Type":            "Pages$FormattingInfo",
+		"decimalPrecision": fi.DecimalPrecision,
+		"groupDigits":      fi.GroupDigits,
+		"enumFormat":       fi.EnumFormat,
+		"dateFormat":       fi.DateFormat,
+		"customDateFormat": fi.CustomDateFormat,
+	}
+	return w
+}
+
+// withSubmitBehaviour adds a text box's or text area's authored submit
+// behaviour and input delay. Unset leaves both to Studio Pro's defaults
+// (OnEndEditing, 300), as before (ako/mxcli-ledger FINDINGS #170).
+func withSubmitBehaviour(w map[string]any, behaviour string, delay *int) map[string]any {
+	if behaviour != "" {
+		w["submitBehaviour"] = behaviour
+	}
+	if delay != nil {
+		w["submitOnInputDelay"] = *delay
+	}
+	return w
+}
+
+// layoutGridWidth is a layout grid's authored Width, or Studio Pro's default.
+func layoutGridWidth(width string) string {
+	if width == "" {
+		return pages.DefaultLayoutGridWidth
+	}
+	return width
+}
+
+// pageVariable builds a Pages$PageVariable naming a data view and, beside it,
+// the data view's own variable. Studio Pro 11.14 fills that variable in itself
+// when given only the widget, so sending it is the same document either way.
+func pageVariable(widget, name, kind string) map[string]any {
+	pv := map[string]any{"$Type": "Pages$PageVariable", "widget": widget, "useAllPages": false}
+	if name != "" {
+		switch kind {
+		case "snippet":
+			pv["snippetParameter"] = name
+		case "local":
+			pv["localVariable"] = name
+		default:
+			pv["pageParameter"] = name
+		}
+	}
+	return pv
 }
 
 // mapListViewSource maps a list-view data source. A database source becomes a
@@ -275,6 +347,13 @@ func mapListViewSource(ds pages.DataSource) (map[string]any, error) {
 	if db, ok := ds.(*pages.DatabaseSource); ok {
 		if db.EntityName == "" {
 			return nil, fmt.Errorf("list view database source has no entity")
+		}
+		if len(db.EntitySteps) > 0 {
+			// Writing the entity alone would retrieve every row instead of the
+			// context's; refused until the pg shape of the path is pinned
+			// (ako/mxcli#721 L5).
+			return nil, fmt.Errorf("list view database source over an association " +
+				"(`database from $ctx/Assoc/Entity`) is not supported by the MCP backend yet")
 		}
 		src := map[string]any{
 			"$Type":     "Pages$ListViewXPathSource",
@@ -297,26 +376,37 @@ func mapListViewSource(ds pages.DataSource) (map[string]any, error) {
 func mapDataViewSource(ds pages.DataSource) (map[string]any, error) {
 	switch s := ds.(type) {
 	case *pages.DataViewSource:
+		if s.ParameterName == "" && s.EntityName == "" {
+			return nil, fmt.Errorf("data view source has neither a page parameter nor an entity")
+		}
 		src := map[string]any{"$Type": "Pages$DataViewSource", "forceFullObjects": false}
-		switch {
-		case s.ParameterName != "":
+		// A context (parameter-bound) data view still needs its entity configured
+		// ON the data source: Studio Pro writes entityRef AND the sourceVariable
+		// binding together (see testdata/pg-page-contact-newedit.json). Setting
+		// only sourceVariable leaves the source with no entity → CE0488 "No entity
+		// configured for the data source of this data view". The executor resolves
+		// the page parameter's entity into EntityName (cmd_pages_builder_v3.go), so
+		// it is available here even when a parameter is the source.
+		if s.EntityName != "" {
+			src["entityRef"] = map[string]any{
+				"$Type":  "DomainModels$DirectEntityRef",
+				"entity": s.EntityName,
+			}
+		}
+		if s.ParameterName != "" {
 			src["sourceVariable"] = map[string]any{
 				"$Type":         "Pages$PageVariable",
 				"pageParameter": s.ParameterName,
 				"useAllPages":   false,
 			}
-		case s.EntityName != "":
-			src["entityRef"] = map[string]any{
-				"$Type":  "DomainModels$DirectEntityRef",
-				"entity": s.EntityName,
-			}
-		default:
-			return nil, fmt.Errorf("data view source has neither a page parameter nor an entity")
 		}
 		return src, nil
 	case *pages.MicroflowSource:
 		if s.Microflow == "" {
 			return nil, fmt.Errorf("microflow data source has no microflow")
+		}
+		if s.FormValidations != "" && s.FormValidations != "All" {
+			return nil, fmt.Errorf("microflow data source %s: FormValidations %s is not yet supported by the MCP backend", s.Microflow, s.FormValidations)
 		}
 		return map[string]any{
 			"$Type":            "Pages$MicroflowSource",
@@ -383,6 +473,9 @@ func mapClientAction(a pages.ClientAction) (map[string]any, error) {
 	case nil, *pages.NoClientAction:
 		return map[string]any{"$Type": "Pages$NoClientAction"}, nil
 	case *pages.MicroflowClientAction:
+		if len(act.OutputMappings) > 0 {
+			return nil, fmt.Errorf("call microflow %s: returns ( … ) is not yet supported by the MCP backend", act.MicroflowName)
+		}
 		return map[string]any{
 			"$Type":     "Pages$MicroflowClientAction",
 			"microflow": act.MicroflowName,
@@ -472,7 +565,7 @@ func pageAppearance(class, style string) map[string]any {
 }
 
 // designPropertiesMap renders a widget's design properties into the object shape
-// pg_write_page expects (verified against testdata/pg-page-contact-newedit-
+// pg_patch_page expects (verified against testdata/pg-page-contact-newedit-
 // designprops.json): keys are "<kind>:<DisplayName>" — "toggle:" with a bool
 // value, "option:" with a string value, "compound:" with a nested object of the
 // same shape (e.g. "compound:Spacing": {"option:margin-top": "L"}). "custom"
@@ -532,10 +625,23 @@ func clientTemplateParam(p *pages.ClientTemplateParameter) map[string]any {
 	switch {
 	case p.AttributeRef != "":
 		param["attributeRef"] = map[string]any{"$Type": "DomainModels$AttributeRef", "attribute": p.AttributeRef}
+		if p.SourceWidget != "" {
+			// `{1} = $dataView1.Attr` reads through the data view (#826).
+			param["sourceVariable"] = pageVariable(p.SourceWidget, p.SourceVariable, p.SourceVariableKind)
+		}
 	case p.Expression != "":
 		param["expression"] = p.Expression
 	case p.SourceVariable != "":
 		param["sourceVariable"] = map[string]any{"$Type": "Pages$PageVariable", "pageParameter": p.SourceVariable, "useAllPages": false}
 	}
 	return param
+}
+
+// alignmentOrNone maps an unset layout-grid row/column alignment to Mendix's
+// default.
+func alignmentOrNone(a string) string {
+	if a == "" {
+		return "None"
+	}
+	return a
 }

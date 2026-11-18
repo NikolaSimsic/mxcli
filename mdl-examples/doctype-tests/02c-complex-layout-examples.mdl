@@ -1,3 +1,4 @@
+mdl 1;
 -- ============================================================================
 -- Complex Layout Examples — Real-World Microflow Complexity Showcase
 -- ============================================================================
@@ -24,6 +25,10 @@
 --                                (~35 activities, McCabe ~16)
 --   5. CX_ACT_BatchProcessFactories — loop with CASE + nested-if body
 --                                (~30 activities, McCabe ~8)
+--   6. CX_SYNC_FactoryTelemetry — jumps and merges: a retry that jumps
+--                                backwards, error handlers rejoining the main
+--                                flow, and crossed branches
+--                                (~37 activities, 4 merges, 11 joins)
 --
 -- Usage:
 --   ./bin/mxcli check mdl-examples/doctype-tests/02c-complex-layout-examples.mdl
@@ -41,7 +46,6 @@ create enumeration CxLayout.AuthMethod (
   ClientSecretBasic 'Client Secret (Basic Auth)',
   None              'None'
 );
-/
 
 create enumeration CxLayout.FactoryStatus (
   Active           'Active',
@@ -49,7 +53,6 @@ create enumeration CxLayout.FactoryStatus (
   Offline          'Offline',
   Decommissioned   'Decommissioned'
 );
-/
 
 @position(100, 100)
 create persistent entity CxLayout.Factory (
@@ -123,7 +126,6 @@ as $$
 /* Placeholder — implement with RestCallAction or HttpClient in production */
 return null;
 $$;
-/
 
 -- ============================================================================
 -- PATTERN 1: Multi-Field Range Validation with Error Accumulator
@@ -256,7 +258,6 @@ begin
 
   return $IsValid;
 end;
-/
 
 -- ============================================================================
 -- PATTERN 2: Sequential Guard-Chain (Conditional Waterfall)
@@ -298,7 +299,7 @@ begin
   -- Guard 2: survey tracker must exist
   retrieve $Tracker from CxLayout.SurveyTracker
     where TrackerId = $TrackerId
-    limit 1;
+    first;
 
   if $Tracker = empty then
     log warning node 'Survey' 'Tracker not found: ' + $TrackerId;
@@ -316,7 +317,7 @@ begin
   -- Guard 4: check for an existing submission
   retrieve $ExistingSubmission from CxLayout.SurveySubmission
     where TrackerId = $TrackerId
-    limit 1;
+    first;
 
   if $ExistingSubmission != empty then
     -- Guard 4a: already completed?
@@ -354,7 +355,6 @@ begin
   set $ResponseBody = '{"status":"ok","code":201,"message":"Submission created"}';
   return $ResponseBody;
 end;
-/
 
 -- ============================================================================
 -- PATTERN 3: Enum Split with Parallel Nested Logic per Branch
@@ -412,10 +412,10 @@ begin
         ClientSecret = $ClientSecret,
         RedirectUri  = $RedirectUri,
         UseBasicAuth = false
-      ) on error without rollback {
+      ) on error without rollback begin
         log error node 'Auth' 'Token exchange failed (client_secret_post): ' + $ClientId;
         return false;
-      };
+      end error;
 
       if $PostResponse = empty then
         log error node 'Auth' 'Empty token response (client_secret_post): ' + $ClientId;
@@ -424,7 +424,7 @@ begin
 
       retrieve $PostToken from CxLayout.AuthToken
         where ClientId = $ClientId
-        limit 1;
+        first;
 
       if $PostToken = empty then
         $NewPostToken = create CxLayout.AuthToken (
@@ -454,10 +454,10 @@ begin
         ClientSecret = $ClientSecret,
         RedirectUri  = $RedirectUri,
         UseBasicAuth = true
-      ) on error without rollback {
+      ) on error without rollback begin
         log error node 'Auth' 'Token exchange failed (client_secret_basic): ' + $ClientId;
         return false;
-      };
+      end error;
 
       if $BasicResponse = empty then
         log error node 'Auth' 'Empty token response (client_secret_basic): ' + $ClientId;
@@ -466,7 +466,7 @@ begin
 
       retrieve $BasicToken from CxLayout.AuthToken
         where ClientId = $ClientId
-        limit 1;
+        first;
 
       if $BasicToken = empty then
         $NewBasicToken = create CxLayout.AuthToken (
@@ -500,7 +500,6 @@ begin
 
   return $Success;
 end;
-/
 
 -- ============================================================================
 -- PATTERN 4: Optional-Field Validation with Per-Field Format Guards
@@ -599,7 +598,6 @@ begin
 
   return $IsValid;
 end;
-/
 
 -- ============================================================================
 -- PATTERN 5: Batch Loop with CASE + Nested-If Body
@@ -680,4 +678,157 @@ begin
 
   return $ProcessedCount;
 end;
-/
+
+-- ============================================================================
+-- PATTERN 6: Jumps and Merges — retry, error rejoin, crossed branches
+-- Source: the graph shapes a nested IF cannot express (mendixlabs/mxcli#923)
+-- Layout: a BACKWARD edge (the retry), two error handlers rejoining the main
+--         flow, two splits whose arms land on a shared merge, and a funnel
+--         where three independent paths end. Expected canvas: tall rather
+--         than wide, with lines running right-to-left across it.
+-- ============================================================================
+
+/**
+ * Synchronises one Factory's telemetry, with retry and a degraded fallback.
+ *
+ * Every join shape MDL can spell, in one flow:
+ *   - BACKWARD     the handler jumps back to `attempt`, above the call, so
+ *                  the failed call is retried until $MaxAttempts
+ *   - ERROR → MAIN a handler that gives up joins `degraded`, which the main
+ *                  flow also reaches when the response came back empty
+ *   - CROSSED      the inner split's FALSE arm and the outer split's FALSE
+ *                  arm both land on `review`, which no nesting of IF
+ *                  reproduces
+ *   - FALL-THROUGH the last handler ends without RETURN or JOIN, so it
+ *                  merges back into the main flow of its own accord
+ *   - FUNNEL       three independent paths end at `finish`
+ *
+ * Expected layout: `attempt`, `degraded`, `review`, `emit` and `finish`
+ * are merge nodes carrying two or three incoming lines each; the retry edge
+ * is the one that runs backwards.
+ */
+create microflow CxLayout.CX_SYNC_FactoryTelemetry (
+  $Factory:     CxLayout.Factory,
+  $MaxAttempts: integer
+)
+returns string as $Outcome
+begin
+  declare $Outcome     string  = 'pending';
+  declare $Attempts    integer = 0;
+
+  -- A decommissioned factory reports nothing: straight to the funnel.
+  if $Factory/Status = CxLayout.FactoryStatus.Decommissioned then
+    set $Outcome = 'skipped';
+    join finish;
+  end if;
+
+  -- ---- retry: the handler jumps BACK to the merge above the call ---------
+  merge attempt;
+  set $Attempts = $Attempts + 1;
+
+  $RawResponse = call java action CxLayout.SUB_ExchangeAuthCode (
+    AuthCode     = $Factory/Name,
+    ClientId     = 'telemetry-client',
+    ClientSecret = 'telemetry-secret',
+    RedirectUri  = 'https://telemetry.example.com/callback',
+    UseBasicAuth = false
+  ) on error without rollback begin
+    log warning node 'Telemetry' 'Telemetry call failed for ' + $Factory/Name
+      + ' (attempt ' + toString($Attempts) + ')';
+    if $Attempts < $MaxAttempts then
+      join attempt;
+    else
+      log error node 'Telemetry' 'Giving up on ' + $Factory/Name
+        + ' after ' + toString($Attempts) + ' attempts';
+      join degraded;
+    end if;
+  end error;
+
+  -- The main flow reaches `degraded` as well, for a call that returned nothing.
+  if $RawResponse = empty then
+    log warning node 'Telemetry' 'Empty telemetry payload for ' + $Factory/Name;
+    join degraded;
+  end if;
+
+  $Token = create CxLayout.AuthToken (
+    ClientId    = 'telemetry-client',
+    AuthMethod  = CxLayout.AuthMethod.None,
+    RawResponse = $RawResponse,
+    IssuedAt    = [%CurrentDateTime%]
+  );
+
+  commit $Token with events on error begin
+    log error node 'Telemetry' 'Could not store the telemetry token';
+    join degraded;
+  end error;
+
+  -- ---- crossed branches: two splits, three arms, two landing points -----
+  if $Factory/Availability > 80 then
+    if $Factory/Performance > 90 then
+      set $Outcome = 'healthy';
+      join emit;
+    else
+      set $Outcome = 'performance-watch';
+      join review;
+    end if;
+  else
+    set $Outcome = 'availability-watch';
+    join review;
+  end if;
+
+  merge review;
+  log info node 'Telemetry' 'Queued for review: ' + $Factory/Name;
+  change $Factory (
+    Status       = CxLayout.FactoryStatus.Maintenance,
+    LastModified = [%CurrentDateTime%]
+  );
+  join emit;
+
+  merge emit;
+  change $Factory (LastModified = [%CurrentDateTime%]);
+  commit $Factory with events on error rollback;
+  log info node 'Telemetry' 'Telemetry published for ' + $Factory/Name;
+  join finish;
+
+  merge degraded;
+  set $Outcome = 'degraded';
+  change $Factory (Status = CxLayout.FactoryStatus.Offline);
+  commit $Factory with events on error begin
+    log error node 'Telemetry' 'Degraded write failed for ' + $Factory/Name;
+  end error;
+  join finish;
+
+  merge finish;
+  log info node 'Telemetry' 'Telemetry sync finished for ' + $Factory/Name
+    + ' with outcome ' + $Outcome;
+  return $Outcome;
+end;
+
+-- ============================================================================
+-- 7. CX_ROUTE_ByStatus — choosing each CASE outcome's side
+-- ============================================================================
+--
+-- @anchor on a CASE names each outcome's edge by its WHEN value, (empty)
+-- included; an outcome it does not name keeps its default side. The CASE's
+-- own `from:` is the flow leaving its merge, as on an IF. DESCRIBE writes an
+-- outcome only where its stored side differs from the default.
+-- (ako/mxcli#1492, mendixlabs/mxcli#1587)
+-- ============================================================================
+
+create microflow CxLayout.CX_ROUTE_ByStatus (
+  $Factory: CxLayout.Factory
+)
+begin
+  @anchor(from: bottom, Active: (from: right), (empty): (from: bottom, to: top))
+  case $Factory/Status
+    when Active then
+      log info node 'Route' 'active';
+    when Maintenance then
+      log info node 'Route' 'maintenance';
+    when Offline, Decommissioned then
+      log warning node 'Route' 'not running';
+    when (empty) then
+      log error node 'Route' 'no status';
+  end case;
+  log info node 'Route' 'routed';
+end;

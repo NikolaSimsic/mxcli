@@ -1,3 +1,4 @@
+mdl 1;
 -- ============================================================================
 -- Bug #114: Reserved words can't be used as page/snippet parameter names
 -- ============================================================================
@@ -28,27 +29,27 @@ create page BugTest114.P_Edit
 (
   title: 'Edit',
   layout: Atlas_Core.Atlas_Default,
-  params: { "List": BugTest114.Order }
+  params: ( "List": BugTest114.Order )
 )
 {
   container c {
     dynamictext t (content: 'x')
   }
-}
+};
 
 -- Snippet with a reserved-keyword parameter name, quoted.
 create snippet BugTest114.Snip
 (
-  params: { "Template": BugTest114.Order }
+  params: ( "Template": BugTest114.Order )
 )
 {
   container c2 {
     dynamictext t2 (content: 'y')
   }
-}
+};
 
 -- SHOW PAGE with a reserved-keyword argument name (already worked; pinned here).
 create microflow BugTest114.ACT_Open (Obj : BugTest114.Order) returns Nothing
 begin
-  show page BugTest114.P_Edit ("List": $Obj);
+  show page BugTest114.P_Edit ("List" = $Obj);
 end;
