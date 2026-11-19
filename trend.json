@@ -1,0 +1,551 @@
+{
+ "runs": 1,
+ "alerts": null,
+ "series": [
+  {
+   "session": "small",
+   "step": "(session-weighted total)",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 128541.28700000001
+    }
+   ]
+  },
+  {
+   "session": "small",
+   "step": "open-cold",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 192.98
+    }
+   ]
+  },
+  {
+   "session": "small",
+   "step": "open",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 69.362
+    }
+   ]
+  },
+  {
+   "session": "small",
+   "step": "domain",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 859.552
+    }
+   ]
+  },
+  {
+   "session": "small",
+   "step": "microflows",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 634.94
+    }
+   ]
+  },
+  {
+   "session": "small",
+   "step": "pages",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 2006.029
+    }
+   ]
+  },
+  {
+   "session": "small",
+   "step": "describe",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 156.811
+    }
+   ]
+  },
+  {
+   "session": "small",
+   "step": "catalog",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 284.374
+    }
+   ]
+  },
+  {
+   "session": "small",
+   "step": "catalog-full",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 1436.025
+    }
+   ]
+  },
+  {
+   "session": "small",
+   "step": "query",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 94.562
+    }
+   ]
+  },
+  {
+   "session": "small",
+   "step": "check",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 412.348
+    }
+   ]
+  },
+  {
+   "session": "small",
+   "step": "single-edit",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 426.264
+    }
+   ]
+  },
+  {
+   "session": "small",
+   "step": "catalog-after-edit",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 267.159
+    }
+   ]
+  },
+  {
+   "session": "small",
+   "step": "bulk-alter",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 1426.285
+    }
+   ]
+  },
+  {
+   "session": "small",
+   "step": "re-exec",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 735.278
+    }
+   ]
+  },
+  {
+   "session": "small",
+   "step": "rename",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 644.198
+    }
+   ]
+  },
+  {
+   "session": "large",
+   "step": "(session-weighted total)",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 192899.57
+    }
+   ]
+  },
+  {
+   "session": "large",
+   "step": "open-cold",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 352.592
+    }
+   ]
+  },
+  {
+   "session": "large",
+   "step": "open",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 86.275
+    }
+   ]
+  },
+  {
+   "session": "large",
+   "step": "domain",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 1008.348
+    }
+   ]
+  },
+  {
+   "session": "large",
+   "step": "microflows",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 1563.203
+    }
+   ]
+  },
+  {
+   "session": "large",
+   "step": "pages",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 2451.513
+    }
+   ]
+  },
+  {
+   "session": "large",
+   "step": "describe",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 191.747
+    }
+   ]
+  },
+  {
+   "session": "large",
+   "step": "catalog",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 427.006
+    }
+   ]
+  },
+  {
+   "session": "large",
+   "step": "catalog-full",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 4524.471
+    }
+   ]
+  },
+  {
+   "session": "large",
+   "step": "query",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 101.435
+    }
+   ]
+  },
+  {
+   "session": "large",
+   "step": "check",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 643.354
+    }
+   ]
+  },
+  {
+   "session": "large",
+   "step": "single-edit",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 642.382
+    }
+   ]
+  },
+  {
+   "session": "large",
+   "step": "catalog-after-edit",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 387.671
+    }
+   ]
+  },
+  {
+   "session": "large",
+   "step": "bulk-alter",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 1738.064
+    }
+   ]
+  },
+  {
+   "session": "large",
+   "step": "re-exec",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 1018.297
+    }
+   ]
+  },
+  {
+   "session": "large",
+   "step": "rename",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 1262.162
+    }
+   ]
+  },
+  {
+   "session": "scale",
+   "step": "(session-weighted total)",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 7185.064
+    }
+   ]
+  },
+  {
+   "session": "scale",
+   "step": "check-cold",
+   "statements": 1,
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 1963.933
+    }
+   ]
+  },
+  {
+   "session": "scale",
+   "step": "check-one",
+   "statements": 1,
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 737.426
+    }
+   ]
+  },
+  {
+   "session": "scale",
+   "step": "check-batch",
+   "statements": 100,
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 1313.467
+    }
+   ]
+  },
+  {
+   "session": "scale",
+   "step": "exec-batch",
+   "statements": 100,
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 1448.132
+    }
+   ]
+  },
+  {
+   "session": "scale",
+   "step": "re-exec-batch",
+   "statements": 100,
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 769.851
+    }
+   ]
+  },
+  {
+   "session": "scale",
+   "step": "new-batch",
+   "statements": 100,
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 952.255
+    }
+   ]
+  },
+  {
+   "session": "runtime",
+   "step": "(session-weighted total)",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 2014570.8399999996
+    }
+   ]
+  },
+  {
+   "session": "runtime",
+   "step": "mx-check",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 8001.43
+    }
+   ]
+  },
+  {
+   "session": "runtime",
+   "step": "build",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 57944.78
+    }
+   ]
+  },
+  {
+   "session": "runtime",
+   "step": "boot",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 29610.643
+    }
+   ]
+  },
+  {
+   "session": "runtime",
+   "step": "page-check",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 3291.94
+    }
+   ]
+  },
+  {
+   "session": "runtime",
+   "step": "hot-apply",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 5777.39
+    }
+   ]
+  },
+  {
+   "session": "runtime",
+   "step": "test-attach",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 136.78
+    }
+   ]
+  },
+  {
+   "session": "runtime",
+   "step": "apply-entity",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 18950.696
+    }
+   ]
+  },
+  {
+   "session": "runtime",
+   "step": "stop",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 846.862
+    }
+   ]
+  },
+  {
+   "session": "runtime",
+   "step": "test-cold",
+   "points": [
+    {
+     "date": "2026-11-19T10:28:36Z",
+     "commit": "dc89a6c",
+     "wall_ms": 25094.582
+    }
+   ]
+  }
+ ]
+}
